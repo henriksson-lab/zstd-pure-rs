@@ -1,0 +1,2833 @@
+# ccc_mapping.toml — machine-readable twin of FUNCTIONS.md
+#
+# Every Rust ↔ C translation pair for `zstd-pure-rs` is pinned here so
+# `ccc-rs compare` doesn't depend on fingerprint fallback OR accidentally
+# pair with the legacy v0.1–v0.7 decoders under `lib/legacy/`. The file
+# has three sections:
+#
+#   1. DISAMBIGUATION — Rust names that appear in more than one Rust
+#      module. `rust_path` + `other_path` pin exactly which C function
+#      each copy translates.
+#   2. RENAMES — Rust names that differ from their upstream C peer.
+#   3. IDENTICAL-NAME PAIRS — one `[[entries]]` per Rust ↔ C pair with
+#      matching names. `other_path` is pinned so pairings can never
+#      route to a v02/v03/…/v07 legacy copy. When upstream has several
+#      non-legacy definitions (e.g. MEM_read* guarded by #ifdefs,
+#      or POOL_* with/without MT), the first encountered path wins —
+#      tree-sitter treats each #ifdef branch as a separate function
+#      and they're equivalent for complexity-comparison purposes.
+#
+# Rust-only extensions intentionally NOT mapped: `_withOpStart`,
+# `_with_history`, `_with_prefix`, `_probe`, `_framed` variants,
+# CLI helpers in `src/bin/`, and private file-local helpers like
+# `round`, `avalanche`, `from_bits`, `ct_u16_read`, etc.
+#
+# Invoke as:  ccc-rs compare rust.json c.json --mapping ccc_mapping.toml
+
+# =====================================================================
+# 1. DISAMBIGUATION
+# =====================================================================
+
+[[entries]]
+rust       = "ZSTD_copy4"
+rust_path  = "src/decompress/zstd_decompress_block.rs"
+other      = "ZSTD_copy4"
+other_path = "lib/decompress/zstd_decompress_block.c"
+
+[[entries]]
+rust       = "ZSTD_copy8"
+rust_path  = "src/common/zstd_internal.rs"
+other      = "ZSTD_copy8"
+other_path = "lib/common/zstd_internal.h"
+
+[[entries]]
+rust       = "ZSTD_getBlockSize"
+rust_path  = "src/compress/zstd_compress.rs"
+other      = "ZSTD_getBlockSize"
+other_path = "lib/compress/zstd_compress.c"
+
+# =====================================================================
+# 2. RENAMES
+# =====================================================================
+
+[[entries]]
+rust  = "ZSTD_ldm_generateSequences_internal_prefixOnly"
+other = "ZSTD_ldm_generateSequences_internal"
+other_path = "zstd/lib/compress/zstd_ldm.c"
+
+[[entries]]
+rust  = "HUF_decompress1X1_usingDTable_internal"
+other = "HUF_decompress1X1_usingDTable_internal_body"
+other_path = "zstd/lib/decompress/huf_decompress.c"
+
+[[entries]]
+rust  = "HUF_decompress1X2_usingDTable_internal"
+other = "HUF_decompress1X2_usingDTable_internal_body"
+other_path = "zstd/lib/decompress/huf_decompress.c"
+
+[[entries]]
+rust  = "HUF_decompress4X1_usingDTable_internal"
+other = "HUF_decompress4X1_usingDTable_internal_body"
+other_path = "zstd/lib/decompress/huf_decompress.c"
+
+[[entries]]
+rust  = "HUF_decompress4X2_usingDTable_internal"
+other = "HUF_decompress4X2_usingDTable_internal_body"
+other_path = "zstd/lib/decompress/huf_decompress.c"
+
+[[entries]]
+rust  = "round"
+rust_path = "src/common/xxhash.rs"
+other = "XXH64_round"
+other_path = "zstd/lib/common/xxhash.h"
+
+[[entries]]
+rust  = "merge_round"
+rust_path = "src/common/xxhash.rs"
+other = "XXH64_mergeRound"
+other_path = "zstd/lib/common/xxhash.h"
+
+[[entries]]
+rust  = "ZSTD_compressBlock_lazy_noDict_generic"
+other = "ZSTD_compressBlock_lazy_generic"
+other_path = "zstd/lib/compress/zstd_lazy.c"
+
+[[entries]]
+rust  = "ZSTD_HcFindBestMatch_noDict"
+other = "ZSTD_HcFindBestMatch"
+other_path = "zstd/lib/compress/zstd_lazy.c"
+
+[[entries]]
+rust  = "FSE_decompress_wksp"
+other = "FSE_decompress_wksp_body"
+other_path = "zstd/lib/common/fse_decompress.c"
+
+[[entries]]
+rust  = "ZSTD_btGetAllMatches_noDict"
+other = "ZSTD_btGetAllMatches_internal"
+other_path = "zstd/lib/compress/zstd_opt.c"
+
+[[entries]]
+rust  = "ZSTD_buildFSETable"
+other = "ZSTD_buildFSETable_body"
+other_path = "zstd/lib/decompress/zstd_decompress_block.c"
+
+[[entries]]
+rust  = "FSE_readNCount"
+other = "FSE_readNCount_body"
+other_path = "zstd/lib/common/entropy_common.c"
+
+[[entries]]
+rust  = "HUF_readStats_wksp"
+other = "HUF_readStats_body"
+other_path = "zstd/lib/common/entropy_common.c"
+
+# =====================================================================
+# 3. IDENTICAL-NAME PAIRS (non-legacy only)
+# =====================================================================
+
+[[entries]]
+rust  = "BIT_addBits"
+other = "BIT_addBits"
+other_path = "zstd/lib/common/bitstream.h"
+
+[[entries]]
+rust  = "BIT_addBitsFast"
+other = "BIT_addBitsFast"
+other_path = "zstd/lib/common/bitstream.h"
+
+[[entries]]
+rust  = "BIT_closeCStream"
+other = "BIT_closeCStream"
+other_path = "zstd/lib/common/bitstream.h"
+
+[[entries]]
+rust  = "BIT_endOfDStream"
+other = "BIT_endOfDStream"
+other_path = "zstd/lib/common/bitstream.h"
+
+[[entries]]
+rust  = "BIT_flushBits"
+other = "BIT_flushBits"
+other_path = "zstd/lib/common/bitstream.h"
+
+[[entries]]
+rust  = "BIT_flushBitsFast"
+other = "BIT_flushBitsFast"
+other_path = "zstd/lib/common/bitstream.h"
+
+[[entries]]
+rust  = "BIT_getLowerBits"
+other = "BIT_getLowerBits"
+other_path = "zstd/lib/common/bitstream.h"
+
+[[entries]]
+rust  = "BIT_getMiddleBits"
+other = "BIT_getMiddleBits"
+other_path = "zstd/lib/common/bitstream.h"
+
+[[entries]]
+rust  = "BIT_getUpperBits"
+other = "BIT_getUpperBits"
+other_path = "zstd/lib/common/bitstream.h"
+
+[[entries]]
+rust  = "BIT_initCStream"
+other = "BIT_initCStream"
+other_path = "zstd/lib/common/bitstream.h"
+
+[[entries]]
+rust  = "BIT_initDStream"
+other = "BIT_initDStream"
+other_path = "zstd/lib/common/bitstream.h"
+
+[[entries]]
+rust  = "BIT_lookBits"
+other = "BIT_lookBits"
+other_path = "zstd/lib/common/bitstream.h"
+
+[[entries]]
+rust  = "BIT_lookBitsFast"
+other = "BIT_lookBitsFast"
+other_path = "zstd/lib/common/bitstream.h"
+
+[[entries]]
+rust  = "BIT_readBits"
+other = "BIT_readBits"
+other_path = "zstd/lib/common/bitstream.h"
+
+[[entries]]
+rust  = "BIT_readBitsFast"
+other = "BIT_readBitsFast"
+other_path = "zstd/lib/common/bitstream.h"
+
+[[entries]]
+rust  = "BIT_reloadDStream"
+other = "BIT_reloadDStream"
+other_path = "zstd/lib/common/bitstream.h"
+
+[[entries]]
+rust  = "BIT_reloadDStreamFast"
+other = "BIT_reloadDStreamFast"
+other_path = "zstd/lib/common/bitstream.h"
+
+[[entries]]
+rust  = "BIT_reloadDStream_internal"
+other = "BIT_reloadDStream_internal"
+other_path = "zstd/lib/common/bitstream.h"
+
+[[entries]]
+rust  = "BIT_skipBits"
+other = "BIT_skipBits"
+other_path = "zstd/lib/common/bitstream.h"
+
+[[entries]]
+rust  = "ERR_getErrorCode"
+other = "ERR_getErrorCode"
+other_path = "zstd/lib/common/error_private.h"
+
+[[entries]]
+rust  = "ERR_getErrorName"
+other = "ERR_getErrorName"
+other_path = "zstd/lib/common/error_private.h"
+
+[[entries]]
+rust  = "ERR_getErrorString"
+other = "ERR_getErrorString"
+other_path = "zstd/lib/common/error_private.c"
+
+[[entries]]
+rust  = "ERR_isError"
+other = "ERR_isError"
+other_path = "zstd/lib/common/error_private.h"
+
+[[entries]]
+rust  = "FSE_NCountWriteBound"
+other = "FSE_NCountWriteBound"
+other_path = "zstd/lib/compress/fse_compress.c"
+
+[[entries]]
+rust  = "FSE_bitCost"
+other = "FSE_bitCost"
+other_path = "zstd/lib/common/fse.h"
+
+[[entries]]
+rust  = "FSE_buildCTable_rle"
+other = "FSE_buildCTable_rle"
+other_path = "zstd/lib/compress/fse_compress.c"
+
+[[entries]]
+rust  = "FSE_buildCTable_wksp"
+other = "FSE_buildCTable_wksp"
+other_path = "zstd/lib/compress/fse_compress.c"
+
+[[entries]]
+rust  = "FSE_buildDTable_internal"
+other = "FSE_buildDTable_internal"
+other_path = "zstd/lib/common/fse_decompress.c"
+
+[[entries]]
+rust  = "FSE_buildDTable_wksp"
+other = "FSE_buildDTable_wksp"
+other_path = "zstd/lib/common/fse_decompress.c"
+
+[[entries]]
+rust  = "FSE_compressBound"
+other = "FSE_compressBound"
+other_path = "zstd/lib/compress/fse_compress.c"
+
+[[entries]]
+rust  = "FSE_compress_usingCTable"
+other = "FSE_compress_usingCTable"
+other_path = "zstd/lib/compress/fse_compress.c"
+
+[[entries]]
+rust  = "FSE_compress_usingCTable_generic"
+other = "FSE_compress_usingCTable_generic"
+other_path = "zstd/lib/compress/fse_compress.c"
+
+[[entries]]
+rust  = "FSE_decodeSymbol"
+other = "FSE_decodeSymbol"
+other_path = "zstd/lib/common/fse.h"
+
+[[entries]]
+rust  = "FSE_decodeSymbolFast"
+other = "FSE_decodeSymbolFast"
+other_path = "zstd/lib/common/fse.h"
+
+[[entries]]
+rust  = "FSE_decompress_usingDTable_generic"
+other = "FSE_decompress_usingDTable_generic"
+other_path = "zstd/lib/common/fse_decompress.c"
+
+[[entries]]
+rust  = "FSE_decompress_wksp_bmi2"
+other = "FSE_decompress_wksp_bmi2"
+other_path = "zstd/lib/common/fse_decompress.c"
+
+[[entries]]
+rust  = "FSE_encodeSymbol"
+other = "FSE_encodeSymbol"
+other_path = "zstd/lib/common/fse.h"
+
+[[entries]]
+rust  = "FSE_endOfDState"
+other = "FSE_endOfDState"
+other_path = "zstd/lib/common/fse.h"
+
+[[entries]]
+rust  = "FSE_flushCState"
+other = "FSE_flushCState"
+other_path = "zstd/lib/common/fse.h"
+
+[[entries]]
+rust  = "FSE_getErrorName"
+other = "FSE_getErrorName"
+other_path = "zstd/lib/common/entropy_common.c"
+
+[[entries]]
+rust  = "FSE_getMaxNbBits"
+other = "FSE_getMaxNbBits"
+other_path = "zstd/lib/common/fse.h"
+
+[[entries]]
+rust  = "FSE_initCState"
+other = "FSE_initCState"
+other_path = "zstd/lib/common/fse.h"
+
+[[entries]]
+rust  = "FSE_initCState2"
+other = "FSE_initCState2"
+other_path = "zstd/lib/common/fse.h"
+
+[[entries]]
+rust  = "FSE_initDState"
+other = "FSE_initDState"
+other_path = "zstd/lib/common/fse.h"
+
+[[entries]]
+rust  = "FSE_isError"
+other = "FSE_isError"
+other_path = "zstd/lib/common/entropy_common.c"
+
+[[entries]]
+rust  = "FSE_minTableLog"
+other = "FSE_minTableLog"
+other_path = "zstd/lib/compress/fse_compress.c"
+
+[[entries]]
+rust  = "FSE_normalizeCount"
+other = "FSE_normalizeCount"
+other_path = "zstd/lib/compress/fse_compress.c"
+
+[[entries]]
+rust  = "FSE_normalizeM2"
+other = "FSE_normalizeM2"
+other_path = "zstd/lib/compress/fse_compress.c"
+
+[[entries]]
+rust  = "FSE_optimalTableLog"
+other = "FSE_optimalTableLog"
+other_path = "zstd/lib/compress/fse_compress.c"
+
+[[entries]]
+rust  = "FSE_optimalTableLog_internal"
+other = "FSE_optimalTableLog_internal"
+other_path = "zstd/lib/compress/fse_compress.c"
+
+[[entries]]
+rust  = "FSE_peekSymbol"
+other = "FSE_peekSymbol"
+other_path = "zstd/lib/common/fse.h"
+
+[[entries]]
+rust  = "FSE_readNCount_bmi2"
+other = "FSE_readNCount_bmi2"
+other_path = "zstd/lib/common/entropy_common.c"
+
+[[entries]]
+rust  = "FSE_updateState"
+other = "FSE_updateState"
+other_path = "zstd/lib/common/fse.h"
+
+[[entries]]
+rust  = "FSE_versionNumber"
+other = "FSE_versionNumber"
+other_path = "zstd/lib/common/entropy_common.c"
+
+[[entries]]
+rust  = "FSE_writeNCount"
+other = "FSE_writeNCount"
+other_path = "zstd/lib/compress/fse_compress.c"
+
+[[entries]]
+rust  = "FSE_writeNCount_generic"
+other = "FSE_writeNCount_generic"
+other_path = "zstd/lib/compress/fse_compress.c"
+
+[[entries]]
+rust  = "HIST_add"
+other = "HIST_add"
+other_path = "zstd/lib/compress/hist.c"
+
+[[entries]]
+rust  = "HIST_count"
+other = "HIST_count"
+other_path = "zstd/lib/compress/hist.c"
+
+[[entries]]
+rust  = "HIST_countFast"
+other = "HIST_countFast"
+other_path = "zstd/lib/compress/hist.c"
+
+[[entries]]
+rust  = "HIST_countFast_wksp"
+other = "HIST_countFast_wksp"
+other_path = "zstd/lib/compress/hist.c"
+
+[[entries]]
+rust  = "HIST_count_parallel_wksp"
+other = "HIST_count_parallel_wksp"
+other_path = "zstd/lib/compress/hist.c"
+
+[[entries]]
+rust  = "HIST_count_simple"
+other = "HIST_count_simple"
+other_path = "zstd/lib/compress/hist.c"
+
+[[entries]]
+rust  = "HIST_count_wksp"
+other = "HIST_count_wksp"
+other_path = "zstd/lib/compress/hist.c"
+
+[[entries]]
+rust  = "HIST_isError"
+other = "HIST_isError"
+other_path = "zstd/lib/compress/hist.c"
+
+[[entries]]
+rust  = "HUF_DEltX1_set4"
+other = "HUF_DEltX1_set4"
+other_path = "zstd/lib/decompress/huf_decompress.c"
+
+[[entries]]
+rust  = "HUF_addBits"
+other = "HUF_addBits"
+other_path = "zstd/lib/compress/huf_compress.c"
+
+[[entries]]
+rust  = "HUF_buildCTableFromTree"
+other = "HUF_buildCTableFromTree"
+other_path = "zstd/lib/compress/huf_compress.c"
+
+[[entries]]
+rust  = "HUF_buildCTable_wksp"
+other = "HUF_buildCTable_wksp"
+other_path = "zstd/lib/compress/huf_compress.c"
+
+[[entries]]
+rust  = "HUF_buildDEltX2"
+other = "HUF_buildDEltX2"
+other_path = "zstd/lib/decompress/huf_decompress.c"
+
+[[entries]]
+rust  = "HUF_buildDEltX2U32"
+other = "HUF_buildDEltX2U32"
+other_path = "zstd/lib/decompress/huf_decompress.c"
+
+[[entries]]
+rust  = "HUF_buildTree"
+other = "HUF_buildTree"
+other_path = "zstd/lib/compress/huf_compress.c"
+
+[[entries]]
+rust  = "HUF_cardinality"
+other = "HUF_cardinality"
+other_path = "zstd/lib/compress/huf_compress.c"
+
+[[entries]]
+rust  = "HUF_closeCStream"
+other = "HUF_closeCStream"
+other_path = "zstd/lib/compress/huf_compress.c"
+
+[[entries]]
+rust  = "HUF_compress1X_repeat"
+other = "HUF_compress1X_repeat"
+other_path = "zstd/lib/compress/huf_compress.c"
+
+[[entries]]
+rust  = "HUF_compress1X_usingCTable"
+other = "HUF_compress1X_usingCTable"
+other_path = "zstd/lib/compress/huf_compress.c"
+
+[[entries]]
+rust  = "HUF_compress1X_usingCTable_internal_body"
+other = "HUF_compress1X_usingCTable_internal_body"
+other_path = "zstd/lib/compress/huf_compress.c"
+
+[[entries]]
+rust  = "HUF_compress4X_repeat"
+other = "HUF_compress4X_repeat"
+other_path = "zstd/lib/compress/huf_compress.c"
+
+[[entries]]
+rust  = "HUF_compress4X_usingCTable"
+other = "HUF_compress4X_usingCTable"
+other_path = "zstd/lib/compress/huf_compress.c"
+
+[[entries]]
+rust  = "HUF_compressBound"
+other = "HUF_compressBound"
+other_path = "zstd/lib/compress/huf_compress.c"
+
+[[entries]]
+rust  = "HUF_compressCTable_internal"
+other = "HUF_compressCTable_internal"
+other_path = "zstd/lib/compress/huf_compress.c"
+
+[[entries]]
+rust  = "HUF_compressWeights"
+other = "HUF_compressWeights"
+other_path = "zstd/lib/compress/huf_compress.c"
+
+[[entries]]
+rust  = "HUF_compress_internal"
+other = "HUF_compress_internal"
+other_path = "zstd/lib/compress/huf_compress.c"
+
+[[entries]]
+rust  = "HUF_decodeLastSymbolX2"
+other = "HUF_decodeLastSymbolX2"
+other_path = "zstd/lib/decompress/huf_decompress.c"
+
+[[entries]]
+rust  = "HUF_decodeStreamX1"
+other = "HUF_decodeStreamX1"
+other_path = "zstd/lib/decompress/huf_decompress.c"
+
+[[entries]]
+rust  = "HUF_decodeStreamX2"
+other = "HUF_decodeStreamX2"
+other_path = "zstd/lib/decompress/huf_decompress.c"
+
+[[entries]]
+rust  = "HUF_decodeSymbolX1"
+other = "HUF_decodeSymbolX1"
+other_path = "zstd/lib/decompress/huf_decompress.c"
+
+[[entries]]
+rust  = "HUF_decodeSymbolX2"
+other = "HUF_decodeSymbolX2"
+other_path = "zstd/lib/decompress/huf_decompress.c"
+
+[[entries]]
+rust  = "HUF_decompress1X1_DCtx_wksp"
+other = "HUF_decompress1X1_DCtx_wksp"
+other_path = "zstd/lib/decompress/huf_decompress.c"
+
+[[entries]]
+rust  = "HUF_decompress1X2_DCtx_wksp"
+other = "HUF_decompress1X2_DCtx_wksp"
+other_path = "zstd/lib/decompress/huf_decompress.c"
+
+[[entries]]
+rust  = "HUF_decompress1X_usingDTable"
+other = "HUF_decompress1X_usingDTable"
+other_path = "zstd/lib/decompress/huf_decompress.c"
+
+[[entries]]
+rust  = "HUF_decompress4X1_DCtx_wksp"
+other = "HUF_decompress4X1_DCtx_wksp"
+other_path = "zstd/lib/decompress/huf_decompress.c"
+
+[[entries]]
+rust  = "HUF_decompress4X2_DCtx_wksp"
+other = "HUF_decompress4X2_DCtx_wksp"
+other_path = "zstd/lib/decompress/huf_decompress.c"
+
+[[entries]]
+rust  = "HUF_decompress4X_usingDTable"
+other = "HUF_decompress4X_usingDTable"
+other_path = "zstd/lib/decompress/huf_decompress.c"
+
+[[entries]]
+rust  = "HUF_encodeSymbol"
+other = "HUF_encodeSymbol"
+other_path = "zstd/lib/compress/huf_compress.c"
+
+[[entries]]
+rust  = "HUF_endMark"
+other = "HUF_endMark"
+other_path = "zstd/lib/compress/huf_compress.c"
+
+[[entries]]
+rust  = "HUF_estimateCompressedSize"
+other = "HUF_estimateCompressedSize"
+other_path = "zstd/lib/compress/huf_compress.c"
+
+[[entries]]
+rust  = "HUF_fillDTableX2"
+other = "HUF_fillDTableX2"
+other_path = "zstd/lib/decompress/huf_decompress.c"
+
+[[entries]]
+rust  = "HUF_fillDTableX2ForWeight"
+other = "HUF_fillDTableX2ForWeight"
+other_path = "zstd/lib/decompress/huf_decompress.c"
+
+[[entries]]
+rust  = "HUF_fillDTableX2Level2"
+other = "HUF_fillDTableX2Level2"
+other_path = "zstd/lib/decompress/huf_decompress.c"
+
+[[entries]]
+rust  = "HUF_flushBits"
+other = "HUF_flushBits"
+other_path = "zstd/lib/compress/huf_compress.c"
+
+[[entries]]
+rust  = "HUF_getDTableDesc"
+other = "HUF_getDTableDesc"
+other_path = "zstd/lib/decompress/huf_decompress.c"
+
+[[entries]]
+rust  = "HUF_getErrorName"
+other = "HUF_getErrorName"
+other_path = "zstd/lib/common/entropy_common.c"
+
+[[entries]]
+rust  = "HUF_getIndex"
+other = "HUF_getIndex"
+other_path = "zstd/lib/compress/huf_compress.c"
+
+[[entries]]
+rust  = "HUF_getNbBits"
+other = "HUF_getNbBits"
+other_path = "zstd/lib/compress/huf_compress.c"
+
+[[entries]]
+rust  = "HUF_getNbBitsFast"
+other = "HUF_getNbBitsFast"
+other_path = "zstd/lib/compress/huf_compress.c"
+
+[[entries]]
+rust  = "HUF_getNbBitsFromCTable"
+other = "HUF_getNbBitsFromCTable"
+other_path = "zstd/lib/compress/huf_compress.c"
+
+[[entries]]
+rust  = "HUF_getValue"
+other = "HUF_getValue"
+other_path = "zstd/lib/compress/huf_compress.c"
+
+[[entries]]
+rust  = "HUF_getValueFast"
+other = "HUF_getValueFast"
+other_path = "zstd/lib/compress/huf_compress.c"
+
+[[entries]]
+rust  = "HUF_initCStream"
+other = "HUF_initCStream"
+other_path = "zstd/lib/compress/huf_compress.c"
+
+[[entries]]
+rust  = "HUF_insertionSort"
+other = "HUF_insertionSort"
+other_path = "zstd/lib/compress/huf_compress.c"
+
+[[entries]]
+rust  = "HUF_isError"
+other = "HUF_isError"
+other_path = "zstd/lib/common/entropy_common.c"
+
+[[entries]]
+rust  = "HUF_isSorted"
+other = "HUF_isSorted"
+other_path = "zstd/lib/compress/huf_compress.c"
+
+[[entries]]
+rust  = "HUF_mergeIndex1"
+other = "HUF_mergeIndex1"
+other_path = "zstd/lib/compress/huf_compress.c"
+
+[[entries]]
+rust  = "HUF_minTableLog"
+other = "HUF_minTableLog"
+other_path = "zstd/lib/compress/huf_compress.c"
+
+[[entries]]
+rust  = "HUF_optimalTableLog"
+other = "HUF_optimalTableLog"
+other_path = "zstd/lib/compress/huf_compress.c"
+
+[[entries]]
+rust  = "HUF_readCTableHeader"
+other = "HUF_readCTableHeader"
+other_path = "zstd/lib/compress/huf_compress.c"
+
+[[entries]]
+rust  = "HUF_readStats"
+other = "HUF_readStats"
+other_path = "zstd/lib/common/entropy_common.c"
+
+[[entries]]
+rust  = "HUF_rescaleStats"
+other = "HUF_rescaleStats"
+other_path = "zstd/lib/decompress/huf_decompress.c"
+
+[[entries]]
+rust  = "HUF_setMaxHeight"
+other = "HUF_setMaxHeight"
+other_path = "zstd/lib/compress/huf_compress.c"
+
+[[entries]]
+rust  = "HUF_setNbBits"
+other = "HUF_setNbBits"
+other_path = "zstd/lib/compress/huf_compress.c"
+
+[[entries]]
+rust  = "HUF_setValue"
+other = "HUF_setValue"
+other_path = "zstd/lib/compress/huf_compress.c"
+
+[[entries]]
+rust  = "HUF_sort"
+other = "HUF_sort"
+other_path = "zstd/lib/compress/huf_compress.c"
+
+[[entries]]
+rust  = "HUF_validateCTable"
+other = "HUF_validateCTable"
+other_path = "zstd/lib/compress/huf_compress.c"
+
+[[entries]]
+rust  = "HUF_writeCTableHeader"
+other = "HUF_writeCTableHeader"
+other_path = "zstd/lib/compress/huf_compress.c"
+
+[[entries]]
+rust  = "HUF_zeroIndex1"
+other = "HUF_zeroIndex1"
+other_path = "zstd/lib/compress/huf_compress.c"
+
+[[entries]]
+rust  = "MEM_32bits"
+other = "MEM_32bits"
+other_path = "zstd/lib/common/mem.h"
+
+[[entries]]
+rust  = "MEM_64bits"
+other = "MEM_64bits"
+other_path = "zstd/lib/common/mem.h"
+
+[[entries]]
+rust  = "MEM_isLittleEndian"
+other = "MEM_isLittleEndian"
+other_path = "zstd/lib/common/mem.h"
+
+[[entries]]
+rust  = "MEM_read16"
+other = "MEM_read16"
+other_path = "zstd/lib/common/mem.h"
+
+[[entries]]
+rust  = "MEM_read32"
+other = "MEM_read32"
+other_path = "zstd/lib/common/mem.h"
+
+[[entries]]
+rust  = "MEM_read64"
+other = "MEM_read64"
+other_path = "zstd/lib/common/mem.h"
+
+[[entries]]
+rust  = "MEM_readBE32"
+other = "MEM_readBE32"
+other_path = "zstd/lib/common/mem.h"
+
+[[entries]]
+rust  = "MEM_readBE64"
+other = "MEM_readBE64"
+other_path = "zstd/lib/common/mem.h"
+
+[[entries]]
+rust  = "MEM_readBEST"
+other = "MEM_readBEST"
+other_path = "zstd/lib/common/mem.h"
+
+[[entries]]
+rust  = "MEM_readLE16"
+other = "MEM_readLE16"
+other_path = "zstd/lib/common/mem.h"
+
+[[entries]]
+rust  = "MEM_readLE24"
+other = "MEM_readLE24"
+other_path = "zstd/lib/common/mem.h"
+
+[[entries]]
+rust  = "MEM_readLE32"
+other = "MEM_readLE32"
+other_path = "zstd/lib/common/mem.h"
+
+[[entries]]
+rust  = "MEM_readLE64"
+other = "MEM_readLE64"
+other_path = "zstd/lib/common/mem.h"
+
+[[entries]]
+rust  = "MEM_readLEST"
+other = "MEM_readLEST"
+other_path = "zstd/lib/common/mem.h"
+
+[[entries]]
+rust  = "MEM_readST"
+other = "MEM_readST"
+other_path = "zstd/lib/common/mem.h"
+
+[[entries]]
+rust  = "MEM_swap32"
+other = "MEM_swap32"
+other_path = "zstd/lib/common/mem.h"
+
+[[entries]]
+rust  = "MEM_swap64"
+other = "MEM_swap64"
+other_path = "zstd/lib/common/mem.h"
+
+[[entries]]
+rust  = "MEM_swapST"
+other = "MEM_swapST"
+other_path = "zstd/lib/common/mem.h"
+
+[[entries]]
+rust  = "MEM_write16"
+other = "MEM_write16"
+other_path = "zstd/lib/common/mem.h"
+
+[[entries]]
+rust  = "MEM_write32"
+other = "MEM_write32"
+other_path = "zstd/lib/common/mem.h"
+
+[[entries]]
+rust  = "MEM_write64"
+other = "MEM_write64"
+other_path = "zstd/lib/common/mem.h"
+
+[[entries]]
+rust  = "MEM_writeBE32"
+other = "MEM_writeBE32"
+other_path = "zstd/lib/common/mem.h"
+
+[[entries]]
+rust  = "MEM_writeBE64"
+other = "MEM_writeBE64"
+other_path = "zstd/lib/common/mem.h"
+
+[[entries]]
+rust  = "MEM_writeBEST"
+other = "MEM_writeBEST"
+other_path = "zstd/lib/common/mem.h"
+
+[[entries]]
+rust  = "MEM_writeLE16"
+other = "MEM_writeLE16"
+other_path = "zstd/lib/common/mem.h"
+
+[[entries]]
+rust  = "MEM_writeLE24"
+other = "MEM_writeLE24"
+other_path = "zstd/lib/common/mem.h"
+
+[[entries]]
+rust  = "MEM_writeLE32"
+other = "MEM_writeLE32"
+other_path = "zstd/lib/common/mem.h"
+
+[[entries]]
+rust  = "MEM_writeLE64"
+other = "MEM_writeLE64"
+other_path = "zstd/lib/common/mem.h"
+
+[[entries]]
+rust  = "MEM_writeLEST"
+other = "MEM_writeLEST"
+other_path = "zstd/lib/common/mem.h"
+
+[[entries]]
+rust  = "POOL_add"
+other = "POOL_add"
+other_path = "zstd/lib/common/pool.c"
+
+[[entries]]
+rust  = "POOL_create"
+other = "POOL_create"
+other_path = "zstd/lib/common/pool.c"
+
+[[entries]]
+rust  = "POOL_free"
+other = "POOL_free"
+other_path = "zstd/lib/common/pool.c"
+
+[[entries]]
+rust  = "POOL_joinJobs"
+other = "POOL_joinJobs"
+other_path = "zstd/lib/common/pool.c"
+
+[[entries]]
+rust  = "POOL_resize"
+other = "POOL_resize"
+other_path = "zstd/lib/common/pool.c"
+
+[[entries]]
+rust  = "POOL_sizeof"
+other = "POOL_sizeof"
+other_path = "zstd/lib/common/pool.c"
+
+[[entries]]
+rust  = "POOL_tryAdd"
+other = "POOL_tryAdd"
+other_path = "zstd/lib/common/pool.c"
+
+[[entries]]
+rust  = "XXH64_digest"
+other = "XXH64_digest"
+other_path = "zstd/lib/common/xxhash.h"
+
+[[entries]]
+rust  = "XXH64_reset"
+other = "XXH64_reset"
+other_path = "zstd/lib/common/xxhash.h"
+
+[[entries]]
+rust  = "ZSTDMT_compressStream_generic"
+other = "ZSTDMT_compressStream_generic"
+other_path = "zstd/lib/compress/zstdmt_compress.c"
+
+[[entries]]
+rust  = "ZSTDMT_freeCCtx"
+other = "ZSTDMT_freeCCtx"
+other_path = "zstd/lib/compress/zstdmt_compress.c"
+
+[[entries]]
+rust  = "ZSTDMT_nextInputSizeHint"
+other = "ZSTDMT_nextInputSizeHint"
+other_path = "zstd/lib/compress/zstdmt_compress.c"
+
+[[entries]]
+rust  = "ZSTDMT_sizeof_CCtx"
+other = "ZSTDMT_sizeof_CCtx"
+other_path = "zstd/lib/compress/zstdmt_compress.c"
+
+[[entries]]
+rust  = "ZSTDMT_toFlushNow"
+other = "ZSTDMT_toFlushNow"
+other_path = "zstd/lib/compress/zstdmt_compress.c"
+
+[[entries]]
+rust  = "ZSTD_CCtxParams_getParameter"
+other = "ZSTD_CCtxParams_getParameter"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_CCtxParams_init"
+other = "ZSTD_CCtxParams_init"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_CCtxParams_init_advanced"
+other = "ZSTD_CCtxParams_init_advanced"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_CCtxParams_reset"
+other = "ZSTD_CCtxParams_reset"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_CCtxParams_setParameter"
+other = "ZSTD_CCtxParams_setParameter"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_CCtx_getParameter"
+other = "ZSTD_CCtx_getParameter"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_CCtx_loadDictionary"
+other = "ZSTD_CCtx_loadDictionary"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_CCtx_loadDictionary_advanced"
+other = "ZSTD_CCtx_loadDictionary_advanced"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_CCtx_loadDictionary_byReference"
+other = "ZSTD_CCtx_loadDictionary_byReference"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_CCtx_refCDict"
+other = "ZSTD_CCtx_refCDict"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_CCtx_refPrefix"
+other = "ZSTD_CCtx_refPrefix"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_CCtx_refPrefix_advanced"
+other = "ZSTD_CCtx_refPrefix_advanced"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_CCtx_refThreadPool"
+other = "ZSTD_CCtx_refThreadPool"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_CCtx_reset"
+other = "ZSTD_CCtx_reset"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_CCtx_setCParams"
+other = "ZSTD_CCtx_setCParams"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_CCtx_setFParams"
+other = "ZSTD_CCtx_setFParams"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_CCtx_setParameter"
+other = "ZSTD_CCtx_setParameter"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_CCtx_setParametersUsingCCtxParams"
+other = "ZSTD_CCtx_setParametersUsingCCtxParams"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_CCtx_setParams"
+other = "ZSTD_CCtx_setParams"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_CCtx_setPledgedSrcSize"
+other = "ZSTD_CCtx_setPledgedSrcSize"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_CDictIndicesAreTagged"
+other = "ZSTD_CDictIndicesAreTagged"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_CStreamInSize"
+other = "ZSTD_CStreamInSize"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_CStreamOutSize"
+other = "ZSTD_CStreamOutSize"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_DCtx_getParameter"
+other = "ZSTD_DCtx_getParameter"
+other_path = "zstd/lib/decompress/zstd_decompress.c"
+
+[[entries]]
+rust  = "ZSTD_DCtx_loadDictionary"
+other = "ZSTD_DCtx_loadDictionary"
+other_path = "zstd/lib/decompress/zstd_decompress.c"
+
+[[entries]]
+rust  = "ZSTD_DCtx_loadDictionary_advanced"
+other = "ZSTD_DCtx_loadDictionary_advanced"
+other_path = "zstd/lib/decompress/zstd_decompress.c"
+
+[[entries]]
+rust  = "ZSTD_DCtx_loadDictionary_byReference"
+other = "ZSTD_DCtx_loadDictionary_byReference"
+other_path = "zstd/lib/decompress/zstd_decompress.c"
+
+[[entries]]
+rust  = "ZSTD_DCtx_refDDict"
+other = "ZSTD_DCtx_refDDict"
+other_path = "zstd/lib/decompress/zstd_decompress.c"
+
+[[entries]]
+rust  = "ZSTD_DCtx_refPrefix"
+other = "ZSTD_DCtx_refPrefix"
+other_path = "zstd/lib/decompress/zstd_decompress.c"
+
+[[entries]]
+rust  = "ZSTD_DCtx_refPrefix_advanced"
+other = "ZSTD_DCtx_refPrefix_advanced"
+other_path = "zstd/lib/decompress/zstd_decompress.c"
+
+[[entries]]
+rust  = "ZSTD_DCtx_reset"
+other = "ZSTD_DCtx_reset"
+other_path = "zstd/lib/decompress/zstd_decompress.c"
+
+[[entries]]
+rust  = "ZSTD_DCtx_setFormat"
+other = "ZSTD_DCtx_setFormat"
+other_path = "zstd/lib/decompress/zstd_decompress.c"
+
+[[entries]]
+rust  = "ZSTD_DCtx_setMaxWindowSize"
+other = "ZSTD_DCtx_setMaxWindowSize"
+other_path = "zstd/lib/decompress/zstd_decompress.c"
+
+[[entries]]
+rust  = "ZSTD_DCtx_setParameter"
+other = "ZSTD_DCtx_setParameter"
+other_path = "zstd/lib/decompress/zstd_decompress.c"
+
+[[entries]]
+rust  = "ZSTD_DDict_dictContent"
+other = "ZSTD_DDict_dictContent"
+other_path = "zstd/lib/decompress/zstd_ddict.c"
+
+[[entries]]
+rust  = "ZSTD_DDict_dictSize"
+other = "ZSTD_DDict_dictSize"
+other_path = "zstd/lib/decompress/zstd_ddict.c"
+
+[[entries]]
+rust  = "ZSTD_DStreamInSize"
+other = "ZSTD_DStreamInSize"
+other_path = "zstd/lib/decompress/zstd_decompress.c"
+
+[[entries]]
+rust  = "ZSTD_DStreamOutSize"
+other = "ZSTD_DStreamOutSize"
+other_path = "zstd/lib/decompress/zstd_decompress.c"
+
+[[entries]]
+rust  = "ZSTD_LLcode"
+other = "ZSTD_LLcode"
+other_path = "zstd/lib/compress/zstd_compress_internal.h"
+
+[[entries]]
+rust  = "ZSTD_MLcode"
+other = "ZSTD_MLcode"
+other_path = "zstd/lib/compress/zstd_compress_internal.h"
+
+[[entries]]
+rust  = "ZSTD_NCountCost"
+other = "ZSTD_NCountCost"
+other_path = "zstd/lib/compress/zstd_compress_sequences.c"
+
+[[entries]]
+rust  = "ZSTD_NbCommonBytes"
+other = "ZSTD_NbCommonBytes"
+other_path = "zstd/lib/common/bits.h"
+
+[[entries]]
+rust  = "ZSTD_adjustCParams"
+other = "ZSTD_adjustCParams"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_adjustCParams_internal"
+other = "ZSTD_adjustCParams_internal"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_advanceHashSalt"
+other = "ZSTD_advanceHashSalt"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_allocateChainTable"
+other = "ZSTD_allocateChainTable"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_allocateLiteralsBuffer"
+other = "ZSTD_allocateLiteralsBuffer"
+other_path = "zstd/lib/decompress/zstd_decompress_block.c"
+
+[[entries]]
+rust  = "ZSTD_assertEqualCParams"
+other = "ZSTD_assertEqualCParams"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_bitWeight"
+other = "ZSTD_bitWeight"
+other_path = "zstd/lib/compress/zstd_opt.c"
+
+[[entries]]
+rust  = "ZSTD_bitmix"
+other = "ZSTD_bitmix"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_blockSizeMax"
+other = "ZSTD_blockSizeMax"
+other_path = "zstd/lib/decompress/zstd_decompress_block.c"
+
+[[entries]]
+rust  = "ZSTD_buildCTable"
+other = "ZSTD_buildCTable"
+other_path = "zstd/lib/compress/zstd_compress_sequences.c"
+
+[[entries]]
+rust  = "ZSTD_buildSeqTable"
+other = "ZSTD_buildSeqTable"
+other_path = "zstd/lib/decompress/zstd_decompress_block.c"
+
+[[entries]]
+rust  = "ZSTD_buildSeqTable_rle"
+other = "ZSTD_buildSeqTable_rle"
+other_path = "zstd/lib/decompress/zstd_decompress_block.c"
+
+[[entries]]
+rust  = "ZSTD_buildSequencesStatistics"
+other = "ZSTD_buildSequencesStatistics"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_cParam_clampBounds"
+other = "ZSTD_cParam_clampBounds"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_cParam_getBounds"
+other = "ZSTD_cParam_getBounds"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_cParam_withinBounds"
+other = "ZSTD_cParam_withinBounds"
+other_path = "zstd/lib/compress/zstd_compress_internal.h"
+
+[[entries]]
+rust  = "ZSTD_checkCParams"
+other = "ZSTD_checkCParams"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_checkDictValidity"
+other = "ZSTD_checkDictValidity"
+other_path = "zstd/lib/compress/zstd_compress_internal.h"
+
+[[entries]]
+rust  = "ZSTD_clearAllDicts"
+other = "ZSTD_clearAllDicts"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_comparePackedTags"
+other = "ZSTD_comparePackedTags"
+other_path = "zstd/lib/compress/zstd_compress_internal.h"
+
+[[entries]]
+rust  = "ZSTD_compress"
+other = "ZSTD_compress"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_compress2"
+other = "ZSTD_compress2"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_compressBegin"
+other = "ZSTD_compressBegin"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_compressBegin_usingCDict"
+other = "ZSTD_compressBegin_usingCDict"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_compressBegin_usingDict"
+other = "ZSTD_compressBegin_usingDict"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_compressBlock_btlazy2"
+other = "ZSTD_compressBlock_btlazy2"
+other_path = "zstd/lib/compress/zstd_lazy.c"
+
+[[entries]]
+rust  = "ZSTD_compressBlock_btopt"
+other = "ZSTD_compressBlock_btopt"
+other_path = "zstd/lib/compress/zstd_opt.c"
+
+[[entries]]
+rust  = "ZSTD_compressBlock_btultra"
+other = "ZSTD_compressBlock_btultra"
+other_path = "zstd/lib/compress/zstd_opt.c"
+
+[[entries]]
+rust  = "ZSTD_compressBlock_btultra2"
+other = "ZSTD_compressBlock_btultra2"
+other_path = "zstd/lib/compress/zstd_opt.c"
+
+[[entries]]
+rust  = "ZSTD_compressBlock_doubleFast"
+other = "ZSTD_compressBlock_doubleFast"
+other_path = "zstd/lib/compress/zstd_double_fast.c"
+
+[[entries]]
+rust  = "ZSTD_compressBlock_doubleFast_noDict_generic"
+other = "ZSTD_compressBlock_doubleFast_noDict_generic"
+other_path = "zstd/lib/compress/zstd_double_fast.c"
+
+[[entries]]
+rust  = "ZSTD_compressBlock_fast"
+other = "ZSTD_compressBlock_fast"
+other_path = "zstd/lib/compress/zstd_fast.c"
+
+[[entries]]
+rust  = "ZSTD_compressBlock_fast_noDict_generic"
+other = "ZSTD_compressBlock_fast_noDict_generic"
+other_path = "zstd/lib/compress/zstd_fast.c"
+
+[[entries]]
+rust  = "ZSTD_compressBlock_greedy"
+other = "ZSTD_compressBlock_greedy"
+other_path = "zstd/lib/compress/zstd_lazy.c"
+
+[[entries]]
+rust  = "ZSTD_compressBlock_lazy"
+other = "ZSTD_compressBlock_lazy"
+other_path = "zstd/lib/compress/zstd_lazy.c"
+
+[[entries]]
+rust  = "ZSTD_compressBlock_lazy2"
+other = "ZSTD_compressBlock_lazy2"
+other_path = "zstd/lib/compress/zstd_lazy.c"
+
+[[entries]]
+rust  = "ZSTD_compressBound"
+other = "ZSTD_compressBound"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_compressCCtx"
+other = "ZSTD_compressCCtx"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_compressContinue"
+other = "ZSTD_compressContinue"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_compressEnd"
+other = "ZSTD_compressEnd"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_compressLiterals"
+other = "ZSTD_compressLiterals"
+other_path = "zstd/lib/compress/zstd_compress_literals.c"
+
+[[entries]]
+rust  = "ZSTD_compressRleLiteralsBlock"
+other = "ZSTD_compressRleLiteralsBlock"
+other_path = "zstd/lib/compress/zstd_compress_literals.c"
+
+[[entries]]
+rust  = "ZSTD_compressSequences"
+other = "ZSTD_compressSequences"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_compressStream"
+other = "ZSTD_compressStream"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_compressStream2"
+other = "ZSTD_compressStream2"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_compressStream2_simpleArgs"
+other = "ZSTD_compressStream2_simpleArgs"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_compressSuperBlock"
+other = "ZSTD_compressSuperBlock"
+other_path = "zstd/lib/compress/zstd_compress_superblock.c"
+
+[[entries]]
+rust  = "ZSTD_compress_usingCDict"
+other = "ZSTD_compress_usingCDict"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_compress_usingDict"
+other = "ZSTD_compress_usingDict"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_compressedLiterals"
+other = "ZSTD_compressedLiterals"
+other_path = "zstd/lib/compress/zstd_opt.c"
+
+[[entries]]
+rust  = "ZSTD_copy16"
+other = "ZSTD_copy16"
+other_path = "zstd/lib/common/zstd_internal.h"
+
+[[entries]]
+rust  = "ZSTD_copyDCtx"
+other = "ZSTD_copyDCtx"
+other_path = "zstd/lib/decompress/zstd_decompress.c"
+
+[[entries]]
+rust  = "ZSTD_copyRawBlock"
+other = "ZSTD_copyRawBlock"
+other_path = "zstd/lib/decompress/zstd_decompress.c"
+
+[[entries]]
+rust  = "ZSTD_count"
+other = "ZSTD_count"
+other_path = "zstd/lib/compress/zstd_compress_internal.h"
+
+[[entries]]
+rust  = "ZSTD_countLeadingZeros32"
+other = "ZSTD_countLeadingZeros32"
+other_path = "zstd/lib/common/bits.h"
+
+[[entries]]
+rust  = "ZSTD_countLeadingZeros64"
+other = "ZSTD_countLeadingZeros64"
+other_path = "zstd/lib/common/bits.h"
+
+[[entries]]
+rust  = "ZSTD_countTrailingZeros32"
+other = "ZSTD_countTrailingZeros32"
+other_path = "zstd/lib/common/bits.h"
+
+[[entries]]
+rust  = "ZSTD_countTrailingZeros64"
+other = "ZSTD_countTrailingZeros64"
+other_path = "zstd/lib/common/bits.h"
+
+[[entries]]
+rust  = "ZSTD_count_2segments"
+other = "ZSTD_count_2segments"
+other_path = "zstd/lib/compress/zstd_compress_internal.h"
+
+[[entries]]
+rust  = "ZSTD_createCCtx"
+other = "ZSTD_createCCtx"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_createCCtxParams"
+other = "ZSTD_createCCtxParams"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_createCCtx_advanced"
+other = "ZSTD_createCCtx_advanced"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_createCDict"
+other = "ZSTD_createCDict"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_createCDict_advanced"
+other = "ZSTD_createCDict_advanced"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_createCDict_byReference"
+other = "ZSTD_createCDict_byReference"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_createCStream"
+other = "ZSTD_createCStream"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_createCStream_advanced"
+other = "ZSTD_createCStream_advanced"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_createDCtx"
+other = "ZSTD_createDCtx"
+other_path = "zstd/lib/decompress/zstd_decompress.c"
+
+[[entries]]
+rust  = "ZSTD_createDCtx_advanced"
+other = "ZSTD_createDCtx_advanced"
+other_path = "zstd/lib/decompress/zstd_decompress.c"
+
+[[entries]]
+rust  = "ZSTD_createDDict"
+other = "ZSTD_createDDict"
+other_path = "zstd/lib/decompress/zstd_ddict.c"
+
+[[entries]]
+rust  = "ZSTD_createDDict_advanced"
+other = "ZSTD_createDDict_advanced"
+other_path = "zstd/lib/decompress/zstd_ddict.c"
+
+[[entries]]
+rust  = "ZSTD_createDDict_byReference"
+other = "ZSTD_createDDict_byReference"
+other_path = "zstd/lib/decompress/zstd_ddict.c"
+
+[[entries]]
+rust  = "ZSTD_createDStream"
+other = "ZSTD_createDStream"
+other_path = "zstd/lib/decompress/zstd_decompress.c"
+
+[[entries]]
+rust  = "ZSTD_createDStream_advanced"
+other = "ZSTD_createDStream_advanced"
+other_path = "zstd/lib/decompress/zstd_decompress.c"
+
+[[entries]]
+rust  = "ZSTD_createThreadPool"
+other = "ZSTD_createThreadPool"
+other_path = "zstd/lib/common/pool.c"
+
+[[entries]]
+rust  = "ZSTD_crossEntropyCost"
+other = "ZSTD_crossEntropyCost"
+other_path = "zstd/lib/compress/zstd_compress_sequences.c"
+
+[[entries]]
+rust  = "ZSTD_cycleLog"
+other = "ZSTD_cycleLog"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_dParam_getBounds"
+other = "ZSTD_dParam_getBounds"
+other_path = "zstd/lib/decompress/zstd_decompress.c"
+
+[[entries]]
+rust  = "ZSTD_decodeLiteralsBlock"
+other = "ZSTD_decodeLiteralsBlock"
+other_path = "zstd/lib/decompress/zstd_decompress_block.c"
+
+[[entries]]
+rust  = "ZSTD_decodeSeqHeaders"
+other = "ZSTD_decodeSeqHeaders"
+other_path = "zstd/lib/decompress/zstd_decompress_block.c"
+
+[[entries]]
+rust  = "ZSTD_decodeSequence"
+other = "ZSTD_decodeSequence"
+other_path = "zstd/lib/decompress/zstd_decompress_block.c"
+
+[[entries]]
+rust  = "ZSTD_decodingBufferSize_min"
+other = "ZSTD_decodingBufferSize_min"
+other_path = "zstd/lib/decompress/zstd_decompress.c"
+
+[[entries]]
+rust  = "ZSTD_decompress"
+other = "ZSTD_decompress"
+other_path = "zstd/lib/decompress/zstd_decompress.c"
+
+[[entries]]
+rust  = "ZSTD_decompressBegin"
+other = "ZSTD_decompressBegin"
+other_path = "zstd/lib/decompress/zstd_decompress.c"
+
+[[entries]]
+rust  = "ZSTD_decompressBegin_usingDDict"
+other = "ZSTD_decompressBegin_usingDDict"
+other_path = "zstd/lib/decompress/zstd_decompress.c"
+
+[[entries]]
+rust  = "ZSTD_decompressBegin_usingDict"
+other = "ZSTD_decompressBegin_usingDict"
+other_path = "zstd/lib/decompress/zstd_decompress.c"
+
+[[entries]]
+rust  = "ZSTD_decompressBlock"
+other = "ZSTD_decompressBlock"
+other_path = "zstd/lib/decompress/zstd_decompress_block.c"
+
+[[entries]]
+rust  = "ZSTD_decompressBound"
+other = "ZSTD_decompressBound"
+other_path = "zstd/lib/decompress/zstd_decompress.c"
+
+[[entries]]
+rust  = "ZSTD_decompressContinue"
+other = "ZSTD_decompressContinue"
+other_path = "zstd/lib/decompress/zstd_decompress.c"
+
+[[entries]]
+rust  = "ZSTD_decompressDCtx"
+other = "ZSTD_decompressDCtx"
+other_path = "zstd/lib/decompress/zstd_decompress.c"
+
+[[entries]]
+rust  = "ZSTD_decompressFrame"
+other = "ZSTD_decompressFrame"
+other_path = "zstd/lib/decompress/zstd_decompress.c"
+
+[[entries]]
+rust  = "ZSTD_decompressSequences_body"
+other = "ZSTD_decompressSequences_body"
+other_path = "zstd/lib/decompress/zstd_decompress_block.c"
+
+[[entries]]
+rust  = "ZSTD_decompressStream"
+other = "ZSTD_decompressStream"
+other_path = "zstd/lib/decompress/zstd_decompress.c"
+
+[[entries]]
+rust  = "ZSTD_decompress_usingDDict"
+other = "ZSTD_decompress_usingDDict"
+other_path = "zstd/lib/decompress/zstd_decompress.c"
+
+[[entries]]
+rust  = "ZSTD_decompress_usingDict"
+other = "ZSTD_decompress_usingDict"
+other_path = "zstd/lib/decompress/zstd_decompress.c"
+
+[[entries]]
+rust  = "ZSTD_decompressionMargin"
+other = "ZSTD_decompressionMargin"
+other_path = "zstd/lib/decompress/zstd_decompress.c"
+
+[[entries]]
+rust  = "ZSTD_dedicatedDictSearch_isSupported"
+other = "ZSTD_dedicatedDictSearch_isSupported"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_dedicatedDictSearch_revertCParams"
+other = "ZSTD_dedicatedDictSearch_revertCParams"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_defaultCLevel"
+other = "ZSTD_defaultCLevel"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_dictAndWindowLog"
+other = "ZSTD_dictAndWindowLog"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_downscaleStats"
+other = "ZSTD_downscaleStats"
+other_path = "zstd/lib/compress/zstd_opt.c"
+
+[[entries]]
+rust  = "ZSTD_encodeSequences"
+other = "ZSTD_encodeSequences"
+other_path = "zstd/lib/compress/zstd_compress_sequences.c"
+
+[[entries]]
+rust  = "ZSTD_encodeSequences_body"
+other = "ZSTD_encodeSequences_body"
+other_path = "zstd/lib/compress/zstd_compress_sequences.c"
+
+[[entries]]
+rust  = "ZSTD_endStream"
+other = "ZSTD_endStream"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_entropyCompressSeqStore"
+other = "ZSTD_entropyCompressSeqStore"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_entropyCompressSeqStore_internal"
+other = "ZSTD_entropyCompressSeqStore_internal"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_entropyCost"
+other = "ZSTD_entropyCost"
+other_path = "zstd/lib/compress/zstd_compress_sequences.c"
+
+[[entries]]
+rust  = "ZSTD_estimateCCtxSize"
+other = "ZSTD_estimateCCtxSize"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_estimateCCtxSize_usingCCtxParams"
+other = "ZSTD_estimateCCtxSize_usingCCtxParams"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_estimateCCtxSize_usingCParams"
+other = "ZSTD_estimateCCtxSize_usingCParams"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_estimateCDictSize"
+other = "ZSTD_estimateCDictSize"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_estimateCDictSize_advanced"
+other = "ZSTD_estimateCDictSize_advanced"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_estimateCStreamSize"
+other = "ZSTD_estimateCStreamSize"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_estimateCStreamSize_usingCCtxParams"
+other = "ZSTD_estimateCStreamSize_usingCCtxParams"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_estimateCStreamSize_usingCParams"
+other = "ZSTD_estimateCStreamSize_usingCParams"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_estimateDCtxSize"
+other = "ZSTD_estimateDCtxSize"
+other_path = "zstd/lib/decompress/zstd_decompress.c"
+
+[[entries]]
+rust  = "ZSTD_estimateDDictSize"
+other = "ZSTD_estimateDDictSize"
+other_path = "zstd/lib/decompress/zstd_ddict.c"
+
+[[entries]]
+rust  = "ZSTD_estimateDStreamSize"
+other = "ZSTD_estimateDStreamSize"
+other_path = "zstd/lib/decompress/zstd_decompress.c"
+
+[[entries]]
+rust  = "ZSTD_estimateDStreamSize_fromFrame"
+other = "ZSTD_estimateDStreamSize_fromFrame"
+other_path = "zstd/lib/decompress/zstd_decompress.c"
+
+[[entries]]
+rust  = "ZSTD_execSequence"
+other = "ZSTD_execSequence"
+other_path = "zstd/lib/decompress/zstd_decompress_block.c"
+
+[[entries]]
+rust  = "ZSTD_fCost"
+other = "ZSTD_fCost"
+other_path = "zstd/lib/compress/zstd_opt.c"
+
+[[entries]]
+rust  = "ZSTD_fWeight"
+other = "ZSTD_fWeight"
+other_path = "zstd/lib/compress/zstd_compress_internal.h"
+
+[[entries]]
+rust  = "ZSTD_fastSequenceLengthSum"
+other = "ZSTD_fastSequenceLengthSum"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_fillDoubleHashTable"
+other = "ZSTD_fillDoubleHashTable"
+other_path = "zstd/lib/compress/zstd_double_fast.c"
+
+[[entries]]
+rust  = "ZSTD_fillDoubleHashTableForCCtx"
+other = "ZSTD_fillDoubleHashTableForCCtx"
+other_path = "zstd/lib/compress/zstd_double_fast.c"
+
+[[entries]]
+rust  = "ZSTD_fillHashTable"
+other = "ZSTD_fillHashTable"
+other_path = "zstd/lib/compress/zstd_fast.c"
+
+[[entries]]
+rust  = "ZSTD_fillHashTableForCCtx"
+other = "ZSTD_fillHashTableForCCtx"
+other_path = "zstd/lib/compress/zstd_fast.c"
+
+[[entries]]
+rust  = "ZSTD_fillHashTableForCDict"
+other = "ZSTD_fillHashTableForCDict"
+other_path = "zstd/lib/compress/zstd_fast.c"
+
+[[entries]]
+rust  = "ZSTD_finalizeOffBase"
+other = "ZSTD_finalizeOffBase"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_findDecompressedSize"
+other = "ZSTD_findDecompressedSize"
+other_path = "zstd/lib/decompress/zstd_decompress.c"
+
+[[entries]]
+rust  = "ZSTD_findFrameCompressedSize"
+other = "ZSTD_findFrameCompressedSize"
+other_path = "zstd/lib/decompress/zstd_decompress.c"
+
+[[entries]]
+rust  = "ZSTD_findFrameSizeInfo"
+other = "ZSTD_findFrameSizeInfo"
+other_path = "zstd/lib/decompress/zstd_decompress.c"
+
+[[entries]]
+rust  = "ZSTD_flushStream"
+other = "ZSTD_flushStream"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_fracWeight"
+other = "ZSTD_fracWeight"
+other_path = "zstd/lib/compress/zstd_opt.c"
+
+[[entries]]
+rust  = "ZSTD_frameHeaderSize"
+other = "ZSTD_frameHeaderSize"
+other_path = "zstd/lib/decompress/zstd_decompress.c"
+
+[[entries]]
+rust  = "ZSTD_frameHeaderSize_internal"
+other = "ZSTD_frameHeaderSize_internal"
+other_path = "zstd/lib/decompress/zstd_decompress.c"
+
+[[entries]]
+rust  = "ZSTD_freeCCtx"
+other = "ZSTD_freeCCtx"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_freeCCtxParams"
+other = "ZSTD_freeCCtxParams"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_freeCDict"
+other = "ZSTD_freeCDict"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_freeCStream"
+other = "ZSTD_freeCStream"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_freeDCtx"
+other = "ZSTD_freeDCtx"
+other_path = "zstd/lib/decompress/zstd_decompress.c"
+
+[[entries]]
+rust  = "ZSTD_freeDDict"
+other = "ZSTD_freeDDict"
+other_path = "zstd/lib/decompress/zstd_ddict.c"
+
+[[entries]]
+rust  = "ZSTD_freeDStream"
+other = "ZSTD_freeDStream"
+other_path = "zstd/lib/decompress/zstd_decompress.c"
+
+[[entries]]
+rust  = "ZSTD_freeThreadPool"
+other = "ZSTD_freeThreadPool"
+other_path = "zstd/lib/common/pool.c"
+
+[[entries]]
+rust  = "ZSTD_fseBitCost"
+other = "ZSTD_fseBitCost"
+other_path = "zstd/lib/compress/zstd_compress_sequences.c"
+
+[[entries]]
+rust  = "ZSTD_generateSequences"
+other = "ZSTD_generateSequences"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_getCParamRowSize"
+other = "ZSTD_getCParamRowSize"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_getCParams"
+other = "ZSTD_getCParams"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_getDecompressedSize"
+other = "ZSTD_getDecompressedSize"
+other_path = "zstd/lib/decompress/zstd_decompress.c"
+
+[[entries]]
+rust  = "ZSTD_getDictID_fromCDict"
+other = "ZSTD_getDictID_fromCDict"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_getDictID_fromDDict"
+other = "ZSTD_getDictID_fromDDict"
+other_path = "zstd/lib/decompress/zstd_ddict.c"
+
+[[entries]]
+rust  = "ZSTD_getDictID_fromDict"
+other = "ZSTD_getDictID_fromDict"
+other_path = "zstd/lib/decompress/zstd_decompress.c"
+
+[[entries]]
+rust  = "ZSTD_getDictID_fromFrame"
+other = "ZSTD_getDictID_fromFrame"
+other_path = "zstd/lib/decompress/zstd_decompress.c"
+
+[[entries]]
+rust  = "ZSTD_getErrorCode"
+other = "ZSTD_getErrorCode"
+other_path = "zstd/lib/common/zstd_common.c"
+
+[[entries]]
+rust  = "ZSTD_getErrorName"
+other = "ZSTD_getErrorName"
+other_path = "zstd/lib/common/zstd_common.c"
+
+[[entries]]
+rust  = "ZSTD_getErrorString"
+other = "ZSTD_getErrorString"
+other_path = "zstd/lib/common/zstd_common.c"
+
+[[entries]]
+rust  = "ZSTD_getFSEMaxSymbolValue"
+other = "ZSTD_getFSEMaxSymbolValue"
+other_path = "zstd/lib/compress/zstd_compress_sequences.c"
+
+[[entries]]
+rust  = "ZSTD_getFrameContentSize"
+other = "ZSTD_getFrameContentSize"
+other_path = "zstd/lib/decompress/zstd_decompress.c"
+
+[[entries]]
+rust  = "ZSTD_getFrameHeader"
+other = "ZSTD_getFrameHeader"
+other_path = "zstd/lib/decompress/zstd_decompress.c"
+
+[[entries]]
+rust  = "ZSTD_getFrameHeader_advanced"
+other = "ZSTD_getFrameHeader_advanced"
+other_path = "zstd/lib/decompress/zstd_decompress.c"
+
+[[entries]]
+rust  = "ZSTD_getFrameProgression"
+other = "ZSTD_getFrameProgression"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_getLowestMatchIndex"
+other = "ZSTD_getLowestMatchIndex"
+other_path = "zstd/lib/compress/zstd_compress_internal.h"
+
+[[entries]]
+rust  = "ZSTD_getLowestPrefixIndex"
+other = "ZSTD_getLowestPrefixIndex"
+other_path = "zstd/lib/compress/zstd_compress_internal.h"
+
+[[entries]]
+rust  = "ZSTD_getMatchPrice"
+other = "ZSTD_getMatchPrice"
+other_path = "zstd/lib/compress/zstd_opt.c"
+
+[[entries]]
+rust  = "ZSTD_getParams"
+other = "ZSTD_getParams"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_getSequenceLength"
+other = "ZSTD_getSequenceLength"
+other_path = "zstd/lib/compress/zstd_compress_internal.h"
+
+[[entries]]
+rust  = "ZSTD_getcBlockSize"
+other = "ZSTD_getcBlockSize"
+other_path = "zstd/lib/decompress/zstd_decompress_block.c"
+
+[[entries]]
+rust  = "ZSTD_hash3"
+other = "ZSTD_hash3"
+other_path = "zstd/lib/compress/zstd_compress_internal.h"
+
+[[entries]]
+rust  = "ZSTD_hash3Ptr"
+other = "ZSTD_hash3Ptr"
+other_path = "zstd/lib/compress/zstd_compress_internal.h"
+
+[[entries]]
+rust  = "ZSTD_hash3PtrS"
+other = "ZSTD_hash3PtrS"
+other_path = "zstd/lib/compress/zstd_compress_internal.h"
+
+[[entries]]
+rust  = "ZSTD_hash4"
+other = "ZSTD_hash4"
+other_path = "zstd/lib/compress/zstd_compress_internal.h"
+
+[[entries]]
+rust  = "ZSTD_hash4Ptr"
+other = "ZSTD_hash4Ptr"
+other_path = "zstd/lib/compress/zstd_compress_internal.h"
+
+[[entries]]
+rust  = "ZSTD_hash4PtrS"
+other = "ZSTD_hash4PtrS"
+other_path = "zstd/lib/compress/zstd_compress_internal.h"
+
+[[entries]]
+rust  = "ZSTD_hash5"
+other = "ZSTD_hash5"
+other_path = "zstd/lib/compress/zstd_compress_internal.h"
+
+[[entries]]
+rust  = "ZSTD_hash5Ptr"
+other = "ZSTD_hash5Ptr"
+other_path = "zstd/lib/compress/zstd_compress_internal.h"
+
+[[entries]]
+rust  = "ZSTD_hash5PtrS"
+other = "ZSTD_hash5PtrS"
+other_path = "zstd/lib/compress/zstd_compress_internal.h"
+
+[[entries]]
+rust  = "ZSTD_hash6"
+other = "ZSTD_hash6"
+other_path = "zstd/lib/compress/zstd_compress_internal.h"
+
+[[entries]]
+rust  = "ZSTD_hash6Ptr"
+other = "ZSTD_hash6Ptr"
+other_path = "zstd/lib/compress/zstd_compress_internal.h"
+
+[[entries]]
+rust  = "ZSTD_hash6PtrS"
+other = "ZSTD_hash6PtrS"
+other_path = "zstd/lib/compress/zstd_compress_internal.h"
+
+[[entries]]
+rust  = "ZSTD_hash7"
+other = "ZSTD_hash7"
+other_path = "zstd/lib/compress/zstd_compress_internal.h"
+
+[[entries]]
+rust  = "ZSTD_hash7Ptr"
+other = "ZSTD_hash7Ptr"
+other_path = "zstd/lib/compress/zstd_compress_internal.h"
+
+[[entries]]
+rust  = "ZSTD_hash7PtrS"
+other = "ZSTD_hash7PtrS"
+other_path = "zstd/lib/compress/zstd_compress_internal.h"
+
+[[entries]]
+rust  = "ZSTD_hash8"
+other = "ZSTD_hash8"
+other_path = "zstd/lib/compress/zstd_compress_internal.h"
+
+[[entries]]
+rust  = "ZSTD_hash8Ptr"
+other = "ZSTD_hash8Ptr"
+other_path = "zstd/lib/compress/zstd_compress_internal.h"
+
+[[entries]]
+rust  = "ZSTD_hash8PtrS"
+other = "ZSTD_hash8PtrS"
+other_path = "zstd/lib/compress/zstd_compress_internal.h"
+
+[[entries]]
+rust  = "ZSTD_hashPtr"
+other = "ZSTD_hashPtr"
+other_path = "zstd/lib/compress/zstd_compress_internal.h"
+
+[[entries]]
+rust  = "ZSTD_hashPtrSalted"
+other = "ZSTD_hashPtrSalted"
+other_path = "zstd/lib/compress/zstd_compress_internal.h"
+
+[[entries]]
+rust  = "ZSTD_highbit32"
+other = "ZSTD_highbit32"
+other_path = "zstd/lib/common/bits.h"
+
+[[entries]]
+rust  = "ZSTD_index_overlap_check"
+other = "ZSTD_index_overlap_check"
+other_path = "zstd/lib/compress/zstd_compress_internal.h"
+
+[[entries]]
+rust  = "ZSTD_initCStream"
+other = "ZSTD_initCStream"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_initCStream_srcSize"
+other = "ZSTD_initCStream_srcSize"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_initCStream_usingDict"
+other = "ZSTD_initCStream_usingDict"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_initDStream"
+other = "ZSTD_initDStream"
+other_path = "zstd/lib/decompress/zstd_decompress.c"
+
+[[entries]]
+rust  = "ZSTD_initDStream_usingDDict"
+other = "ZSTD_initDStream_usingDDict"
+other_path = "zstd/lib/decompress/zstd_decompress.c"
+
+[[entries]]
+rust  = "ZSTD_initDStream_usingDict"
+other = "ZSTD_initDStream_usingDict"
+other_path = "zstd/lib/decompress/zstd_decompress.c"
+
+[[entries]]
+rust  = "ZSTD_initFseState"
+other = "ZSTD_initFseState"
+other_path = "zstd/lib/decompress/zstd_decompress_block.c"
+
+[[entries]]
+rust  = "ZSTD_initStaticCCtx"
+other = "ZSTD_initStaticCCtx"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_initStaticCDict"
+other = "ZSTD_initStaticCDict"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_initStaticCStream"
+other = "ZSTD_initStaticCStream"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_initStaticDCtx"
+other = "ZSTD_initStaticDCtx"
+other_path = "zstd/lib/decompress/zstd_decompress.c"
+
+[[entries]]
+rust  = "ZSTD_initStaticDDict"
+other = "ZSTD_initStaticDDict"
+other_path = "zstd/lib/decompress/zstd_ddict.c"
+
+[[entries]]
+rust  = "ZSTD_initStaticDStream"
+other = "ZSTD_initStaticDStream"
+other_path = "zstd/lib/decompress/zstd_decompress.c"
+
+[[entries]]
+rust  = "ZSTD_insertAndFindFirstIndex"
+other = "ZSTD_insertAndFindFirstIndex"
+other_path = "zstd/lib/compress/zstd_lazy.c"
+
+[[entries]]
+rust  = "ZSTD_insertAndFindFirstIndexHash3"
+other = "ZSTD_insertAndFindFirstIndexHash3"
+other_path = "zstd/lib/compress/zstd_opt.c"
+
+[[entries]]
+rust  = "ZSTD_insertAndFindFirstIndex_internal"
+other = "ZSTD_insertAndFindFirstIndex_internal"
+other_path = "zstd/lib/compress/zstd_lazy.c"
+
+[[entries]]
+rust  = "ZSTD_insertBt1"
+other = "ZSTD_insertBt1"
+other_path = "zstd/lib/compress/zstd_opt.c"
+
+[[entries]]
+rust  = "ZSTD_insertDUBT1"
+other = "ZSTD_insertDUBT1"
+other_path = "zstd/lib/compress/zstd_lazy.c"
+
+[[entries]]
+rust  = "ZSTD_invalidateMatchState"
+other = "ZSTD_invalidateMatchState"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_invalidateRepCodes"
+other = "ZSTD_invalidateRepCodes"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_isDeterministicBuild"
+other = "ZSTD_isDeterministicBuild"
+other_path = "zstd/lib/common/zstd_common.c"
+
+[[entries]]
+rust  = "ZSTD_isError"
+other = "ZSTD_isError"
+other_path = "zstd/lib/common/zstd_common.c"
+
+[[entries]]
+rust  = "ZSTD_isFrame"
+other = "ZSTD_isFrame"
+other_path = "zstd/lib/decompress/zstd_decompress.c"
+
+[[entries]]
+rust  = "ZSTD_isRLE"
+other = "ZSTD_isRLE"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_isSkippableFrame"
+other = "ZSTD_isSkippableFrame"
+other_path = "zstd/lib/decompress/zstd_decompress.c"
+
+[[entries]]
+rust  = "ZSTD_ldm_adjustParameters"
+other = "ZSTD_ldm_adjustParameters"
+other_path = "zstd/lib/compress/zstd_ldm.c"
+
+[[entries]]
+rust  = "ZSTD_ldm_blockCompress"
+other = "ZSTD_ldm_blockCompress"
+other_path = "zstd/lib/compress/zstd_ldm.c"
+
+[[entries]]
+rust  = "ZSTD_ldm_countBackwardsMatch"
+other = "ZSTD_ldm_countBackwardsMatch"
+other_path = "zstd/lib/compress/zstd_ldm.c"
+
+[[entries]]
+rust  = "ZSTD_ldm_countBackwardsMatch_2segments"
+other = "ZSTD_ldm_countBackwardsMatch_2segments"
+other_path = "zstd/lib/compress/zstd_ldm.c"
+
+[[entries]]
+rust  = "ZSTD_ldm_fillFastTables"
+other = "ZSTD_ldm_fillFastTables"
+other_path = "zstd/lib/compress/zstd_ldm.c"
+
+[[entries]]
+rust  = "ZSTD_ldm_fillHashTable"
+other = "ZSTD_ldm_fillHashTable"
+other_path = "zstd/lib/compress/zstd_ldm.c"
+
+[[entries]]
+rust  = "ZSTD_ldm_gear_feed"
+other = "ZSTD_ldm_gear_feed"
+other_path = "zstd/lib/compress/zstd_ldm.c"
+
+[[entries]]
+rust  = "ZSTD_ldm_gear_init"
+other = "ZSTD_ldm_gear_init"
+other_path = "zstd/lib/compress/zstd_ldm.c"
+
+[[entries]]
+rust  = "ZSTD_ldm_gear_reset"
+other = "ZSTD_ldm_gear_reset"
+other_path = "zstd/lib/compress/zstd_ldm.c"
+
+[[entries]]
+rust  = "ZSTD_ldm_generateSequences"
+other = "ZSTD_ldm_generateSequences"
+other_path = "zstd/lib/compress/zstd_ldm.c"
+
+[[entries]]
+rust  = "ZSTD_ldm_getBucket"
+other = "ZSTD_ldm_getBucket"
+other_path = "zstd/lib/compress/zstd_ldm.c"
+
+[[entries]]
+rust  = "ZSTD_ldm_getMaxNbSeq"
+other = "ZSTD_ldm_getMaxNbSeq"
+other_path = "zstd/lib/compress/zstd_ldm.c"
+
+[[entries]]
+rust  = "ZSTD_ldm_getTableSize"
+other = "ZSTD_ldm_getTableSize"
+other_path = "zstd/lib/compress/zstd_ldm.c"
+
+[[entries]]
+rust  = "ZSTD_ldm_insertEntry"
+other = "ZSTD_ldm_insertEntry"
+other_path = "zstd/lib/compress/zstd_ldm.c"
+
+[[entries]]
+rust  = "ZSTD_ldm_limitTableUpdate"
+other = "ZSTD_ldm_limitTableUpdate"
+other_path = "zstd/lib/compress/zstd_ldm.c"
+
+[[entries]]
+rust  = "ZSTD_ldm_reduceTable"
+other = "ZSTD_ldm_reduceTable"
+other_path = "zstd/lib/compress/zstd_ldm.c"
+
+[[entries]]
+rust  = "ZSTD_ldm_skipRawSeqStoreBytes"
+other = "ZSTD_ldm_skipRawSeqStoreBytes"
+other_path = "zstd/lib/compress/zstd_ldm.c"
+
+[[entries]]
+rust  = "ZSTD_ldm_skipSequences"
+other = "ZSTD_ldm_skipSequences"
+other_path = "zstd/lib/compress/zstd_ldm.c"
+
+[[entries]]
+rust  = "ZSTD_limitCopy"
+other = "ZSTD_limitCopy"
+other_path = "zstd/lib/common/zstd_internal.h"
+
+[[entries]]
+rust  = "ZSTD_litLengthPrice"
+other = "ZSTD_litLengthPrice"
+other_path = "zstd/lib/compress/zstd_opt.c"
+
+[[entries]]
+rust  = "ZSTD_literalsCompressionIsDisabled"
+other = "ZSTD_literalsCompressionIsDisabled"
+other_path = "zstd/lib/compress/zstd_compress_internal.h"
+
+[[entries]]
+rust  = "ZSTD_loadEntropy_intoDDict"
+other = "ZSTD_loadEntropy_intoDDict"
+other_path = "zstd/lib/decompress/zstd_ddict.c"
+
+[[entries]]
+rust  = "ZSTD_match4Found_branch"
+other = "ZSTD_match4Found_branch"
+other_path = "zstd/lib/compress/zstd_fast.c"
+
+[[entries]]
+rust  = "ZSTD_matchState_dictMode"
+other = "ZSTD_matchState_dictMode"
+other_path = "zstd/lib/compress/zstd_compress_internal.h"
+
+[[entries]]
+rust  = "ZSTD_maxCLevel"
+other = "ZSTD_maxCLevel"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_maxNbSeq"
+other = "ZSTD_maxNbSeq"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_mergeBlockDelimiters"
+other = "ZSTD_mergeBlockDelimiters"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_minCLevel"
+other = "ZSTD_minCLevel"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_minGain"
+other = "ZSTD_minGain"
+other_path = "zstd/lib/compress/zstd_compress_internal.h"
+
+[[entries]]
+rust  = "ZSTD_minLiteralsToCompress"
+other = "ZSTD_minLiteralsToCompress"
+other_path = "zstd/lib/compress/zstd_compress_literals.c"
+
+[[entries]]
+rust  = "ZSTD_newRep"
+other = "ZSTD_newRep"
+other_path = "zstd/lib/compress/zstd_compress_internal.h"
+
+[[entries]]
+rust  = "ZSTD_nextInputType"
+other = "ZSTD_nextInputType"
+other_path = "zstd/lib/decompress/zstd_decompress.c"
+
+[[entries]]
+rust  = "ZSTD_nextSrcSizeToDecompress"
+other = "ZSTD_nextSrcSizeToDecompress"
+other_path = "zstd/lib/decompress/zstd_decompress.c"
+
+[[entries]]
+rust  = "ZSTD_noCompressBlock"
+other = "ZSTD_noCompressBlock"
+other_path = "zstd/lib/compress/zstd_compress_internal.h"
+
+[[entries]]
+rust  = "ZSTD_noCompressLiterals"
+other = "ZSTD_noCompressLiterals"
+other_path = "zstd/lib/compress/zstd_compress_literals.c"
+
+[[entries]]
+rust  = "ZSTD_optLdm_maybeAddMatch"
+other = "ZSTD_optLdm_maybeAddMatch"
+other_path = "zstd/lib/compress/zstd_opt.c"
+
+[[entries]]
+rust  = "ZSTD_optLdm_processMatchCandidate"
+other = "ZSTD_optLdm_processMatchCandidate"
+other_path = "zstd/lib/compress/zstd_opt.c"
+
+[[entries]]
+rust  = "ZSTD_opt_getNextMatchAndUpdateSeqStore"
+other = "ZSTD_opt_getNextMatchAndUpdateSeqStore"
+other_path = "zstd/lib/compress/zstd_opt.c"
+
+[[entries]]
+rust  = "ZSTD_overlapCopy8"
+other = "ZSTD_overlapCopy8"
+other_path = "zstd/lib/decompress/zstd_decompress_block.c"
+
+[[entries]]
+rust  = "ZSTD_overrideCParams"
+other = "ZSTD_overrideCParams"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_rawLiteralsCost"
+other = "ZSTD_rawLiteralsCost"
+other_path = "zstd/lib/compress/zstd_opt.c"
+
+[[entries]]
+rust  = "ZSTD_readMINMATCH"
+other = "ZSTD_readMINMATCH"
+other_path = "zstd/lib/compress/zstd_opt.c"
+
+[[entries]]
+rust  = "ZSTD_readSkippableFrame"
+other = "ZSTD_readSkippableFrame"
+other_path = "zstd/lib/decompress/zstd_decompress.c"
+
+[[entries]]
+rust  = "ZSTD_reduceIndex"
+other = "ZSTD_reduceIndex"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_reduceTable"
+other = "ZSTD_reduceTable"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_reduceTable_btlazy2"
+other = "ZSTD_reduceTable_btlazy2"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_reduceTable_internal"
+other = "ZSTD_reduceTable_internal"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_rescaleFreqs"
+other = "ZSTD_rescaleFreqs"
+other_path = "zstd/lib/compress/zstd_opt.c"
+
+[[entries]]
+rust  = "ZSTD_resetCStream"
+other = "ZSTD_resetCStream"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_resetDStream"
+other = "ZSTD_resetDStream"
+other_path = "zstd/lib/decompress/zstd_decompress.c"
+
+[[entries]]
+rust  = "ZSTD_resetSeqStore"
+other = "ZSTD_resetSeqStore"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_resolveBlockSplitterMode"
+other = "ZSTD_resolveBlockSplitterMode"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_resolveEnableLdm"
+other = "ZSTD_resolveEnableLdm"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_resolveExternalRepcodeSearch"
+other = "ZSTD_resolveExternalRepcodeSearch"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_resolveExternalSequenceValidation"
+other = "ZSTD_resolveExternalSequenceValidation"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_resolveMaxBlockSize"
+other = "ZSTD_resolveMaxBlockSize"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_resolveRowMatchFinderMode"
+other = "ZSTD_resolveRowMatchFinderMode"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_rleCompressBlock"
+other = "ZSTD_rleCompressBlock"
+other_path = "zstd/lib/compress/zstd_compress_internal.h"
+
+[[entries]]
+rust  = "ZSTD_rotateRight_U16"
+other = "ZSTD_rotateRight_U16"
+other_path = "zstd/lib/common/bits.h"
+
+[[entries]]
+rust  = "ZSTD_rotateRight_U32"
+other = "ZSTD_rotateRight_U32"
+other_path = "zstd/lib/common/bits.h"
+
+[[entries]]
+rust  = "ZSTD_rotateRight_U64"
+other = "ZSTD_rotateRight_U64"
+other_path = "zstd/lib/common/bits.h"
+
+[[entries]]
+rust  = "ZSTD_rowMatchFinderSupported"
+other = "ZSTD_rowMatchFinderSupported"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_rowMatchFinderUsed"
+other = "ZSTD_rowMatchFinderUsed"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_scaleStats"
+other = "ZSTD_scaleStats"
+other_path = "zstd/lib/compress/zstd_opt.c"
+
+[[entries]]
+rust  = "ZSTD_selectEncodingType"
+other = "ZSTD_selectEncodingType"
+other_path = "zstd/lib/compress/zstd_compress_sequences.c"
+
+[[entries]]
+rust  = "ZSTD_seqToCodes"
+other = "ZSTD_seqToCodes"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_sequenceBound"
+other = "ZSTD_sequenceBound"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_setBasePrices"
+other = "ZSTD_setBasePrices"
+other_path = "zstd/lib/compress/zstd_opt.c"
+
+[[entries]]
+rust  = "ZSTD_setRleBlock"
+other = "ZSTD_setRleBlock"
+other_path = "zstd/lib/decompress/zstd_decompress.c"
+
+[[entries]]
+rust  = "ZSTD_sizeof_CCtx"
+other = "ZSTD_sizeof_CCtx"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_sizeof_CDict"
+other = "ZSTD_sizeof_CDict"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_sizeof_CStream"
+other = "ZSTD_sizeof_CStream"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_sizeof_DCtx"
+other = "ZSTD_sizeof_DCtx"
+other_path = "zstd/lib/decompress/zstd_decompress.c"
+
+[[entries]]
+rust  = "ZSTD_sizeof_DDict"
+other = "ZSTD_sizeof_DDict"
+other_path = "zstd/lib/decompress/zstd_ddict.c"
+
+[[entries]]
+rust  = "ZSTD_sizeof_DStream"
+other = "ZSTD_sizeof_DStream"
+other_path = "zstd/lib/decompress/zstd_decompress.c"
+
+[[entries]]
+rust  = "ZSTD_sizeof_mtctx"
+other = "ZSTD_sizeof_mtctx"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_splitBlock"
+other = "ZSTD_splitBlock"
+other_path = "zstd/lib/compress/zstd_preSplit.c"
+
+[[entries]]
+rust  = "ZSTD_splitBlock_byChunks"
+other = "ZSTD_splitBlock_byChunks"
+other_path = "zstd/lib/compress/zstd_preSplit.c"
+
+[[entries]]
+rust  = "ZSTD_splitBlock_fromBorders"
+other = "ZSTD_splitBlock_fromBorders"
+other_path = "zstd/lib/compress/zstd_preSplit.c"
+
+[[entries]]
+rust  = "ZSTD_startingInputLength"
+other = "ZSTD_startingInputLength"
+other_path = "zstd/lib/decompress/zstd_decompress.c"
+
+[[entries]]
+rust  = "ZSTD_storeLastLiterals"
+other = "ZSTD_storeLastLiterals"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_storeSeq"
+other = "ZSTD_storeSeq"
+other_path = "zstd/lib/compress/zstd_compress_internal.h"
+
+[[entries]]
+rust  = "ZSTD_storeSeqOnly"
+other = "ZSTD_storeSeqOnly"
+other_path = "zstd/lib/compress/zstd_compress_internal.h"
+
+[[entries]]
+rust  = "ZSTD_toFlushNow"
+other = "ZSTD_toFlushNow"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_updateDUBT"
+other = "ZSTD_updateDUBT"
+other_path = "zstd/lib/compress/zstd_lazy.c"
+
+[[entries]]
+rust  = "ZSTD_updateFseStateWithDInfo"
+other = "ZSTD_updateFseStateWithDInfo"
+other_path = "zstd/lib/decompress/zstd_decompress_block.c"
+
+[[entries]]
+rust  = "ZSTD_updateRep"
+other = "ZSTD_updateRep"
+other_path = "zstd/lib/compress/zstd_compress_internal.h"
+
+[[entries]]
+rust  = "ZSTD_updateStats"
+other = "ZSTD_updateStats"
+other_path = "zstd/lib/compress/zstd_opt.c"
+
+[[entries]]
+rust  = "ZSTD_updateTree"
+other = "ZSTD_updateTree"
+other_path = "zstd/lib/compress/zstd_opt.c"
+
+[[entries]]
+rust  = "ZSTD_updateTree_internal"
+other = "ZSTD_updateTree_internal"
+other_path = "zstd/lib/compress/zstd_opt.c"
+
+[[entries]]
+rust  = "ZSTD_useLowProbCount"
+other = "ZSTD_useLowProbCount"
+other_path = "zstd/lib/compress/zstd_compress_sequences.c"
+
+[[entries]]
+rust  = "ZSTD_validateSequence"
+other = "ZSTD_validateSequence"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_versionNumber"
+other = "ZSTD_versionNumber"
+other_path = "zstd/lib/common/zstd_common.c"
+
+[[entries]]
+rust  = "ZSTD_versionString"
+other = "ZSTD_versionString"
+other_path = "zstd/lib/common/zstd_common.c"
+
+[[entries]]
+rust  = "ZSTD_wildcopy"
+other = "ZSTD_wildcopy"
+other_path = "zstd/lib/common/zstd_internal.h"
+
+[[entries]]
+rust  = "ZSTD_window_canOverflowCorrect"
+other = "ZSTD_window_canOverflowCorrect"
+other_path = "zstd/lib/compress/zstd_compress_internal.h"
+
+[[entries]]
+rust  = "ZSTD_window_clear"
+other = "ZSTD_window_clear"
+other_path = "zstd/lib/compress/zstd_compress_internal.h"
+
+[[entries]]
+rust  = "ZSTD_window_correctOverflow"
+other = "ZSTD_window_correctOverflow"
+other_path = "zstd/lib/compress/zstd_compress_internal.h"
+
+[[entries]]
+rust  = "ZSTD_window_enforceMaxDist"
+other = "ZSTD_window_enforceMaxDist"
+other_path = "zstd/lib/compress/zstd_compress_internal.h"
+
+[[entries]]
+rust  = "ZSTD_window_hasExtDict"
+other = "ZSTD_window_hasExtDict"
+other_path = "zstd/lib/compress/zstd_compress_internal.h"
+
+[[entries]]
+rust  = "ZSTD_window_init"
+other = "ZSTD_window_init"
+other_path = "zstd/lib/compress/zstd_compress_internal.h"
+
+[[entries]]
+rust  = "ZSTD_window_isEmpty"
+other = "ZSTD_window_isEmpty"
+other_path = "zstd/lib/compress/zstd_compress_internal.h"
+
+[[entries]]
+rust  = "ZSTD_window_needOverflowCorrection"
+other = "ZSTD_window_needOverflowCorrection"
+other_path = "zstd/lib/compress/zstd_compress_internal.h"
+
+[[entries]]
+rust  = "ZSTD_writeFrameHeader"
+other = "ZSTD_writeFrameHeader"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_writeLastEmptyBlock"
+other = "ZSTD_writeLastEmptyBlock"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_writeSkippableFrame"
+other = "ZSTD_writeSkippableFrame"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust  = "ZSTD_writeTaggedIndex"
+other = "ZSTD_writeTaggedIndex"
+other_path = "zstd/lib/compress/zstd_compress_internal.h"
+
+[[entries]]
+rust  = "abs64"
+other = "abs64"
+other_path = "zstd/lib/compress/zstd_preSplit.c"
+
+[[entries]]
+rust  = "addEvents_generic"
+other = "addEvents_generic"
+other_path = "zstd/lib/compress/zstd_preSplit.c"
+
+[[entries]]
+rust  = "allBytesIdentical"
+other = "allBytesIdentical"
+other_path = "zstd/lib/compress/zstd_compress_literals.c"
+
+[[entries]]
+rust  = "compareFingerprints"
+other = "compareFingerprints"
+other_path = "zstd/lib/compress/zstd_preSplit.c"
+
+[[entries]]
+rust  = "fpDistance"
+other = "fpDistance"
+other_path = "zstd/lib/compress/zstd_preSplit.c"
+
+[[entries]]
+rust  = "hash2"
+other = "hash2"
+other_path = "zstd/lib/compress/zstd_preSplit.c"
+
+[[entries]]
+rust  = "maybeSplitSequence"
+other = "maybeSplitSequence"
+other_path = "zstd/lib/compress/zstd_ldm.c"
+
+[[entries]]
+rust  = "mergeEvents"
+other = "mergeEvents"
+other_path = "zstd/lib/compress/zstd_preSplit.c"
+
+[[entries]]
+rust  = "readSkippableFrameSize"
+other = "readSkippableFrameSize"
+other_path = "zstd/lib/decompress/zstd_decompress.c"
+
+[[entries]]
+rust  = "sum_u32"
+other = "sum_u32"
+other_path = "zstd/lib/compress/zstd_opt.c"
+

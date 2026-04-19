@@ -1,24 +1,22 @@
 //! Translation of `lib/decompress/zstd_decompress_block.c`.
 //!
 //! This file is the core of the decoder: literals decoding (raw / RLE /
-//! HUF-compressed) and sequence execution. The full port requires the
-//! `ZSTD_DCtx` struct (defined in `zstd_decompress_internal.h`) and
-//! several FSE table types; those land in later ticks.
+//! HUF-compressed) and sequence execution. The full `ZSTD_DCtx` struct
+//! (defined in `zstd_decompress_internal.h`) is ported here, along
+//! with the FSE seq-table builders, bitstream state, and the full
+//! `ZSTD_decompressBlock_internal` pipeline — every fixture roundtrip,
+//! CLI roundtrip, and magicless/refPrefix lifecycle test exercises
+//! this module.
 //!
-//! Landed so far (leaf helpers that don't need `ZSTD_DCtx`):
-//!   - block-header types (`blockType_e`, `blockProperties_t`) and
-//!     related constants
-//!   - `ZSTD_getcBlockSize`
-//!   - `ZSTD_copy4`, `ZSTD_copy8`
-//!   - `ZSTD_overlapCopy8` (the tricky overlap-to-8 spreader)
-//!   - sequence-decoder value types: `seq_t`, `ZSTD_fseState`
+//! Types + helpers: block-header (`blockType_e`, `blockProperties_t`),
+//! `ZSTD_getcBlockSize`, `ZSTD_copy4` / `ZSTD_copy8`, `ZSTD_overlapCopy8`
+//! (overlap-to-8 spreader), sequence-decoder value types (`seq_t`,
+//! `ZSTD_fseState`).
 //!
-//! **Fully implemented**: `ZSTD_decodeLiteralsBlock`,
-//! `ZSTD_decodeSeqHeaders`, `ZSTD_decompressBlock_internal`,
-//! `ZSTD_decompressBlock` — end-to-end block decode is working
-//! (every fixture roundtrip test exercises this path).
+//! Entry points: `ZSTD_decodeLiteralsBlock`, `ZSTD_decodeSeqHeaders`,
+//! `ZSTD_buildSeqTable`, `ZSTD_decompressBlock_internal`,
+//! `ZSTD_decompressBlock`.
 
-#![allow(unused_variables)]
 
 use crate::common::error::{ErrorCode, ERROR};
 use crate::common::mem::{MEM_readLE16, MEM_readLE24, MEM_readLE32};
@@ -62,9 +60,87 @@ pub const ZSTD_BLOCKSIZELOG_MAX: u32 = 17;
 pub const ZSTD_BLOCKSIZE_MAX: usize = 1 << ZSTD_BLOCKSIZELOG_MAX;
 pub const ZSTD_REP_NUM: usize = 3;
 pub const MIN_CBLOCK_SIZE: usize = 2;
-pub const WILDCOPY_OVERLENGTH: usize = 32;
-pub const WILDCOPY_VECLEN: usize = 16;
+pub use crate::common::zstd_internal::{WILDCOPY_OVERLENGTH, WILDCOPY_VECLEN};
 pub const ZSTD_LITBUFFEREXTRASIZE: usize = 65536; // BLOCKSIZE_MAX / 2
+
+/// Port of `ZSTD_longOffset_e` (`zstd_decompress_block.c:1227`). Tells
+/// the sequence-decode inner loop whether to take the long-offset
+/// path (extra reload of the bitstream accumulator before reading
+/// offset extra bits). Relevant only on 32-bit targets where the
+/// accumulator is 25 bits wide; on 64-bit, the regular path handles
+/// every legal offset without a split.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ZSTD_longOffset_e {
+    #[default]
+    ZSTD_lo_isRegularOffset = 0,
+    ZSTD_lo_isLongOffset = 1,
+}
+
+/// Port of `ZSTD_checkContinuity` (`zstd_decompress_block.c:2280`).
+/// When decoding multiple blocks into distinct dst regions, upstream
+/// rotates its `previousDstEnd` / `prefixStart` / `virtualStart` /
+/// `dictEnd` pointers so that cross-block back-references still
+/// resolve. Our port doesn't yet track those pointer fields — the
+/// single-buffer decoder path handles cross-block references by
+/// passing an `op_start` offset into the same dst slice. This is a
+/// no-op stub preserving the upstream call-site signature.
+#[inline]
+pub fn ZSTD_checkContinuity(_dctx: &mut ZSTD_DCtx, _dst: &[u8], _dstSize: usize) {}
+
+/// Port of `ZSTD_DCtx_get_bmi2` (`zstd_decompress_internal.h:213`).
+/// Reads back the DCtx's `bmi2` detection flag. Upstream guards this
+/// behind `DYNAMIC_BMI2`; our port always returns the stored flag
+/// (which is `0` in v0.1 — we don't ship a BMI2 fast path yet).
+#[inline]
+pub fn ZSTD_DCtx_get_bmi2(dctx: &ZSTD_DCtx) -> i32 {
+    dctx.bmi2
+}
+
+/// Port of `ZSTD_totalHistorySize` (`zstd_decompress_block.c:2098`).
+/// Size of the decompressed history available before `curPtr` —
+/// expressed as bytes between a virtual start and the current write
+/// cursor. Upstream's formula is pointer-subtraction; our port mirrors
+/// it with index-based inputs so callers stay in safe Rust.
+#[inline]
+pub fn ZSTD_totalHistorySize(curIdx: usize, virtualStartIdx: usize) -> usize {
+    curIdx - virtualStartIdx
+}
+
+/// Port of `ZSTD_maxShortOffset` (`zstd_decompress_block.c:2147`).
+/// Largest offset that can be decoded in a single bitstream read
+/// without mid-offset refill. On 64-bit targets the 57-bit accumulator
+/// can hold any legal zstd offset (windowLog ≤ 31), so the cap is
+/// `usize::MAX`. On 32-bit, the 25-bit accumulator caps `offBase` at
+/// `(1 << 26) - 1`; subtract `ZSTD_REP_NUM` to convert to a raw offset.
+#[inline]
+pub fn ZSTD_maxShortOffset() -> usize {
+    use crate::common::mem::MEM_64bits;
+    if MEM_64bits() != 0 {
+        usize::MAX
+    } else {
+        let stream_accumulator_min: u32 = 25;
+        let maxOffbase: usize = (1usize << (stream_accumulator_min + 1)) - 1;
+        maxOffbase - ZSTD_REP_NUM
+    }
+}
+
+/// Port of `ZSTD_safecopyDstBeforeSrc` (`zstd_decompress_block.c:883`).
+/// Copies `length` bytes starting at `src_idx` in `buf` to `dst_idx`,
+/// where upstream's contract says `dst` comes *before* `src` in memory
+/// (no aliasing concerns for a forward copy, but short overlaps are
+/// still special-cased). Upstream mixes the short-length fallback with
+/// a wildcopy fast-path when `dst` and `src` are far apart; the Rust
+/// port uses a byte-by-byte forward copy since the aliasing-safety of
+/// our wildcopy helpers is already centralized elsewhere.
+///
+/// Operates on a single mutable buffer with two indices to stay safe
+/// in the face of borrow-checker constraints.
+pub fn ZSTD_safecopyDstBeforeSrc(buf: &mut [u8], dst_idx: usize, src_idx: usize, length: usize) {
+    debug_assert!(dst_idx <= src_idx || src_idx + length <= dst_idx);
+    for i in 0..length {
+        buf[dst_idx + i] = buf[src_idx + i];
+    }
+}
 
 /// Port of `ZSTD_getcBlockSize`. Reads the 3-byte block header from
 /// `src` and fills `bpPtr`. Returns the compressed block size (except
@@ -469,6 +545,13 @@ pub struct ZSTD_DCtx {
     pub litSize: usize,
     pub litEntropy: u32,
 
+    /// Upstream `dctx->dictID`. Parsed from a zstd-format dict's
+    /// 4-byte ID field when one is loaded; 0 for raw-content dicts.
+    pub dictID: u32,
+    /// Upstream `dctx->ddict_rep[ZSTD_REP_NUM]`. Rep values parsed
+    /// from a zstd-format dict's trailing 12-byte rep section.
+    pub ddict_rep: [u32; 3],
+
     /// isFrameDecompression toggles `ZSTD_blockSizeMax` behaviour;
     /// for standalone block decode (our current scope) it's 0.
     pub isFrameDecompression: i32,
@@ -505,6 +588,18 @@ pub struct ZSTD_DCtx {
     /// `ZSTD_d_windowLogMax`: upper bound on the window size the
     /// decoder will accept. Set via `ZSTD_DCtx_setParameter`.
     pub d_windowLogMax: u32,
+
+    /// Upstream `dctx->format`. Selected decoder format — zstd1 (with
+    /// magic) or zstd1_magicless (for embedded / streaming contexts
+    /// where the 4-byte magic is known redundantly).
+    pub format: crate::decompress::zstd_decompress::ZSTD_format_e,
+
+    /// Upstream `dctx->dictUses` (`zstd_decompress_internal.h:97`).
+    /// Tracks the dict lifecycle: `ZSTD_dont_use` = no dict attached;
+    /// `ZSTD_use_once` = `refPrefix`-bound dict that auto-clears
+    /// after one frame; `ZSTD_use_indefinitely` = persistent dict
+    /// from `loadDictionary` / `refDDict`.
+    pub dictUses: crate::decompress::zstd_decompress::ZSTD_dictUses_e,
 }
 
 fn build_default_ll_dtable() -> Vec<ZSTD_seqSymbol> {
@@ -572,6 +667,8 @@ impl Default for ZSTD_DCtx {
             litPtr_from_dst: false,
             litSize: 0,
             litEntropy: 0,
+            dictID: 0,
+            ddict_rep: [0; 3],
             isFrameDecompression: 0,
             blockSizeMax: ZSTD_BLOCKSIZE_MAX,
             disableHufAsm: 0,
@@ -588,7 +685,9 @@ impl Default for ZSTD_DCtx {
             stream_out_buffer: Vec::new(),
             stream_out_drained: 0,
             stream_dict: Vec::new(),
-            d_windowLogMax: 0,
+            d_windowLogMax: crate::decompress::zstd_decompress::ZSTD_WINDOWLOG_LIMIT_DEFAULT,
+            format: crate::decompress::zstd_decompress::ZSTD_format_e::ZSTD_f_zstd1,
+            dictUses: crate::decompress::zstd_decompress::ZSTD_dictUses_e::ZSTD_dont_use,
         }
     }
 }
@@ -610,12 +709,13 @@ fn ZSTD_blockSizeMax(dctx: &ZSTD_DCtx) -> usize {
     }
 }
 
-/// Allocate the literals buffer. Rust port: we always allocate inside
-/// `dctx.litExtraBuffer` (ZSTD_not_in_dst) for small literals, and
-/// bail back to the caller for ZSTD_in_dst / ZSTD_split since those
-/// need a raw pointer into `dst`. The optimization of spilling large
-/// literals into the tail of `dst` will land with `ZSTD_execSequence`
-/// — it's a perf-only win and correctness doesn't depend on it.
+/// Allocate the literals buffer. Rust port: always allocate inside
+/// `dctx.litExtraBuffer` (`ZSTD_not_in_dst`). The upstream
+/// optimization of spilling large literals into the tail of `dst`
+/// (`ZSTD_in_dst` / `ZSTD_split`) needs raw pointers into the
+/// caller's buffer and is skipped here — it's a perf-only win,
+/// correctness is unaffected since `ZSTD_execSequence` reads literals
+/// through `dctx.litPtr` regardless of where they live.
 fn ZSTD_allocateLiteralsBuffer(
     dctx: &mut ZSTD_DCtx,
     _dst_len: usize,
@@ -625,15 +725,17 @@ fn ZSTD_allocateLiteralsBuffer(
     _expectedWriteSize: usize,
     _splitImmediately: u32,
 ) {
-    // Always place in the owned extra buffer for now. Fidelity note:
-    // upstream would spill into `dst` to avoid a double-copy when
-    // possible; we'll revisit after `ZSTD_execSequence` lands.
+    // Always place in the owned extra buffer. Fidelity note: upstream
+    // spills into `dst` when it can to avoid a double-copy; our port
+    // keeps the simpler extra-buffer layout since `ZSTD_execSequence`
+    // reads literals through `dctx.litPtr` regardless of which buffer
+    // holds them — the spill is a perf win, not a correctness gate.
     dctx.litBuffer_offset = 0;
     dctx.litBufferEnd_offset = litSize;
     dctx.litBufferLocation = ZSTD_litLocation_e::ZSTD_not_in_dst;
 }
 
-// ---- Top-level block API (still skeletal) -----------------------------
+// ---- Top-level block API ----------------------------------------------
 
 /// Decoder entropy state retained across blocks — mirrors the subset
 /// of `ZSTD_entropyDTables_t` that this port touches today.
@@ -813,6 +915,19 @@ pub fn ZSTD_decompressBlock_internal(
     )
 }
 
+/// Port of `ZSTD_decodeLiteralsBlock_wrapper` (`zstd_decompress_block.c:342`).
+/// Standalone-block variant: sets `isFrameDecompression = 0` and
+/// forwards to `ZSTD_decodeLiteralsBlock` with `streaming =
+/// not_streaming`.
+pub fn ZSTD_decodeLiteralsBlock_wrapper(
+    dctx: &mut ZSTD_DCtx,
+    src: &[u8],
+    dst: &mut [u8],
+) -> usize {
+    dctx.isFrameDecompression = 0;
+    ZSTD_decodeLiteralsBlock(dctx, src, dst, streaming_operation::not_streaming)
+}
+
 /// Port of `ZSTD_decodeLiteralsBlock`. Decodes a literals-block header,
 /// populates `dctx.litBuffer` / `litSize` / `litPtr` and returns the
 /// number of bytes consumed from `src`.
@@ -925,10 +1040,11 @@ pub fn ZSTD_decodeLiteralsBlock(
                     0,
                 )
             } else {
-                // Upstream calls HUF_decompress4X_hufOnly_wksp which
-                // auto-selects between X1 and X2 by table-log; for now
-                // we route to X1 (the common path) and will add the
-                // auto-selector with a small helper in a future tick.
+                // Upstream calls `HUF_decompress4X_hufOnly_wksp` which
+                // auto-selects between X1 and X2 by table-log. We route
+                // directly to X1 — the common case for zstd-produced
+                // frames — deferring the X2 branch until we have a
+                // corpus that actually exercises it.
                 HUF_decompress4X1_DCtx_wksp(
                     &mut dctx.hufTable,
                     &mut dctx.litExtraBuffer[..litSize],
@@ -1378,7 +1494,8 @@ pub fn ZSTD_buildSeqTable(
 }
 
 /// Decoded sequence-block header descriptor. The FSE-table builder
-/// `ZSTD_buildSeqTable` consumes this next, but that's a later tick.
+/// `ZSTD_buildSeqTable` (ported) consumes this to populate the DCtx's
+/// LL / OF / ML FSE tables for the body's bitstream.
 #[derive(Debug, Clone, Copy)]
 pub struct SeqBlockHeader {
     pub nbSeq: i32,
@@ -1396,7 +1513,8 @@ pub struct SeqBlockHeader {
 /// number of bytes consumed so far.
 ///
 /// The FSE-table building that follows (three `ZSTD_buildSeqTable`
-/// calls) is deferred to a later tick.
+/// calls) is the next step — `ZSTD_buildSeqTable` itself is already
+/// ported and used by the full `ZSTD_decodeSeqHeaders` entry.
 pub fn ZSTD_decodeSeqHeaders_probe(src: &[u8], out: &mut SeqBlockHeader) -> usize {
     let iend = src.len();
     if iend < MIN_SEQUENCES_SIZE {
@@ -1590,6 +1708,185 @@ pub fn ZSTD_decodeSeqHeaders(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blockType_e_discriminants_match_upstream_spec() {
+        // Block-type discriminants are baked into the 2-bit block
+        // header field — spec-critical, cross-compat-critical.
+        assert_eq!(blockType_e::bt_raw as u8, 0);
+        assert_eq!(blockType_e::bt_rle as u8, 1);
+        assert_eq!(blockType_e::bt_compressed as u8, 2);
+        assert_eq!(blockType_e::bt_reserved as u8, 3);
+        // from_bits should round-trip through each value.
+        assert_eq!(blockType_e::from_bits(0), blockType_e::bt_raw);
+        assert_eq!(blockType_e::from_bits(1), blockType_e::bt_rle);
+        assert_eq!(blockType_e::from_bits(2), blockType_e::bt_compressed);
+        assert_eq!(blockType_e::from_bits(3), blockType_e::bt_reserved);
+        // Higher bits are masked off — 7 still resolves to reserved.
+        assert_eq!(blockType_e::from_bits(7), blockType_e::bt_reserved);
+    }
+
+    #[test]
+    fn symbolEncodingType_e_discriminants_match_upstream_spec() {
+        // Same 2-bit discriminator is reused in the literal section
+        // header and in each of LL/OF/ML encoding-type fields of the
+        // sequences section header — all spec-critical.
+        assert_eq!(SymbolEncodingType_e::set_basic as u8, 0);
+        assert_eq!(SymbolEncodingType_e::set_rle as u8, 1);
+        assert_eq!(SymbolEncodingType_e::set_compressed as u8, 2);
+        assert_eq!(SymbolEncodingType_e::set_repeat as u8, 3);
+        // from_bits should round-trip through each value.
+        assert_eq!(
+            SymbolEncodingType_e::from_bits(0),
+            SymbolEncodingType_e::set_basic
+        );
+        assert_eq!(
+            SymbolEncodingType_e::from_bits(1),
+            SymbolEncodingType_e::set_rle
+        );
+        assert_eq!(
+            SymbolEncodingType_e::from_bits(2),
+            SymbolEncodingType_e::set_compressed
+        );
+        assert_eq!(
+            SymbolEncodingType_e::from_bits(3),
+            SymbolEncodingType_e::set_repeat
+        );
+        // Higher bits are masked off — 7 still resolves to set_repeat.
+        assert_eq!(
+            SymbolEncodingType_e::from_bits(7),
+            SymbolEncodingType_e::set_repeat
+        );
+    }
+
+    #[test]
+    fn block_format_constants_match_upstream() {
+        // Format-level constants must match the Zstandard format spec.
+        // Drift here would break cross-compatibility with upstream.
+        assert_eq!(ZSTD_BLOCKHEADERSIZE, 3);
+        assert_eq!(ZSTD_blockHeaderSize, 3);
+        assert_eq!(ZSTD_BLOCKSIZELOG_MAX, 17);
+        assert_eq!(ZSTD_BLOCKSIZE_MAX, 128 * 1024);
+        assert_eq!(ZSTD_REP_NUM, 3);
+        assert_eq!(MIN_CBLOCK_SIZE, 2);
+        assert_eq!(WILDCOPY_OVERLENGTH, 32);
+        assert_eq!(WILDCOPY_VECLEN, 16);
+    }
+
+    #[test]
+    fn sequences_default_norms_match_spec_anchors() {
+        // Default normalized-count tables + their tableLogs form the
+        // "basic" encoding mode's implicit FSE tables — every frame
+        // compressed via default entropy references these values.
+        // Drift here would silently flip to incompatible default
+        // distributions. Pinned against upstream's zstd_internal.h.
+
+        // Log values and array lengths.
+        assert_eq!(LL_defaultNormLog, 6);
+        assert_eq!(ML_defaultNormLog, 6);
+        assert_eq!(OF_defaultNormLog, 5);
+        assert_eq!(LL_defaultNorm.len(), (MaxLL + 1) as usize);
+        assert_eq!(ML_defaultNorm.len(), (MaxML + 1) as usize);
+        assert_eq!(OF_defaultNorm.len(), (DefaultMaxOff + 1) as usize);
+
+        // Anchor entries (first, specific interior, last -1 marker).
+        assert_eq!(LL_defaultNorm[0], 4);
+        assert_eq!(LL_defaultNorm[13], 1);
+        assert_eq!(LL_defaultNorm[25], 3);
+        assert_eq!(LL_defaultNorm[35], -1);
+        assert_eq!(ML_defaultNorm[0], 1);
+        assert_eq!(ML_defaultNorm[1], 4);
+        assert_eq!(ML_defaultNorm[52], -1);
+        assert_eq!(OF_defaultNorm[0], 1);
+        assert_eq!(OF_defaultNorm[6], 2);
+        assert_eq!(OF_defaultNorm[28], -1);
+
+        // Normalization sum invariant: signed non-default entries sum
+        // to `1 << tableLog` plus the count of -1 "less-probable"
+        // entries (upstream expects each -1 to represent 1/(1<<log)).
+        fn verify_norm_sum(norm: &[i16], log: u32) {
+            let total: i32 = norm.iter().map(|&v| if v == -1 { 1 } else { v as i32 }).sum();
+            assert_eq!(total as u32, 1 << log);
+        }
+        verify_norm_sum(&LL_defaultNorm, LL_defaultNormLog);
+        verify_norm_sum(&ML_defaultNorm, ML_defaultNormLog);
+        verify_norm_sum(&OF_defaultNorm, OF_defaultNormLog);
+    }
+
+    #[test]
+    fn sequences_extra_bits_tables_match_spec_anchors() {
+        // Spot-check the spec-anchored entries of LL_bits, ML_bits,
+        // OF_bits against the Zstandard format spec. These tables
+        // drive "number of extra bits to read after the code" during
+        // sequence decode — a single wrong entry corrupts output.
+        // Full arrays sit in `zstd_internal.h` upstream.
+
+        // LL_bits: codes 0..15 → 0; 16..19 → 1; 20,21 → 2; 22,23 → 3;
+        // 24 → 4; 25 → 6; 26..35 increment monotonically 7..16.
+        assert_eq!(LL_bits[0], 0);
+        assert_eq!(LL_bits[15], 0);
+        assert_eq!(LL_bits[16], 1);
+        assert_eq!(LL_bits[19], 1);
+        assert_eq!(LL_bits[24], 4);
+        assert_eq!(LL_bits[25], 6);
+        assert_eq!(LL_bits[35], 16);
+
+        // ML_bits: codes 0..31 → 0; 32..35 → 1; 36,37 → 2; 38,39 → 3;
+        // 40,41 → 4; 42 → 5; 43 → 7; last (52) → 16.
+        assert_eq!(ML_bits[0], 0);
+        assert_eq!(ML_bits[31], 0);
+        assert_eq!(ML_bits[32], 1);
+        assert_eq!(ML_bits[42], 5);
+        assert_eq!(ML_bits[43], 7);
+        assert_eq!(ML_bits[52], 16);
+
+        // OF_bits: pure identity OF_bits[i] == i over the 0..=31 range.
+        for (i, b) in OF_bits.iter().enumerate() {
+            assert_eq!(*b as usize, i);
+        }
+
+        // Anchor values of the _base tables.
+        assert_eq!(LL_base[0], 0);
+        assert_eq!(LL_base[15], 15);
+        assert_eq!(LL_base[16], 16);
+        assert_eq!(LL_base[35], 0x10000);
+        assert_eq!(ML_base[0], 3);
+        assert_eq!(ML_base[52], 0x10003);
+
+        // OF_base has a closed-form invariant: for code >= 2,
+        // `OF_base[c] == (1 << c) - 3`. Codes 0,1 are special (0,1).
+        assert_eq!(OF_base[0], 0);
+        assert_eq!(OF_base[1], 1);
+        for (c, &got) in OF_base.iter().enumerate().skip(2) {
+            let expected: u32 = (1u32 << c) - 3;
+            assert_eq!(
+                got, expected,
+                "OF_base[{c}] should be (1<<{c})-3 = {expected}, got {got}",
+            );
+        }
+    }
+
+    #[test]
+    fn sequences_FSE_format_constants_match_upstream() {
+        // Sequences-section FSE log constants are baked into every
+        // frame's entropy tables; drift here would make us read/write
+        // the wrong number of bits per state and silently corrupt the
+        // bitstream. Pinned against `lib/common/zstd_internal.h`.
+        assert_eq!(MaxLL, 35);
+        assert_eq!(MaxML, 52);
+        assert_eq!(MaxOff, 31);
+        assert_eq!(DefaultMaxOff, 28);
+        assert_eq!(MaxSeq, core::cmp::max(MaxLL, MaxML));
+        assert_eq!(LLFSELog, 9);
+        assert_eq!(MLFSELog, 9);
+        assert_eq!(OffFSELog, 8);
+        assert_eq!(
+            MaxFSELog,
+            core::cmp::max(core::cmp::max(MLFSELog, LLFSELog), OffFSELog),
+        );
+        // LL_bits table must have MaxLL+1 entries.
+        assert_eq!(LL_bits.len(), (MaxLL + 1) as usize);
+    }
 
     #[test]
     fn get_cblock_size_parses_header_raw() {

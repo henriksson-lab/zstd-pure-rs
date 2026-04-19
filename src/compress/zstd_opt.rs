@@ -27,7 +27,6 @@
 //! strategies 7–9 down to `btlazy2` / `lazy2` at the `ZSTD_compress`
 //! dispatcher so `compressBlock_bt*` here still return a clean error.
 
-#![allow(unused_variables)]
 #![allow(non_snake_case)]
 
 use crate::common::bits::ZSTD_highbit32;
@@ -1072,6 +1071,56 @@ pub fn ZSTD_compressBlock_btultra(
 
 /// Port of `ZSTD_compressBlock_btultra2`. Same error-until-ported pattern.
 pub fn ZSTD_compressBlock_btultra2(
+    _ms: &mut ZSTD_MatchState_t,
+    _seqStore: &mut crate::compress::seq_store::SeqStore_t,
+    _rep: &mut [u32; ZSTD_REP_NUM],
+    _src: &[u8],
+) -> usize {
+    crate::common::error::ERROR(crate::common::error::ErrorCode::Generic)
+}
+
+// ─── NOT YET PORTED: bt{opt,ultra}_{dictMatchState,extDict} variants.
+// These would require the forward-DP optimal parser (currently also
+// unported — base bt{opt,ultra,ultra2} return `Generic`) AND the
+// dictMatchState / extDict linkage on `ZSTD_MatchState_t`. Returning
+// `ErrorCode::Generic` so callers fail loudly. ───────────────────────
+
+/// Port of `ZSTD_compressBlock_btopt_dictMatchState` (`zstd_opt.c:1539`).
+/// **NOT YET PORTED** — returns `ErrorCode::Generic`.
+pub fn ZSTD_compressBlock_btopt_dictMatchState(
+    _ms: &mut ZSTD_MatchState_t,
+    _seqStore: &mut crate::compress::seq_store::SeqStore_t,
+    _rep: &mut [u32; ZSTD_REP_NUM],
+    _src: &[u8],
+) -> usize {
+    crate::common::error::ERROR(crate::common::error::ErrorCode::Generic)
+}
+
+/// Port of `ZSTD_compressBlock_btopt_extDict` (`zstd_opt.c:1546`).
+/// **NOT YET PORTED** — returns `ErrorCode::Generic`.
+pub fn ZSTD_compressBlock_btopt_extDict(
+    _ms: &mut ZSTD_MatchState_t,
+    _seqStore: &mut crate::compress::seq_store::SeqStore_t,
+    _rep: &mut [u32; ZSTD_REP_NUM],
+    _src: &[u8],
+) -> usize {
+    crate::common::error::ERROR(crate::common::error::ErrorCode::Generic)
+}
+
+/// Port of `ZSTD_compressBlock_btultra_dictMatchState` (`zstd_opt.c:1555`).
+/// **NOT YET PORTED** — returns `ErrorCode::Generic`.
+pub fn ZSTD_compressBlock_btultra_dictMatchState(
+    _ms: &mut ZSTD_MatchState_t,
+    _seqStore: &mut crate::compress::seq_store::SeqStore_t,
+    _rep: &mut [u32; ZSTD_REP_NUM],
+    _src: &[u8],
+) -> usize {
+    crate::common::error::ERROR(crate::common::error::ErrorCode::Generic)
+}
+
+/// Port of `ZSTD_compressBlock_btultra_extDict` (`zstd_opt.c:1562`).
+/// **NOT YET PORTED** — returns `ErrorCode::Generic`.
+pub fn ZSTD_compressBlock_btultra_extDict(
     _ms: &mut ZSTD_MatchState_t,
     _seqStore: &mut crate::compress::seq_store::SeqStore_t,
     _rep: &mut [u32; ZSTD_REP_NUM],

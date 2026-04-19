@@ -16,9 +16,12 @@ pub const repStartValue: [u32; 3] = [1, 4, 8];
 /// slots to zero so the next block can't reuse any repcode — useful
 /// when the caller has committed a discontinuity upstream cannot see.
 ///
-/// Upstream signature takes `ZSTD_CCtx*`; ours takes the rep slice
-/// directly because our `ZSTD_CCtx` doesn't yet carry a dual
-/// `prevCBlock / nextCBlock` block-state pair.
+/// Rust-port note: upstream's signature is
+/// `ZSTD_invalidateRepCodes(ZSTD_CCtx*)`; we take the `rep` slice
+/// directly so the helper stays reusable from call sites that have
+/// a `[u32; 3]` but no CCtx (e.g. tests, `ZSTD_compressFrame_fast`
+/// standalone paths). The CCtx-receiving caller side invalidates
+/// both `prev_rep` and `next_rep` explicitly via two calls.
 #[inline]
 pub fn ZSTD_invalidateRepCodes(rep: &mut [u32; 3]) {
     for r in rep.iter_mut() {
@@ -42,6 +45,39 @@ pub fn ZSTD_reset_compressedBlockState_rep(rep: &mut [u32; 3]) {
 pub enum ZSTD_overlap_e {
     ZSTD_no_overlap,
     ZSTD_overlap_src_before_dst,
+}
+
+/// Port of `ZSTD_safecopyLiterals` (`zstd_compress_internal.h:700`).
+/// Copies bytes from `src[ip..iend]` to `dst[op..]`, using a fast
+/// non-overlapping bulk copy up to `ilimit_w` and a safe byte-by-byte
+/// tail past it. Only called when the sequence extends past
+/// `ilimit_w`, so the tail is the hot path.
+///
+/// Rust-port note: upstream takes raw pointers; our port takes
+/// `(dst, op, src, ip, iend, ilimit_w)` as indices. Caller must
+/// guarantee `iend > ilimit_w`.
+pub fn ZSTD_safecopyLiterals(
+    dst: &mut [u8],
+    op: usize,
+    src: &[u8],
+    ip: usize,
+    iend: usize,
+    ilimit_w: usize,
+) {
+    debug_assert!(iend > ilimit_w);
+    let mut op_cur = op;
+    let mut ip_cur = ip;
+    if ip_cur <= ilimit_w {
+        let n = ilimit_w - ip_cur;
+        dst[op_cur..op_cur + n].copy_from_slice(&src[ip_cur..ip_cur + n]);
+        op_cur += n;
+        ip_cur = ilimit_w;
+    }
+    while ip_cur < iend {
+        dst[op_cur] = src[ip_cur];
+        op_cur += 1;
+        ip_cur += 1;
+    }
 }
 
 /// Port of `ZSTD_copy8` — 8-byte memcpy via one 64-bit load/store.
@@ -136,6 +172,17 @@ pub fn ZSTD_limitCopy(dst: &mut [u8], src: &[u8]) -> usize {
     n
 }
 
+/// Port of `ZSTD_cpuSupportsBmi2` (zstd_internal.h:320). Upstream
+/// probes CPUID for BMI1 + BMI2 support to enable fast-path HUF
+/// decoding. v0.1 doesn't ship a BMI2-specific code path — the scalar
+/// decoder is the only one — so this always returns 0. Kept as part
+/// of the public surface so call-site-compatible C-bridge code
+/// compiles unchanged.
+#[inline]
+pub fn ZSTD_cpuSupportsBmi2() -> i32 {
+    0
+}
+
 /// Port of `ZSTD_copy4`. Kept here so compress + decompress can share.
 #[inline]
 pub fn ZSTD_copy4(dst: &mut [u8], src: &[u8]) {
@@ -146,6 +193,17 @@ pub fn ZSTD_copy4(dst: &mut [u8], src: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ZSTD_overlap_e_discriminants_match_upstream() {
+        // Upstream: `typedef enum { ZSTD_no_overlap,
+        // ZSTD_overlap_src_before_dst } ZSTD_overlap_e;` — default
+        // sequential 0/1. `ZSTD_wildcopy` dispatches on this; flipping
+        // the two values would silently swap which overlap mode is
+        // "safe no-overlap" vs "upstream src before dst".
+        assert_eq!(ZSTD_overlap_e::ZSTD_no_overlap as u32, 0);
+        assert_eq!(ZSTD_overlap_e::ZSTD_overlap_src_before_dst as u32, 1);
+    }
 
     #[test]
     fn wildcopy_handles_length_exactly_16() {

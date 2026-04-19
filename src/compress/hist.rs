@@ -18,7 +18,7 @@ pub const HIST_WKSP_SIZE: usize = HIST_WKSP_SIZE_U32 * 4; // sizeof(unsigned)
 /// `checkMaxSymbolValue` we enforce it and return an error if
 /// violated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HIST_checkInput_e {
+pub enum HIST_checkInput_e {
     TrustInput,
     CheckMaxSymbolValue,
 }
@@ -70,7 +70,7 @@ pub fn HIST_count_simple(count: &mut [u32], maxSymbolValuePtr: &mut u32, src: &[
 /// Port of `HIST_count_parallel_wksp`. Four counter arrays (one per
 /// byte-lane in a u32 stripe) are updated in parallel to amortize the
 /// store-queue; then accumulated into `count`.
-fn HIST_count_parallel_wksp(
+pub fn HIST_count_parallel_wksp(
     count: &mut [u32],
     maxSymbolValuePtr: &mut u32,
     src: &[u8],

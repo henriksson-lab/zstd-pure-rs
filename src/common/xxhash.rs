@@ -109,6 +109,30 @@ pub struct XXH64_state_t {
 /// `XXH_OK` from upstream.
 pub const XXH_OK: u32 = 0;
 
+/// Port of `XXH64_createState` (xxhash.h:923). Upstream allocates a
+/// zeroed state via `XXH_malloc`. Our Rust port's `XXH64_state_t` is
+/// a simple `Default`-constructible struct — just box the default
+/// value. Returns `None` only on allocation failure (which Rust's
+/// `Box::new` panics on, so this effectively always returns `Some`).
+#[inline]
+pub fn XXH64_createState() -> Option<Box<XXH64_state_t>> {
+    Some(Box::new(XXH64_state_t::default()))
+}
+
+/// Port of `XXH64_freeState` (xxhash.h:934). Drops the boxed state;
+/// returns 0 (`XXH_OK`).
+#[inline]
+pub fn XXH64_freeState(_state: Option<Box<XXH64_state_t>>) -> u32 {
+    XXH_OK
+}
+
+/// Port of `XXH64_copyState` (xxhash.h:944). Byte-for-byte copy of
+/// the source state into the destination.
+#[inline]
+pub fn XXH64_copyState(dst: &mut XXH64_state_t, src: &XXH64_state_t) {
+    dst.clone_from(src);
+}
+
 pub fn XXH64_reset(state: &mut XXH64_state_t, seed: u64) -> u32 {
     *state = XXH64_state_t {
         total_len: 0,

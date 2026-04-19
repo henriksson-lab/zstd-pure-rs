@@ -1,9 +1,10 @@
-//! Translation of `lib/compress/zstd_lazy.c` — strategies 3..=7
-//! (greedy / lazy / lazy2 / btlazy2 / btopt-adjacent). This first
-//! tick ports the hash-chain infra (`ZSTD_insertAndFindFirstIndex`,
-//! `ZSTD_HcFindBestMatch_noDict`) plus a simplified greedy (strategy 3)
-//! noDict entry point. Binary-tree (btlazy2) and true lazy depth=1/2
-//! lookahead are deferred to later ticks.
+//! Translation of `lib/compress/zstd_lazy.c` — strategies 3..=6
+//! (greedy / lazy / lazy2 / btlazy2). Hash-chain infra
+//! (`ZSTD_insertAndFindFirstIndex`, `ZSTD_HcFindBestMatch_noDict`) +
+//! all four noDict entry points (`ZSTD_compressBlock_{greedy,lazy,lazy2,btlazy2}`)
+//! are ported. btlazy2 currently falls through to lazy2 until the
+//! true binary-tree matcher lands. dictMatchState / extDict / row-hash
+//! variants remain skeletal — see the `stub_block_compressor!` macro.
 
 #![allow(non_snake_case)]
 
@@ -421,6 +422,50 @@ pub fn ZSTD_compressBlock_lazy2(
 ) -> usize {
     ZSTD_compressBlock_lazy_noDict_generic(ms, seqStore, rep, src, 0, 2)
 }
+
+// ─── NOT YET PORTED: row-hash / dictMatchState / extDict / DDSS
+// variants of the greedy/lazy/lazy2/btlazy2 match-finders. Upstream
+// uses `ms.tagTable` (row-hash), `ms.dictMatchState` (dict-attach
+// mode), and `window.dictBase` as a distinct pointer (ext-dict); none
+// of those are on our `ZSTD_MatchState_t` yet. Returning
+// `ErrorCode::Generic` so callers dispatching via
+// `ZSTD_selectBlockCompressor` fail loudly instead of silently
+// emitting wrong output. ─────────────────────────────────────────────
+macro_rules! stub_block_compressor {
+    ($name:ident) => {
+        pub fn $name(
+            _ms: &mut ZSTD_MatchState_t,
+            _seqStore: &mut SeqStore_t,
+            _rep: &mut [u32; ZSTD_REP_NUM],
+            _src: &[u8],
+        ) -> usize {
+            crate::common::error::ERROR(crate::common::error::ErrorCode::Generic)
+        }
+    };
+}
+stub_block_compressor!(ZSTD_compressBlock_greedy_row);
+stub_block_compressor!(ZSTD_compressBlock_lazy_row);
+stub_block_compressor!(ZSTD_compressBlock_lazy2_row);
+stub_block_compressor!(ZSTD_compressBlock_greedy_dictMatchState_row);
+stub_block_compressor!(ZSTD_compressBlock_lazy_dictMatchState_row);
+stub_block_compressor!(ZSTD_compressBlock_lazy2_dictMatchState_row);
+stub_block_compressor!(ZSTD_compressBlock_greedy_extDict_row);
+stub_block_compressor!(ZSTD_compressBlock_lazy_extDict_row);
+stub_block_compressor!(ZSTD_compressBlock_lazy2_extDict_row);
+stub_block_compressor!(ZSTD_compressBlock_greedy_dedicatedDictSearch);
+stub_block_compressor!(ZSTD_compressBlock_lazy_dedicatedDictSearch);
+stub_block_compressor!(ZSTD_compressBlock_lazy2_dedicatedDictSearch);
+stub_block_compressor!(ZSTD_compressBlock_greedy_dedicatedDictSearch_row);
+stub_block_compressor!(ZSTD_compressBlock_lazy_dedicatedDictSearch_row);
+stub_block_compressor!(ZSTD_compressBlock_lazy2_dedicatedDictSearch_row);
+stub_block_compressor!(ZSTD_compressBlock_greedy_dictMatchState);
+stub_block_compressor!(ZSTD_compressBlock_lazy_dictMatchState);
+stub_block_compressor!(ZSTD_compressBlock_lazy2_dictMatchState);
+stub_block_compressor!(ZSTD_compressBlock_btlazy2_dictMatchState);
+stub_block_compressor!(ZSTD_compressBlock_greedy_extDict);
+stub_block_compressor!(ZSTD_compressBlock_lazy_extDict);
+stub_block_compressor!(ZSTD_compressBlock_lazy2_extDict);
+stub_block_compressor!(ZSTD_compressBlock_btlazy2_extDict);
 
 /// Cross-block-history variant — caller passes `src[..istart]` as
 /// prior content. Shared by all three depth variants.

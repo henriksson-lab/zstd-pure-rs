@@ -91,9 +91,53 @@ pub fn ZSTD_matchState_dictMode(ms: &ZSTD_MatchState_t) -> ZSTD_dictMode_e {
     }
 }
 
-/// Upstream `ZSTD_CURRENT_MAX`. Upper limit on `nextSrc` before we
-/// must fold the index space back to zero via overflow correction.
-pub const ZSTD_CURRENT_MAX: u32 = (3u32 << 29) + 1;
+/// Upstream `ZSTD_CURRENT_MAX` (zstd_compress_internal.h:1031). Upper
+/// limit on `nextSrc` before we must fold the index space back to
+/// zero via overflow correction. 64-bit target: `3500 * (1 << 20)`
+/// bytes (~3.67 GB) — leaves 512 MB margin below 4 GB for the
+/// maximum job size. 32-bit target: `2000 * (1 << 20)` (~2 GB) to
+/// avoid crossing the signed-index midpoint. Previously our port used
+/// `(3 << 29) + 1` (~1.6 GB) — wrong by ~2 GB; never visibly broke
+/// anything because overflow correction rarely triggers in v0.1's
+/// roundtrips, but would cut history window capacity by ~half.
+pub const ZSTD_CURRENT_MAX: u32 = if crate::common::mem::MEM_32bits() != 0 {
+    2000u32 * (1u32 << 20)
+} else {
+    3500u32 * (1u32 << 20)
+};
+
+/// Upstream `ZSTD_CHUNKSIZE_MAX` (zstd_compress_internal.h:1033).
+/// Maximum chunk size before overflow correction needs to be called
+/// again: `u32::MAX - ZSTD_CURRENT_MAX`.
+pub const ZSTD_CHUNKSIZE_MAX: u32 = u32::MAX - ZSTD_CURRENT_MAX;
+
+/// Port of `ZSTD_dictTooBig` (zstd_compress.c:2113). A loaded dict
+/// bigger than one chunk-max can't be represented without triggering
+/// overflow correction mid-load — upstream uses this gate to decide
+/// whether to attach vs copy the dict tables.
+#[inline]
+pub const fn ZSTD_dictTooBig(loadedDictSize: usize) -> bool {
+    loadedDictSize > ZSTD_CHUNKSIZE_MAX as usize
+}
+
+/// Port of `ZSTD_INDEXOVERFLOW_MARGIN` (zstd_compress.c:2102).
+/// 16 MB safety margin below `ZSTD_CURRENT_MAX` — the threshold
+/// below which we can ignore overflow-correction for small inputs.
+pub const ZSTD_INDEXOVERFLOW_MARGIN: u32 = 16 * (1 << 20);
+
+/// Port of `ZSTD_indexTooCloseToMax` (zstd_compress.c:2103). Returns
+/// true when the window's `nextSrc` index is within
+/// `ZSTD_INDEXOVERFLOW_MARGIN` of `ZSTD_CURRENT_MAX` — upstream uses
+/// this gate to decide whether small-input compressions can skip the
+/// normally-mandatory overflow check. In our port the window stores
+/// indices directly (no base pointer), so we compute
+/// `nextSrc - base` as the absolute index.
+#[inline]
+pub fn ZSTD_indexTooCloseToMax(w: &ZSTD_window_t) -> bool {
+    // `nextSrc - base` in the pointer world maps to `nextSrc` itself
+    // in the index world (both are offsets relative to base).
+    w.nextSrc as u64 > (ZSTD_CURRENT_MAX - ZSTD_INDEXOVERFLOW_MARGIN) as u64
+}
 
 /// Upstream `ZSTD_DUBT_UNSORTED_MARK`. For `btlazy2`, an index of 1
 /// means "still in unsorted queue" — the reducer must preserve it
@@ -610,11 +654,60 @@ pub fn ZSTD_window_needOverflowCorrection(
     srcEnd_abs > ZSTD_CURRENT_MAX
 }
 
-/// Cut-down `ZSTD_MatchState_t`. Only the fields the v0.1 port
-/// currently uses are present; the rest (row-hash cache, chain
-/// tables, opt-parser state, dictMatchState linkage) will land as
-/// their consumers are ported.
-#[derive(Debug)]
+/// Port of `ZSTD_overflowCorrectIfNeeded` (`zstd_compress.c:4550`).
+/// Checks whether the window has accumulated enough absolute-index
+/// distance to risk a u32 wrap (`> ZSTD_CURRENT_MAX`); if so, runs
+/// `ZSTD_window_correctOverflow` to shift indices down and applies
+/// the same correction to every hash/chain table entry via
+/// `ZSTD_reduceIndex`. Also forces `nextToUpdate` and `loadedDictEnd`
+/// to match the new index space.
+///
+/// Upstream takes `ZSTD_cwksp*` to mark tables dirty/clean around the
+/// reduce; our Rust port owns tables as `Vec` and doesn't need that
+/// transactional marking — the reduce is in-place.
+///
+/// `src_abs` is the current cursor's absolute index; `srcEnd_abs` is
+/// the end of the current chunk (upstream's `iend - window.base`).
+pub fn ZSTD_overflowCorrectIfNeeded(
+    ms: &mut ZSTD_MatchState_t,
+    useRowMatchFinder: crate::compress::zstd_ldm::ZSTD_ParamSwitch_e,
+    dedicatedDictSearch: u32,
+    windowLog: u32,
+    chainLog: u32,
+    strategy: u32,
+    src_abs: u32,
+    srcEnd_abs: u32,
+) {
+    let cycleLog = crate::compress::zstd_compress::ZSTD_cycleLog(chainLog, strategy);
+    let maxDist: u32 = 1u32 << windowLog;
+    if ZSTD_window_needOverflowCorrection(
+        &ms.window,
+        cycleLog,
+        maxDist,
+        ms.loadedDictEnd,
+        src_abs,
+        srcEnd_abs,
+    ) {
+        let correction = ZSTD_window_correctOverflow(&mut ms.window, cycleLog, maxDist, src_abs);
+        ZSTD_reduceIndex(ms, useRowMatchFinder, dedicatedDictSearch, correction);
+        if ms.nextToUpdate < correction {
+            ms.nextToUpdate = 0;
+        } else {
+            ms.nextToUpdate -= correction;
+        }
+        // Invalidate loaded dict on overflow correction — upstream
+        // also nulls `ms.dictMatchState`, which we don't yet track.
+        ms.loadedDictEnd = 0;
+    }
+}
+
+/// Cut-down `ZSTD_MatchState_t`. Covers the primary hash table, the
+/// `hashTable3` short-hash leg, and the `chainTable` used by
+/// `zstd_lazy` / `zstd_opt`. Fields still absent: the `tagTable` /
+/// `rowHashLog` row-hash cache, the `ZSTD_optimal_t` opt-parser
+/// state, and the `dictMatchState` linkage — all will land with
+/// their consumers.
+#[derive(Debug, Clone)]
 pub struct ZSTD_MatchState_t {
     pub window: ZSTD_window_t,
 
@@ -709,6 +802,36 @@ impl ZSTD_MatchState_t {
 #[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ZSTD_CURRENT_MAX_and_CHUNKSIZE_MAX_match_upstream_formula() {
+        // Previously `(3<<29)+1 = 1.6 GB`; upstream is `3500*(1<<20)
+        // = 3.67 GB` on 64-bit / `2000*(1<<20) = 2.0 GB` on 32-bit.
+        // Pin the fix so the constant can't drift back.
+        let expected = if crate::common::mem::MEM_32bits() != 0 {
+            2000u32 * (1u32 << 20)
+        } else {
+            3500u32 * (1u32 << 20)
+        };
+        assert_eq!(ZSTD_CURRENT_MAX, expected);
+        assert_eq!(ZSTD_CHUNKSIZE_MAX, u32::MAX - ZSTD_CURRENT_MAX);
+        // And the dictTooBig gate flips at the chunk boundary.
+        assert!(!ZSTD_dictTooBig(ZSTD_CHUNKSIZE_MAX as usize));
+        assert!(ZSTD_dictTooBig(ZSTD_CHUNKSIZE_MAX as usize + 1));
+    }
+
+    #[test]
+    fn ZSTD_dictMode_e_discriminants_match_upstream() {
+        // Upstream (zstd_compress_internal.h:551-557):
+        //   ZSTD_noDict=0, ZSTD_extDict=1, ZSTD_dictMatchState=2,
+        //   ZSTD_dedicatedDictSearch=3
+        // Block compressors dispatch on this enum via equality
+        // checks; reordering would silently route to wrong strategy.
+        assert_eq!(ZSTD_dictMode_e::ZSTD_noDict as u32, 0);
+        assert_eq!(ZSTD_dictMode_e::ZSTD_extDict as u32, 1);
+        assert_eq!(ZSTD_dictMode_e::ZSTD_dictMatchState as u32, 2);
+        assert_eq!(ZSTD_dictMode_e::ZSTD_dedicatedDictSearch as u32, 3);
+    }
 
     #[test]
     fn new_state_sizes_hash_table_from_hashlog() {

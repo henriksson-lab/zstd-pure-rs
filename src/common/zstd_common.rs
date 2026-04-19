@@ -60,6 +60,16 @@ mod tests {
     fn version_number_matches_string() {
         assert_eq!(ZSTD_versionNumber(), 1_06_00);
         assert_eq!(ZSTD_versionString(), "1.6.0");
+        // Also pin the individual major/minor/release triplet so
+        // a bump (e.g. to 1.6.1) updates all four constants together.
+        assert_eq!(ZSTD_VERSION_MAJOR, 1);
+        assert_eq!(ZSTD_VERSION_MINOR, 6);
+        assert_eq!(ZSTD_VERSION_RELEASE, 0);
+        // And verify the formula: MAJOR*10000 + MINOR*100 + RELEASE.
+        assert_eq!(
+            ZSTD_VERSION_NUMBER,
+            ZSTD_VERSION_MAJOR * 10_000 + ZSTD_VERSION_MINOR * 100 + ZSTD_VERSION_RELEASE
+        );
     }
 
     #[test]

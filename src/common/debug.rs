@@ -4,19 +4,18 @@
 //! macros. In release builds these compile to nothing; here we mirror
 //! that by gating on `debug_assertions`.
 
-pub static mut g_debuglevel: i32 = 0;
+use core::sync::atomic::{AtomicI32, Ordering};
+
+static G_DEBUGLEVEL: AtomicI32 = AtomicI32::new(0);
 
 #[inline]
 pub fn set_debug_level(lvl: i32) {
-    // Safety: zstd's C code treats this as a write-once knob during setup.
-    unsafe {
-        g_debuglevel = lvl;
-    }
+    G_DEBUGLEVEL.store(lvl, Ordering::Relaxed);
 }
 
 #[inline]
 pub fn debug_level() -> i32 {
-    unsafe { g_debuglevel }
+    G_DEBUGLEVEL.load(Ordering::Relaxed)
 }
 
 #[cfg(test)]

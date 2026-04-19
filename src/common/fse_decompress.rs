@@ -13,8 +13,6 @@
 //! inside each `u32` so that code-complexity-comparator sees the same
 //! two-step build → decode structure.
 
-#![allow(unused_variables)]
-
 use crate::common::bitstream::{
     BIT_DStream_overflow, BIT_DStream_t, BIT_DStream_unfinished, BIT_endOfDStream, BIT_initDStream,
     BIT_readBits, BIT_readBitsFast, BIT_reloadDStream,
@@ -163,7 +161,7 @@ pub fn FSE_buildDTable_internal(
     normalizedCounter: &[i16],
     maxSymbolValue: u32,
     tableLog: u32,
-    workSpace: &mut [u8],
+    _workSpace: &mut [u8],
     wkspSize: usize,
 ) -> usize {
     let maxSV1 = maxSymbolValue + 1;

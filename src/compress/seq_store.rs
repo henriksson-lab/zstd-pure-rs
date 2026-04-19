@@ -45,7 +45,7 @@ pub enum ZSTD_longLengthType_e {
 /// caller-provided buffers — we keep the buffers inline (owned
 /// `Vec`s) plus current-end indices that behave like the upstream
 /// `sequences` / `lit` cursors.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SeqStore_t {
     pub sequences: Vec<SeqDef>,
     pub literals: Vec<u8>,
@@ -101,6 +101,146 @@ pub fn ZSTD_resetSeqStore(ss: &mut SeqStore_t) {
     ss.sequences.clear();
     ss.literals.clear();
     ss.longLengthType = ZSTD_longLengthType_e::ZSTD_llt_none;
+}
+
+/// Port of `ZSTD_deriveSeqStoreChunk` (`zstd_compress.c:4025`). Builds
+/// a new `SeqStore_t` that represents the sequence subrange
+/// `[startIdx, endIdx)` of `originalSeqStore`, used by the block
+/// splitter to cost-estimate potential splits.
+///
+/// Upstream reuses the allocation via pointer arithmetic into
+/// `sequencesStart`/`litStart`/`llCode`/`mlCode`/`ofCode`. Our port
+/// clones the relevant subranges into fresh `Vec`s — correct but
+/// allocates; the block splitter isn't yet wired into our compressor
+/// so the allocation cost is moot for now.
+///
+/// `longLengthPos` is rebased or cleared if it falls outside the
+/// chunk range, mirroring upstream exactly.
+pub fn ZSTD_deriveSeqStoreChunk(
+    originalSeqStore: &SeqStore_t,
+    startIdx: usize,
+    endIdx: usize,
+) -> SeqStore_t {
+    debug_assert!(endIdx <= originalSeqStore.sequences.len());
+    debug_assert!(startIdx <= endIdx);
+
+    let seqs_chunk: Vec<SeqDef> = originalSeqStore.sequences[startIdx..endIdx].to_vec();
+
+    // Sum literals bytes before startIdx (consumed by prior chunks)
+    // and within [startIdx, endIdx) (kept for this chunk).
+    let prior_lits: usize = originalSeqStore.sequences[..startIdx]
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let mut n = s.litLength as usize;
+            if i as u32 == originalSeqStore.longLengthPos
+                && originalSeqStore.longLengthType == ZSTD_longLengthType_e::ZSTD_llt_literalLength
+            {
+                n += 0x10000;
+            }
+            n
+        })
+        .sum();
+
+    let chunk_lits: usize = seqs_chunk
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let mut n = s.litLength as usize;
+            let orig_idx = startIdx + i;
+            if orig_idx as u32 == originalSeqStore.longLengthPos
+                && originalSeqStore.longLengthType == ZSTD_longLengthType_e::ZSTD_llt_literalLength
+            {
+                n += 0x10000;
+            }
+            n
+        })
+        .sum();
+
+    let is_last_chunk = endIdx == originalSeqStore.sequences.len();
+    let lit_take = if is_last_chunk {
+        // Take everything from prior_lits through end (includes trailing literals).
+        originalSeqStore.literals.len().saturating_sub(prior_lits)
+    } else {
+        chunk_lits
+    };
+    let literals_chunk: Vec<u8> =
+        originalSeqStore.literals[prior_lits..prior_lits + lit_take].to_vec();
+
+    // Carry per-sequence code-tables if they've been materialized.
+    let ll_chunk = if originalSeqStore.llCode.len() >= endIdx {
+        originalSeqStore.llCode[startIdx..endIdx].to_vec()
+    } else {
+        Vec::new()
+    };
+    let ml_chunk = if originalSeqStore.mlCode.len() >= endIdx {
+        originalSeqStore.mlCode[startIdx..endIdx].to_vec()
+    } else {
+        Vec::new()
+    };
+    let of_chunk = if originalSeqStore.ofCode.len() >= endIdx {
+        originalSeqStore.ofCode[startIdx..endIdx].to_vec()
+    } else {
+        Vec::new()
+    };
+
+    let (longLengthType, longLengthPos) = match originalSeqStore.longLengthType {
+        ZSTD_longLengthType_e::ZSTD_llt_none => {
+            (ZSTD_longLengthType_e::ZSTD_llt_none, 0)
+        }
+        _ => {
+            let p = originalSeqStore.longLengthPos as usize;
+            if p < startIdx || p > endIdx {
+                (ZSTD_longLengthType_e::ZSTD_llt_none, 0)
+            } else {
+                (originalSeqStore.longLengthType, (p - startIdx) as u32)
+            }
+        }
+    };
+
+    SeqStore_t {
+        sequences: seqs_chunk,
+        literals: literals_chunk,
+        llCode: ll_chunk,
+        mlCode: ml_chunk,
+        ofCode: of_chunk,
+        maxNbSeq: originalSeqStore.maxNbSeq,
+        maxNbLit: originalSeqStore.maxNbLit,
+        longLengthType,
+        longLengthPos,
+    }
+}
+
+/// Port of `ZSTD_countSeqStoreLiteralsBytes` (`zstd_compress.c:3993`).
+/// Sum of all sequences' literal-length fields, plus 0x10000 when the
+/// long-length flag marks a literal-length overflow.
+pub fn ZSTD_countSeqStoreLiteralsBytes(seqStore: &SeqStore_t) -> usize {
+    let mut literalsBytes: usize = 0;
+    for (i, seq) in seqStore.sequences.iter().enumerate() {
+        literalsBytes += seq.litLength as usize;
+        if i as u32 == seqStore.longLengthPos
+            && seqStore.longLengthType == ZSTD_longLengthType_e::ZSTD_llt_literalLength
+        {
+            literalsBytes += 0x10000;
+        }
+    }
+    literalsBytes
+}
+
+/// Port of `ZSTD_countSeqStoreMatchBytes` (`zstd_compress.c:4008`). Sum
+/// of decoded match lengths (`mlBase + MINMATCH`) across the seqStore,
+/// plus 0x10000 when the long-length flag marks a match-length overflow.
+pub fn ZSTD_countSeqStoreMatchBytes(seqStore: &SeqStore_t) -> usize {
+    let mut matchBytes: usize = 0;
+    for (i, seq) in seqStore.sequences.iter().enumerate() {
+        matchBytes += seq.mlBase as usize + MINMATCH as usize;
+        if i as u32 == seqStore.longLengthPos
+            && seqStore.longLengthType == ZSTD_longLengthType_e::ZSTD_llt_matchLength
+        {
+            matchBytes += 0x10000;
+        }
+    }
+    matchBytes
 }
 
 /// Port of `ZSTD_getSequenceLength`. Decodes the long-length bit and
@@ -249,6 +389,87 @@ pub fn ZSTD_updateRep(rep: &mut [u32; ZSTD_REP_NUM], offBase: u32, ll0: u32) {
     }
 }
 
+/// Port of `ZSTD_resolveRepcodeToRawOffset` (`zstd_compress.c:4061`).
+/// Given a repcode-flavored offBase, literal-length-zero flag, and the
+/// current `rep[]`, returns the raw offset bytes the repcode resolves
+/// to. The `(repCode == ZSTD_REP_NUM) → rep[0] - 1` corner case is
+/// preserved for symmetry with `ZSTD_updateRep`; the caller must handle
+/// the edge case where `rep[0] == 1` produces a zero offset (invalid,
+/// discarded downstream by `ZSTD_seqStore_resolveOffCodes`).
+pub fn ZSTD_resolveRepcodeToRawOffset(rep: &[u32; ZSTD_REP_NUM], offBase: u32, ll0: u32) -> u32 {
+    debug_assert!(OFFBASE_IS_REPCODE(offBase));
+    let adjustedRepCode = OFFBASE_TO_REPCODE(offBase) - 1 + ll0;
+    if adjustedRepCode == ZSTD_REP_NUM as u32 {
+        debug_assert!(ll0 != 0);
+        rep[0].wrapping_sub(1)
+    } else {
+        rep[adjustedRepCode as usize]
+    }
+}
+
+/// Port of `ZSTD_validateSeqStore` (`zstd_compress.c:3261`). Debug-
+/// only assertion that every sequence's decoded matchLength respects
+/// the minimum dictated by `cParams.minMatch` (3 when minMatch=3, else
+/// 4). In release builds this is a no-op; in debug builds it panics
+/// on violation.
+pub fn ZSTD_validateSeqStore(seqStore: &SeqStore_t, minMatchParam: u32) {
+    #[cfg(debug_assertions)]
+    {
+        let matchLenLowerBound: u32 = if minMatchParam == 3 { 3 } else { 4 };
+        for idx in 0..seqStore.sequences.len() {
+            let seqLen = ZSTD_getSequenceLength(seqStore, idx);
+            debug_assert!(seqLen.matchLength >= matchLenLowerBound);
+        }
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = (seqStore, minMatchParam);
+    }
+}
+
+/// Port of `ZSTD_seqStore_resolveOffCodes` (`zstd_compress.c:4093`).
+/// Walks `seqStore.sequences` in order, maintaining parallel
+/// decompression-side (`dRepcodes`) and compression-side (`cRepcodes`)
+/// repcode histories. Whenever a repcode-flavored `offBase` would
+/// resolve to different raw offsets on the two sides — which can
+/// happen after an RLE/raw-block emission perturbs the implicit
+/// decoder history — the sequence's `offBase` is rewritten to
+/// explicitly carry the compression-side raw offset via
+/// `OFFSET_TO_OFFBASE`, so the decoder's rep history matches.
+///
+/// Post-condition: both rep histories are advanced — `dRepcodes` via
+/// the (possibly rewritten) `seq.offBase` (the value the decoder will
+/// see), `cRepcodes` via the original `offBase` (the compressor's
+/// actual choice).
+pub fn ZSTD_seqStore_resolveOffCodes(
+    dRepcodes: &mut Repcodes_t,
+    cRepcodes: &mut Repcodes_t,
+    seqStore: &mut SeqStore_t,
+    nbSeq: u32,
+) {
+    let longLitLenIdx = if seqStore.longLengthType == ZSTD_longLengthType_e::ZSTD_llt_literalLength {
+        seqStore.longLengthPos
+    } else {
+        nbSeq
+    };
+    for idx in 0..(nbSeq as usize) {
+        let seq = &mut seqStore.sequences[idx];
+        let ll0 = (seq.litLength == 0 && idx as u32 != longLitLenIdx) as u32;
+        let offBase = seq.offBase;
+        debug_assert!(offBase > 0);
+        if OFFBASE_IS_REPCODE(offBase) {
+            let dRaw = ZSTD_resolveRepcodeToRawOffset(&dRepcodes.rep, offBase, ll0);
+            let cRaw = ZSTD_resolveRepcodeToRawOffset(&cRepcodes.rep, offBase, ll0);
+            if dRaw != cRaw {
+                seq.offBase = OFFSET_TO_OFFBASE(cRaw);
+            }
+        }
+        let new_offBase = seq.offBase;
+        ZSTD_updateRep(&mut dRepcodes.rep, new_offBase, ll0);
+        ZSTD_updateRep(&mut cRepcodes.rep, offBase, ll0);
+    }
+}
+
 /// Port of `ZSTD_newRep`. Non-destructive variant of
 /// `ZSTD_updateRep`.
 pub fn ZSTD_newRep(rep: &[u32; ZSTD_REP_NUM], offBase: u32, ll0: u32) -> Repcodes_t {
@@ -260,6 +481,18 @@ pub fn ZSTD_newRep(rep: &[u32; ZSTD_REP_NUM], offBase: u32, ll0: u32) -> Repcode
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ZSTD_longLengthType_e_discriminants_match_upstream() {
+        // Upstream: `typedef enum { ZSTD_llt_none, ZSTD_llt_literalLength,
+        // ZSTD_llt_matchLength } ZSTD_longLengthType_e;` — default
+        // sequential 0/1/2. `ZSTD_seqToCodes` stamps a single sequence's
+        // long-length flag into this u32 field; drift would mis-route
+        // the "which length exceeds the FSE code max" discriminator.
+        assert_eq!(ZSTD_longLengthType_e::ZSTD_llt_none as u32, 0);
+        assert_eq!(ZSTD_longLengthType_e::ZSTD_llt_literalLength as u32, 1);
+        assert_eq!(ZSTD_longLengthType_e::ZSTD_llt_matchLength as u32, 2);
+    }
 
     #[test]
     fn storeLastLiterals_appends() {
@@ -399,5 +632,26 @@ mod tests {
         let mut rep = [5u32, 10, 20];
         ZSTD_updateRep(&mut rep, REPCODE_TO_OFFBASE(2), 0);
         assert_eq!(rep, [10, 5, 20]);
+    }
+
+    #[test]
+    fn update_rep_uses_rep0_minus_one_when_repCode_equals_ZSTD_REP_NUM() {
+        // Special case: repcode 3 with ll0=1 → repCode = 3+1-1 = 3 (=
+        // ZSTD_REP_NUM). Upstream uses `rep[0] - 1` as the new offset
+        // in this branch (the "virtual 4th repcode" slot). Pin this
+        // corner so a future refactor can't swap it with rep[2].
+        let mut rep = [5u32, 10, 20];
+        ZSTD_updateRep(&mut rep, REPCODE_TO_OFFBASE(3), 1);
+        assert_eq!(rep, [4, 5, 10]); // new rep[0] = 5-1 = 4
+    }
+
+    #[test]
+    fn newRep_is_non_destructive_to_input() {
+        // `ZSTD_newRep` is the non-destructive sibling — returns a
+        // fresh Repcodes_t without mutating the caller's array.
+        let rep = [5u32, 10, 20];
+        let result = ZSTD_newRep(&rep, OFFSET_TO_OFFBASE(42), 0);
+        assert_eq!(rep, [5, 10, 20], "input must not be mutated");
+        assert_eq!(result.rep, [42, 5, 10]);
     }
 }

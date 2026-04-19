@@ -24,6 +24,64 @@ pub const PRIME_6BYTES: u64 = 227_718_039_650_203;
 pub const PRIME_7BYTES: u64 = 58_295_818_150_454_627;
 pub const PRIME_8BYTES: u64 = 0xCF1B_BCDC_B7A5_6463;
 
+/// Upstream `ZSTD_ROLL_HASH_CHAR_OFFSET` (zstd_compress_internal.h:979).
+/// Byte bias added before multiplication so that leading zero bytes
+/// still propagate into the rolling hash.
+pub const ZSTD_ROLL_HASH_CHAR_OFFSET: u64 = 10;
+
+/// Port of `ZSTD_ipow` (zstd_compress_internal.h:968). Fast u64
+/// exponentiation by squaring.
+#[inline]
+pub fn ZSTD_ipow(mut base: u64, mut exponent: u64) -> u64 {
+    let mut power: u64 = 1;
+    while exponent != 0 {
+        if exponent & 1 != 0 {
+            power = power.wrapping_mul(base);
+        }
+        exponent >>= 1;
+        base = base.wrapping_mul(base);
+    }
+    power
+}
+
+/// Port of `ZSTD_rollingHash_append` (zstd_compress_internal.h:984).
+/// Multiplies `hash` by `prime8bytes` for each byte, adding the byte
+/// (with `ZSTD_ROLL_HASH_CHAR_OFFSET` bias).
+#[inline]
+pub fn ZSTD_rollingHash_append(mut hash: u64, buf: &[u8]) -> u64 {
+    for &b in buf {
+        hash = hash.wrapping_mul(PRIME_8BYTES);
+        hash = hash.wrapping_add(b as u64 + ZSTD_ROLL_HASH_CHAR_OFFSET);
+    }
+    hash
+}
+
+/// Port of `ZSTD_rollingHash_compute` (zstd_compress_internal.h:998).
+/// Rolling hash over the whole buffer, seeded at 0.
+#[inline]
+pub fn ZSTD_rollingHash_compute(buf: &[u8]) -> u64 {
+    ZSTD_rollingHash_append(0, buf)
+}
+
+/// Port of `ZSTD_rollingHash_primePower` (zstd_compress_internal.h:1007).
+/// Pre-computes the multiplicative prime power for a window of `length`
+/// bytes. Pass the result to `ZSTD_rollingHash_rotate`.
+#[inline]
+pub fn ZSTD_rollingHash_primePower(length: u32) -> u64 {
+    ZSTD_ipow(PRIME_8BYTES, length.saturating_sub(1) as u64)
+}
+
+/// Port of `ZSTD_rollingHash_rotate` (zstd_compress_internal.h:1015).
+/// Slide the window by one byte: remove `toRemove` from the front,
+/// add `toAdd` at the back.
+#[inline]
+pub fn ZSTD_rollingHash_rotate(hash: u64, toRemove: u8, toAdd: u8, primePower: u64) -> u64 {
+    let removed = (toRemove as u64 + ZSTD_ROLL_HASH_CHAR_OFFSET).wrapping_mul(primePower);
+    let after_remove = hash.wrapping_sub(removed);
+    let after_mult = after_remove.wrapping_mul(PRIME_8BYTES);
+    after_mult.wrapping_add(toAdd as u64 + ZSTD_ROLL_HASH_CHAR_OFFSET)
+}
+
 #[inline]
 pub fn ZSTD_hash3(u: u32, h: u32, s: u32) -> u32 {
     debug_assert!(h <= 32);
@@ -148,10 +206,6 @@ pub fn ZSTD_hashPtrSalted(p: &[u8], hBits: u32, mls: u32, hashSalt: u64) -> usiz
 
 // ---- Common-prefix match length --------------------------------------
 
-/// Port of `ZSTD_count`. Returns the number of leading bytes that
-/// match between `buf[in_pos..]` and `buf[match_pos..]` up to
-/// `buf[in_limit]`. Upstream's pointer-based loop becomes
-/// index-based here; semantics are identical: read size_t words,
 /// Port of `ZSTD_count_2segments`. Match-length counter that can
 /// cross from an ext-dict segment into the current prefix. When the
 /// forward count reaches the end of the dict segment (`mEnd`), it
@@ -203,7 +257,11 @@ pub fn ZSTD_count_2segments(
     matchLength + extra
 }
 
-/// XOR, count common bytes on first mismatch.
+/// Port of `ZSTD_count`. Returns the number of leading bytes that
+/// match between `buf[in_pos..]` and `buf[match_pos..]` up to
+/// `buf[in_limit]`. Upstream's pointer-based loop becomes index-based
+/// here; semantics are identical: read size_t words, XOR, count
+/// common bytes on first mismatch.
 ///
 /// Rust signature note: upstream takes three raw `BYTE*` pointers
 /// into the same buffer. We take one `&[u8]` + three byte indices.
@@ -249,6 +307,30 @@ pub fn ZSTD_count(buf: &[u8], in_pos: usize, match_pos: usize, in_limit: usize) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rollingHash_rotate_equals_recompute_on_slide() {
+        // Core invariant of the rolling hash: sliding the window by
+        // one byte via rotate() produces the same hash as recomputing
+        // from scratch on the new slice. Pin against a simple 4-byte
+        // window rotating through a 10-byte buffer.
+        let buf = b"rolling123";
+        let window: u32 = 4;
+        let primePower = ZSTD_rollingHash_primePower(window);
+        let mut hash = ZSTD_rollingHash_compute(&buf[..window as usize]);
+        for i in 0..(buf.len() - window as usize) {
+            hash = ZSTD_rollingHash_rotate(
+                hash,
+                buf[i],                // toRemove = leading byte
+                buf[i + window as usize],// toAdd = new trailing byte
+                primePower,
+            );
+            let fresh = ZSTD_rollingHash_compute(
+                &buf[i + 1..i + 1 + window as usize],
+            );
+            assert_eq!(hash, fresh, "slide {i}");
+        }
+    }
 
     #[test]
     fn count_2segments_stays_within_dict_when_short() {

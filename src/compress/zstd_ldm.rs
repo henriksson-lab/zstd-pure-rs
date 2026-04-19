@@ -43,6 +43,12 @@ pub const ZSTD_HASHLOG_MIN: u32 = 6;
 /// Upstream `ZSTD_HASHLOG_MAX` — capped at 30 for sanity.
 pub const ZSTD_HASHLOG_MAX: u32 = 30;
 
+/// Upstream `ZSTD_LDM_DEFAULT_WINDOW_LOG` (`zstd_ldm.h:21`) — aliased
+/// onto `ZSTD_WINDOWLOG_LIMIT_DEFAULT` (27). Applied when LDM is
+/// enabled and the caller hasn't set an explicit windowLog — a wider
+/// window makes long-distance matches worthwhile.
+pub const ZSTD_LDM_DEFAULT_WINDOW_LOG: u32 = 27;
+
 /// Port of `ZSTD_ParamSwitch_e`. Used by LDM / block splitter to
 /// express "auto / force-on / force-off".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -937,10 +943,12 @@ pub fn ZSTD_ldm_generateSequences(
 
 /// Port of `ZSTD_ldm_blockCompress`. Skeletal — compresses a block
 /// using LDM-discovered sequences, wrapping a block-compressor call
-/// per match run. Upstream dispatches on strategy via
-/// `ZSTD_selectBlockCompressor`, which we don't yet surface as a
-/// function pointer. Returns `ErrorCode::Generic` so callers that
-/// accidentally hit the LDM-active path fall back cleanly.
+/// per match run. Still returns `ErrorCode::Generic` because the
+/// per-run wrapping (maybeSplitSequence + `ms.ldmSeqStore` linkage +
+/// nbSeq accounting) isn't ported yet. `ZSTD_selectBlockCompressor`
+/// itself IS available and wired into `ZSTD_compressFrame_fast`
+/// dispatch; the stub guards callers that accidentally hit the
+/// LDM-active path before the wrapper lands.
 pub fn ZSTD_ldm_blockCompress(
     _rawSeqStore: &mut RawSeqStore_t,
     _ms: &mut ZSTD_MatchState_t,
@@ -1483,5 +1491,29 @@ mod tests {
         };
         assert_eq!(ZSTD_ldm_getMaxNbSeq(lp, 65536), 1024);
         assert_eq!(ZSTD_ldm_getMaxNbSeq(lp, 0), 0);
+    }
+
+    #[test]
+    fn blockCompress_stub_returns_Generic_error() {
+        // `ZSTD_ldm_blockCompress` is stubbed in v0.1 (needs the
+        // per-run wrapping: `maybeSplitSequence` + `ms.ldmSeqStore`
+        // linkage + nbSeq accounting). `ZSTD_selectBlockCompressor`
+        // itself is ported and wired. Contract: callers that
+        // accidentally hit the LDM-active path get a proper zstd
+        // error, not a panic.
+        use crate::common::error::{ERR_getErrorCode, ERR_isError, ErrorCode};
+        use crate::compress::match_state::{ZSTD_MatchState_t, ZSTD_compressionParameters};
+        use crate::compress::seq_store::SeqStore_t;
+
+        let mut store = RawSeqStore_t::with_capacity(4);
+        let mut ms = ZSTD_MatchState_t::new(ZSTD_compressionParameters {
+            hashLog: 10, chainLog: 10, minMatch: 4,
+            ..Default::default()
+        });
+        let mut seq = SeqStore_t::with_capacity(16, 256);
+        let mut rep = [1u32, 4, 8];
+        let rc = ZSTD_ldm_blockCompress(&mut store, &mut ms, &mut seq, &mut rep, b"x");
+        assert!(ERR_isError(rc));
+        assert_eq!(ERR_getErrorCode(rc), ErrorCode::Generic);
     }
 }

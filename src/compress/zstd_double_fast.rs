@@ -390,6 +390,30 @@ pub fn ZSTD_compressBlock_doubleFast(
     ZSTD_compressBlock_doubleFast_noDict_generic(ms, seqStore, rep, src, 0, mml)
 }
 
+/// Port of `ZSTD_compressBlock_doubleFast_dictMatchState`
+/// (`zstd_double_fast.c:483`). **NOT YET PORTED** — requires
+/// `ms.dictMatchState` linkage. Returns `ErrorCode::Generic`.
+pub fn ZSTD_compressBlock_doubleFast_dictMatchState(
+    _ms: &mut ZSTD_MatchState_t,
+    _seqStore: &mut SeqStore_t,
+    _rep: &mut [u32; ZSTD_REP_NUM],
+    _src: &[u8],
+) -> usize {
+    crate::common::error::ERROR(crate::common::error::ErrorCode::Generic)
+}
+
+/// Port of `ZSTD_compressBlock_doubleFast_extDict` (`zstd_double_fast.c:709`).
+/// **NOT YET PORTED** — requires ext-dict pointer tracking.
+/// Returns `ErrorCode::Generic`.
+pub fn ZSTD_compressBlock_doubleFast_extDict(
+    _ms: &mut ZSTD_MatchState_t,
+    _seqStore: &mut SeqStore_t,
+    _rep: &mut [u32; ZSTD_REP_NUM],
+    _src: &[u8],
+) -> usize {
+    crate::common::error::ERROR(crate::common::error::ErrorCode::Generic)
+}
+
 /// Cross-block-history variant. Treats `src[..istart]` as prior
 /// content; hashTable / chainTable entries from earlier blocks stay
 /// valid as back-references.

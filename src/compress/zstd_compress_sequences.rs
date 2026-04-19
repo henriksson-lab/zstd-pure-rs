@@ -1,11 +1,12 @@
 //! Translation of `lib/compress/zstd_compress_sequences.c`.
 //!
-//! Now includes `ZSTD_encodeSequences` — emits the per-block FSE
-//! sequence bit-stream. `ZSTD_NCountCost`, `ZSTD_fseBitCost`,
-//! `ZSTD_selectEncodingType`, and `ZSTD_buildCTable` still need the
-//! top-level `ZSTD_compress` orchestration to land first.
+//! Ported: `ZSTD_encodeSequences` (per-block FSE sequence bit-stream
+//! emitter), `ZSTD_NCountCost` / `ZSTD_fseBitCost` (encoding-cost
+//! estimators), `ZSTD_selectEncodingType` (rle / raw / compressed /
+//! repeat chooser), and `ZSTD_buildCTable` (symbol-count → FSE
+//! encoding table).
 
-#![allow(unused_variables, non_snake_case)]
+#![allow(non_snake_case)]
 
 use crate::common::bitstream::{
     BIT_addBits, BIT_closeCStream, BIT_flushBits, BIT_initCStream,
@@ -32,6 +33,27 @@ pub enum FSE_repeat {
     FSE_repeat_check,
     /// Can use the previous table and it is assumed valid.
     FSE_repeat_valid,
+}
+
+/// Port of `ZSTD_dictNCountRepeat` (`zstd_compress.c:5071`). Classifies
+/// whether a dictionary-supplied NCount is a `valid` ready-to-reuse
+/// table (every symbol up to `maxSymbolValue` has a nonzero count) or
+/// merely `check` (needs runtime validation). Returns `FSE_repeat_check`
+/// when the dict's alphabet is smaller than the caller needs.
+pub fn ZSTD_dictNCountRepeat(
+    normalizedCounter: &[i16],
+    dictMaxSymbolValue: u32,
+    maxSymbolValue: u32,
+) -> FSE_repeat {
+    if dictMaxSymbolValue < maxSymbolValue {
+        return FSE_repeat::FSE_repeat_check;
+    }
+    for &count in normalizedCounter.iter().take(maxSymbolValue as usize + 1) {
+        if count == 0 {
+            return FSE_repeat::FSE_repeat_check;
+        }
+    }
+    FSE_repeat::FSE_repeat_valid
 }
 
 /// Port of `ZSTD_DefaultPolicy_e`.
@@ -521,6 +543,51 @@ pub fn ZSTD_encodeSequences(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn FSE_repeat_discriminants_match_upstream() {
+        // Upstream `FSE_repeat`: none (0), check (1), valid (2).
+        // Mirror of `HUF_repeat`. `selectEncodingType` cycles through
+        // this enum when deciding set_repeat vs set_compressed, so
+        // discriminant drift would silently swap repeat vs compressed.
+        assert_eq!(FSE_repeat::FSE_repeat_none as u32, 0);
+        assert_eq!(FSE_repeat::FSE_repeat_check as u32, 1);
+        assert_eq!(FSE_repeat::FSE_repeat_valid as u32, 2);
+    }
+
+    #[test]
+    fn ZSTD_strategy_constants_match_upstream_and_monotonic_ordering() {
+        // Upstream `typedef enum { ZSTD_fast=1, ..., ZSTD_btultra2=9 }
+        // ZSTD_strategy;` — strategies are ABI-exposed as integers
+        // through `ZSTD_c_strategy` / `ZSTD_compressionParameters.strategy`.
+        // Order is guaranteed (fast→strong) per zstd.h comment.
+        assert_eq!(ZSTD_fast, 1);
+        assert_eq!(ZSTD_dfast, 2);
+        assert_eq!(ZSTD_greedy, 3);
+        assert_eq!(ZSTD_lazy, 4);
+        assert_eq!(ZSTD_lazy2, 5);
+        assert_eq!(ZSTD_btlazy2, 6);
+        assert_eq!(ZSTD_btopt, 7);
+        assert_eq!(ZSTD_btultra, 8);
+        assert_eq!(ZSTD_btultra2, 9);
+        // Strict ordering (fast→strong) must hold.
+        let order: [u32; 9] = [
+            ZSTD_fast, ZSTD_dfast, ZSTD_greedy, ZSTD_lazy, ZSTD_lazy2,
+            ZSTD_btlazy2, ZSTD_btopt, ZSTD_btultra, ZSTD_btultra2,
+        ];
+        for pair in order.windows(2) {
+            assert!(pair[0] < pair[1]);
+        }
+    }
+
+    #[test]
+    fn ZSTD_DefaultPolicy_e_discriminants_match_upstream() {
+        // `ZSTD_DefaultPolicy_e` drives `ZSTD_selectEncodingType` —
+        // internal enum, but pinning the 0/1 values prevents an
+        // accidental reorder from silently flipping default/allowed.
+        assert_eq!(ZSTD_DefaultPolicy_e::ZSTD_defaultDisallowed as u32, 0);
+        assert_eq!(ZSTD_DefaultPolicy_e::ZSTD_defaultAllowed as u32, 1);
+    }
 
     #[test]
     fn inverse_prob_log_table_is_monotonic() {

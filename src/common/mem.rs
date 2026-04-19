@@ -219,6 +219,21 @@ mod tests {
     }
 
     #[test]
+    fn MEM_read24_reads_native_endian_3_bytes() {
+        // MEM_read24 is upstream's natural-endian 3-byte read. On LE
+        // hosts (where our port runs) it should match MEM_readLE24.
+        // Pins the semantic so a future refactor can't silently swap
+        // in a BE composition.
+        let bytes = [0xAB, 0xCD, 0xEF];
+        // On LE, both readers produce the same value.
+        assert_eq!(MEM_read24(&bytes), MEM_readLE24(&bytes));
+        // Concrete value: 0xEFCDAB on LE.
+        if is_little_endian() {
+            assert_eq!(MEM_read24(&bytes), 0xEFCDAB);
+        }
+    }
+
+    #[test]
     fn le_roundtrip_24() {
         let mut buf = [0u8; 3];
         MEM_writeLE24(&mut buf, 0x123456);
@@ -259,6 +274,29 @@ mod tests {
     }
 
     #[test]
+    fn best_roundtrip_matches_size_of_usize() {
+        // `MEM_readBEST` / `MEM_writeBEST` dispatch on usize width,
+        // parallel to the `*LEST` variants. On 64-bit targets they
+        // route to BE64; on 32-bit to BE32. Verify write→read
+        // roundtrip on the host's native width.
+        let value: usize = 0x1234_5678;
+        let mut buf = vec![0u8; 8];
+        MEM_writeBEST(&mut buf, value);
+        assert_eq!(MEM_readBEST(&buf), value);
+
+        // First `size_of::<usize>()` bytes match writing via the
+        // explicit BE helper.
+        let mut explicit = vec![0u8; 8];
+        if core::mem::size_of::<usize>() == 8 {
+            MEM_writeBE64(&mut explicit, value as u64);
+        } else {
+            MEM_writeBE32(&mut explicit[..4], value as u32);
+        }
+        let w = core::mem::size_of::<usize>();
+        assert_eq!(&buf[..w], &explicit[..w]);
+    }
+
+    #[test]
     fn be_roundtrip_64() {
         // BE64 writes MSB first, which is the byte order used for
         // xxhash secret mixing in some paths.
@@ -289,5 +327,13 @@ mod tests {
         if MEM_isLittleEndian() == 1 {
             assert_eq!(MEM_readST(&buf), value_st);
         }
+
+        // writeLEST round-trips through readLEST.
+        let mut buf2 = vec![0u8; 8];
+        MEM_writeLEST(&mut buf2, value_st);
+        assert_eq!(MEM_readLEST(&buf2), value_st);
+        // And the first `size` bytes match what we wrote via the
+        // explicit-width helper.
+        assert_eq!(&buf2[..size], &buf[..size]);
     }
 }

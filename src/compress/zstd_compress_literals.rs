@@ -5,8 +5,6 @@
 //! `ZSTD_compressLiterals` — the HUF-compressed path) plus the
 //! `ZSTD_minLiteralsToCompress` / `ZSTD_minGain` heuristics.
 
-#![allow(unused_variables)]
-
 use crate::common::error::{ErrorCode, ERROR};
 use crate::common::mem::{MEM_writeLE16, MEM_writeLE32};
 use crate::decompress::zstd_decompress_block::SymbolEncodingType_e;
@@ -36,8 +34,12 @@ pub fn ZSTD_literalsCompressionIsDisabled(
     }
 }
 
-/// Upstream `ZSTD_strategy` is 1..9; we accept `u32` to keep the
-/// helper call-site ergonomic until the full strategy enum lands.
+/// Upstream `ZSTD_strategy` is an enum `{ZSTD_fast=1, ..,
+/// ZSTD_btultra2=9}`. The Rust port alias is a `u32` paired with
+/// module-scoped `ZSTD_fast` / `ZSTD_dfast` / ... constants defined
+/// in `zstd_compress_sequences` — keeps call sites ergonomic (plain
+/// integer comparisons and arithmetic) without losing the named
+/// constants.
 pub type ZSTD_strategy = u32;
 
 /// Upstream `HUF_repeat`. Mirrored here since this file is the first
@@ -133,19 +135,27 @@ pub fn ZSTD_minLiteralsToCompress(strategy: ZSTD_strategy, huf_repeat: HUF_repea
 }
 
 /// Minimum literals for a multi-stream (4X) Huffman block.
-pub const MIN_LITERALS_FOR_4_STREAMS: usize = 6;
+/// Canonical constant lives on the decoder side; re-exported here
+/// for the symmetric `compress1X_vs_compress4X` selector.
+pub use crate::decompress::zstd_decompress_block::MIN_LITERALS_FOR_4_STREAMS;
 
 /// Upstream's `LitHufLog`.
 pub const LitHufLog: u32 = 11;
 
 /// Port of upstream's `ZSTD_minGain`. Minimum compressed-vs-raw
 /// savings (in bytes) needed before Huffman compression is worth
-/// keeping. Upstream formula: `srcSize >> (6 + strategy - 1)`.
+/// keeping. Upstream (zstd_compress_internal.h:677-683):
+///   `minlog = (strat >= ZSTD_btultra) ? strat - 1 : 6`
+///   returns `(srcSize >> minlog) + 2`
+///
+/// Previously our port used `shift = 5 + strategy` with no `+ 2`
+/// constant — a different formula that skewed the
+/// literals-compression gate at every strategy.
 #[inline]
 pub fn ZSTD_minGain(srcSize: usize, strategy: ZSTD_strategy) -> usize {
-    // strategy values 1..9. Shift never negative.
-    let shift = (6 + strategy as i32).max(1) - 1;
-    srcSize >> shift
+    use crate::compress::zstd_compress_sequences::ZSTD_btultra;
+    let minlog: u32 = if strategy >= ZSTD_btultra { strategy - 1 } else { 6 };
+    (srcSize >> minlog) + 2
 }
 
 /// Port of `ZSTD_compressLiterals`. Attempts to Huffman-compress
@@ -218,10 +228,17 @@ pub fn ZSTD_compressLiterals(
         0
     });
 
-    // Compress into dst[lhSize..]. Body-only state: we pass prevHufTable
-    // + prevRepeat through to HUF_compress*_repeat so the caller's
-    // repeat gating works.
-    // Rust lifetime: Option-split so repeat and hufTable can coexist.
+    // Snapshot the caller's initial repeat flag before handing
+    // `prevRepeat` to `HUF_compress*_repeat` — the inner function
+    // overwrites it with the post-compression state (none / valid).
+    // Upstream distinguishes `set_compressed` (fresh tree emitted)
+    // from `set_repeat` (prior tree reused) by checking this final
+    // state. We need both views: pre-call for gating, post-call for
+    // the header's hType.
+    let mut repeat_scratch = prevRepeat
+        .as_deref()
+        .copied()
+        .unwrap_or(HUF_repeat::HUF_repeat_none);
     let cLitSize = {
         let (_, payload_dst) = dst.split_at_mut(lhSize);
         if singleStream {
@@ -231,7 +248,7 @@ pub fn ZSTD_compressLiterals(
                 crate::decompress::huf_decompress::HUF_SYMBOLVALUE_MAX,
                 LitHufLog,
                 prevHufTable,
-                prevRepeat,
+                Some(&mut repeat_scratch),
                 flags,
             )
         } else if srcSize >= MIN_LITERALS_FOR_4_STREAMS {
@@ -241,13 +258,17 @@ pub fn ZSTD_compressLiterals(
                 crate::decompress::huf_decompress::HUF_SYMBOLVALUE_MAX,
                 LitHufLog,
                 prevHufTable,
-                prevRepeat,
+                Some(&mut repeat_scratch),
                 flags,
             )
         } else {
             0
         }
     };
+    // Propagate the final repeat state back to the caller's slot.
+    if let Some(r) = prevRepeat {
+        *r = repeat_scratch;
+    }
     if crate::common::error::ERR_isError(cLitSize) {
         return ZSTD_noCompressLiterals(dst, src);
     }
@@ -265,15 +286,12 @@ pub fn ZSTD_compressLiterals(
     }
 
     // Differentiate set_repeat (HUF table was reused) vs set_compressed
-    // by consulting the repeat flag the compressor left behind.
-    let used_repeat = {
-        // Note: `prevRepeat` has been moved into HUF_compress*_repeat;
-        // we can't inspect it here. Upstream's logic: if the emitted
-        // payload skipped the tree header, it was set_repeat. For the
-        // initial port we always emit the tree, so hType stays
-        // `set_compressed`.
-        false
-    };
+    // by consulting the repeat flag the compressor left behind in
+    // `repeat_scratch`. Upstream: when `HUF_compress*_repeat` chose to
+    // reuse the prior CTable, it leaves the flag at HUF_repeat_valid and
+    // skips emitting a tree description — the header then advertises
+    // set_repeat so the decoder knows to reuse its prior table.
+    let used_repeat = repeat_scratch == HUF_repeat::HUF_repeat_valid;
     if used_repeat {
         hType = SymbolEncodingType_e::set_repeat;
     }
@@ -316,6 +334,75 @@ fn set_rle_bits() -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn HUF_repeat_discriminants_match_upstream() {
+        // Upstream `HUF_repeat` order: none (0), check (1), valid (2).
+        // The encoder's state-machine transitions rely on this exact
+        // ordering — e.g., `HUF_compressCTable_internal` treats
+        // values via `>= HUF_repeat_valid` and `== HUF_repeat_none`
+        // checks. Pin the discriminants.
+        assert_eq!(HUF_repeat::HUF_repeat_none as u32, 0);
+        assert_eq!(HUF_repeat::HUF_repeat_check as u32, 1);
+        assert_eq!(HUF_repeat::HUF_repeat_valid as u32, 2);
+        // Default is "none" — matches upstream's zero-init convention.
+        assert_eq!(HUF_repeat::default(), HUF_repeat::HUF_repeat_none);
+    }
+
+    #[test]
+    fn minLiteralsToCompress_matches_upstream_formula() {
+        // Upstream (zstd_compress_literals.c:115): shift=MIN(9-strat,3);
+        // mintc = (huf_repeat==valid) ? 6 : (8 << shift). Regression
+        // gate pinning both branches across the full strategy range.
+        // `HUF_repeat` is already in scope via `use super::*` at the
+        // top of this tests module.
+        // No repeat: geometric 8 << min(9-strat, 3).
+        for strat in 1u32..=9 {
+            let shift = core::cmp::min(9 - strat as i32, 3) as u32;
+            let expected: usize = 8usize << shift;
+            assert_eq!(
+                ZSTD_minLiteralsToCompress(strat, HUF_repeat::HUF_repeat_none),
+                expected,
+                "no-repeat minLiteralsToCompress({strat})",
+            );
+        }
+        // Repeat valid: always 6.
+        for strat in 1u32..=9 {
+            assert_eq!(
+                ZSTD_minLiteralsToCompress(strat, HUF_repeat::HUF_repeat_valid),
+                6,
+                "repeat-valid minLiteralsToCompress({strat})",
+            );
+        }
+    }
+
+    #[test]
+    fn minGain_matches_upstream_formula_across_strategies() {
+        // Pin the exact upstream formula:
+        //   minlog = strat >= ZSTD_btultra(8) ? strat-1 : 6
+        //   minGain = (srcSize >> minlog) + 2
+        // Catches drift in either the shift selection or the
+        // constant-2 term — both of which an earlier Rust port had
+        // wrong (used `5 + strat` shift and no +2).
+        let cases: &[(u32, usize)] = &[
+            (1, 1024),    // fast: minlog=6 → (1024>>6)+2 = 16+2 = 18
+            (3, 1024),    // greedy: still minlog=6 → 18
+            (7, 1024),    // btopt: still minlog=6 → 18
+            (8, 1024),    // btultra: minlog=7 → 8+2 = 10
+            (9, 1024),    // btultra2: minlog=8 → 4+2 = 6
+            (1, 65536),   // larger src: minlog=6 → 1024+2 = 1026
+            (9, 65536),   // minlog=8 → 256+2 = 258
+        ];
+        for &(strat, sz) in cases {
+            let minlog: u32 = if strat >= 8 { strat - 1 } else { 6 };
+            let expected = (sz >> minlog) + 2;
+            assert_eq!(
+                ZSTD_minGain(sz, strat),
+                expected,
+                "minGain(size={sz}, strat={strat})",
+            );
+        }
+    }
 
     // End-to-end: encoder's output is accepted by the decoder. Uses the
     // already-ported `ZSTD_decodeLiteralsBlock` so emit-then-decode

@@ -1,13 +1,14 @@
 //! Translation of `lib/compress/zstd_fast.c` (strategy 1). Single-
-//! hash-table match finder. Lands in two phases:
-//!   - `ZSTD_fillHashTable` (seed hash with the start of the block)
-//!   - `ZSTD_compressBlock_fast` (main emit loop) — next tick.
+//! hash-table match finder. Both phases are ported:
+//!   - `ZSTD_fillHashTable` seeds the hash with the start of the
+//!     block,
+//!   - `ZSTD_compressBlock_fast` runs the main emit loop.
 //!
 //! Rust signature note: upstream's `end` argument is a `void*` into
 //! the caller's source buffer; we accept an explicit `&[u8]` slice
 //! representing the full source region.
 
-#![allow(unused_variables, non_snake_case)]
+#![allow(non_snake_case)]
 
 use crate::common::mem::MEM_read32;
 use crate::compress::match_state::ZSTD_MatchState_t;
@@ -168,16 +169,16 @@ pub fn ZSTD_fillHashTableForCCtx(
 /// literals, repcode updates) is specified by the format and should
 /// match upstream's output bit-for-bit for the same input.
 ///
+/// Scans `src[istart..]`, treating `src[0..istart]` as already-
+/// processed history (the hashTable entries for those positions
+/// remain valid back-references). Emits sequences + literals into
+/// `seqStore` from `anchor=istart`. `ms.window.base_offset` is the
+/// absolute index offset: positions
+/// `[base_off+0..base_off+src.len()]` identify bytes in the source.
+///
 /// Returns the length of the final "tail" literals segment (bytes
 /// after the last emitted sequence that the entropy stage will
 /// copy verbatim).
-/// Port of `ZSTD_compressBlock_fast_noDict_generic`. Scans
-/// `src[istart..]`, treating `src[0..istart]` as already-processed
-/// history (the hashTable entries for those positions remain valid
-/// back-references). Emits sequences + literals into `seqStore` from
-/// `anchor=istart`. `ms.window.base_offset` is the absolute index
-/// offset: positions `[base_off+0..base_off+src.len()]` identify
-/// bytes in the source.
 pub fn ZSTD_compressBlock_fast_noDict_generic(
     ms: &mut ZSTD_MatchState_t,
     seqStore: &mut SeqStore_t,
@@ -392,6 +393,33 @@ pub fn ZSTD_compressBlock_fast(
     ZSTD_compressBlock_fast_noDict_generic(ms, seqStore, rep, src, 0, mml)
 }
 
+/// Port of `ZSTD_compressBlock_fast_dictMatchState` (`zstd_fast.c:686`).
+/// **NOT YET PORTED** — requires `ms.dictMatchState` linkage on
+/// `ZSTD_MatchState_t` to consult the CDict's pre-digested hash
+/// table. Returns `ErrorCode::Generic` so callers fail loudly rather
+/// than silently producing wrong output.
+pub fn ZSTD_compressBlock_fast_dictMatchState(
+    _ms: &mut ZSTD_MatchState_t,
+    _seqStore: &mut SeqStore_t,
+    _rep: &mut [u32; ZSTD_REP_NUM],
+    _src: &[u8],
+) -> usize {
+    crate::common::error::ERROR(crate::common::error::ErrorCode::Generic)
+}
+
+/// Port of `ZSTD_compressBlock_fast_extDict` (`zstd_fast.c:967`).
+/// **NOT YET PORTED** — requires ext-dict pointer tracking
+/// (`window.dictBase` as a pointer distinct from `window.base`).
+/// Returns `ErrorCode::Generic`.
+pub fn ZSTD_compressBlock_fast_extDict(
+    _ms: &mut ZSTD_MatchState_t,
+    _seqStore: &mut SeqStore_t,
+    _rep: &mut [u32; ZSTD_REP_NUM],
+    _src: &[u8],
+) -> usize {
+    crate::common::error::ERROR(crate::common::error::ErrorCode::Generic)
+}
+
 /// Variant that scans `src[istart..]`, treating `src[0..istart]` as
 /// valid history for back-references. Used for cross-block match
 /// carry in `ZSTD_compressFrame_fast`.
@@ -423,6 +451,19 @@ pub fn ZSTD_fillHashTable(
 mod tests {
     use super::*;
     use crate::compress::match_state::ZSTD_compressionParameters;
+
+    #[test]
+    fn dictTableLoadMethod_and_tableFillPurpose_discriminants_match_upstream() {
+        // Upstream (zstd_compress_internal.h:548-549):
+        //   ZSTD_dictTableLoadMethod_e: dtlm_fast=0, dtlm_full=1
+        //   ZSTD_tableFillPurpose_e:    tfp_forCCtx=0, tfp_forCDict=1
+        // These parameterize hash-table seeding strategy; drift would
+        // mis-route the dict loader to the wrong fill mode.
+        assert_eq!(ZSTD_dictTableLoadMethod_e::ZSTD_dtlm_fast as u32, 0);
+        assert_eq!(ZSTD_dictTableLoadMethod_e::ZSTD_dtlm_full as u32, 1);
+        assert_eq!(ZSTD_tableFillPurpose_e::ZSTD_tfp_forCCtx as u32, 0);
+        assert_eq!(ZSTD_tableFillPurpose_e::ZSTD_tfp_forCDict as u32, 1);
+    }
 
     fn test_state() -> ZSTD_MatchState_t {
         ZSTD_MatchState_t::new(ZSTD_compressionParameters {

@@ -20,7 +20,8 @@ fn fixtures_dir() -> PathBuf {
 fn read_fixture(name: &str) -> Vec<u8> {
     fs::read(fixtures_dir().join(name)).unwrap_or_else(|e| {
         panic!(
-            "missing fixture {name}: {e}; regenerate with scripts in tests/fixtures/"
+            "missing fixture {name}: {e}; regenerate with the upstream \
+             `zstd` CLI — each test's docstring lists the exact command."
         )
     })
 }

@@ -32,19 +32,19 @@
 rust       = "ZSTD_copy4"
 rust_path  = "src/decompress/zstd_decompress_block.rs"
 other      = "ZSTD_copy4"
-other_path = "lib/decompress/zstd_decompress_block.c"
+other_path = "zstd/lib/decompress/zstd_decompress_block.c"
 
 [[entries]]
 rust       = "ZSTD_copy8"
 rust_path  = "src/common/zstd_internal.rs"
 other      = "ZSTD_copy8"
-other_path = "lib/common/zstd_internal.h"
+other_path = "zstd/lib/common/zstd_internal.h"
 
 [[entries]]
 rust       = "ZSTD_getBlockSize"
 rust_path  = "src/compress/zstd_compress.rs"
 other      = "ZSTD_getBlockSize"
-other_path = "lib/compress/zstd_compress.c"
+other_path = "zstd/lib/compress/zstd_compress.c"
 
 # =====================================================================
 # 2. RENAMES
@@ -121,6 +121,64 @@ other_path = "zstd/lib/common/entropy_common.c"
 rust  = "HUF_readStats_wksp"
 other = "HUF_readStats_body"
 other_path = "zstd/lib/common/entropy_common.c"
+
+# BIT_highbit32 is the pre-1.5 name; upstream now exposes this as
+# ZSTD_highbit32 in bits.h. Rust keeps the historical alias.
+[[entries]]
+rust  = "BIT_highbit32"
+other = "ZSTD_highbit32"
+other_path = "zstd/lib/common/bits.h"
+
+# HUF_readDTableX1/X2 in our port dispatch to the wksp variants —
+# upstream removed the non-wksp helpers in recent refactors.
+[[entries]]
+rust  = "HUF_readDTableX1"
+other = "HUF_readDTableX1_wksp"
+other_path = "zstd/lib/decompress/huf_decompress.c"
+
+[[entries]]
+rust  = "HUF_readDTableX2"
+other = "HUF_readDTableX2_wksp"
+other_path = "zstd/lib/decompress/huf_decompress.c"
+
+# Upstream collapsed the tiny `ZSTDMT_createCCtx` convenience wrapper
+# into `_advanced`; Rust keeps the plain name.
+[[entries]]
+rust  = "ZSTDMT_createCCtx"
+other = "ZSTDMT_createCCtx_advanced"
+other_path = "zstd/lib/compress/zstdmt_compress.c"
+
+# Upstream inlines `FSE_decompress_usingDTable` into the _generic
+# template; Rust's standalone function is the closest complexity peer.
+[[entries]]
+rust  = "FSE_decompress_usingDTable"
+other = "FSE_decompress_usingDTable_generic"
+other_path = "zstd/lib/common/fse_decompress.c"
+
+# Rust's `_prefixOnly` is the extDict-free specialization of
+# upstream's parameterized `ZSTD_insertBtAndGetAllMatches`.
+[[entries]]
+rust  = "ZSTD_insertBtAndGetAllMatches_prefixOnly"
+other = "ZSTD_insertBtAndGetAllMatches"
+other_path = "zstd/lib/compress/zstd_opt.c"
+
+# HUF_buildCTable / HUF_writeCTable were renamed upstream to add
+# explicit `_wksp` suffixes — Rust keeps the historical plain names.
+[[entries]]
+rust  = "HUF_buildCTable"
+other = "HUF_buildCTable_wksp"
+other_path = "zstd/lib/compress/huf_compress.c"
+
+[[entries]]
+rust  = "HUF_writeCTable"
+other = "HUF_writeCTable_wksp"
+other_path = "zstd/lib/compress/huf_compress.c"
+
+# Rust's fn name elides the `_internal` infix that upstream keeps.
+[[entries]]
+rust  = "HUF_compress1X_usingCTable_body_loop"
+other = "HUF_compress1X_usingCTable_internal_body_loop"
+other_path = "zstd/lib/compress/huf_compress.c"
 
 # =====================================================================
 # 3. IDENTICAL-NAME PAIRS (non-legacy only)
@@ -932,8 +990,18 @@ other = "POOL_tryAdd"
 other_path = "zstd/lib/common/pool.c"
 
 [[entries]]
+rust  = "XXH64"
+other = "XXH64"
+other_path = "zstd/lib/common/xxhash.h"
+
+[[entries]]
 rust  = "XXH64_digest"
 other = "XXH64_digest"
+other_path = "zstd/lib/common/xxhash.h"
+
+[[entries]]
+rust  = "XXH64_update"
+other = "XXH64_update"
 other_path = "zstd/lib/common/xxhash.h"
 
 [[entries]]
@@ -1609,6 +1677,11 @@ other_path = "zstd/lib/decompress/zstd_decompress.c"
 [[entries]]
 rust  = "ZSTD_decompressBlock"
 other = "ZSTD_decompressBlock"
+other_path = "zstd/lib/decompress/zstd_decompress_block.c"
+
+[[entries]]
+rust  = "ZSTD_decompressBlock_internal"
+other = "ZSTD_decompressBlock_internal"
 other_path = "zstd/lib/decompress/zstd_decompress_block.c"
 
 [[entries]]
@@ -2424,6 +2497,11 @@ other_path = "zstd/lib/compress/zstd_compress_literals.c"
 [[entries]]
 rust  = "ZSTD_optLdm_maybeAddMatch"
 other = "ZSTD_optLdm_maybeAddMatch"
+other_path = "zstd/lib/compress/zstd_opt.c"
+
+[[entries]]
+rust  = "ZSTD_optLdm_skipRawSeqStoreBytes"
+other = "ZSTD_optLdm_skipRawSeqStoreBytes"
 other_path = "zstd/lib/compress/zstd_opt.c"
 
 [[entries]]

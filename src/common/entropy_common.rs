@@ -2,25 +2,84 @@
 //!
 //! Covers:
 //! - `FSE_readNCount` (parses an FSE normalized-count header)
-//! - `HUF_readStats` / `HUF_readStats_wksp` (parses a HUF tree descriptor)
-//!   — depends on `FSE_decompress_wksp_bmi2`, so the FSE-compressed
-//!   branch panics until `fse_decompress.rs` is implemented. The raw
-//!   branch (`iSize >= 128`) works today.
+//! - `HUF_readStats` / `HUF_readStats_wksp` — parses a HUF tree
+//!   descriptor; the FSE-compressed branch routes through
+//!   `fse_decompress::FSE_decompress_wksp_bmi2`, the raw branch
+//!   (`iSize >= 128`) handles short headers in-module.
 //! - thin version/error accessors
-
-#![allow(unused_variables)]
 
 use crate::common::bits::{ZSTD_countTrailingZeros32, ZSTD_highbit32};
 use crate::common::error::{ErrorCode, ERROR};
 use crate::common::mem::MEM_readLE32;
 
 pub const FSE_VERSION_NUMBER: u32 = 5;
-pub const FSE_MIN_TABLELOG: u32 = 5;
-pub const FSE_TABLELOG_ABSOLUTE_MAX: u32 = 15;
 
-pub const HUF_TABLELOG_MAX: u32 = 12;
-pub const HUF_TABLELOG_ABSOLUTE_MAX: u32 = 12;
-pub const HUF_flags_bmi2: i32 = 1 << 0;
+/// Re-exports — canonical definitions live in `fse_decompress`.
+pub use crate::common::fse_decompress::{
+    FSE_MAX_SYMBOL_VALUE, FSE_MIN_TABLELOG, FSE_TABLELOG_ABSOLUTE_MAX,
+};
+
+/// Upstream `FSE_DTABLE_SIZE_U32(maxTableLog)` (`fse.h:241`). Number of
+/// u32 entries a DTable of `maxTableLog` occupies (including the
+/// 1-entry header).
+#[inline]
+pub const fn FSE_DTABLE_SIZE_U32(maxTableLog: u32) -> usize {
+    1 + (1usize << maxTableLog)
+}
+
+/// Upstream `FSE_DTABLE_SIZE` — DTable size in bytes.
+#[inline]
+pub const fn FSE_DTABLE_SIZE(maxTableLog: u32) -> usize {
+    FSE_DTABLE_SIZE_U32(maxTableLog) * 4
+}
+
+/// Upstream `FSE_BUILD_DTABLE_WKSP_SIZE` (`fse.h:266`). Scratch
+/// required by `FSE_buildDTable_wksp`. Upstream formula:
+/// `(2 * (maxSymbolValue+1) * maxTableLog) + ((maxTableLog==15) ? 1 : 0)`.
+#[inline]
+pub const fn FSE_BUILD_DTABLE_WKSP_SIZE(maxTableLog: u32, maxSymbolValue: u32) -> usize {
+    // Upstream bakes in the +1 slack at tableLog = 15.
+    let extra = if maxTableLog == 15 { 1 } else { 0 };
+    2 * (maxSymbolValue as usize + 1) * (maxTableLog as usize) + extra
+}
+
+/// Upstream `FSE_BUILD_DTABLE_WKSP_SIZE_U32`. Same in u32 counts.
+#[inline]
+pub const fn FSE_BUILD_DTABLE_WKSP_SIZE_U32(maxTableLog: u32, maxSymbolValue: u32) -> usize {
+    FSE_BUILD_DTABLE_WKSP_SIZE(maxTableLog, maxSymbolValue).div_ceil(4)
+}
+
+/// Upstream `FSE_DECOMPRESS_WKSP_SIZE_U32` (`fse.h:272`). Total
+/// workspace needed by `FSE_decompress_wksp` — DTable + build
+/// scratch + symbol-bitmap + slack.
+#[inline]
+pub const fn FSE_DECOMPRESS_WKSP_SIZE_U32(maxTableLog: u32, maxSymbolValue: u32) -> usize {
+    FSE_DTABLE_SIZE_U32(maxTableLog)
+        + 1
+        + FSE_BUILD_DTABLE_WKSP_SIZE_U32(maxTableLog, maxSymbolValue)
+        + ((FSE_MAX_SYMBOL_VALUE + 1) as usize) / 2
+        + 1
+}
+
+/// Upstream `FSE_DECOMPRESS_WKSP_SIZE` — byte count of the above.
+#[inline]
+pub const fn FSE_DECOMPRESS_WKSP_SIZE(maxTableLog: u32, maxSymbolValue: u32) -> usize {
+    FSE_DECOMPRESS_WKSP_SIZE_U32(maxTableLog, maxSymbolValue) * 4
+}
+
+// Re-exports — canonical definitions live in huf_decompress.
+pub use crate::decompress::huf_decompress::{
+    HUF_flags_bmi2, HUF_TABLELOG_ABSOLUTEMAX, HUF_TABLELOG_MAX,
+};
+
+/// Upstream `HUF_READ_STATS_WORKSPACE_SIZE_U32` (`huf.h:181`). Scratch
+/// u32 count required by `HUF_readStats_wksp`. Upstream folds through
+/// `FSE_DECOMPRESS_WKSP_SIZE_U32(6, HUF_TABLELOG_MAX-1)`.
+pub const HUF_READ_STATS_WORKSPACE_SIZE_U32: usize =
+    FSE_DECOMPRESS_WKSP_SIZE_U32(6, HUF_TABLELOG_MAX - 1);
+
+/// Upstream `HUF_READ_STATS_WORKSPACE_SIZE` — byte count.
+pub const HUF_READ_STATS_WORKSPACE_SIZE: usize = HUF_READ_STATS_WORKSPACE_SIZE_U32 * 4;
 
 pub fn FSE_versionNumber() -> u32 {
     FSE_VERSION_NUMBER
@@ -233,10 +292,11 @@ pub fn HUF_readStats(
     )
 }
 
-/// Port of `HUF_readStats_body` (and its BMI2 wrapper). The
-/// FSE-compressed branch reaches into `fse_decompress`, which is not
-/// yet implemented — that branch panics with `yet to be translated`
-/// until it lands.
+/// Port of `HUF_readStats_body` (and its BMI2 wrapper). Handles both
+/// the raw layout (`iSize >= 128`, weights packed as half-bytes) and
+/// the FSE-compressed layout (routed through
+/// `fse_decompress::FSE_decompress_wksp_bmi2`). Returns the total
+/// header size consumed.
 pub fn HUF_readStats_wksp(
     huffWeight: &mut [u8],
     hwSize: usize,

@@ -8,8 +8,6 @@
 //! **Deferred**: BMI2 / ARM64 hardware-assist fast paths — current
 //! port uses the portable scalar inner loops.
 
-#![allow(unused_variables)]
-
 pub const HUF_TABLELOG_MAX: u32 = 12;
 pub const HUF_TABLELOG_ABSOLUTEMAX: u32 = 12;
 pub const HUF_SYMBOLVALUE_MAX: u32 = 255;
@@ -468,7 +466,54 @@ pub fn HUF_decodeStreamX2(
     p - pStart
 }
 
-// ---- Public APIs: still skeletal --------------------------------------
+// ---- Public APIs ------------------------------------------------------
+
+/// Port of `HUF_selectDecoder` (huf_decompress.c:1830). Picks between
+/// the X1 (4-byte-per-entry, faster for low-ratio blocks) and X2
+/// (2-byte-per-entry, faster for high-ratio blocks) decoders based on
+/// compression ratio. Returns 0 for X1, 1 for X2. Upstream uses a
+/// 16-row table of pre-computed cost metrics indexed by the
+/// ratio-quantization `Q = cSrcSize * 16 / dstSize` (clamped to 15).
+pub fn HUF_selectDecoder(dstSize: usize, cSrcSize: usize) -> u32 {
+    debug_assert!(dstSize > 0);
+    debug_assert!(dstSize <= 128 * 1024);
+
+    // algoTime[Q][single/double] = (tableTime, decode256Time).
+    // From upstream huf_decompress.c:1803.
+    const ALGO_TIME: [[(u32, u32); 2]; 16] = [
+        [(0, 0),     (1, 1)],
+        [(0, 0),     (1, 1)],
+        [(150, 216), (381, 119)],
+        [(170, 205), (514, 112)],
+        [(177, 199), (539, 110)],
+        [(197, 194), (644, 107)],
+        [(221, 192), (735, 107)],
+        [(256, 189), (881, 106)],
+        [(359, 188), (1167, 109)],
+        [(582, 187), (1570, 114)],
+        [(688, 187), (1712, 122)],
+        [(825, 186), (1965, 136)],
+        [(976, 185), (2131, 150)],
+        [(1180, 186), (2070, 175)],
+        [(1377, 185), (1731, 202)],
+        [(1412, 185), (1695, 202)],
+    ];
+
+    let q = if cSrcSize >= dstSize {
+        15u32
+    } else {
+        ((cSrcSize * 16) / dstSize) as u32
+    };
+    let d256 = (dstSize >> 8) as u32;
+    let d_time0 = ALGO_TIME[q as usize][0].0
+        + ALGO_TIME[q as usize][0].1.wrapping_mul(d256);
+    let mut d_time1 = ALGO_TIME[q as usize][1].0
+        + ALGO_TIME[q as usize][1].1.wrapping_mul(d256);
+    // Small advantage to the smaller-memory algorithm (matches
+    // upstream's cache-eviction bias).
+    d_time1 = d_time1.wrapping_add(d_time1 >> 5);
+    (d_time1 < d_time0) as u32
+}
 
 /// Port of `HUF_readDTableX1_wksp` / `HUF_readDTableX1`. Reads a
 /// compact HUF tree from `src`, fills the decoding table `dtable`.
@@ -641,7 +686,7 @@ pub fn read_entry(dtable: &[HUF_DTable], idx: usize) -> HUF_DEltX1 {
 pub fn HUF_readDTableX2(
     dtable: &mut [HUF_DTable],
     src: &[u8],
-    workSpace: &mut [u32],
+    _workSpace: &mut [u32],
     flags: i32,
 ) -> usize {
     use crate::common::error::{ErrorCode, ERROR};
@@ -1101,6 +1146,44 @@ pub fn HUF_decompress1X2_DCtx_wksp(
     HUF_decompress1X2_usingDTable_internal(dst, &cSrc[hSize..], dctx)
 }
 
+/// Port of `HUF_decompress1X_DCtx_wksp` (huf_decompress.c:1854).
+/// Single-stream decoder that auto-selects X1 vs X2 via
+/// `HUF_selectDecoder`. Short-circuits on three trivial cases
+/// (empty, not-compressed, RLE) before dispatching. `_DCtx_wksp`
+/// means the caller supplies the DTable scratch + workspace.
+pub fn HUF_decompress1X_DCtx_wksp(
+    dctx: &mut [HUF_DTable],
+    dst: &mut [u8],
+    cSrc: &[u8],
+    workSpace: &mut [u32],
+    flags: i32,
+) -> usize {
+    let dstSize = dst.len();
+    let cSrcSize = cSrc.len();
+    if dstSize == 0 {
+        return crate::common::error::ERROR(crate::common::error::ErrorCode::DstSizeTooSmall);
+    }
+    if cSrcSize > dstSize {
+        return crate::common::error::ERROR(crate::common::error::ErrorCode::CorruptionDetected);
+    }
+    if cSrcSize == dstSize {
+        dst[..dstSize].copy_from_slice(&cSrc[..dstSize]);
+        return dstSize;
+    }
+    if cSrcSize == 1 {
+        for b in dst.iter_mut().take(dstSize) {
+            *b = cSrc[0];
+        }
+        return dstSize;
+    }
+    let algoNb = HUF_selectDecoder(dstSize, cSrcSize);
+    if algoNb != 0 {
+        HUF_decompress1X2_DCtx_wksp(dctx, dst, cSrc, workSpace, flags)
+    } else {
+        HUF_decompress1X1_DCtx_wksp(dctx, dst, cSrc, workSpace, flags)
+    }
+}
+
 /// Port of `HUF_decompress4X1_DCtx_wksp`. Reads the DTable header from
 /// `cSrc`, then runs the quad-stream decoder on the remainder.
 pub fn HUF_decompress4X1_DCtx_wksp(
@@ -1263,6 +1346,31 @@ pub fn HUF_decompress4X2_DCtx_wksp(
         return crate::common::error::ERROR(crate::common::error::ErrorCode::SrcSizeWrong);
     }
     HUF_decompress4X2_usingDTable_internal(dst, &cSrc[hSize..], dctx)
+}
+
+/// Port of `HUF_decompress4X_hufOnly_wksp` (huf_decompress.c:1933).
+/// Four-stream decoder that auto-selects X1 vs X2 via
+/// `HUF_selectDecoder`. Unlike the 1X version, this rejects empty
+/// src (any valid 4-stream block carries at least the jump table).
+pub fn HUF_decompress4X_hufOnly_wksp(
+    dctx: &mut [HUF_DTable],
+    dst: &mut [u8],
+    cSrc: &[u8],
+    workSpace: &mut [u32],
+    flags: i32,
+) -> usize {
+    if dst.is_empty() {
+        return crate::common::error::ERROR(crate::common::error::ErrorCode::DstSizeTooSmall);
+    }
+    if cSrc.is_empty() {
+        return crate::common::error::ERROR(crate::common::error::ErrorCode::CorruptionDetected);
+    }
+    let algoNb = HUF_selectDecoder(dst.len(), cSrc.len());
+    if algoNb != 0 {
+        HUF_decompress4X2_DCtx_wksp(dctx, dst, cSrc, workSpace, flags)
+    } else {
+        HUF_decompress4X1_DCtx_wksp(dctx, dst, cSrc, workSpace, flags)
+    }
 }
 
 #[cfg(test)]

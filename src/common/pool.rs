@@ -3,8 +3,6 @@
 //! satisfy callers without spawning threads; a real port will sit on
 //! `std::thread` or `rayon` and land with `zstdmt_compress.c`.
 
-#![allow(unused_variables)]
-
 use core::marker::PhantomData;
 
 pub struct POOL_ctx {
@@ -13,7 +11,18 @@ pub struct POOL_ctx {
 
 /// Port of `POOL_create`. Returns `None` — the MT path is not yet
 /// active; callers should fall back to single-threaded execution.
-pub fn POOL_create(_numThreads: usize, _queueSize: usize) -> Option<Box<POOL_ctx>> {
+pub fn POOL_create(numThreads: usize, queueSize: usize) -> Option<Box<POOL_ctx>> {
+    POOL_create_advanced(numThreads, queueSize, crate::compress::zstd_compress::ZSTD_customMem)
+}
+
+/// Port of `POOL_create_advanced` (pool.c:115). Same as `POOL_create`
+/// but accepts an explicit `customMem` allocator. v0.1 ignores the
+/// allocator and routes through `POOL_create`'s stub.
+pub fn POOL_create_advanced(
+    _numThreads: usize,
+    _queueSize: usize,
+    _customMem: crate::compress::zstd_compress::ZSTD_customMem,
+) -> Option<Box<POOL_ctx>> {
     None
 }
 
@@ -61,6 +70,22 @@ pub fn ZSTD_freeThreadPool(pool: Option<Box<POOL_ctx>>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pool_add_tryAdd_resize_joinJobs_are_safe_noops() {
+        // v0.1 has no worker backend, but the remaining POOL_* API
+        // must accept calls on a stub ctx without panicking.
+        // POOL_tryAdd returns 0 (not-enqueued), POOL_resize 0 (success),
+        // POOL_add and POOL_joinJobs are no-ops.
+        let mut stub = POOL_ctx { _priv: core::marker::PhantomData };
+        fn dummy_job(_: *mut core::ffi::c_void) {}
+        POOL_add(&mut stub, dummy_job, core::ptr::null_mut());
+        assert_eq!(POOL_tryAdd(&mut stub, dummy_job, core::ptr::null_mut()), 0);
+        assert_eq!(POOL_resize(&mut stub, 4), 0);
+        POOL_joinJobs(&mut stub);
+        // POOL_sizeof still works.
+        let _ = POOL_sizeof(&stub);
+    }
 
     #[test]
     fn pool_and_thread_pool_creators_return_none_in_v0_1() {

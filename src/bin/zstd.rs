@@ -13,13 +13,15 @@ use std::process::ExitCode;
 use zstd_pure_rs::common::error::{ERR_getErrorName, ERR_isError};
 use zstd_pure_rs::compress::match_state::ZSTD_compressionParameters;
 use zstd_pure_rs::compress::zstd_compress::{
-    ZSTD_compressBound, ZSTD_compressFrame_fast, ZSTD_compress_usingDict, ZSTD_createCCtx,
-    ZSTD_getCParams, ZSTD_FrameParameters,
+    ZSTD_CCtx_setFormat, ZSTD_compressBound, ZSTD_compressFrame_fast_advanced,
+    ZSTD_compress_advanced, ZSTD_createCCtx, ZSTD_getCParams, ZSTD_FrameParameters,
+    ZSTD_parameters,
 };
 use zstd_pure_rs::compress::zstd_compress_sequences::{ZSTD_btlazy2, ZSTD_fast};
 use zstd_pure_rs::decompress::zstd_decompress::{
-    ZSTD_decompress, ZSTD_decompress_usingDict, ZSTD_findDecompressedSize,
-    ZSTD_findFrameSizeInfo, ZSTD_format_e, ZSTD_CONTENTSIZE_ERROR, ZSTD_CONTENTSIZE_UNKNOWN,
+    ZSTD_DCtx_setFormat, ZSTD_decompress, ZSTD_decompress_usingDict, ZSTD_decompressStream,
+    ZSTD_findDecompressedSize, ZSTD_findFrameSizeInfo, ZSTD_format_e, ZSTD_CONTENTSIZE_ERROR,
+    ZSTD_CONTENTSIZE_UNKNOWN,
 };
 use zstd_pure_rs::decompress::zstd_decompress_block::ZSTD_DCtx;
 
@@ -30,6 +32,12 @@ use zstd_pure_rs::decompress::zstd_decompress_block::ZSTD_DCtx;
     name = "zstd",
     about = "Pure-Rust port of the zstd CLI — compression, decompression, dict support, and streaming",
     version,
+    long_version = concat!(
+        env!("CARGO_PKG_VERSION"),
+        " (pure-rust port of libzstd ",
+        "1.6.0",  // matches ZSTD_VERSION_STRING; gated by `cli_long_version_matches_library_ZSTD_VERSION_STRING` test
+        ")",
+    ),
     disable_help_subcommand = true
 )]
 struct Cli {
@@ -53,7 +61,7 @@ struct Cli {
     #[arg(short = 'v', long = "verbose")]
     verbose: bool,
 
-    /// Read from stdin explicitly (mirrors upstream's `-`).
+    /// Write output to an explicit file path (mirrors upstream's `-o`).
     #[arg(short = 'o', long = "output-file")]
     output_file: Option<PathBuf>,
 
@@ -75,6 +83,13 @@ struct Cli {
     /// compatibility; currently the default).
     #[arg(long = "no-check", conflicts_with = "check")]
     no_check: bool,
+
+    /// Emit / expect magicless-format frames (`ZSTD_f_zstd1_magicless`):
+    /// skip the 4-byte magic prefix on compression, and require the
+    /// same format on decompression. Saves 4 bytes/frame but breaks
+    /// interoperability with standard zstd tools.
+    #[arg(long = "magicless")]
+    magicless: bool,
 
     /// Input files. Use `-` for stdin.
     files: Vec<PathBuf>,
@@ -120,7 +135,7 @@ fn write_output(path: Option<&Path>, force: bool, data: &[u8]) -> io::Result<()>
     }
 }
 
-fn decompress_bytes(src: &[u8], dict: Option<&[u8]>) -> Result<Vec<u8>, String> {
+fn decompress_bytes(src: &[u8], dict: Option<&[u8]>, magicless: bool) -> Result<Vec<u8>, String> {
     // Size the output buffer from frame metadata:
     //   1. `ZSTD_findDecompressedSize` sums declared FCS across frames
     //      when present — exact.
@@ -129,36 +144,67 @@ fn decompress_bytes(src: &[u8], dict: Option<&[u8]>) -> Result<Vec<u8>, String> 
     //      upper bound per frame.
     //   3. Fall back to a 32× src estimate only if no bound is
     //      available (shouldn't happen for well-formed zstd streams).
-    let declared = ZSTD_findDecompressedSize(src);
-    if declared == ZSTD_CONTENTSIZE_ERROR {
-        return Err(format!(
-            "invalid input: {}",
-            ERR_getErrorName(declared as usize)
-        ));
-    }
-
-    let dst_size = if declared != ZSTD_CONTENTSIZE_UNKNOWN {
-        declared as usize
+    let format = if magicless {
+        ZSTD_format_e::ZSTD_f_zstd1_magicless
     } else {
-        // Walk frames and sum decompressedBound.
-        let mut bound: u64 = 0;
-        let mut cursor = src;
-        while !cursor.is_empty() {
-            let info = ZSTD_findFrameSizeInfo(cursor, ZSTD_format_e::ZSTD_f_zstd1);
-            if ERR_isError(info.compressedSize) {
-                return Err(format!(
-                    "frame walk failed: {}",
-                    ERR_getErrorName(info.compressedSize)
-                ));
-            }
-            bound = bound.saturating_add(info.decompressedBound);
-            cursor = &cursor[info.compressedSize..];
+        ZSTD_format_e::ZSTD_f_zstd1
+    };
+    // Magicless frames don't have a content-size probe-friendly path
+    // via the plain `ZSTD_findDecompressedSize` helper (it hardcodes
+    // zstd1 format). Fall back to a size-hint estimate in that case.
+    let dst_size = if magicless {
+        src.len().saturating_mul(32)
+    } else {
+        let declared = ZSTD_findDecompressedSize(src);
+        if declared == ZSTD_CONTENTSIZE_ERROR {
+            return Err(format!(
+                "invalid input: {}",
+                ERR_getErrorName(declared as usize)
+            ));
         }
-        bound as usize
+        if declared != ZSTD_CONTENTSIZE_UNKNOWN {
+            declared as usize
+        } else {
+            // Walk frames and sum decompressedBound.
+            let mut bound: u64 = 0;
+            let mut cursor = src;
+            while !cursor.is_empty() {
+                let info = ZSTD_findFrameSizeInfo(cursor, ZSTD_format_e::ZSTD_f_zstd1);
+                if ERR_isError(info.compressedSize) {
+                    return Err(format!(
+                        "frame walk failed: {}",
+                        ERR_getErrorName(info.compressedSize)
+                    ));
+                }
+                bound = bound.saturating_add(info.decompressedBound);
+                cursor = &cursor[info.compressedSize..];
+            }
+            bound as usize
+        }
     };
 
     let mut dst = vec![0u8; dst_size.max(1)];
-    let out = if let Some(d) = dict {
+    let out = if magicless {
+        // Magicless decode must route through a format-aware dctx.
+        let mut dctx = ZSTD_DCtx::new();
+        let _ = ZSTD_DCtx_setFormat(&mut dctx, format);
+        if let Some(d) = dict {
+            ZSTD_decompress_usingDict(&mut dctx, &mut dst, src, d)
+        } else {
+            // Single-frame streaming decode threads dctx.format.
+            let mut in_pos = 0usize;
+            let mut out_pos = 0usize;
+            let mut hint = ZSTD_decompressStream(
+                &mut dctx, &mut dst, &mut out_pos, src, &mut in_pos,
+            );
+            while hint != 0 && !ERR_isError(hint) {
+                hint = ZSTD_decompressStream(
+                    &mut dctx, &mut dst, &mut out_pos, &[], &mut 0usize,
+                );
+            }
+            if ERR_isError(hint) { hint } else { out_pos }
+        }
+    } else if let Some(d) = dict {
         let mut dctx = ZSTD_DCtx::new();
         ZSTD_decompress_usingDict(&mut dctx, &mut dst, src, d)
     } else {
@@ -176,19 +222,41 @@ fn compress_bytes(
     level: i32,
     dict: Option<&[u8]>,
     checksum: bool,
+    magicless: bool,
 ) -> Result<Vec<u8>, String> {
     let bound = ZSTD_compressBound(src.len());
     if ERR_isError(bound) {
         return Err(format!("compressBound error: {}", ERR_getErrorName(bound)));
     }
     let mut dst = vec![0u8; bound.max(32)];
-    let n = if let Some(d) = dict {
-        // Dict path: checksum not yet routed through usingDict.
-        let mut cctx = ZSTD_createCCtx().ok_or("cctx alloc failed")?;
-        ZSTD_compress_usingDict(&mut cctx, &mut dst, src, d, level)
+    let format = if magicless {
+        ZSTD_format_e::ZSTD_f_zstd1_magicless
     } else {
-        // Use compressFrame_fast directly so we can set the checksum
-        // flag. Equivalent to ZSTD_compress otherwise.
+        ZSTD_format_e::ZSTD_f_zstd1
+    };
+    let n = if let Some(d) = dict {
+        // Dict path: route through `ZSTD_compress_advanced` so that
+        // `--check` threads through as `fParams.checksumFlag` and the
+        // final frame carries the XXH64 trailer alongside the dict-
+        // back-refs. The cctx.format slot picks up magicless.
+        let mut cctx = ZSTD_createCCtx().ok_or("cctx alloc failed")?;
+        if magicless {
+            let _ = ZSTD_CCtx_setFormat(&mut cctx, ZSTD_format_e::ZSTD_f_zstd1_magicless);
+        }
+        let mut cp = ZSTD_getCParams(level, src.len() as u64, d.len());
+        cp.strategy = cp.strategy.clamp(ZSTD_fast, ZSTD_btlazy2);
+        let params = ZSTD_parameters {
+            cParams: cp,
+            fParams: ZSTD_FrameParameters {
+                contentSizeFlag: 1,
+                checksumFlag: if checksum { 1 } else { 0 },
+                noDictIDFlag: 0,
+            },
+        };
+        ZSTD_compress_advanced(&mut cctx, &mut dst, src, d, params)
+    } else {
+        // Use compressFrame_fast_advanced so --magicless can skip the
+        // 4-byte magic prefix.
         let mut cp: ZSTD_compressionParameters = ZSTD_getCParams(level, src.len() as u64, 0);
         cp.strategy = cp.strategy.clamp(ZSTD_fast, ZSTD_btlazy2);
         let fp = ZSTD_FrameParameters {
@@ -196,7 +264,7 @@ fn compress_bytes(
             checksumFlag: if checksum { 1 } else { 0 },
             noDictIDFlag: 1,
         };
-        ZSTD_compressFrame_fast(&mut dst, src, cp, fp)
+        ZSTD_compressFrame_fast_advanced(&mut dst, src, cp, fp, format)
     };
     if ERR_isError(n) {
         return Err(ERR_getErrorName(n).to_string());
@@ -225,9 +293,9 @@ fn run() -> Result<(), String> {
     for input in &inputs {
         let src = read_input(input).map_err(|e| format!("{}: {e}", input.display()))?;
         let dst = if cli.decompress {
-            decompress_bytes(&src, dict_ref)?
+            decompress_bytes(&src, dict_ref, cli.magicless)?
         } else {
-            compress_bytes(&src, cli.level, dict_ref, cli.check)?
+            compress_bytes(&src, cli.level, dict_ref, cli.check, cli.magicless)?
         };
         let out_path: Option<PathBuf> = if cli.stdout || input == Path::new("-") {
             cli.output_file.clone()

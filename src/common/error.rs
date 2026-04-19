@@ -247,6 +247,21 @@ mod tests {
     }
 
     #[test]
+    fn from_raw_clamps_extreme_and_negative_inputs_to_Generic() {
+        // Callers that build an `ErrorCode` from an arbitrary i32
+        // (e.g. FFI return values from legacy APIs) must get a safe
+        // `Generic` fallback for values outside the enum, including
+        // i32::MIN / i32::MAX / negative / oversized.
+        assert_eq!(ErrorCode::from_raw(i32::MIN), ErrorCode::Generic);
+        assert_eq!(ErrorCode::from_raw(-1), ErrorCode::Generic);
+        assert_eq!(ErrorCode::from_raw(-42), ErrorCode::Generic);
+        assert_eq!(ErrorCode::from_raw(i32::MAX), ErrorCode::Generic);
+        assert_eq!(ErrorCode::from_raw(999_999), ErrorCode::Generic);
+        // Known-valid code still round-trips.
+        assert_eq!(ErrorCode::from_raw(22), ErrorCode::ChecksumWrong);
+    }
+
+    #[test]
     fn getErrorName_on_non_error_returns_no_error_string() {
         // Contract: calling `ERR_getErrorName` on a code that isn't
         // actually an error (i.e. a small successful size like 100)

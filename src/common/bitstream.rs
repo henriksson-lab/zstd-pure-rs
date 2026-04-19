@@ -488,6 +488,112 @@ mod tests {
     }
 
     #[test]
+    fn reloadDStream_overflow_returns_overflow_sentinel() {
+        // When bitsConsumed > CONTAINER_BITS (caller over-consumed),
+        // `BIT_reloadDStream` must short-circuit to the overflow
+        // sentinel — not try to rewind into negative territory.
+        let mut buf = [0u8; 16];
+        let cap = buf.len();
+        let (mut bitC, _) = BIT_initCStream(&mut buf, cap);
+        BIT_addBits(&mut bitC, 0xFF, 8);
+        BIT_flushBits(&mut bitC);
+        let written = BIT_closeCStream(&mut bitC);
+
+        let mut bitD = BIT_DStream_t::default();
+        BIT_initDStream(&mut bitD, &buf[..written], written);
+        // Force an over-consumption state.
+        bitD.bitsConsumed = CONTAINER_BITS + 1;
+        assert_eq!(BIT_reloadDStream(&mut bitD), BIT_DStream_overflow);
+    }
+
+    #[test]
+    fn reloadDStream_at_start_with_full_bits_returns_completed() {
+        // When ptr already sits at start AND all container bits have
+        // been consumed, reload reports `BIT_DStream_completed` —
+        // the decoder should stop.
+        let mut buf = [0u8; 16];
+        let cap = buf.len();
+        let (mut bitC, _) = BIT_initCStream(&mut buf, cap);
+        BIT_addBits(&mut bitC, 1, 1);
+        BIT_flushBits(&mut bitC);
+        let written = BIT_closeCStream(&mut bitC);
+
+        let mut bitD = BIT_DStream_t::default();
+        BIT_initDStream(&mut bitD, &buf[..written], written);
+        // Hand-force the completed state.
+        bitD.ptr = bitD.start;
+        bitD.bitsConsumed = CONTAINER_BITS;
+        assert_eq!(BIT_reloadDStream(&mut bitD), BIT_DStream_completed);
+
+        // Same position but bitsConsumed < CONTAINER_BITS → endOfBuffer.
+        bitD.bitsConsumed = CONTAINER_BITS - 4;
+        assert_eq!(BIT_reloadDStream(&mut bitD), BIT_DStream_endOfBuffer);
+    }
+
+    #[test]
+    fn endOfDStream_reports_true_only_at_start_with_all_bits_consumed() {
+        // Contract: returns 1 iff `ptr == start && bitsConsumed ==
+        // CONTAINER_BITS`. Used by the FSE/HUF decoders as a
+        // stream-termination signal. Regression: drift in the
+        // condition would make decoders either stop early (losing
+        // data) or loop past EOF (reading garbage).
+        let mut buf = vec![0u8; 16];
+        let cap = buf.len();
+        let (mut bitC, rc) = BIT_initCStream(&mut buf, cap);
+        assert_eq!(rc, 0);
+        BIT_addBits(&mut bitC, 0xAB, 8);
+        BIT_flushBits(&mut bitC);
+        let written = BIT_closeCStream(&mut bitC);
+
+        let mut bitD = BIT_DStream_t::default();
+        BIT_initDStream(&mut bitD, &buf[..written], written);
+
+        // Fresh stream — not at end.
+        assert_eq!(BIT_endOfDStream(&bitD), 0);
+
+        // Read the byte + drive ptr back to start.
+        let _ = BIT_readBits(&mut bitD, 8);
+        // Still not at end in general — we haven't rewound / consumed
+        // the container fully.
+        // Hand-set the condition that makes `endOfDStream` fire.
+        bitD.ptr = bitD.start;
+        bitD.bitsConsumed = CONTAINER_BITS;
+        assert_eq!(BIT_endOfDStream(&bitD), 1);
+
+        // Break either invariant → returns 0.
+        bitD.bitsConsumed = CONTAINER_BITS - 1;
+        assert_eq!(BIT_endOfDStream(&bitD), 0);
+    }
+
+    #[test]
+    fn readBitsFast_produces_same_values_as_readBits_for_nbBits_ge_1() {
+        // `BIT_readBitsFast` requires `nbBits >= 1` (debug_assert).
+        // For that domain it MUST produce byte-identical results to
+        // `BIT_readBits`. A regression where the Fast path's bit-mask
+        // drifts would corrupt every decoded FSE/HUF symbol silently.
+        let mut buf = vec![0u8; 64];
+        let cap = buf.len();
+        let (mut bitC, rc) = BIT_initCStream(&mut buf, cap);
+        assert_eq!(rc, 0);
+        BIT_addBits(&mut bitC, 0x0A, 4);
+        BIT_flushBits(&mut bitC);
+        BIT_addBits(&mut bitC, 0x15, 5);
+        BIT_flushBits(&mut bitC);
+        BIT_addBits(&mut bitC, 0x2B, 6);
+        BIT_flushBits(&mut bitC);
+        let written = BIT_closeCStream(&mut bitC);
+        assert!(written > 0);
+
+        // Decode with the Fast variant.
+        let mut bitD = BIT_DStream_t::default();
+        let rc = BIT_initDStream(&mut bitD, &buf[..written], written);
+        assert_eq!(rc, written);
+        assert_eq!(BIT_readBitsFast(&mut bitD, 6), 0x2B);
+        assert_eq!(BIT_readBitsFast(&mut bitD, 5), 0x15);
+        assert_eq!(BIT_readBitsFast(&mut bitD, 4), 0x0A);
+    }
+
+    #[test]
     fn close_cstream_reports_zero_on_overflow() {
         // Tiny capacity + many bytes written → ptr advances past endPtr
         // → close must report 0.

@@ -7,8 +7,6 @@
 //! the sequential path already handles all correctness requirements —
 //! MT is purely a speed optimization.
 
-#![allow(unused_variables)]
-
 use core::marker::PhantomData;
 
 pub struct ZSTDMT_CCtx {
@@ -57,4 +55,48 @@ pub fn ZSTDMT_toFlushNow(_mtctx: &ZSTDMT_CCtx) -> usize {
 #[inline]
 pub fn ZSTDMT_nextInputSizeHint(_mtctx: &ZSTDMT_CCtx) -> usize {
     crate::compress::zstd_compress::ZSTD_CStreamInSize()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zstdmt_api_surface_stubs_behave_safely() {
+        // v0.1 has no MT backend — the API surface exists for
+        // callers to compile-check against, but every entry must
+        // return a safe default (None / 0 / Generic) rather than
+        // panicking. Guards against an accidental `todo!()` sneaking
+        // in during the future rayon port.
+        use crate::common::error::{ERR_getErrorCode, ERR_isError, ErrorCode};
+        use crate::compress::zstd_compress::ZSTD_EndDirective;
+
+        // Creator always returns None in v0.1.
+        assert!(ZSTDMT_createCCtx(1).is_none());
+        assert!(ZSTDMT_createCCtx(0).is_none());
+
+        // Free accepts None without panicking.
+        assert_eq!(ZSTDMT_freeCCtx(None), 0);
+
+        // Size / flush-now queries work on a dangling PhantomData
+        // stub ctx without allocating.
+        let stub = ZSTDMT_CCtx { _priv: core::marker::PhantomData };
+        // `ZSTDMT_CCtx` is PhantomData-only → size is 0; just ensure
+        // the accessor doesn't panic.
+        let _ = ZSTDMT_sizeof_CCtx(&stub);
+        assert_eq!(ZSTDMT_toFlushNow(&stub), 0);
+        assert!(ZSTDMT_nextInputSizeHint(&stub) > 0);
+
+        // compressStream_generic returns Generic.
+        let mut dst = [0u8; 32];
+        let mut dp = 0usize;
+        let mut sp = 0usize;
+        let mut stub = ZSTDMT_CCtx { _priv: core::marker::PhantomData };
+        let rc = ZSTDMT_compressStream_generic(
+            &mut stub, &mut dst, &mut dp, b"x", &mut sp,
+            ZSTD_EndDirective::ZSTD_e_end,
+        );
+        assert!(ERR_isError(rc));
+        assert_eq!(ERR_getErrorCode(rc), ErrorCode::Generic);
+    }
 }

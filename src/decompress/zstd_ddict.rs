@@ -8,8 +8,6 @@
 //! for v0.1. Magic-tagged dicts in `ZSTD_dct_fullDict` mode currently
 //! return `DictionaryCreationFailed` to flag the gap.
 
-#![allow(unused_variables)]
-
 use crate::common::error::{ErrorCode, ERROR};
 
 /// Mirror of upstream `ZSTD_dictLoadMethod_e`.
@@ -130,8 +128,10 @@ fn ZSTD_loadEntropy_intoDDict(
         return 0;
     }
 
-    // Magic-tagged: load dictID, but defer entropy-table parsing to a
-    // future tick. Upstream would build HUF + FSE DTables here.
+    // Magic-tagged: load dictID, but defer entropy-table parsing —
+    // upstream would build HUF + FSE DTables here; that path is
+    // gated on the pre-digested dict port (flagged below for
+    // `ZSTD_dct_fullDict` callers with an explicit error).
     ddict.dictID = MEM_readLE32(&ddict.dictBuffer[ZSTD_FRAMEIDSIZE..ZSTD_FRAMEIDSIZE + 4]);
 
     if dictContentType == ZSTD_dictContentType_e::ZSTD_dct_fullDict {
@@ -191,9 +191,64 @@ pub fn ZSTD_freeDDict(_ddict: Option<Box<ZSTD_DDict>>) -> usize {
     0
 }
 
+/// Port of `ZSTD_copyDDictParameters` (zstd_ddict.c:58). Seeds a DCtx
+/// with a DDict's parameters. Upstream sets the prefix/virtualStart/
+/// dictEnd/previousDstEnd pointers that it uses to resolve back-refs
+/// into the dict; v0.1's decoder works by materializing the dict into
+/// `stream_dict` and re-scanning, so we just copy the content there
+/// and flag `litEntropy` per the DDict's pre-digest status.
+pub fn ZSTD_copyDDictParameters(
+    dctx: &mut crate::decompress::zstd_decompress_block::ZSTD_DCtx,
+    ddict: &ZSTD_DDict,
+) {
+    dctx.stream_dict = ZSTD_DDict_dictContent(ddict).to_vec();
+    // Upstream (zstd_ddict.c:63-84) also copies dictID and flips
+    // `fseEntropy` alongside `litEntropy` when the DDict has
+    // pre-digested entropy tables. Our port was only copying
+    // `litEntropy` — callers reading `dctx.dictID` / `dctx.fseEntropy`
+    // after this helper would see stale zeros.
+    dctx.dictID = ddict.dictID;
+    if ddict.entropyPresent != 0 {
+        dctx.litEntropy = 1;
+        dctx.fseEntropy = 1;
+    } else {
+        dctx.litEntropy = 0;
+        dctx.fseEntropy = 0;
+    }
+}
+
 #[cfg(test)]
 mod byref_tests {
     use super::*;
+
+    #[test]
+    fn copyDDictParameters_propagates_dictID_and_fseEntropy() {
+        // Parity with upstream `ZSTD_copyDDictParameters`
+        // (zstd_ddict.c:58): copies `dictID` + sets both
+        // `litEntropy` AND `fseEntropy` from `ddict.entropyPresent`.
+        // Previously our port only wrote `stream_dict` + `litEntropy`.
+        use crate::decompress::zstd_decompress_block::ZSTD_DCtx;
+        let mut ddict = ZSTD_DDict {
+            dictBuffer: b"copy-params-dict".to_vec(),
+            dictSize: 16,
+            dictID: 0xDEAD_BEEF,
+            entropyPresent: 1,
+        };
+        let mut dctx = ZSTD_DCtx::new();
+        ZSTD_copyDDictParameters(&mut dctx, &ddict);
+        assert_eq!(dctx.dictID, 0xDEAD_BEEF);
+        assert_eq!(dctx.litEntropy, 1);
+        assert_eq!(dctx.fseEntropy, 1);
+
+        // When entropy isn't pre-digested, both flags clear.
+        ddict.entropyPresent = 0;
+        ddict.dictID = 0;
+        let mut dctx = ZSTD_DCtx::new();
+        ZSTD_copyDDictParameters(&mut dctx, &ddict);
+        assert_eq!(dctx.dictID, 0);
+        assert_eq!(dctx.litEntropy, 0);
+        assert_eq!(dctx.fseEntropy, 0);
+    }
 
     #[test]
     fn createDDict_byReference_matches_regular_creator_content() {
@@ -219,6 +274,20 @@ mod byref_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dict_method_and_contentType_discriminants_match_upstream() {
+        // `ZSTD_dictLoadMethod_e` and `ZSTD_dictContentType_e` are
+        // both part of the public advanced-API surface (consumed by
+        // ZSTD_createCDict_advanced, ZSTD_CCtx_loadDictionary_advanced,
+        // etc.). Upstream pins them at 0/1 and 0/1/2 respectively.
+        // Accidental reordering would silently mis-route dict handling.
+        assert_eq!(ZSTD_dictLoadMethod_e::ZSTD_dlm_byCopy as u32, 0);
+        assert_eq!(ZSTD_dictLoadMethod_e::ZSTD_dlm_byRef as u32, 1);
+        assert_eq!(ZSTD_dictContentType_e::ZSTD_dct_auto as u32, 0);
+        assert_eq!(ZSTD_dictContentType_e::ZSTD_dct_rawContent as u32, 1);
+        assert_eq!(ZSTD_dictContentType_e::ZSTD_dct_fullDict as u32, 2);
+    }
 
     #[test]
     fn estimateDDictSize_byCopy_vs_byRef() {

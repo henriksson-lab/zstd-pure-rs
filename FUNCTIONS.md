@@ -12,7 +12,7 @@ Legend: `skel` = skeleton (returns clean error / no-op — no panic), `impl` = i
 |---|---|
 | `common/{bits, mem, error, zstd_common, xxhash, debug, bitstream, entropy_common, fse_decompress, zstd_internal}` | **Impl** (incl. `repStartValue`, `ZSTD_invalidateRepCodes`) |
 | `common/{pool, threading}` | API stubs (MT feature future) |
-| `decompress/{huf_decompress, zstd_decompress_block, zstd_ddict, zstd_decompress}` | **Impl** (raw dicts; pre-digested entropy TODO) |
+| `decompress/{huf_decompress, zstd_decompress_block, zstd_ddict, zstd_decompress}` | **Impl**. Magic-prefix dict entropy tables load via `ZSTD_DCtx_loadDictionary` / `ZSTD_decompress_insertDictionary` / `ZSTD_loadDEntropy`; the one-shot `ZSTD_decompress_usingDict` stays raw-content only. |
 | `compress/{hist, fse_compress, huf_compress, zstd_compress_literals, zstd_compress_sequences, zstd_fast, zstd_double_fast, zstd_lazy, zstd_preSplit, zstd_compress}` | **Impl** (plus btlazy2 DUBT queue insertion — `updateDUBT` / `insertDUBT1`) |
 | `compress/zstd_ldm` | Types + gear-hash rolling + bucket hash table + backward-match helpers + sequence-generator (prefix-only) + outer driver + skip helpers **impl**; ext-dict branch of generateSequences + blockCompress skeletal |
 | `compress/zstd_opt` | Price helpers + pricing + stats-update + rescaleFreqs (no-dict) + hash3 + binary-tree insert + match-gatherer (prefix-only) + optLdm wiring **impl**; `compressBlock_bt{opt,ultra,ultra2}` skeletal (forward-DP parser not yet wired) |
@@ -58,19 +58,19 @@ Legend: `skel` = skeleton (returns clean error / no-op — no panic), `impl` = i
 
 | C symbol | Rust symbol | Status |
 | --- | --- | --- |
-| `BIT_initCStream`    | `common::bitstream::BIT_initCStream` | skel |
-| `BIT_addBits`        | `common::bitstream::BIT_addBits` | skel |
-| `BIT_addBitsFast`    | `common::bitstream::BIT_addBitsFast` | skel |
-| `BIT_flushBits`      | `common::bitstream::BIT_flushBits` | skel |
-| `BIT_flushBitsFast`  | `common::bitstream::BIT_flushBitsFast` | skel |
-| `BIT_closeCStream`   | `common::bitstream::BIT_closeCStream` | skel |
-| `BIT_initDStream`    | `common::bitstream::BIT_initDStream` | skel |
-| `BIT_lookBits`       | `common::bitstream::BIT_lookBits` | skel |
-| `BIT_lookBitsFast`   | `common::bitstream::BIT_lookBitsFast` | skel |
-| `BIT_readBits`       | `common::bitstream::BIT_readBits` | skel |
-| `BIT_readBitsFast`   | `common::bitstream::BIT_readBitsFast` | skel |
-| `BIT_reloadDStream`  | `common::bitstream::BIT_reloadDStream` | skel |
-| `BIT_endOfDStream`   | `common::bitstream::BIT_endOfDStream` | skel |
+| `BIT_initCStream`    | `common::bitstream::BIT_initCStream` | impl |
+| `BIT_addBits`        | `common::bitstream::BIT_addBits` | impl |
+| `BIT_addBitsFast`    | `common::bitstream::BIT_addBitsFast` | impl |
+| `BIT_flushBits`      | `common::bitstream::BIT_flushBits` | impl |
+| `BIT_flushBitsFast`  | `common::bitstream::BIT_flushBitsFast` | impl |
+| `BIT_closeCStream`   | `common::bitstream::BIT_closeCStream` | impl |
+| `BIT_initDStream`    | `common::bitstream::BIT_initDStream` | impl |
+| `BIT_lookBits`       | `common::bitstream::BIT_lookBits` | impl |
+| `BIT_lookBitsFast`   | `common::bitstream::BIT_lookBitsFast` | impl |
+| `BIT_readBits`       | `common::bitstream::BIT_readBits` | impl |
+| `BIT_readBitsFast`   | `common::bitstream::BIT_readBitsFast` | impl |
+| `BIT_reloadDStream`  | `common::bitstream::BIT_reloadDStream` | impl |
+| `BIT_endOfDStream`   | `common::bitstream::BIT_endOfDStream` | impl |
 
 ### mem.h → common::mem
 
@@ -95,26 +95,26 @@ Complete function list deferred; skeleton module only.
 ### entropy_common.c → common::entropy_common
 | C symbol | Rust symbol | Status |
 | --- | --- | --- |
-| `FSE_versionNumber`        | `common::entropy_common::FSE_versionNumber` | skel |
-| `FSE_isError`              | `common::entropy_common::FSE_isError` | skel |
-| `FSE_getErrorName`         | `common::entropy_common::FSE_getErrorName` | skel |
-| `HUF_isError`              | `common::entropy_common::HUF_isError` | skel |
-| `HUF_getErrorName`         | `common::entropy_common::HUF_getErrorName` | skel |
-| `FSE_readNCount`           | `common::entropy_common::FSE_readNCount` | skel |
-| `FSE_readNCount_bmi2`      | `common::entropy_common::FSE_readNCount_bmi2` | skel |
-| `HUF_readStats`            | `common::entropy_common::HUF_readStats` | skel |
-| `HUF_readStats_wksp`       | `common::entropy_common::HUF_readStats_wksp` | skel |
+| `FSE_versionNumber`        | `common::entropy_common::FSE_versionNumber` | impl |
+| `FSE_isError`              | `common::entropy_common::FSE_isError` | impl |
+| `FSE_getErrorName`         | `common::entropy_common::FSE_getErrorName` | impl |
+| `HUF_isError`              | `common::entropy_common::HUF_isError` | impl |
+| `HUF_getErrorName`         | `common::entropy_common::HUF_getErrorName` | impl |
+| `FSE_readNCount`           | `common::entropy_common::FSE_readNCount` | impl |
+| `FSE_readNCount_bmi2`      | `common::entropy_common::FSE_readNCount_bmi2` | impl |
+| `HUF_readStats`            | `common::entropy_common::HUF_readStats` | impl |
+| `HUF_readStats_wksp`       | `common::entropy_common::HUF_readStats_wksp` | impl |
 
 ### fse_decompress.c → common::fse_decompress
 | C symbol | Rust symbol | Status |
 | --- | --- | --- |
-| `FSE_buildDTable_internal` | `common::fse_decompress::FSE_buildDTable_internal` | skel |
-| `FSE_buildDTable_wksp`     | `common::fse_decompress::FSE_buildDTable_wksp` | skel |
-| `FSE_buildDTable_raw`      | `common::fse_decompress::FSE_buildDTable_raw` | skel |
-| `FSE_buildDTable_rle`      | `common::fse_decompress::FSE_buildDTable_rle` | skel |
-| `FSE_decompress_usingDTable` | `common::fse_decompress::FSE_decompress_usingDTable` | skel |
-| `FSE_decompress_wksp`      | `common::fse_decompress::FSE_decompress_wksp` | skel |
-| `FSE_decompress_wksp_bmi2` | `common::fse_decompress::FSE_decompress_wksp_bmi2` | skel |
+| `FSE_buildDTable_internal` | `common::fse_decompress::FSE_buildDTable_internal` | impl |
+| `FSE_buildDTable_wksp`     | `common::fse_decompress::FSE_buildDTable_wksp` | impl |
+| `FSE_buildDTable_raw`      | `common::fse_decompress::FSE_buildDTable_raw` | impl |
+| `FSE_buildDTable_rle`      | `common::fse_decompress::FSE_buildDTable_rle` | impl |
+| `FSE_decompress_usingDTable` | `common::fse_decompress::FSE_decompress_usingDTable` | impl |
+| `FSE_decompress_wksp`      | `common::fse_decompress::FSE_decompress_wksp` | impl |
+| `FSE_decompress_wksp_bmi2` | `common::fse_decompress::FSE_decompress_wksp_bmi2` | impl |
 
 ### pool.c → common::pool
 Skeleton only; thread pool — implementation will use `std::thread` / `rayon`.

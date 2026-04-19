@@ -1,7 +1,7 @@
 //! Translation of `lib/compress/zstd_compress.c`. Top-level compression
 //! API and orchestration.
 
-#![allow(unused_variables, non_snake_case)]
+#![allow(non_snake_case)]
 
 use crate::common::bits::ZSTD_highbit32;
 use crate::common::error::{ErrorCode, ERR_isError, ERROR};
@@ -26,7 +26,7 @@ use crate::decompress::zstd_decompress_block::{
 /// allocation. Also backs the simple streaming API — `initCStream`
 /// captures the level, `compressStream` buffers input, `endStream`
 /// compresses the buffered input and drains the result.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ZSTD_CCtx {
     /// Match state carried across blocks inside a single frame. Lazy
     /// initialized on first `ZSTD_compressCCtx` call.
@@ -37,6 +37,12 @@ pub struct ZSTD_CCtx {
     /// and `next` slots rotate each block.
     pub prevEntropy: ZSTD_entropyCTables_t,
     pub nextEntropy: ZSTD_entropyCTables_t,
+    /// Upstream `blockState.prevCBlock.rep` / `nextCBlock.rep`. The
+    /// three-slot repcode history that tracks which offsets the
+    /// compressor last emitted — rotated each block alongside
+    /// `prev/nextEntropy`.
+    pub prev_rep: [u32; 3],
+    pub next_rep: [u32; 3],
 
     // ---- Streaming-mode state (initCStream / compressStream / endStream) ----
     /// Compression level set by `ZSTD_initCStream`. `None` until init.
@@ -67,10 +73,65 @@ pub struct ZSTD_CCtx {
     pub stream_out_drained: usize,
     /// Flag: `endStream` has produced output (frame is final).
     pub stream_closed: bool,
-    /// cParams requested via `ZSTD_CCtx_setCParams` — not yet honored
-    /// by the compressor path (v0.1 uses level-derived cParams via
-    /// `ZSTD_getCParams`), but stored so API getters can round-trip.
+    /// cParams requested via `ZSTD_CCtx_setCParams`. Stored so API
+    /// getters can round-trip and so `ZSTD_getBlockSize` can fall
+    /// back to the requested `windowLog` before the CCtx has been
+    /// initialized. The compressor path resolves the final cParams
+    /// via `resolveCParams` → `ZSTD_overrideCParams`, which layers
+    /// `requestedParams.cParams` on top of level-derived defaults.
     pub requested_cParams: Option<crate::compress::match_state::ZSTD_compressionParameters>,
+    /// Upstream `cctx.requestedParams`. Full CCtx_params struct the
+    /// user has configured; `appliedParams` is derived from this at
+    /// `ZSTD_compressBegin_internal` time.
+    pub requestedParams: ZSTD_CCtx_params,
+    /// Upstream `cctx.appliedParams`. The active parameter set for
+    /// the current compression session — set by `ZSTD_resetCCtx_internal`
+    /// after resolving knobs against the concrete cParams.
+    pub appliedParams: ZSTD_CCtx_params,
+    /// Upstream `cctx.stage`. Lifecycle marker for the block-level
+    /// compression API.
+    pub stage: ZSTD_compressionStage_e,
+    /// Upstream `cctx.dictID`. The dictID of the active dictionary;
+    /// zero when no dict is in use.
+    pub dictID: u32,
+    /// Upstream `cctx.dictContentSize`. Size in bytes of the active
+    /// dict's content.
+    pub dictContentSize: usize,
+    /// Upstream `cctx.consumedSrcSize`. Running total of source
+    /// bytes consumed this frame.
+    pub consumedSrcSize: u64,
+    /// Upstream `cctx.producedCSize`. Running total of compressed
+    /// bytes emitted this frame.
+    pub producedCSize: u64,
+    /// Upstream `cctx.pledgedSrcSizePlusOne`. One plus the pledged
+    /// content size, or 0 if unknown. The `+1` encoding lets zero
+    /// disambiguate "unknown" from "pledged 0".
+    pub pledgedSrcSizePlusOne: u64,
+    /// Upstream `cctx.isFirstBlock`. True until the first block has
+    /// been emitted; used to gate the RLE-downgrade path.
+    pub isFirstBlock: i32,
+    /// Upstream `cctx.blockSizeMax`. Max block size for the current
+    /// session; derived from `params.cParams.windowLog` capped at
+    /// `ZSTD_BLOCKSIZE_MAX`.
+    pub blockSizeMax: usize,
+    /// Upstream `cctx.xxhState`. XXH64 accumulator for the optional
+    /// frame-end checksum.
+    pub xxhState: crate::common::xxhash::XXH64_state_t,
+    /// Upstream `cctx.appliedParams.format`. Active frame format —
+    /// `ZSTD_f_zstd1` (default, magic-prefixed) or
+    /// `ZSTD_f_zstd1_magicless`. Set via `ZSTD_CCtx_setFormat`;
+    /// `ZSTD_compressFrame_fast` / `_with_prefix` thread it through
+    /// `ZSTD_writeFrameHeader_advanced`.
+    pub format: crate::decompress::zstd_decompress::ZSTD_format_e,
+
+    /// Upstream-equivalent of `cctx.prefixDict` being non-empty
+    /// (`zstd_compress.c:6378`). When set, `stream_dict` was
+    /// attached via `ZSTD_CCtx_refPrefix` and is single-use — the
+    /// stream compressor auto-clears it after the next frame.
+    /// `loadDictionary` / `refCDict` leave this `false` so the
+    /// dict persists (matches upstream's `localDict` / `cdict`
+    /// fields which aren't zeroed at compress start).
+    pub prefix_is_single_use: bool,
 }
 
 impl Default for ZSTD_CCtx {
@@ -80,6 +141,10 @@ impl Default for ZSTD_CCtx {
             seqStore: None,
             prevEntropy: ZSTD_entropyCTables_t::default(),
             nextEntropy: ZSTD_entropyCTables_t::default(),
+            // Upstream's `repStartValue = {1, 4, 8}` — the canonical
+            // initial repcode history at frame start.
+            prev_rep: [1, 4, 8],
+            next_rep: [1, 4, 8],
             stream_level: None,
             pledged_src_size: None,
             stream_dict: Vec::new(),
@@ -91,6 +156,19 @@ impl Default for ZSTD_CCtx {
             stream_out_drained: 0,
             stream_closed: false,
             requested_cParams: None,
+            requestedParams: ZSTD_CCtx_params::default(),
+            appliedParams: ZSTD_CCtx_params::default(),
+            stage: ZSTD_compressionStage_e::default(),
+            dictID: 0,
+            dictContentSize: 0,
+            consumedSrcSize: 0,
+            producedCSize: 0,
+            pledgedSrcSizePlusOne: 0,
+            isFirstBlock: 1,
+            blockSizeMax: 0,
+            xxhState: crate::common::xxhash::XXH64_state_t::default(),
+            format: crate::decompress::zstd_decompress::ZSTD_format_e::ZSTD_f_zstd1,
+            prefix_is_single_use: false,
         }
     }
 }
@@ -227,6 +305,20 @@ pub fn ZSTD_cParam_getBounds(param: ZSTD_cParameter) -> ZSTD_bounds {
             lowerBound: 0,
             upperBound: 1,
         },
+        ZSTD_cParameter::ZSTD_c_format => ZSTD_bounds {
+            error: 0,
+            lowerBound: crate::decompress::zstd_decompress::ZSTD_format_e::ZSTD_f_zstd1 as i32,
+            upperBound: crate::decompress::zstd_decompress::ZSTD_format_e::ZSTD_f_zstd1_magicless
+                as i32,
+        },
+        // Upstream: MT-disabled builds clamp the bound to
+        // `[0, 0]` (so any non-zero worker request fails with
+        // `ParameterOutOfBound`). We report the same.
+        ZSTD_cParameter::ZSTD_c_nbWorkers => ZSTD_bounds {
+            error: 0,
+            lowerBound: 0,
+            upperBound: 0,
+        },
     }
 }
 
@@ -236,9 +328,96 @@ pub const fn ZSTD_WINDOWLOG_MAX() -> u32 {
     if crate::common::mem::MEM_32bits() != 0 { 30 } else { 31 }
 }
 
-/// Upstream `ZSTD_WINDOWLOG_ABSOLUTEMIN`. Smallest windowLog that
-/// produces a valid frame header.
-pub const ZSTD_WINDOWLOG_ABSOLUTEMIN: u32 = 10;
+/// Re-export of `crate::decompress::zstd_decompress::ZSTD_WINDOWLOG_ABSOLUTEMIN`
+/// — same upstream constant, previously duplicated on both sides.
+pub use crate::decompress::zstd_decompress::ZSTD_WINDOWLOG_ABSOLUTEMIN;
+
+/// Upstream `ZSTD_WINDOWLOG_MIN` (`zstd.h:1266`). Minimum windowLog
+/// accepted by `ZSTD_c_windowLog` — below this the compressor rejects
+/// the param.
+pub const ZSTD_WINDOWLOG_MIN: u32 = 10;
+
+/// Upstream `ZSTD_CHAINLOG_MAX_32` / `ZSTD_CHAINLOG_MAX_64`
+/// (`zstd.h:1269-1270`). Max chain-table log, differs by target
+/// width.
+pub const ZSTD_CHAINLOG_MAX_32: u32 = 29;
+pub const ZSTD_CHAINLOG_MAX_64: u32 = 30;
+
+/// Upstream `ZSTD_CHAINLOG_MAX`. Resolved at runtime against the
+/// current pointer width.
+pub const fn ZSTD_CHAINLOG_MAX() -> u32 {
+    if crate::common::mem::MEM_32bits() != 0 {
+        ZSTD_CHAINLOG_MAX_32
+    } else {
+        ZSTD_CHAINLOG_MAX_64
+    }
+}
+
+/// Upstream `ZSTD_CHAINLOG_MIN` (= `ZSTD_HASHLOG_MIN`).
+pub const ZSTD_CHAINLOG_MIN: u32 = 6;
+
+/// Upstream `ZSTD_SEARCHLOG_MAX` — `windowLogMax - 1`.
+pub const fn ZSTD_SEARCHLOG_MAX() -> u32 {
+    ZSTD_WINDOWLOG_MAX() - 1
+}
+
+/// Upstream `ZSTD_SEARCHLOG_MIN`.
+pub const ZSTD_SEARCHLOG_MIN: u32 = 1;
+
+/// Upstream `ZSTD_MINMATCH_MIN` / `ZSTD_MINMATCH_MAX` (`zstd.h:1275-76`).
+pub const ZSTD_MINMATCH_MIN: u32 = 3;
+pub const ZSTD_MINMATCH_MAX: u32 = 7;
+
+/// Upstream `ZSTD_TARGETLENGTH_MIN` / `ZSTD_TARGETLENGTH_MAX`
+/// (`zstd.h:1277-78`).
+pub const ZSTD_TARGETLENGTH_MIN: u32 = 0;
+pub const ZSTD_TARGETLENGTH_MAX: u32 =
+    crate::decompress::zstd_decompress_block::ZSTD_BLOCKSIZE_MAX as u32;
+
+/// Upstream `ZSTD_STRATEGY_MIN` / `MAX` (`zstd.h:1279-80`).
+pub const ZSTD_STRATEGY_MIN: u32 = 1; // ZSTD_fast
+pub const ZSTD_STRATEGY_MAX: u32 = 9; // ZSTD_btultra2
+
+/// Upstream `ZSTD_BLOCKSIZE_MAX_MIN` (`zstd.h:1281`). Smallest valid
+/// `maxBlockSize` param — below this, `ZSTD_compressBound` becomes
+/// inaccurate.
+pub const ZSTD_BLOCKSIZE_MAX_MIN: usize = 1 << 10;
+
+/// Upstream `ZSTD_OVERLAPLOG_MIN` / `MAX` (`zstd.h:1284-85`). Controls
+/// the LDM `overlapLog` param — overlap size between MT worker jobs.
+pub const ZSTD_OVERLAPLOG_MIN: u32 = 0;
+pub const ZSTD_OVERLAPLOG_MAX: u32 = 9;
+
+/// Upstream `ZSTD_LDM_HASHLOG_MIN` / `MAX` (`zstd.h:1295-96`). Aliased
+/// onto the ZSTD-wide hashLog bounds so the LDM parametric API can
+/// share validation.
+pub const ZSTD_LDM_HASHLOG_MIN: u32 = 6; // ZSTD_HASHLOG_MIN
+pub const ZSTD_LDM_HASHLOG_MAX: u32 = 30; // ZSTD_HASHLOG_MAX
+
+/// Upstream `ZSTD_LDM_MINMATCH_MIN` / `MAX` (`zstd.h:1297-98`).
+pub const ZSTD_LDM_MINMATCH_MIN: u32 = 4;
+pub const ZSTD_LDM_MINMATCH_MAX: u32 = 4096;
+
+/// Upstream `ZSTD_LDM_BUCKETSIZELOG_MIN` (`zstd.h:1299`).
+pub const ZSTD_LDM_BUCKETSIZELOG_MIN: u32 = 1;
+
+/// Upstream `ZSTD_LDM_HASHRATELOG_MIN` / `MAX` (`zstd.h:1301-02`).
+pub const ZSTD_LDM_HASHRATELOG_MIN: u32 = 0;
+pub const fn ZSTD_LDM_HASHRATELOG_MAX() -> u32 {
+    use crate::compress::zstd_ldm::ZSTD_HASHLOG_MIN;
+    ZSTD_WINDOWLOG_MAX() - ZSTD_HASHLOG_MIN
+}
+
+/// Upstream `ZSTD_TARGETCBLOCKSIZE_MIN` / `MAX` (`zstd.h:1305-06`).
+/// Target per-block compressed size for the block splitter; 1340
+/// fits an Ethernet/wifi/4G transport frame.
+pub const ZSTD_TARGETCBLOCKSIZE_MIN: u32 = 1340;
+pub const ZSTD_TARGETCBLOCKSIZE_MAX: u32 =
+    crate::decompress::zstd_decompress_block::ZSTD_BLOCKSIZE_MAX as u32;
+
+/// Upstream `ZSTD_SRCSIZEHINT_MIN` / `MAX` (`zstd.h:1307-08`).
+pub const ZSTD_SRCSIZEHINT_MIN: i32 = 0;
+pub const ZSTD_SRCSIZEHINT_MAX: i32 = i32::MAX;
 
 /// Port of `ZSTD_cycleLog`. The btlazy2 family stores 2 chains per
 /// `chainLog` entry (left + right), so its effective cycle length is
@@ -522,6 +701,31 @@ pub fn ZSTD_getCParamRowSize(
 /// scan more candidates per probe.
 pub const ZSTD_LAZY_DDSS_BUCKET_LOG: u32 = 2;
 
+/// Port of `ZSTD_dedicatedDictSearch_getCParams` (`zstd_compress.c:8204`).
+/// Produces cParams for a CDict being created with the Dedicated
+/// Dictionary Search strategy: derives baseline cParams via
+/// `ZSTD_getCParams` (cpm_createCDict mode is folded into our
+/// `ZSTD_getCParams` via its dictSize handling), then inflates
+/// `hashLog` by `ZSTD_LAZY_DDSS_BUCKET_LOG` for lazy-family
+/// strategies (greedy/lazy/lazy2). Fast/dfast and bt-family
+/// strategies pass through unchanged.
+pub fn ZSTD_dedicatedDictSearch_getCParams(
+    compressionLevel: i32,
+    dictSize: usize,
+) -> crate::compress::match_state::ZSTD_compressionParameters {
+    use crate::compress::zstd_compress_sequences::{
+        ZSTD_greedy, ZSTD_lazy, ZSTD_lazy2,
+    };
+    let mut cParams = ZSTD_getCParams(compressionLevel, 0, dictSize);
+    if cParams.strategy == ZSTD_greedy
+        || cParams.strategy == ZSTD_lazy
+        || cParams.strategy == ZSTD_lazy2
+    {
+        cParams.hashLog += ZSTD_LAZY_DDSS_BUCKET_LOG;
+    }
+    cParams
+}
+
 /// Port of `ZSTD_dedicatedDictSearch_revertCParams`. After DDSS has
 /// artificially inflated `hashLog` for bucket expansion, reverse the
 /// adjustment so the baseline cParams are suitable for a plain search.
@@ -580,21 +784,73 @@ pub fn ZSTD_freeCStream(zcs: Option<Box<ZSTD_CStream>>) -> usize {
     ZSTD_freeCCtx(zcs)
 }
 
+/// Proxy for upstream's `streamStage == zcss_init` check. Returns true
+/// when the CCtx is at a point where dict / prefix / pledge setters
+/// are legal — i.e. nothing has been staged or emitted for the
+/// current frame yet.
+#[inline]
+fn cctx_is_in_init_stage(cctx: &ZSTD_CCtx) -> bool {
+    cctx.stream_in_buffer.is_empty()
+        && cctx.stream_out_buffer.is_empty()
+        && !cctx.stream_closed
+}
+
 /// Port of `ZSTD_CCtx_loadDictionary`. Stashes the dict on the CCtx
 /// so subsequent streaming / one-shot compressions use it. Upstream
 /// also supports pre-digested dicts via `ZSTD_CCtx_refCDict` — we
 /// treat everything as raw-content for now.
+///
+/// Upstream (zstd_compress.c:1306) rejects with `StageWrong` when
+/// called mid-session — silently swapping dicts between
+/// `compressStream` calls would leave the already-buffered bytes
+/// compressed against the wrong back-reference substrate.
 pub fn ZSTD_CCtx_loadDictionary(cctx: &mut ZSTD_CCtx, dict: &[u8]) -> usize {
-    cctx.stream_dict = dict.to_vec();
+    if !cctx_is_in_init_stage(cctx) {
+        return ERROR(ErrorCode::StageWrong);
+    }
+    // Upstream (zstd_compress.c:1308): `clearAllDicts` first, then
+    // install only when there's actual content. Empty-dict calls
+    // become a pure clear — matches the `refPrefix(&[])` path too.
+    ZSTD_clearAllDicts(cctx);
+    if !dict.is_empty() {
+        cctx.stream_dict = dict.to_vec();
+        // Upstream's dictID tracking — parse the dict's embedded ID
+        // if it starts with the magic prefix; otherwise 0 (raw).
+        cctx.dictID = crate::decompress::zstd_ddict::ZSTD_getDictID_fromDict(dict);
+        cctx.dictContentSize = dict.len();
+        // loadDictionary attaches persistently — the single-use
+        // flag stays at the `clearAllDicts` default (`false`).
+    }
     0
 }
 
-/// Port of `ZSTD_CCtx_refPrefix`. Same effect as loadDictionary in
-/// v0.1 — we store the prefix as-is, treating it as raw content.
-/// Upstream treats prefixes as single-use (cleared after next
-/// compression); we don't enforce that distinction yet.
+/// Port of `ZSTD_CCtx_refPrefix`. Stores `prefix` as raw-content dict
+/// on the cctx and flags it as single-use — the next `endStream` /
+/// `compress2` auto-clears it so the prefix doesn't persist into a
+/// subsequent frame. Matches upstream's `ZSTD_memset(&cctx->prefixDict)`
+/// consumption in `ZSTD_CCtx_init_compressStream2`
+/// (`zstd_compress.c:6381`). Same init-stage gate as the other
+/// dict-family setters.
 pub fn ZSTD_CCtx_refPrefix(cctx: &mut ZSTD_CCtx, prefix: &[u8]) -> usize {
-    cctx.stream_dict = prefix.to_vec();
+    if !cctx_is_in_init_stage(cctx) {
+        return ERROR(ErrorCode::StageWrong);
+    }
+    // Upstream (zstd_compress.c:1372) clears ALL prior dicts first,
+    // then installs the new prefix only if non-empty. Mirror that so
+    // `refPrefix(&[])` behaves as "clear any bound dict" rather than
+    // silently leaving `prefix_is_single_use = true` with an empty
+    // stream_dict (which would be an inconsistent state).
+    ZSTD_clearAllDicts(cctx);
+    if !prefix.is_empty() {
+        cctx.stream_dict = prefix.to_vec();
+        cctx.dictContentSize = prefix.len();
+        // Prefixes are treated as raw content — `dictID` was just
+        // zeroed by `clearAllDicts` so no explicit re-write needed.
+        // Upstream (zstd_compress.c:6381): the prefix is single-use
+        // — it gets cleared by the next compress. Flag so
+        // `endStream` knows to wipe `stream_dict` after emitting.
+        cctx.prefix_is_single_use = true;
+    }
     0
 }
 
@@ -608,8 +864,15 @@ pub fn ZSTD_compressBegin(cctx: &mut ZSTD_CCtx, compressionLevel: i32) -> usize 
     if ERR_isError(rc) {
         return rc;
     }
-    cctx.stream_level = Some(compressionLevel);
-    0
+    // Route through setParameter so the clamp + `0 → CLEVEL_DEFAULT`
+    // mapping is applied — sibling of the `initCStream` fix. Previously
+    // raw-stored, leaving the level-0 case divergent from upstream's
+    // `compressBegin_internal → CCtxParams_setParameter` chain.
+    ZSTD_CCtx_setParameter(
+        cctx,
+        ZSTD_cParameter::ZSTD_c_compressionLevel,
+        compressionLevel,
+    )
 }
 
 /// Port of `ZSTD_compressBegin_usingDict`. Variant that stashes a
@@ -620,12 +883,32 @@ pub fn ZSTD_compressBegin_usingDict(
     dict: &[u8],
     compressionLevel: i32,
 ) -> usize {
-    let rc = ZSTD_compressBegin(cctx, compressionLevel);
-    if ERR_isError(rc) {
-        return rc;
-    }
-    cctx.stream_dict = dict.to_vec();
-    0
+    use crate::decompress::zstd_decompress::ZSTD_CONTENTSIZE_UNKNOWN;
+    use crate::decompress::zstd_ddict::ZSTD_dictContentType_e;
+    // Match upstream: pick cParams via getParams_internal with
+    // cpm_noAttachDict, then initialize params_internal with the
+    // caller's level (mapping 0 → CLEVEL_DEFAULT).
+    let params = ZSTD_getParams_internal(
+        compressionLevel,
+        ZSTD_CONTENTSIZE_UNKNOWN,
+        dict.len(),
+        ZSTD_CParamMode_e::ZSTD_cpm_noAttachDict,
+    );
+    let effective_level = if compressionLevel == 0 {
+        ZSTD_CLEVEL_DEFAULT
+    } else {
+        compressionLevel
+    };
+    let mut cctxParams = ZSTD_CCtx_params::default();
+    ZSTD_CCtxParams_init_internal(&mut cctxParams, &params, effective_level);
+    ZSTD_compressBegin_advanced_internal(
+        cctx,
+        dict,
+        ZSTD_dictContentType_e::ZSTD_dct_auto,
+        None,
+        &cctxParams,
+        ZSTD_CONTENTSIZE_UNKNOWN,
+    )
 }
 
 /// Port of `ZSTD_compressContinue`. Legacy block-level continue —
@@ -652,6 +935,294 @@ pub fn ZSTD_compressEnd(
     ERROR(ErrorCode::Generic)
 }
 
+/// Port of `ZSTD_BlockCompressor_f` (`zstd_compress_internal.h:580`).
+/// Function-pointer type for a single-block match-finder — takes
+/// match state, seq store, repcode array, source bytes, and returns
+/// the bytes processed (or an error).
+pub type ZSTD_BlockCompressor_f = fn(
+    ms: &mut crate::compress::match_state::ZSTD_MatchState_t,
+    seqStore: &mut SeqStore_t,
+    rep: &mut [u32; crate::compress::seq_store::ZSTD_REP_NUM],
+    src: &[u8],
+) -> usize;
+
+/// Port of `ZSTD_selectBlockCompressor` (`zstd_compress.c:3093`).
+/// Picks the match-finder entry point for a given
+/// (strategy × dictMode × useRowMatchFinder) tuple. Upstream carries
+/// separate row-hash variants for greedy/lazy/lazy2; v0.1 uses the
+/// plain chain-hash implementations for all paths (row-hash
+/// matcher's `ms.tagTable` isn't wired into our match state yet, so
+/// the row-hash branch falls through to the non-row path).
+///
+/// Strategy 0 is treated as "fast" per upstream's table-slot default.
+pub fn ZSTD_selectBlockCompressor(
+    strat: u32,
+    useRowMatchFinder: crate::compress::zstd_ldm::ZSTD_ParamSwitch_e,
+    dictMode: crate::compress::match_state::ZSTD_dictMode_e,
+) -> ZSTD_BlockCompressor_f {
+    use crate::compress::match_state::{ZSTD_dictMode_e, ZSTD_rowMatchFinderUsed};
+    use crate::compress::zstd_compress_sequences::{
+        ZSTD_btlazy2, ZSTD_btopt, ZSTD_btultra, ZSTD_btultra2, ZSTD_dfast, ZSTD_fast,
+        ZSTD_greedy, ZSTD_lazy, ZSTD_lazy2,
+    };
+    use crate::compress::zstd_double_fast::{
+        ZSTD_compressBlock_doubleFast, ZSTD_compressBlock_doubleFast_dictMatchState,
+        ZSTD_compressBlock_doubleFast_extDict,
+    };
+    use crate::compress::zstd_fast::{
+        ZSTD_compressBlock_fast, ZSTD_compressBlock_fast_dictMatchState,
+        ZSTD_compressBlock_fast_extDict,
+    };
+    use crate::compress::zstd_lazy::{
+        ZSTD_compressBlock_btlazy2, ZSTD_compressBlock_btlazy2_dictMatchState,
+        ZSTD_compressBlock_btlazy2_extDict, ZSTD_compressBlock_greedy,
+        ZSTD_compressBlock_greedy_dedicatedDictSearch,
+        ZSTD_compressBlock_greedy_dedicatedDictSearch_row,
+        ZSTD_compressBlock_greedy_dictMatchState,
+        ZSTD_compressBlock_greedy_dictMatchState_row, ZSTD_compressBlock_greedy_extDict,
+        ZSTD_compressBlock_greedy_extDict_row, ZSTD_compressBlock_greedy_row,
+        ZSTD_compressBlock_lazy, ZSTD_compressBlock_lazy2,
+        ZSTD_compressBlock_lazy2_dedicatedDictSearch,
+        ZSTD_compressBlock_lazy2_dedicatedDictSearch_row,
+        ZSTD_compressBlock_lazy2_dictMatchState,
+        ZSTD_compressBlock_lazy2_dictMatchState_row, ZSTD_compressBlock_lazy2_extDict,
+        ZSTD_compressBlock_lazy2_extDict_row, ZSTD_compressBlock_lazy2_row,
+        ZSTD_compressBlock_lazy_dedicatedDictSearch,
+        ZSTD_compressBlock_lazy_dedicatedDictSearch_row,
+        ZSTD_compressBlock_lazy_dictMatchState,
+        ZSTD_compressBlock_lazy_dictMatchState_row, ZSTD_compressBlock_lazy_extDict,
+        ZSTD_compressBlock_lazy_extDict_row, ZSTD_compressBlock_lazy_row,
+    };
+    use crate::compress::zstd_opt::{
+        ZSTD_compressBlock_btopt, ZSTD_compressBlock_btopt_dictMatchState,
+        ZSTD_compressBlock_btopt_extDict, ZSTD_compressBlock_btultra,
+        ZSTD_compressBlock_btultra2, ZSTD_compressBlock_btultra_dictMatchState,
+        ZSTD_compressBlock_btultra_extDict,
+    };
+
+    let useRow = ZSTD_rowMatchFinderUsed(strat, useRowMatchFinder);
+    // Strategy 0 defaults to "fast" (upstream table slot 0).
+    let effective_strat = if strat == 0 { ZSTD_fast } else { strat };
+
+    // Row-hash matchers only exist for greedy/lazy/lazy2; other
+    // strategies are unaffected by `useRowMatchFinder`.
+    if useRow && (effective_strat == ZSTD_greedy
+               || effective_strat == ZSTD_lazy
+               || effective_strat == ZSTD_lazy2) {
+        return match dictMode {
+            ZSTD_dictMode_e::ZSTD_noDict => match effective_strat {
+                s if s == ZSTD_greedy => ZSTD_compressBlock_greedy_row,
+                s if s == ZSTD_lazy => ZSTD_compressBlock_lazy_row,
+                _ => ZSTD_compressBlock_lazy2_row,
+            },
+            ZSTD_dictMode_e::ZSTD_extDict => match effective_strat {
+                s if s == ZSTD_greedy => ZSTD_compressBlock_greedy_extDict_row,
+                s if s == ZSTD_lazy => ZSTD_compressBlock_lazy_extDict_row,
+                _ => ZSTD_compressBlock_lazy2_extDict_row,
+            },
+            ZSTD_dictMode_e::ZSTD_dictMatchState => match effective_strat {
+                s if s == ZSTD_greedy => ZSTD_compressBlock_greedy_dictMatchState_row,
+                s if s == ZSTD_lazy => ZSTD_compressBlock_lazy_dictMatchState_row,
+                _ => ZSTD_compressBlock_lazy2_dictMatchState_row,
+            },
+            ZSTD_dictMode_e::ZSTD_dedicatedDictSearch => match effective_strat {
+                s if s == ZSTD_greedy => ZSTD_compressBlock_greedy_dedicatedDictSearch_row,
+                s if s == ZSTD_lazy => ZSTD_compressBlock_lazy_dedicatedDictSearch_row,
+                _ => ZSTD_compressBlock_lazy2_dedicatedDictSearch_row,
+            },
+        };
+    }
+
+    match dictMode {
+        ZSTD_dictMode_e::ZSTD_noDict => match effective_strat {
+            s if s == ZSTD_fast => ZSTD_compressBlock_fast,
+            s if s == ZSTD_dfast => ZSTD_compressBlock_doubleFast,
+            s if s == ZSTD_greedy => ZSTD_compressBlock_greedy,
+            s if s == ZSTD_lazy => ZSTD_compressBlock_lazy,
+            s if s == ZSTD_lazy2 => ZSTD_compressBlock_lazy2,
+            s if s == ZSTD_btlazy2 => ZSTD_compressBlock_btlazy2,
+            s if s == ZSTD_btopt => ZSTD_compressBlock_btopt,
+            s if s == ZSTD_btultra => ZSTD_compressBlock_btultra,
+            s if s == ZSTD_btultra2 => ZSTD_compressBlock_btultra2,
+            _ => ZSTD_compressBlock_fast,
+        },
+        ZSTD_dictMode_e::ZSTD_extDict => match effective_strat {
+            s if s == ZSTD_fast => ZSTD_compressBlock_fast_extDict,
+            s if s == ZSTD_dfast => ZSTD_compressBlock_doubleFast_extDict,
+            s if s == ZSTD_greedy => ZSTD_compressBlock_greedy_extDict,
+            s if s == ZSTD_lazy => ZSTD_compressBlock_lazy_extDict,
+            s if s == ZSTD_lazy2 => ZSTD_compressBlock_lazy2_extDict,
+            s if s == ZSTD_btlazy2 => ZSTD_compressBlock_btlazy2_extDict,
+            s if s == ZSTD_btopt => ZSTD_compressBlock_btopt_extDict,
+            s if s == ZSTD_btultra => ZSTD_compressBlock_btultra_extDict,
+            s if s == ZSTD_btultra2 => ZSTD_compressBlock_btultra_extDict,
+            _ => ZSTD_compressBlock_fast_extDict,
+        },
+        ZSTD_dictMode_e::ZSTD_dictMatchState => match effective_strat {
+            s if s == ZSTD_fast => ZSTD_compressBlock_fast_dictMatchState,
+            s if s == ZSTD_dfast => ZSTD_compressBlock_doubleFast_dictMatchState,
+            s if s == ZSTD_greedy => ZSTD_compressBlock_greedy_dictMatchState,
+            s if s == ZSTD_lazy => ZSTD_compressBlock_lazy_dictMatchState,
+            s if s == ZSTD_lazy2 => ZSTD_compressBlock_lazy2_dictMatchState,
+            s if s == ZSTD_btlazy2 => ZSTD_compressBlock_btlazy2_dictMatchState,
+            s if s == ZSTD_btopt => ZSTD_compressBlock_btopt_dictMatchState,
+            s if s == ZSTD_btultra => ZSTD_compressBlock_btultra_dictMatchState,
+            s if s == ZSTD_btultra2 => ZSTD_compressBlock_btultra_dictMatchState,
+            _ => ZSTD_compressBlock_fast_dictMatchState,
+        },
+        ZSTD_dictMode_e::ZSTD_dedicatedDictSearch => match effective_strat {
+            s if s == ZSTD_greedy => ZSTD_compressBlock_greedy_dedicatedDictSearch,
+            s if s == ZSTD_lazy => ZSTD_compressBlock_lazy_dedicatedDictSearch,
+            s if s == ZSTD_lazy2 => ZSTD_compressBlock_lazy2_dedicatedDictSearch,
+            _ => ZSTD_compressBlock_fast_dictMatchState,
+        },
+    }
+}
+
+/// Upstream `MIN_SEQUENCES_BLOCK_SPLITTING` (`zstd_compress.c:4204`).
+/// Minimum seq count before the block splitter considers bisecting.
+pub const MIN_SEQUENCES_BLOCK_SPLITTING: usize = 300;
+
+/// Upstream `ZSTD_MAX_NB_BLOCK_SPLITS` (`zstd_compress_internal.h:460`).
+/// Absolute cap on how many splits the block splitter can produce
+/// within a single block.
+pub const ZSTD_MAX_NB_BLOCK_SPLITS: usize = 196;
+
+/// Port of `ZSTD_writeEpilogue` (`zstd_compress.c:5368`). Writes a
+/// final empty `bt_raw` block and the optional XXH64 checksum to
+/// close a frame. If the compression session never emitted a block
+/// (`stage == ZSTDcs_init`), writes the frame header first.
+///
+/// Rust-port status: uses our CCtx's `stage`, `xxhState`, and
+/// `appliedParams` fields. Upstream's `ZSTD_writeFrameHeader` takes
+/// the params pointer + pledgedSrcSize + dictID; our port gets those
+/// from `cctx.appliedParams.fParams`, `cctx.pledgedSrcSizePlusOne`,
+/// and `cctx.dictID` respectively.
+pub fn ZSTD_writeEpilogue(cctx: &mut ZSTD_CCtx, dst: &mut [u8]) -> usize {
+    use crate::common::error::{ErrorCode, ERROR};
+    use crate::common::mem::{MEM_writeLE24, MEM_writeLE32};
+    use crate::common::xxhash::XXH64_digest;
+    use crate::decompress::zstd_decompress_block::{blockType_e, ZSTD_blockHeaderSize};
+
+    if cctx.stage == ZSTD_compressionStage_e::ZSTDcs_created {
+        return ERROR(ErrorCode::StageWrong);
+    }
+
+    let mut op = 0usize;
+
+    // Empty-frame path: haven't emitted a block yet.
+    if cctx.stage == ZSTD_compressionStage_e::ZSTDcs_init {
+        let pledged = if cctx.pledgedSrcSizePlusOne != 0 {
+            cctx.pledgedSrcSizePlusOne - 1
+        } else {
+            0
+        };
+        let fhSize = ZSTD_writeFrameHeader(
+            dst,
+            &cctx.appliedParams.fParams,
+            cctx.appliedParams.cParams.windowLog,
+            pledged,
+            cctx.dictID,
+        );
+        if crate::common::error::ERR_isError(fhSize) {
+            return fhSize;
+        }
+        op += fhSize;
+        cctx.stage = ZSTD_compressionStage_e::ZSTDcs_ongoing;
+    }
+
+    if cctx.stage != ZSTD_compressionStage_e::ZSTDcs_ending {
+        if dst.len() - op < ZSTD_blockHeaderSize {
+            return ERROR(ErrorCode::DstSizeTooSmall);
+        }
+        // Last-block marker: lastBlock=1, bt_raw, size=0.
+        let cBlockHeader24: u32 = 1 + ((blockType_e::bt_raw as u32) << 1);
+        MEM_writeLE24(&mut dst[op..], cBlockHeader24);
+        op += ZSTD_blockHeaderSize;
+    }
+
+    if cctx.appliedParams.fParams.checksumFlag != 0 {
+        if dst.len() - op < 4 {
+            return ERROR(ErrorCode::DstSizeTooSmall);
+        }
+        let checksum = XXH64_digest(&cctx.xxhState) as u32;
+        MEM_writeLE32(&mut dst[op..], checksum);
+        op += 4;
+    }
+
+    cctx.stage = ZSTD_compressionStage_e::ZSTDcs_created;
+    op
+}
+
+/// Port of `ZSTD_optimalBlockSize` (`zstd_compress.c:4576`). Picks the
+/// next block size for the outer compressor loop: falls through to
+/// `min(srcSize, blockSizeMax)` unless the caller has enabled pre-
+/// block splitting. Upstream's pre-splitter samples `src` to find a
+/// natural boundary; v0.1 always returns the plain min since
+/// `preBlockSplitter_level` isn't carried on params yet.
+pub fn ZSTD_optimalBlockSize(
+    src: &[u8],
+    blockSizeMax: usize,
+    _splitLevel: i32,
+    _strat: u32,
+    _savings: i64,
+) -> usize {
+    src.len().min(blockSizeMax)
+}
+
+/// Port of `ZSTD_compressContinue_public` (`zstd_compress.c:4877`).
+/// Non-deprecated alias of `ZSTD_compressContinue`.
+#[inline]
+pub fn ZSTD_compressContinue_public(
+    cctx: &mut ZSTD_CCtx,
+    dst: &mut [u8],
+    src: &[u8],
+) -> usize {
+    ZSTD_compressContinue(cctx, dst, src)
+}
+
+/// Port of `ZSTD_compressEnd_public` (`zstd_compress.c:5431`). Public
+/// alias of `ZSTD_compressEnd`.
+#[inline]
+pub fn ZSTD_compressEnd_public(
+    cctx: &mut ZSTD_CCtx,
+    dst: &mut [u8],
+    src: &[u8],
+) -> usize {
+    ZSTD_compressEnd(cctx, dst, src)
+}
+
+/// Port of `ZSTD_compressBlock` (`zstd_compress.c:4917`). Public
+/// single-block compressor that emits a headerless block body.
+/// Upstream routes through `ZSTD_compressBlock_deprecated` →
+/// `ZSTD_compressContinue_internal` with `frame=0`. Our port doesn't
+/// carry the block-mode pipeline yet — returns `ErrorCode::Generic`.
+pub fn ZSTD_compressBlock(
+    _cctx: &mut ZSTD_CCtx,
+    _dst: &mut [u8],
+    _src: &[u8],
+) -> usize {
+    ERROR(ErrorCode::Generic)
+}
+
+/// Port of `ZSTD_compressBlock_deprecated` (`zstd_compress.c:4907`).
+/// Legacy-name forwarder to `ZSTD_compressBlock`.
+#[inline]
+pub fn ZSTD_compressBlock_deprecated(
+    cctx: &mut ZSTD_CCtx,
+    dst: &mut [u8],
+    src: &[u8],
+) -> usize {
+    ZSTD_compressBlock(cctx, dst, src)
+}
+
+/// Port of `ZSTD_getBlockSize_deprecated` (`zstd_compress.c:4893`).
+/// Legacy alias of `ZSTD_getBlockSize`.
+#[inline]
+pub fn ZSTD_getBlockSize_deprecated(cctx: &ZSTD_CCtx) -> usize {
+    ZSTD_getBlockSize(cctx)
+}
+
 /// Port of `ZSTD_compressBegin_usingCDict`. Legacy begin/end
 /// session initializer that wires a pre-built CDict.
 pub fn ZSTD_compressBegin_usingCDict(cctx: &mut ZSTD_CCtx, cdict: &ZSTD_CDict) -> usize {
@@ -659,9 +1230,454 @@ pub fn ZSTD_compressBegin_usingCDict(cctx: &mut ZSTD_CCtx, cdict: &ZSTD_CDict) -
     if ERR_isError(rc) {
         return rc;
     }
-    cctx.stream_dict = cdict.dictContent.clone();
-    cctx.stream_level = Some(cdict.compressionLevel);
-    0
+    // Use refCDict for full dictID / dictContentSize / level tracking.
+    ZSTD_CCtx_refCDict(cctx, cdict)
+}
+
+/// Port of `ZSTD_compressBegin_usingCDict_internal`
+/// (`zstd_compress.c:5847`). Full variant: picks cParams based on the
+/// CDict + pledgedSrcSize heuristic (attach-mode vs derive-from-level),
+/// composes `ZSTD_CCtx_params`, and routes through
+/// `ZSTD_compressBegin_internal` with the cdict.
+pub fn ZSTD_compressBegin_usingCDict_internal(
+    cctx: &mut ZSTD_CCtx,
+    cdict: &ZSTD_CDict,
+    fParams: ZSTD_FrameParameters,
+    pledgedSrcSize: u64,
+) -> usize {
+    use crate::decompress::zstd_decompress::ZSTD_CONTENTSIZE_UNKNOWN;
+    use crate::decompress::zstd_ddict::ZSTD_dictContentType_e;
+    // Upstream: pick between CDict's cParams verbatim (attach mode)
+    // and `ZSTD_getCParams(cdict->compressionLevel, pledged, dictSize)`
+    // (re-derive). Threshold: pledged < 128KB, pledged < dictSize*6,
+    // pledged == UNKNOWN, or cdict.compressionLevel == 0.
+    let dictSize = cdict.dictContent.len();
+    let use_cdict_params = pledgedSrcSize < ZSTD_USE_CDICT_PARAMS_SRCSIZE_CUTOFF
+        || pledgedSrcSize < dictSize as u64 * ZSTD_USE_CDICT_PARAMS_DICTSIZE_MULTIPLIER
+        || pledgedSrcSize == ZSTD_CONTENTSIZE_UNKNOWN
+        || cdict.compressionLevel == 0;
+
+    let cParams = if use_cdict_params {
+        ZSTD_getCParamsFromCDict(cdict)
+    } else {
+        ZSTD_getCParams(cdict.compressionLevel, pledgedSrcSize, dictSize)
+    };
+
+    let params = ZSTD_parameters { cParams, fParams };
+    let mut cctxParams = ZSTD_CCtx_params::default();
+    ZSTD_CCtxParams_init_internal(&mut cctxParams, &params, cdict.compressionLevel);
+    ZSTD_compressBegin_internal(
+        cctx,
+        &[],
+        ZSTD_dictContentType_e::ZSTD_dct_auto,
+        Some(cdict),
+        &cctxParams,
+        pledgedSrcSize,
+        ZSTD_buffered_policy_e::ZSTDb_not_buffered,
+    )
+}
+
+/// Port of `ZSTD_compressBegin_usingCDict_advanced`. Legacy
+/// begin/end-style initializer that wires a pre-built CDict with
+/// explicit `fParams` + `pledgedSrcSize`. Upstream
+/// (zstd_compress.c:5888) routes through
+/// `ZSTD_compressBegin_usingCDict_internal`.
+pub fn ZSTD_compressBegin_usingCDict_advanced(
+    cctx: &mut ZSTD_CCtx,
+    cdict: &ZSTD_CDict,
+    fParams: ZSTD_FrameParameters,
+    pledgedSrcSize: u64,
+) -> usize {
+    ZSTD_compressBegin_usingCDict_internal(cctx, cdict, fParams, pledgedSrcSize)
+}
+
+/// Port of `ZSTD_compressBegin_advanced`. Legacy begin/end-style
+/// initializer that takes an explicit `ZSTD_parameters` bundle + a
+/// raw-content dict + pledged src size. Upstream
+/// (zstd_compress.c:5329) validates cParams, then initializes the
+/// session.
+pub fn ZSTD_compressBegin_advanced(
+    cctx: &mut ZSTD_CCtx,
+    dict: &[u8],
+    params: ZSTD_parameters,
+    pledgedSrcSize: u64,
+) -> usize {
+    let mut cctxParams = ZSTD_CCtx_params::default();
+    ZSTD_CCtxParams_init_internal(&mut cctxParams, &params, ZSTD_NO_CLEVEL);
+    ZSTD_compressBegin_advanced_internal(
+        cctx,
+        dict,
+        crate::decompress::zstd_ddict::ZSTD_dictContentType_e::ZSTD_dct_auto,
+        None,
+        &cctxParams,
+        pledgedSrcSize,
+    )
+}
+
+/// Port of `ZSTD_loadCEntropy` (`zstd_compress.c:5085`). Parses the
+/// entropy-tables section of a zstd-format dictionary into the
+/// caller's entropy tables + `rep[]`. Starts reading at `dict[8..]`
+/// (skipping magic + dictID, which the caller has already validated).
+///
+/// Layout: HUF CTable → FSE OF table → FSE ML table → FSE LL table
+/// → 3 × 4-byte rep values. Returns total bytes consumed, or a
+/// `DictionaryCorrupted` error on any parse failure.
+///
+/// Sets `repeatMode` for each table based on `ZSTD_dictNCountRepeat` —
+/// tables with every symbol present become `FSE_repeat_valid`;
+/// tables with zero-weights become `FSE_repeat_check`. HUF similarly
+/// becomes `HUF_repeat_valid` only if no zero-weight symbols AND the
+/// full 255-symbol alphabet is present.
+pub fn ZSTD_loadCEntropy(
+    entropy: &mut ZSTD_entropyCTables_t,
+    rep: &mut [u32; 3],
+    dict: &[u8],
+) -> usize {
+    use crate::common::error::{ErrorCode, ErrorCode::DictionaryCorrupted, ERR_isError, ERROR};
+    use crate::common::mem::MEM_readLE32;
+    use crate::compress::fse_compress::FSE_buildCTable_wksp;
+    use crate::compress::huf_compress::{
+        HUF_readCTable, HUF_WORKSPACE_SIZE,
+    };
+    use crate::compress::zstd_compress_sequences::{
+        FSE_repeat, ZSTD_dictNCountRepeat,
+    };
+    use crate::compress::zstd_compress_literals::HUF_repeat;
+    use crate::decompress::zstd_decompress_block::{
+        LLFSELog, MLFSELog, MaxLL, MaxML, MaxOff, OffFSELog,
+    };
+
+    if dict.len() < 8 {
+        return ERROR(DictionaryCorrupted);
+    }
+    let mut pos = 8usize; // skip magic + dictID
+    let mut workspace = vec![0u8; HUF_WORKSPACE_SIZE];
+
+    // --- HUF literals CTable ---
+    entropy.huf.repeatMode = HUF_repeat::HUF_repeat_check;
+    let mut maxSymbolValue: u32 = 255;
+    let mut hasZeroWeights: u32 = 1;
+    let hufHeaderSize =
+        HUF_readCTable(&mut entropy.huf.CTable, &mut maxSymbolValue, &dict[pos..], &mut hasZeroWeights);
+    if ERR_isError(hufHeaderSize) {
+        return ERROR(DictionaryCorrupted);
+    }
+    if hasZeroWeights == 0 && maxSymbolValue == 255 {
+        entropy.huf.repeatMode = HUF_repeat::HUF_repeat_valid;
+    }
+    pos += hufHeaderSize;
+
+    // --- FSE offset table ---
+    let mut offcodeNCount = [0i16; (MaxOff + 1) as usize];
+    let mut offcodeMaxValue: u32 = MaxOff;
+    let mut offcodeLog: u32 = 0;
+    let offcodeHeaderSize = crate::common::entropy_common::FSE_readNCount(
+        &mut offcodeNCount,
+        &mut offcodeMaxValue,
+        &mut offcodeLog,
+        &dict[pos..],
+    );
+    if ERR_isError(offcodeHeaderSize) || offcodeLog > OffFSELog {
+        return ERROR(DictionaryCorrupted);
+    }
+    let rc = FSE_buildCTable_wksp(
+        &mut entropy.fse.offcodeCTable,
+        &offcodeNCount,
+        MaxOff,
+        offcodeLog,
+        &mut workspace,
+    );
+    if ERR_isError(rc) {
+        return ERROR(DictionaryCorrupted);
+    }
+    pos += offcodeHeaderSize;
+
+    // --- FSE match-length table ---
+    let mut mlNCount = [0i16; (MaxML + 1) as usize];
+    let mut mlMaxValue: u32 = MaxML;
+    let mut mlLog: u32 = 0;
+    let mlHeaderSize = crate::common::entropy_common::FSE_readNCount(
+        &mut mlNCount,
+        &mut mlMaxValue,
+        &mut mlLog,
+        &dict[pos..],
+    );
+    if ERR_isError(mlHeaderSize) || mlLog > MLFSELog {
+        return ERROR(DictionaryCorrupted);
+    }
+    let rc = FSE_buildCTable_wksp(
+        &mut entropy.fse.matchlengthCTable,
+        &mlNCount,
+        mlMaxValue,
+        mlLog,
+        &mut workspace,
+    );
+    if ERR_isError(rc) {
+        return ERROR(DictionaryCorrupted);
+    }
+    entropy.fse.matchlength_repeatMode = ZSTD_dictNCountRepeat(&mlNCount, mlMaxValue, MaxML);
+    pos += mlHeaderSize;
+
+    // --- FSE literal-length table ---
+    let mut llNCount = [0i16; (MaxLL + 1) as usize];
+    let mut llMaxValue: u32 = MaxLL;
+    let mut llLog: u32 = 0;
+    let llHeaderSize = crate::common::entropy_common::FSE_readNCount(
+        &mut llNCount,
+        &mut llMaxValue,
+        &mut llLog,
+        &dict[pos..],
+    );
+    if ERR_isError(llHeaderSize) || llLog > LLFSELog {
+        return ERROR(DictionaryCorrupted);
+    }
+    let rc = FSE_buildCTable_wksp(
+        &mut entropy.fse.litlengthCTable,
+        &llNCount,
+        llMaxValue,
+        llLog,
+        &mut workspace,
+    );
+    if ERR_isError(rc) {
+        return ERROR(DictionaryCorrupted);
+    }
+    entropy.fse.litlength_repeatMode = ZSTD_dictNCountRepeat(&llNCount, llMaxValue, MaxLL);
+    pos += llHeaderSize;
+
+    // --- 3 × 4-byte rep values ---
+    if pos + 12 > dict.len() {
+        return ERROR(DictionaryCorrupted);
+    }
+    rep[0] = MEM_readLE32(&dict[pos..pos + 4]);
+    rep[1] = MEM_readLE32(&dict[pos + 4..pos + 8]);
+    rep[2] = MEM_readLE32(&dict[pos + 8..pos + 12]);
+    pos += 12;
+
+    // --- Validate ---
+    let dictContentSize = dict.len() - pos;
+    let offcodeMax = if dictContentSize as u64 <= u32::MAX as u64 - 128 * 1024 {
+        let maxOffset = dictContentSize as u32 + 128 * 1024;
+        crate::common::bits::ZSTD_highbit32(maxOffset)
+    } else {
+        MaxOff
+    };
+    entropy.fse.offcode_repeatMode =
+        ZSTD_dictNCountRepeat(&offcodeNCount, offcodeMaxValue, offcodeMax.min(MaxOff));
+
+    // All repcodes must be nonzero and within dict content.
+    for r in rep.iter() {
+        if *r == 0 || *r as usize > dictContentSize {
+            return ERROR(DictionaryCorrupted);
+        }
+    }
+
+    let _ = FSE_repeat::FSE_repeat_valid; // type anchor
+    let _ = ErrorCode::DictionaryCorrupted;
+    pos
+}
+
+/// Port of `ZSTD_compress_insertDictionary` (`zstd_compress.c:5217`).
+/// Routes between raw-content and zstd-format dict paths. For the
+/// zstd-format path, resets the entropy block state and runs
+/// `ZSTD_loadCEntropy` to parse HUF + FSE tables + reps from the
+/// dict bytes, then returns the parsed dictID.
+///
+/// Our simplified port: `dict_rawContent` and `dict_auto` with no
+/// magic prefix just stash the dict on the CCtx for the existing
+/// concatenate-with-src compression path. Match-state pre-seeding
+/// (upstream's `ZSTD_loadDictionaryContent`) is done lazily inside
+/// `ZSTD_compressFrame_fast_with_prefix`.
+///
+/// Returns the dict's dictID (or 0 for raw-content), or a zstd
+/// error code on a malformed zstd-format dict.
+pub fn ZSTD_compress_insertDictionary(
+    cctx: &mut ZSTD_CCtx,
+    dict: &[u8],
+    dictContentType: crate::decompress::zstd_ddict::ZSTD_dictContentType_e,
+) -> usize {
+    use crate::common::error::{ErrorCode, ERR_isError, ERROR};
+    use crate::common::mem::MEM_readLE32;
+    use crate::decompress::zstd_ddict::ZSTD_dictContentType_e;
+    use crate::decompress::zstd_decompress::ZSTD_MAGICNUMBER_DICTIONARY;
+
+    if dict.is_empty() || dict.len() < 8 {
+        if dictContentType == ZSTD_dictContentType_e::ZSTD_dct_fullDict {
+            return ERROR(ErrorCode::DictionaryWrong);
+        }
+        // Short or absent dict: no-op.
+        return 0;
+    }
+
+    ZSTD_reset_compressedBlockState(&mut cctx.prev_rep, &mut cctx.prevEntropy);
+
+    // Raw-content mode: stash + return 0.
+    if dictContentType == ZSTD_dictContentType_e::ZSTD_dct_rawContent {
+        cctx.stream_dict = dict.to_vec();
+        cctx.dictContentSize = dict.len();
+        cctx.dictID = 0;
+        return 0;
+    }
+
+    // Auto mode with non-magic prefix falls back to raw content.
+    let magic = MEM_readLE32(&dict[..4]);
+    if magic != ZSTD_MAGICNUMBER_DICTIONARY {
+        if dictContentType == ZSTD_dictContentType_e::ZSTD_dct_fullDict {
+            return ERROR(ErrorCode::DictionaryWrong);
+        }
+        cctx.stream_dict = dict.to_vec();
+        cctx.dictContentSize = dict.len();
+        cctx.dictID = 0;
+        return 0;
+    }
+
+    // Magic-prefixed zstd-format dict: parse entropy.
+    let eSize = ZSTD_loadCEntropy(&mut cctx.prevEntropy, &mut cctx.prev_rep, dict);
+    if ERR_isError(eSize) {
+        return eSize;
+    }
+    // Parse dictID from the 4-byte field after the magic.
+    let dictID = MEM_readLE32(&dict[4..8]);
+    cctx.dictID = dictID;
+    // The dict content follows the entropy tables.
+    cctx.stream_dict = dict[eSize..].to_vec();
+    cctx.dictContentSize = dict.len() - eSize;
+    dictID as usize
+}
+
+/// Port of `ZSTD_compressBegin_internal` (`zstd_compress.c:5262`).
+/// Internal workhorse of the compressBegin family. Full upstream
+/// version routes through `ZSTD_resetCCtx_internal` +
+/// `ZSTD_compress_insertDictionary`; our simplified port copies
+/// `appliedParams` + tracks pledgedSrcSize + dictID/dictContentSize
+/// on the CCtx (via the loadDictionary/refCDict path). The match
+/// state seeding is still deferred — happens lazily during the
+/// actual compress call.
+pub fn ZSTD_compressBegin_internal(
+    cctx: &mut ZSTD_CCtx,
+    dict: &[u8],
+    _dictContentType: crate::decompress::zstd_ddict::ZSTD_dictContentType_e,
+    cdict: Option<&ZSTD_CDict>,
+    params: &ZSTD_CCtx_params,
+    pledgedSrcSize: u64,
+    _zbuff: ZSTD_buffered_policy_e,
+) -> usize {
+    debug_assert!(!ERR_isError(ZSTD_checkCParams(params.cParams)));
+    debug_assert!(cdict.is_none() || dict.is_empty());
+    cctx.appliedParams = *params;
+    // Keep the legacy `stream_level` shadow in sync so existing
+    // getParameter callers see the level the user configured.
+    cctx.stream_level = Some(params.compressionLevel);
+    // Propagate the params-level `format` (set by
+    // `ZSTD_CCtxParams_setParameter(c_format, ...)` before this call)
+    // onto the direct `cctx.format` slot the compressor path reads.
+    // Without this, a params-driven init would silently fall back to
+    // the default zstd1 format even when the caller wanted magicless.
+    cctx.format = params.format;
+    cctx.stage = ZSTD_compressionStage_e::ZSTDcs_init;
+    cctx.consumedSrcSize = 0;
+    cctx.producedCSize = 0;
+    cctx.isFirstBlock = 1;
+    crate::common::xxhash::XXH64_reset(&mut cctx.xxhState, 0);
+    cctx.pledgedSrcSizePlusOne = pledgedSrcSize.wrapping_add(1);
+
+    if let Some(cd) = cdict {
+        ZSTD_CCtx_refCDict(cctx, cd)
+    } else if !dict.is_empty() {
+        ZSTD_CCtx_loadDictionary(cctx, dict)
+    } else {
+        cctx.dictID = 0;
+        cctx.dictContentSize = 0;
+        0
+    }
+}
+
+/// Port of `ZSTD_initCStream_internal` (`zstd_compress.c:6010`).
+/// Lower-level variant taking `ZSTD_CCtx_params*`. Resets the
+/// session, sets pledged size, stashes the params, and wires in
+/// either a raw-content dict or a CDict (exclusive — upstream
+/// asserts both aren't set). Delegates to existing Rust API methods.
+pub fn ZSTD_initCStream_internal(
+    zcs: &mut ZSTD_CCtx,
+    dict: &[u8],
+    cdict: Option<&ZSTD_CDict>,
+    params: &ZSTD_CCtx_params,
+    pledgedSrcSize: u64,
+) -> usize {
+    let rc = ZSTD_CCtx_reset(zcs, ZSTD_ResetDirective::ZSTD_reset_session_only);
+    if ERR_isError(rc) {
+        return rc;
+    }
+    let rc = ZSTD_CCtx_setPledgedSrcSize(zcs, pledgedSrcSize);
+    if ERR_isError(rc) {
+        return rc;
+    }
+    debug_assert!(!ERR_isError(ZSTD_checkCParams(params.cParams)));
+    // "either dict or cdict, not both" — upstream assertion.
+    debug_assert!(cdict.is_none() || dict.is_empty());
+    // Upstream's `zcs->requestedParams = *params` — keep the full
+    // param bundle so subsequent `ZSTD_CCtx_getParameter` reads
+    // reflect what the caller actually requested.
+    zcs.requestedParams = *params;
+    if !dict.is_empty() {
+        ZSTD_CCtx_loadDictionary(zcs, dict)
+    } else if let Some(cd) = cdict {
+        ZSTD_CCtx_refCDict(zcs, cd)
+    } else {
+        0
+    }
+}
+
+/// Port of `ZSTD_compressBegin_advanced_internal`
+/// (`zstd_compress.c:5309`). Lower-level variant that takes a
+/// pre-built `ZSTD_CCtx_params*` + optional CDict. Our simplified
+/// port ignores the CDict / dictContentType / dictTableLoadMethod
+/// plumbing (these land when `ZSTD_compressBegin_internal` is
+/// ported) and routes through `ZSTD_compressBegin_advanced` for the
+/// dict-only case.
+pub fn ZSTD_compressBegin_advanced_internal(
+    cctx: &mut ZSTD_CCtx,
+    dict: &[u8],
+    dictContentType: crate::decompress::zstd_ddict::ZSTD_dictContentType_e,
+    cdict: Option<&ZSTD_CDict>,
+    params: &ZSTD_CCtx_params,
+    pledgedSrcSize: u64,
+) -> usize {
+    let rc = ZSTD_checkCParams(params.cParams);
+    if ERR_isError(rc) {
+        return rc;
+    }
+    ZSTD_compressBegin_internal(
+        cctx,
+        dict,
+        dictContentType,
+        cdict,
+        params,
+        pledgedSrcSize,
+        ZSTD_buffered_policy_e::ZSTDb_not_buffered,
+    )
+}
+
+/// Port of `ZSTD_compressBegin_usingDict_deprecated`
+/// (`zstd_compress.c:5341`). Legacy name; forwards to the modern
+/// `ZSTD_compressBegin_usingDict`.
+#[inline]
+pub fn ZSTD_compressBegin_usingDict_deprecated(
+    cctx: &mut ZSTD_CCtx,
+    dict: &[u8],
+    compressionLevel: i32,
+) -> usize {
+    ZSTD_compressBegin_usingDict(cctx, dict, compressionLevel)
+}
+
+/// Port of `ZSTD_compressBegin_usingCDict_deprecated`
+/// (`zstd_compress.c:5897`). Legacy name; forwards to modern
+/// `ZSTD_compressBegin_usingCDict`.
+#[inline]
+pub fn ZSTD_compressBegin_usingCDict_deprecated(
+    cctx: &mut ZSTD_CCtx,
+    cdict: &ZSTD_CDict,
+) -> usize {
+    ZSTD_compressBegin_usingCDict(cctx, cdict)
 }
 
 /// Port of `ZSTD_CCtx_refThreadPool`. Wires an external thread pool
@@ -669,9 +1685,17 @@ pub fn ZSTD_compressBegin_usingCDict(cctx: &mut ZSTD_CCtx, cdict: &ZSTD_CDict) -
 /// accept the call for API parity but ignore the pool.
 #[inline]
 pub fn ZSTD_CCtx_refThreadPool(
-    _cctx: &mut ZSTD_CCtx,
+    cctx: &mut ZSTD_CCtx,
     _pool: Option<&crate::common::pool::POOL_ctx>,
 ) -> usize {
+    // Upstream (zstd_compress.c:1356) stage-gates thread-pool binding
+    // the same way as the dict-family setters. Attaching a pool mid-
+    // stream is undefined in upstream and could race with an active
+    // worker dispatch once MT support lands. Gate now so the contract
+    // is consistent across the CCtx API surface.
+    if !cctx_is_in_init_stage(cctx) {
+        return ERROR(ErrorCode::StageWrong);
+    }
     0
 }
 
@@ -710,8 +1734,24 @@ pub fn ZSTD_CCtx_loadDictionary_byReference(cctx: &mut ZSTD_CCtx, dict: &[u8]) -
 /// CCtx. v0.1: copies the CDict's content into `cctx.stream_dict` and
 /// sets the compression level.
 pub fn ZSTD_CCtx_refCDict(cctx: &mut ZSTD_CCtx, cdict: &ZSTD_CDict) -> usize {
+    // Upstream (zstd_compress.c:1346) stage-gates the same way as
+    // loadDictionary / setPledgedSrcSize — swapping a CDict mid-
+    // session would leave already-buffered bytes compressed against
+    // mismatched state.
+    if !cctx_is_in_init_stage(cctx) {
+        return ERROR(ErrorCode::StageWrong);
+    }
+    // Upstream (zstd_compress.c:1348) clears any prior dict state
+    // before installing the new CDict. Mirror so a `refCDict` after
+    // an earlier `refPrefix` / `loadDictionary` doesn't leave stale
+    // fields (e.g. `prefix_is_single_use`) set.
+    ZSTD_clearAllDicts(cctx);
     cctx.stream_dict = cdict.dictContent.clone();
     cctx.stream_level = Some(cdict.compressionLevel);
+    cctx.dictID = cdict.dictID;
+    cctx.dictContentSize = cdict.dictContent.len();
+    // refCDict attaches persistently — the single-use flag stays
+    // at the `clearAllDicts` default (`false`).
     0
 }
 
@@ -740,8 +1780,13 @@ pub fn ZSTD_CStreamInSize() -> usize {
 /// Port of `ZSTD_CStreamOutSize`. Suggested output-buffer size —
 /// `ZSTD_compressBound(ZSTD_BLOCKSIZE_MAX) + header/trailer margin`.
 pub fn ZSTD_CStreamOutSize() -> usize {
-    use crate::decompress::zstd_decompress_block::ZSTD_BLOCKSIZE_MAX;
-    ZSTD_compressBound(ZSTD_BLOCKSIZE_MAX) + ZSTD_FRAMEHEADERSIZE_MAX + 4
+    // Upstream (zstd_compress.c:5980):
+    //   ZSTD_compressBound(ZSTD_BLOCKSIZE_MAX) + ZSTD_blockHeaderSize + 4
+    // — the 4 bytes cover the optional XXH64 checksum trailer.
+    // Previously used `ZSTD_FRAMEHEADERSIZE_MAX` (18) which over-
+    // estimated the stream-end margin by 15 bytes.
+    use crate::decompress::zstd_decompress_block::{ZSTD_BLOCKSIZE_MAX, ZSTD_blockHeaderSize};
+    ZSTD_compressBound(ZSTD_BLOCKSIZE_MAX) + ZSTD_blockHeaderSize + 4
 }
 
 /// Upstream `ZSTD_MAX_CLEVEL` — maximum supported positive level.
@@ -826,17 +1871,19 @@ pub const ZSTD_DEFAULT_CPARAMS: [[CParamRow; 23]; 4] = [
     ],
 ];
 
-/// Port of `ZSTD_getCParams`. Returns the baseline cParams for a
-/// (level, srcSizeHint) combination. `srcSizeHint == 0` is treated as
-/// "unknown" (upstream: `ZSTD_CONTENTSIZE_UNKNOWN`).
-pub fn ZSTD_getCParams(
+/// Port of `ZSTD_getCParams_internal` (`zstd_compress.c:8286`).
+/// Returns baseline cParams for a (level, srcSizeHint, dictSize,
+/// mode) combination, then funnels through
+/// `ZSTD_adjustCParams_internal` for final clamping. Picks the
+/// tableID row via `ZSTD_getCParamRowSize`.
+pub fn ZSTD_getCParams_internal(
     compressionLevel: i32,
     srcSizeHint: u64,
-    _dictSize: usize,
+    dictSize: usize,
+    mode: ZSTD_CParamMode_e,
 ) -> crate::compress::match_state::ZSTD_compressionParameters {
-    // Pick tableID based on srcSize (upstream `ZSTD_getCParamRowSize`
-    // returns 0 if srcSize == UNKNOWN; we map that to tableID 0).
-    let rSize = if srcSizeHint == 0 { u64::MAX } else { srcSizeHint };
+    use crate::compress::zstd_ldm::ZSTD_ParamSwitch_e;
+    let rSize = ZSTD_getCParamRowSize(srcSizeHint, dictSize, mode);
     let tableID: usize = (rSize <= 256 * 1024) as usize
         + (rSize <= 128 * 1024) as usize
         + (rSize <= 16 * 1024) as usize;
@@ -861,19 +1908,40 @@ pub fn ZSTD_getCParams(
         targetLength: tl,
         strategy: strat,
     };
-    // Negative levels → acceleration factor via targetLength = -level.
     if compressionLevel < 0 {
         cp.targetLength = (-compressionLevel) as u32;
     }
-    cp
+    ZSTD_adjustCParams_internal(
+        cp,
+        srcSizeHint,
+        dictSize as u64,
+        mode,
+        ZSTD_ParamSwitch_e::ZSTD_ps_auto,
+    )
 }
 
-/// Port of `ZSTD_compress`. The public one-shot frame compressor.
-///
-/// v0.1 scope: only strategy=fast (level 1-2 for large srcs, level 1-2
-/// for tableID 2+) is actually supported — higher strategies return
-/// `Generic` until dfast/lazy/opt ports land. Callers should either
-/// pick level 1 or cap cParams.strategy manually.
+/// Port of `ZSTD_getCParams` (`zstd_compress.c:8314`). Public wrapper
+/// of `ZSTD_getCParams_internal` with `mode = ZSTD_cpm_unknown`.
+/// `srcSizeHint == 0` maps to `ZSTD_CONTENTSIZE_UNKNOWN` per upstream.
+pub fn ZSTD_getCParams(
+    compressionLevel: i32,
+    srcSizeHint: u64,
+    dictSize: usize,
+) -> crate::compress::match_state::ZSTD_compressionParameters {
+    use crate::decompress::zstd_decompress::ZSTD_CONTENTSIZE_UNKNOWN;
+    let effective_hint = if srcSizeHint == 0 {
+        ZSTD_CONTENTSIZE_UNKNOWN
+    } else {
+        srcSizeHint
+    };
+    ZSTD_getCParams_internal(
+        compressionLevel,
+        effective_hint,
+        dictSize,
+        ZSTD_CParamMode_e::ZSTD_cpm_unknown,
+    )
+}
+
 /// Port of `ZSTD_cParameter` — the parameter id enum for the
 /// parametric `ZSTD_CCtx_setParameter` / `ZSTD_CCtx_getParameter`
 /// API. Only the subset that our compressor actually honors is
@@ -887,6 +1955,28 @@ pub enum ZSTD_cParameter {
     /// `ZSTD_c_dictIDFlag`: emit dictID into the frame header when
     /// applicable (default: 1).
     ZSTD_c_dictIDFlag = 202,
+    /// Upstream `ZSTD_c_format` = `ZSTD_c_experimentalParam2` = 10
+    /// (`zstd.h:523, 2050`). Toggles between `ZSTD_f_zstd1` (default)
+    /// and `ZSTD_f_zstd1_magicless`. Sibling of decoder-side
+    /// `ZSTD_d_format` (= `ZSTD_d_experimentalParam1` = 1000).
+    ZSTD_c_format = 10,
+    /// Upstream `ZSTD_c_nbWorkers` (400). Worker count for
+    /// multithreaded compression. v0.1 is single-threaded so
+    /// only 0 is accepted — any positive value returns
+    /// `ParameterUnsupported` to match upstream's contract that
+    /// MT-unsupported builds reject non-zero workers.
+    ZSTD_c_nbWorkers = 400,
+}
+
+/// Port of `ZSTD_isUpdateAuthorized` (`zstd_compress.c:674`). Tells
+/// `ZSTD_CCtx_setParameter` which parameters can be updated mid-
+/// session (as opposed to only during the init stage). Upstream lets
+/// cParams-only tweaks through so a long-running streaming compressor
+/// can adjust level / strategy / logs between frames; the frame flags
+/// and format cannot change once a frame is in flight.
+#[inline]
+fn is_update_authorized(param: ZSTD_cParameter) -> bool {
+    matches!(param, ZSTD_cParameter::ZSTD_c_compressionLevel)
 }
 
 /// Port of `ZSTD_CCtx_setParameter`. Stashes the value on the CCtx
@@ -898,21 +1988,99 @@ pub fn ZSTD_CCtx_setParameter(
     param: ZSTD_cParameter,
     value: i32,
 ) -> usize {
+    // Upstream (zstd_compress.c:727) stage-gates mid-session param
+    // updates: only the `ZSTD_isUpdateAuthorized` subset (currently
+    // `ZSTD_c_compressionLevel` and cParams-family knobs we haven't
+    // surfaced yet) can change once input has been staged. Everything
+    // else — format, frame flags, nbWorkers — rejects with
+    // `StageWrong`.
+    if !cctx_is_in_init_stage(cctx) && !is_update_authorized(param) {
+        return ERROR(ErrorCode::StageWrong);
+    }
     match param {
         ZSTD_cParameter::ZSTD_c_compressionLevel => {
-            cctx.stream_level = Some(value);
+            // Upstream (zstd_compress.c:797) clamps via
+            // `ZSTD_cParam_clampBounds` and treats `value == 0` as
+            // `ZSTD_CLEVEL_DEFAULT`. Rust port was previously a raw
+            // stash — getParameter would return 0 or out-of-range
+            // values unmodified.
+            let mut clamped = value;
+            let rc =
+                ZSTD_cParam_clampBounds(ZSTD_cParameter::ZSTD_c_compressionLevel, &mut clamped);
+            if ERR_isError(rc) {
+                return rc;
+            }
+            let level = if clamped == 0 {
+                ZSTD_CLEVEL_DEFAULT
+            } else {
+                clamped
+            };
+            cctx.stream_level = Some(level);
+            cctx.requestedParams.compressionLevel = level;
             0
         }
         ZSTD_cParameter::ZSTD_c_checksumFlag => {
+            // Upstream bounds-checks each 0/1 flag — out-of-range (e.g.
+            // -1 or 2) returns `ParameterOutOfBound`, not a silent
+            // clamp. Previously we cast `value as u32` which turned
+            // -1 into `0xFFFFFFFF` on the header write path.
+            let bounds = ZSTD_cParam_getBounds(ZSTD_cParameter::ZSTD_c_checksumFlag);
+            if value < bounds.lowerBound || value > bounds.upperBound {
+                return ERROR(ErrorCode::ParameterOutOfBound);
+            }
             cctx.param_checksum = value != 0;
+            cctx.requestedParams.fParams.checksumFlag = value as u32;
             0
         }
         ZSTD_cParameter::ZSTD_c_contentSizeFlag => {
+            let bounds = ZSTD_cParam_getBounds(ZSTD_cParameter::ZSTD_c_contentSizeFlag);
+            if value < bounds.lowerBound || value > bounds.upperBound {
+                return ERROR(ErrorCode::ParameterOutOfBound);
+            }
             cctx.param_contentSize = value != 0;
+            cctx.requestedParams.fParams.contentSizeFlag = value as u32;
             0
         }
         ZSTD_cParameter::ZSTD_c_dictIDFlag => {
+            let bounds = ZSTD_cParam_getBounds(ZSTD_cParameter::ZSTD_c_dictIDFlag);
+            if value < bounds.lowerBound || value > bounds.upperBound {
+                return ERROR(ErrorCode::ParameterOutOfBound);
+            }
             cctx.param_dictID = value != 0;
+            // Upstream `noDictIDFlag = !dictIDFlag`.
+            cctx.requestedParams.fParams.noDictIDFlag = (value == 0) as u32;
+            0
+        }
+        ZSTD_cParameter::ZSTD_c_format => {
+            // Upstream bounds-checks against `[zstd1, magicless]`.
+            let bounds = ZSTD_cParam_getBounds(ZSTD_cParameter::ZSTD_c_format);
+            if value < bounds.lowerBound || value > bounds.upperBound {
+                return ERROR(ErrorCode::ParameterOutOfBound);
+            }
+            let new_format = match value {
+                v if v == crate::decompress::zstd_decompress::ZSTD_format_e::ZSTD_f_zstd1_magicless
+                    as i32 =>
+                {
+                    crate::decompress::zstd_decompress::ZSTD_format_e::ZSTD_f_zstd1_magicless
+                }
+                _ => crate::decompress::zstd_decompress::ZSTD_format_e::ZSTD_f_zstd1,
+            };
+            cctx.format = new_format;
+            // Keep the parametric shadow in sync so
+            // `ZSTD_CCtxParams_getParameter(cctx.requestedParams, ...)`
+            // reports the same value — matches upstream where
+            // `cctx->requestedParams.format` is the canonical slot.
+            cctx.requestedParams.format = new_format;
+            0
+        }
+        ZSTD_cParameter::ZSTD_c_nbWorkers => {
+            // Single-threaded build: the bounds cap at 0, so any
+            // non-zero request errors out. 0 is the identity.
+            let bounds = ZSTD_cParam_getBounds(ZSTD_cParameter::ZSTD_c_nbWorkers);
+            if value < bounds.lowerBound || value > bounds.upperBound {
+                return ERROR(ErrorCode::ParameterOutOfBound);
+            }
+            cctx.requestedParams.nbWorkers = value;
             0
         }
     }
@@ -929,6 +2097,8 @@ pub fn ZSTD_CCtx_getParameter(
         ZSTD_cParameter::ZSTD_c_checksumFlag => cctx.param_checksum as i32,
         ZSTD_cParameter::ZSTD_c_contentSizeFlag => cctx.param_contentSize as i32,
         ZSTD_cParameter::ZSTD_c_dictIDFlag => cctx.param_dictID as i32,
+        ZSTD_cParameter::ZSTD_c_format => cctx.format as i32,
+        ZSTD_cParameter::ZSTD_c_nbWorkers => cctx.requestedParams.nbWorkers,
     };
     0
 }
@@ -952,30 +2122,68 @@ pub fn ZSTD_CCtx_reset(cctx: &mut ZSTD_CCtx, reset: ZSTD_ResetDirective) -> usiz
         ZSTD_ResetDirective::ZSTD_reset_parameters
             | ZSTD_ResetDirective::ZSTD_reset_session_and_parameters,
     );
+    // Upstream (zstd_compress.c:1392) rejects a parameters-only reset
+    // when `streamStage != zcss_init`. The `session_and_parameters`
+    // variant clears session first (which lands in init), so the gate
+    // only applies to pure `reset_parameters`. Rejecting here prevents
+    // a caller from dropping appliedParams mid-frame while bytes are
+    // still buffered against them.
+    if clear_params && !clear_session && !cctx_is_in_init_stage(cctx) {
+        return ERROR(ErrorCode::StageWrong);
+    }
     if clear_session {
         cctx.stream_in_buffer.clear();
         cctx.stream_out_buffer.clear();
         cctx.stream_out_drained = 0;
         cctx.stream_closed = false;
         cctx.pledged_src_size = None;
+        // Restore the repcode history + entropy repeatModes to
+        // frame-start defaults, matching upstream's
+        // `ZSTD_reset_compressedBlockState` call path during session
+        // reset.
+        ZSTD_reset_compressedBlockState(&mut cctx.prev_rep, &mut cctx.prevEntropy);
+        ZSTD_reset_compressedBlockState(&mut cctx.next_rep, &mut cctx.nextEntropy);
+        // Reset session counters + stage tracker.
+        cctx.stage = ZSTD_compressionStage_e::ZSTDcs_created;
+        cctx.consumedSrcSize = 0;
+        cctx.producedCSize = 0;
+        cctx.pledgedSrcSizePlusOne = 0;
+        cctx.isFirstBlock = 1;
+        crate::common::xxhash::XXH64_reset(&mut cctx.xxhState, 0);
     }
     if clear_params {
+        // Upstream (zstd_compress.c:1394) routes through
+        // `ZSTD_clearAllDicts` + `ZSTD_CCtxParams_reset` so every
+        // dict-related slot is wiped uniformly. Delegate for parity —
+        // a direct field-by-field reset could miss `dictID` or
+        // `dictContentSize` if they're ever re-examined by a future
+        // path.
+        ZSTD_clearAllDicts(cctx);
         cctx.stream_level = None;
-        cctx.stream_dict.clear();
         cctx.param_checksum = false;
         cctx.param_contentSize = true;
         cctx.param_dictID = true;
         cctx.requested_cParams = None;
+        cctx.requestedParams = ZSTD_CCtx_params::default();
+        cctx.appliedParams = ZSTD_CCtx_params::default();
+        // Upstream's `CCtxParams_reset` re-initializes `format` to
+        // `ZSTD_f_zstd1` — a param-level reset must clear the
+        // magicless-mode knob too so a subsequent caller doesn't
+        // silently inherit it.
+        cctx.format = crate::decompress::zstd_decompress::ZSTD_format_e::ZSTD_f_zstd1;
     }
     0
 }
 
-/// Port of `ZSTD_ResetDirective`.
+/// Port of `ZSTD_ResetDirective` (`zstd.h:589`). Upstream fixes the
+/// discriminants at 1/2/3 — not the Rust default 0/1/2. FFI callers
+/// passing the numeric values directly rely on this.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
 pub enum ZSTD_ResetDirective {
-    ZSTD_reset_session_only,
-    ZSTD_reset_parameters,
-    ZSTD_reset_session_and_parameters,
+    ZSTD_reset_session_only = 1,
+    ZSTD_reset_parameters = 2,
+    ZSTD_reset_session_and_parameters = 3,
 }
 
 /// Port of `ZSTD_estimateCCtxSize_usingCParams`. Returns a
@@ -996,11 +2204,10 @@ pub fn ZSTD_estimateCCtxSize_usingCParams(
     core::mem::size_of::<ZSTD_CCtx>() + hashTableSize + chainTableSize + seqStoreSize + entropyTables
 }
 
-/// Port of `ZSTD_estimateCCtxSize`. Iterates over the source-size
-/// tiers (upstream pattern) to find the largest cParams footprint
-/// for the given level, ensuring the estimate is monotonically
-/// non-decreasing with level.
-pub fn ZSTD_estimateCCtxSize(compressionLevel: i32) -> usize {
+/// Port of `ZSTD_estimateCCtxSize_internal` (`zstd_compress.c:1806`).
+/// Picks the max footprint across the 4 upstream srcSize tiers
+/// (16KB / 128KB / 256KB / UNKNOWN) for a single compressionLevel.
+fn ZSTD_estimateCCtxSize_internal(compressionLevel: i32) -> usize {
     let tiers = [16u64 * 1024, 128 * 1024, 256 * 1024, u64::MAX];
     let mut largest = 0usize;
     for tier in &tiers {
@@ -1013,6 +2220,23 @@ pub fn ZSTD_estimateCCtxSize(compressionLevel: i32) -> usize {
     largest
 }
 
+/// Port of `ZSTD_estimateCCtxSize` (`zstd_compress.c:1819`). Sweeps
+/// levels from `min(compressionLevel, 1)` up to `compressionLevel`
+/// and takes the max — matching upstream's monotonicity guarantee
+/// (higher level never reports a smaller footprint than any lower
+/// level).
+pub fn ZSTD_estimateCCtxSize(compressionLevel: i32) -> usize {
+    let start = compressionLevel.min(1);
+    let mut memBudget = 0usize;
+    for level in start..=compressionLevel {
+        let newMB = ZSTD_estimateCCtxSize_internal(level);
+        if newMB > memBudget {
+            memBudget = newMB;
+        }
+    }
+    memBudget
+}
+
 /// Port of `ZSTD_estimateCStreamSize_usingCParams`. Roughly the same
 /// as CCtx size + 2×ZSTD_BLOCKSIZE_MAX for the streaming in/out
 /// buffers (upstream accounts for them explicitly).
@@ -1023,10 +2247,27 @@ pub fn ZSTD_estimateCStreamSize_usingCParams(
     ZSTD_estimateCCtxSize_usingCParams(cParams) + 2 * ZSTD_BLOCKSIZE_MAX
 }
 
-/// Port of `ZSTD_estimateCStreamSize`.
+/// Port of `ZSTD_estimateCStreamSize_internal` (`zstd_compress.c:1872`).
+/// Single-level estimate: CParams at UNKNOWN srcSize →
+/// `ZSTD_estimateCStreamSize_usingCParams`.
+fn ZSTD_estimateCStreamSize_internal(compressionLevel: i32) -> usize {
+    let cp = ZSTD_getCParams(compressionLevel, u64::MAX, 0);
+    ZSTD_estimateCStreamSize_usingCParams(cp)
+}
+
+/// Port of `ZSTD_estimateCStreamSize` (`zstd_compress.c:1878`). Sweeps
+/// levels from `min(compressionLevel, 1)` up to `compressionLevel`
+/// and takes the max — matches upstream's monotonicity guarantee.
 pub fn ZSTD_estimateCStreamSize(compressionLevel: i32) -> usize {
-    use crate::decompress::zstd_decompress_block::ZSTD_BLOCKSIZE_MAX;
-    ZSTD_estimateCCtxSize(compressionLevel) + 2 * ZSTD_BLOCKSIZE_MAX
+    let start = compressionLevel.min(1);
+    let mut memBudget = 0usize;
+    for level in start..=compressionLevel {
+        let newMB = ZSTD_estimateCStreamSize_internal(level);
+        if newMB > memBudget {
+            memBudget = newMB;
+        }
+    }
+    memBudget
 }
 
 /// Port of `ZSTD_estimateCCtxSize_usingCCtxParams`. v0.1 doesn't
@@ -1045,6 +2286,20 @@ pub fn ZSTD_estimateCStreamSize_usingCCtxParams(params: &ZSTD_CCtx_params) -> us
     ZSTD_estimateCCtxSize_usingCCtxParams(params) + 2 * ZSTD_BLOCKSIZE_MAX
 }
 
+/// Port of upstream's one-shot `ZSTD_compress` (`zstd.h:160`).
+/// Compresses `src` at the given level into `dst` and returns the
+/// compressed byte count (or an `ErrorCode`-bearing return value if
+/// `ZSTD_isError`). No dctx, no streaming, no dict — the simplest
+/// entry point. For context-managed, streaming, or dict-bearing
+/// flows use `ZSTD_compressCCtx` / `ZSTD_compressStream2` /
+/// `ZSTD_compress_usingDict` instead.
+///
+/// The frame emitted declares the content size in the header
+/// (`contentSizeFlag = 1`) and suppresses both the dictID field
+/// (`noDictIDFlag = 1`) and the XXH64 trailer (`checksumFlag = 0`).
+/// Level is clamped into `[ZSTD_minCLevel, ZSTD_maxCLevel]` — the
+/// strategy derived from the level is further clamped to `btlazy2`
+/// until the optimal parser (`btopt`+) lands.
 pub fn ZSTD_compress(dst: &mut [u8], src: &[u8], compressionLevel: i32) -> usize {
     let mut cp = ZSTD_getCParams(compressionLevel, src.len() as u64, 0);
     use crate::compress::zstd_compress_sequences::{ZSTD_btlazy2, ZSTD_fast};
@@ -1089,7 +2344,11 @@ pub fn ZSTD_compressCCtx(
     cctx.seqStore.as_mut().unwrap().reset();
     cctx.prevEntropy = ZSTD_entropyCTables_t::default();
     cctx.nextEntropy = ZSTD_entropyCTables_t::default();
-    ZSTD_compressFrame_fast(dst, src, cp, fParams)
+    // Thread the cctx-configured format so a caller who flipped
+    // magicless via `ZSTD_CCtx_setFormat` before calling
+    // `ZSTD_compressCCtx` gets a magicless frame. The level-driven
+    // path here otherwise ignored format entirely.
+    ZSTD_compressFrame_fast_advanced(dst, src, cp, fParams, cctx.format)
 }
 
 /// Port of `ZSTD_CDict`. Pre-digested compression dictionary. In
@@ -1105,17 +2364,34 @@ pub struct ZSTD_CDict {
     /// Parsed dictID (0 for raw-content dicts / any dict without the
     /// `ZSTD_MAGIC_DICTIONARY` prefix).
     pub dictID: u32,
+    /// cParams derived from level + dictSize at creation time.
+    /// Mirrors upstream's `cdict->matchState.cParams` — exposed via
+    /// `ZSTD_getCParamsFromCDict` so callers can inspect the CDict's
+    /// strategy without re-deriving from the level.
+    pub cParams: crate::compress::match_state::ZSTD_compressionParameters,
 }
 
 /// Port of `ZSTD_createCDict`. By-copy dict load — stores a clone.
 /// Parses the dictID out of the dict header (or sets 0 for
 /// raw-content dicts).
 pub fn ZSTD_createCDict(dict: &[u8], compressionLevel: i32) -> Option<Box<ZSTD_CDict>> {
+    // Upstream `ZSTD_createCDict_advanced` routes through the
+    // level-clamp / default-mapping before deriving cParams. Match
+    // here so callers passing 0 (= default) or out-of-range values
+    // get the same cParams as `ZSTD_compress` at the equivalent
+    // level. Previously the raw level was stashed verbatim — a
+    // subsequent `compressBegin_usingCDict_internal` would then use
+    // the unclamped level to pick cParams when re-deriving.
+    let mut clamped = compressionLevel;
+    let _ = ZSTD_cParam_clampBounds(ZSTD_cParameter::ZSTD_c_compressionLevel, &mut clamped);
+    let effective_level = if clamped == 0 { ZSTD_CLEVEL_DEFAULT } else { clamped };
     let dictID = crate::decompress::zstd_ddict::ZSTD_getDictID_fromDict(dict);
+    let cParams = ZSTD_getCParams(effective_level, u64::MAX, dict.len());
     Some(Box::new(ZSTD_CDict {
         dictContent: dict.to_vec(),
-        compressionLevel,
+        compressionLevel: effective_level,
         dictID,
+        cParams,
     }))
 }
 
@@ -1145,16 +2421,586 @@ pub fn ZSTD_createCDict_advanced(
     _dictContentType: crate::decompress::zstd_ddict::ZSTD_dictContentType_e,
     cParams: crate::compress::match_state::ZSTD_compressionParameters,
 ) -> Option<Box<ZSTD_CDict>> {
-    // Map cParams.strategy (1..=9) to a level in [1, ZSTD_MAX_CLEVEL].
-    // Closer to upstream would be to stash cParams directly on the
-    // CDict; we don't yet carry a cParams field, so we compromise.
     let level = (cParams.strategy as i32).clamp(1, ZSTD_MAX_CLEVEL);
-    ZSTD_createCDict(dict, level)
+    let dictID = crate::decompress::zstd_ddict::ZSTD_getDictID_fromDict(dict);
+    Some(Box::new(ZSTD_CDict {
+        dictContent: dict.to_vec(),
+        compressionLevel: level,
+        dictID,
+        cParams,
+    }))
+}
+
+/// Upstream `ZSTD_USE_CDICT_PARAMS_SRCSIZE_CUTOFF` (`zstd_compress.c:5256`).
+/// Threshold below which `ZSTD_compressBegin_usingCDict_*` uses the
+/// CDict's cParams verbatim instead of re-deriving from level+size.
+pub const ZSTD_USE_CDICT_PARAMS_SRCSIZE_CUTOFF: u64 = 128 * 1024;
+
+/// Upstream `ZSTD_USE_CDICT_PARAMS_DICTSIZE_MULTIPLIER` (`zstd_compress.c:5257`).
+/// Keeps CDict's cParams when `pledgedSrcSize < dictSize * MULTIPLIER`.
+pub const ZSTD_USE_CDICT_PARAMS_DICTSIZE_MULTIPLIER: u64 = 6;
+
+/// Upstream `attachDictSizeCutoffs` (`zstd_compress.c:2320`).
+/// Per-strategy cutoff: below this source size, upstream prefers to
+/// attach the CDict's match state in place; above, it prefers to
+/// copy. Indexed by strategy 1..=9 (index 0 is unused).
+pub const attachDictSizeCutoffs: [usize; 10] = [
+    8 * 1024,  // unused (strategy = 0)
+    8 * 1024,  // ZSTD_fast
+    16 * 1024, // ZSTD_dfast
+    32 * 1024, // ZSTD_greedy
+    32 * 1024, // ZSTD_lazy
+    32 * 1024, // ZSTD_lazy2
+    32 * 1024, // ZSTD_btlazy2
+    32 * 1024, // ZSTD_btopt
+    8 * 1024,  // ZSTD_btultra
+    8 * 1024,  // ZSTD_btultra2
+];
+
+/// Port of `ZSTD_getCParamMode` (`zstd_compress.c:5983`). Returns
+/// `cpm_attachDict` when a CDict is present and
+/// `ZSTD_shouldAttachDict` would attach it; otherwise `cpm_noAttachDict`.
+/// Used by `ZSTD_compressBegin_*` to pick the right cParam-derivation
+/// table row.
+pub fn ZSTD_getCParamMode(
+    cdict: Option<&ZSTD_CDict>,
+    params: &ZSTD_CCtx_params,
+    pledgedSrcSize: u64,
+) -> ZSTD_CParamMode_e {
+    match cdict {
+        Some(c) if ZSTD_shouldAttachDict(c, params, pledgedSrcSize) => {
+            ZSTD_CParamMode_e::ZSTD_cpm_attachDict
+        }
+        _ => ZSTD_CParamMode_e::ZSTD_cpm_noAttachDict,
+    }
+}
+
+/// Port of `ZSTD_compressionStage_e` (`zstd_compress_internal.h:46`).
+/// Lifecycle stage of a CCtx: `created` → `init` (post-begin) →
+/// `ongoing` (after first block) → `ending` (epilogue pending).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ZSTD_compressionStage_e {
+    #[default]
+    ZSTDcs_created = 0,
+    ZSTDcs_init = 1,
+    ZSTDcs_ongoing = 2,
+    ZSTDcs_ending = 3,
+}
+
+/// Port of `ZSTD_cStreamStage` (`zstd_compress_internal.h:47`). CStream
+/// ingest sub-stage: `init` → `load` (consuming caller input) →
+/// `flush` (draining output to caller).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ZSTD_cStreamStage {
+    #[default]
+    zcss_init = 0,
+    zcss_load = 1,
+    zcss_flush = 2,
+}
+
+/// Port of `ZSTD_buffered_policy_e` (`zstd_compress_internal.h`). Tells
+/// `ZSTD_resetCCtx_internal` whether to allocate the streaming
+/// in/out buffers or skip them (one-shot compression).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ZSTD_buffered_policy_e {
+    #[default]
+    ZSTDb_not_buffered = 0,
+    ZSTDb_buffered = 1,
+}
+
+/// Port of `ZSTD_copyBlockSequences` (`zstd_compress.c:3453`). After
+/// the match finder has populated `seqStore`, this function translates
+/// the internal `SeqDef[]` representation (offBase + optional long-
+/// length flag) into caller-visible `ZSTD_Sequence[]` entries and
+/// appends them to `outSeqs[seqIndex..]`. Also appends a final
+/// `{ll=lastLiterals, ml=0, off=0, rep=0}` block-delimiter entry.
+///
+/// `prevRepcodes` is the repcode history *before* this block; it's
+/// walked forward as each sequence is emitted to resolve
+/// repcode-flavored offBases to raw offsets.
+///
+/// Returns `0` on success or a zstd error when `outSeqs` is too small.
+pub fn ZSTD_copyBlockSequences(
+    seqCollector: &mut SeqCollector,
+    outSeqs: &mut [ZSTD_Sequence],
+    seqStore: &SeqStore_t,
+    prevRepcodes: &[u32; crate::compress::seq_store::ZSTD_REP_NUM],
+) -> usize {
+    use crate::common::error::{ErrorCode, ERROR};
+    use crate::compress::seq_store::{
+        Repcodes_t, ZSTD_longLengthType_e, ZSTD_updateRep, MINMATCH, OFFBASE_IS_REPCODE,
+        OFFBASE_TO_OFFSET, OFFBASE_TO_REPCODE,
+    };
+    let nbInSequences = seqStore.sequences.len();
+    let nbInLiterals = seqStore.literals.len();
+    let nbOutSequences = nbInSequences + 1;
+    let dst_start = seqCollector.seqIndex;
+    if nbOutSequences > seqCollector.maxSequences.saturating_sub(dst_start) {
+        return ERROR(ErrorCode::DstSizeTooSmall);
+    }
+
+    let mut repcodes = Repcodes_t { rep: *prevRepcodes };
+    let mut nbOutLiterals: u32 = 0;
+    for i in 0..nbInSequences {
+        let inSeq = seqStore.sequences[i];
+        let out = &mut outSeqs[dst_start + i];
+        out.litLength = inSeq.litLength as u32;
+        out.matchLength = inSeq.mlBase as u32 + MINMATCH;
+        out.rep = 0;
+
+        if i as u32 == seqStore.longLengthPos {
+            match seqStore.longLengthType {
+                ZSTD_longLengthType_e::ZSTD_llt_literalLength => out.litLength += 0x10000,
+                ZSTD_longLengthType_e::ZSTD_llt_matchLength => out.matchLength += 0x10000,
+                ZSTD_longLengthType_e::ZSTD_llt_none => {}
+            }
+        }
+
+        let rawOffset = if OFFBASE_IS_REPCODE(inSeq.offBase) {
+            let repcode = OFFBASE_TO_REPCODE(inSeq.offBase);
+            out.rep = repcode;
+            if out.litLength != 0 {
+                repcodes.rep[(repcode - 1) as usize]
+            } else if repcode == 3 {
+                repcodes.rep[0] - 1
+            } else {
+                repcodes.rep[repcode as usize]
+            }
+        } else {
+            OFFBASE_TO_OFFSET(inSeq.offBase)
+        };
+        out.offset = rawOffset;
+
+        ZSTD_updateRep(&mut repcodes.rep, inSeq.offBase, (inSeq.litLength == 0) as u32);
+
+        nbOutLiterals += out.litLength;
+    }
+
+    // Block delimiter: trailing literals with ml=0, off=0.
+    let lastLLSize = (nbInLiterals as u32).saturating_sub(nbOutLiterals);
+    let tail = &mut outSeqs[dst_start + nbInSequences];
+    tail.litLength = lastLLSize;
+    tail.matchLength = 0;
+    tail.offset = 0;
+    tail.rep = 0;
+
+    seqCollector.seqIndex += nbOutSequences;
+    0
+}
+
+/// Port of `ZSTD_inBuffer` (`zstd.h:701`). Public-API cursor struct
+/// used by the streaming compression / decompression APIs — the
+/// caller hands the compressor a buffer and the compressor advances
+/// `pos` to reflect how much it consumed.
+///
+/// Rust-native streaming ports (`ZSTD_compressStream` etc.) accept
+/// slices directly, but this struct is exposed so callers porting
+/// C code can keep their idiom.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ZSTD_inBuffer<'a> {
+    pub src: Option<&'a [u8]>,
+    pub size: usize,
+    pub pos: usize,
+}
+
+/// Port of `ZSTD_outBuffer` (`zstd.h:707`). Symmetric with
+/// `ZSTD_inBuffer` for the output side.
+#[derive(Debug, Default)]
+pub struct ZSTD_outBuffer<'a> {
+    pub dst: Option<&'a mut [u8]>,
+    pub size: usize,
+    pub pos: usize,
+}
+
+/// Port of `ZSTD_postProcessSequenceProducerResult` (`zstd_compress.c:3198`).
+/// Validates sequences returned by an external sequence producer
+/// (`ZSTD_registerSequenceProducer` API) and appends a block-delimiter
+/// sentinel if the caller didn't already emit one. Returns the new
+/// sequence count, or a zstd error on invalid input.
+///
+/// Contract:
+///   - `nbExternalSeqs == 0 && srcSize > 0` ⇒ producer failed.
+///   - `nbExternalSeqs > outSeqs.len()` ⇒ producer overshot capacity.
+///   - `srcSize == 0` ⇒ write a single zero-delimiter, return 1.
+///   - Otherwise append `{0, 0, 0, 0}` if the tail sequence isn't
+///     already a delimiter.
+pub fn ZSTD_postProcessSequenceProducerResult(
+    outSeqs: &mut [ZSTD_Sequence],
+    nbExternalSeqs: usize,
+    srcSize: usize,
+) -> usize {
+    use crate::common::error::{ErrorCode, ERROR};
+    let outSeqsCapacity = outSeqs.len();
+    if nbExternalSeqs > outSeqsCapacity {
+        return ERROR(ErrorCode::Generic);
+    }
+    if nbExternalSeqs == 0 && srcSize > 0 {
+        return ERROR(ErrorCode::Generic);
+    }
+    if srcSize == 0 {
+        if outSeqsCapacity == 0 {
+            return ERROR(ErrorCode::DstSizeTooSmall);
+        }
+        outSeqs[0] = ZSTD_Sequence::default();
+        return 1;
+    }
+    let lastSeq = outSeqs[nbExternalSeqs - 1];
+    if lastSeq.offset == 0 && lastSeq.matchLength == 0 {
+        return nbExternalSeqs;
+    }
+    if nbExternalSeqs == outSeqsCapacity {
+        return ERROR(ErrorCode::Generic);
+    }
+    outSeqs[nbExternalSeqs] = ZSTD_Sequence::default();
+    nbExternalSeqs + 1
+}
+
+/// Port of `SeqCollector` (`zstd_compress_internal.h:355`). Toggles a
+/// shadow-collection mode on the compressor: when `collectSequences`
+/// is set, the block-compress path emits discovered sequences into
+/// the caller's `outSeqs` buffer instead of (or in addition to)
+/// serializing them. Used by `ZSTD_generateSequences`.
+///
+/// Rust-port note: upstream stores `ZSTD_Sequence*` directly — our
+/// port defers the slice until the call site via an index range into
+/// a separate `outSeqs` buffer the caller owns.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SeqCollector {
+    /// Non-zero when `ZSTD_compressBlock_internal` should divert
+    /// match-finder output into the caller's `outSeqs` slice.
+    pub collectSequences: i32,
+    /// How many sequences have been written so far.
+    pub seqIndex: usize,
+    /// Max count the caller's buffer can hold.
+    pub maxSequences: usize,
+}
+
+/// Port of `ZSTD_SequencePosition` (`zstd_compress_internal.h:1517`).
+/// Cursor tracking for caller-supplied `ZSTD_Sequence` arrays —
+/// `(idx, posInSequence, posInSrc)` identifies where the next block
+/// boundary starts when transferring sequences across block splits.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ZSTD_SequencePosition {
+    /// Index in the caller's `ZSTD_Sequence[]`.
+    pub idx: u32,
+    /// Byte position within sequence `idx` — nonzero when a sequence
+    /// straddles a block boundary and was partly consumed by the
+    /// previous block.
+    pub posInSequence: u32,
+    /// Running count of source bytes consumed by sequences so far.
+    pub posInSrc: usize,
+}
+
+/// Port of `blockSize_explicitDelimiter` (`zstd_compress.c:6920`).
+/// Walks a caller-supplied `ZSTD_Sequence[]` starting at `seqPos.idx`
+/// summing litLength + matchLength until it hits a delimiter entry
+/// (`offset == 0`). Returns the total uncompressed bytes the next
+/// block will cover, or a zstd error if the sequence array ends
+/// before a delimiter, or a delimiter carries a non-zero matchLength.
+pub fn blockSize_explicitDelimiter(
+    inSeqs: &[ZSTD_Sequence],
+    seqPos: ZSTD_SequencePosition,
+) -> usize {
+    use crate::common::error::{ErrorCode, ERROR};
+    let mut spos = seqPos.idx as usize;
+    let mut blockSize: usize = 0;
+    let mut end = false;
+    while spos < inSeqs.len() {
+        let seq = inSeqs[spos];
+        end = seq.offset == 0;
+        blockSize += seq.litLength as usize + seq.matchLength as usize;
+        if end {
+            if seq.matchLength != 0 {
+                return ERROR(ErrorCode::ExternalSequencesInvalid);
+            }
+            break;
+        }
+        spos += 1;
+    }
+    if !end {
+        return ERROR(ErrorCode::ExternalSequencesInvalid);
+    }
+    blockSize
+}
+
+/// Port of `determine_blockSize` (`zstd_compress.c:6942`). Dispatches
+/// on `ZSTD_SequenceFormat_e`: for `noBlockDelimiters` returns
+/// `min(remaining, blockSize)` (a "target" size), for
+/// `explicitBlockDelimiters` returns the explicit-delimiter sum,
+/// validating against `blockSize` and `remaining` upper bounds.
+pub fn determine_blockSize(
+    mode: ZSTD_SequenceFormat_e,
+    blockSize: usize,
+    remaining: usize,
+    inSeqs: &[ZSTD_Sequence],
+    seqPos: ZSTD_SequencePosition,
+) -> usize {
+    use crate::common::error::{ErrorCode, ERR_isError, ERROR};
+    if mode == ZSTD_SequenceFormat_e::ZSTD_sf_noBlockDelimiters {
+        return remaining.min(blockSize);
+    }
+    let explicit = blockSize_explicitDelimiter(inSeqs, seqPos);
+    if ERR_isError(explicit) {
+        return explicit;
+    }
+    if explicit > blockSize {
+        return ERROR(ErrorCode::ExternalSequencesInvalid);
+    }
+    if explicit > remaining {
+        return ERROR(ErrorCode::ExternalSequencesInvalid);
+    }
+    explicit
+}
+
+/// Port of `ZSTD_SequenceFormat_e` (`zstd.h:1581`). Tells the
+/// caller-supplied-sequences path whether block boundaries are
+/// explicit `{0,0,X,0}` delimiters or implicit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ZSTD_SequenceFormat_e {
+    #[default]
+    ZSTD_sf_noBlockDelimiters = 0,
+    ZSTD_sf_explicitBlockDelimiters = 1,
+}
+
+/// Port of `ZSTD_sizeof_matchState` (`zstd_compress.c:1669`). Byte
+/// count needed to hold the hash + chain + hashLog3 tables plus
+/// optional opt-parser scratch when the strategy is `btopt`+. Used
+/// by `ZSTD_estimateCDictSize_advanced` and
+/// `ZSTD_estimateCCtxSize_*`.
+///
+/// Our port skips the cwksp alignment wrappers (our tables are
+/// `Vec<u32>` and take only the raw element count × 4 bytes) and the
+/// `slackSpace` reserve (an ASAN-redzone allowance), and keeps the
+/// lazy row-tag table + opt-parser tables as their byte counts.
+pub fn ZSTD_sizeof_matchState(
+    cParams: &crate::compress::match_state::ZSTD_compressionParameters,
+    useRowMatchFinder: crate::compress::zstd_ldm::ZSTD_ParamSwitch_e,
+    enableDedicatedDictSearch: bool,
+    forCCtx: bool,
+) -> usize {
+    use crate::compress::match_state::{
+        ZSTD_allocateChainTable, ZSTD_rowMatchFinderUsed,
+    };
+    use crate::compress::zstd_compress_sequences::ZSTD_btopt;
+
+    let chainSize = if ZSTD_allocateChainTable(
+        cParams.strategy,
+        useRowMatchFinder,
+        (enableDedicatedDictSearch && !forCCtx) as u32,
+    ) {
+        1usize << cParams.chainLog
+    } else {
+        0
+    };
+    let hSize: usize = 1 << cParams.hashLog;
+    let hashLog3 = if forCCtx && cParams.minMatch == 3 {
+        ZSTD_HASHLOG3_MAX.min(cParams.windowLog)
+    } else {
+        0
+    };
+    let h3Size: usize = if hashLog3 != 0 { 1 << hashLog3 } else { 0 };
+    let tableSpace = (chainSize + hSize + h3Size) * core::mem::size_of::<u32>();
+
+    let optSpace = if forCCtx && cParams.strategy >= ZSTD_btopt {
+        ((MaxML + 1) as usize
+            + (MaxLL + 1) as usize
+            + (MaxOff + 1) as usize
+            + (1 << Litbits) as usize)
+            * core::mem::size_of::<u32>()
+            + ZSTD_OPT_SIZE * 16
+            + ZSTD_OPT_SIZE * 16
+    } else {
+        0
+    };
+
+    let lazyAdditionalSpace =
+        if ZSTD_rowMatchFinderUsed(cParams.strategy, useRowMatchFinder) {
+            hSize
+        } else {
+            0
+        };
+
+    tableSpace + optSpace + lazyAdditionalSpace
+}
+
+/// Upstream `ZSTD_HASHLOG3_MAX` (`zstd_compress_internal.h`). Max
+/// log size of the auxiliary 3-byte hash table used when `minMatch=3`.
+pub const ZSTD_HASHLOG3_MAX: u32 = 17;
+
+/// Re-export of `zstd_opt::ZSTD_OPT_SIZE` — the canonical
+/// `ZSTD_OPT_NUM + 3` match-table capacity for the optimal parser's
+/// forward-DP candidate buffer. Previously duplicated here as
+/// `1 << 12`, dropping the +3 margin that upstream requires.
+pub use crate::compress::zstd_opt::ZSTD_OPT_SIZE;
+
+/// Upstream `Litbits`. Log2 of the literal alphabet size (256 symbols
+/// = 8 bits).
+pub const Litbits: u32 = 8;
+
+/// Port of `ZSTD_compResetPolicy_e` (`zstd_compress.c:1974`). Tells
+/// `ZSTD_reset_matchState` whether to scrub the hash/chain tables
+/// (`makeClean`) or leave them with whatever stale entries the
+/// previous frame left behind (`leaveDirty`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ZSTD_compResetPolicy_e {
+    #[default]
+    ZSTDcrp_makeClean = 0,
+    ZSTDcrp_leaveDirty = 1,
+}
+
+/// Port of `ZSTD_indexResetPolicy_e` (`zstd_compress.c:1984`).
+/// Controls whether the window's `nextSrc` index continues from where
+/// the previous block left off (`continue`) or resets to the sentinel
+/// start (`reset`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ZSTD_indexResetPolicy_e {
+    #[default]
+    ZSTDirp_continue = 0,
+    ZSTDirp_reset = 1,
+}
+
+/// Port of `ZSTD_resetTarget_e` (`zstd_compress.c:1989`). Disambiguates
+/// `ZSTD_reset_matchState`'s client — a CDict being constructed vs.
+/// an active CCtx being re-initialized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ZSTD_resetTarget_e {
+    ZSTD_resetTarget_CDict = 0,
+    #[default]
+    ZSTD_resetTarget_CCtx = 1,
+}
+
+/// Port of `ZSTD_BuildSeqStore_e` (`zstd_compress.c:3286`). Reports
+/// whether `ZSTD_buildSeqStore` wants the caller to emit a compressed
+/// block (`ZSTDbss_compress`) or fall through to a raw/rle block
+/// (`ZSTDbss_noCompress` — e.g. when the input is tiny or the match
+/// finder found nothing worth emitting).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZSTD_BuildSeqStore_e {
+    ZSTDbss_compress = 0,
+    ZSTDbss_noCompress = 1,
+}
+
+/// Port of `ZSTD_copyCCtx` (`zstd_compress.c:2615`). Deep-copies
+/// `src` state into `dst` for starting a new compression at the
+/// given `pledgedSrcSize`. Upstream's implementation walks its
+/// cwksp-allocated state; our Rust port owns each field and uses
+/// `Clone::clone_from` to do a byte-faithful copy. Sets
+/// `pledged_src_size` from the argument (0 → UNKNOWN per upstream).
+pub fn ZSTD_copyCCtx(
+    dst: &mut ZSTD_CCtx,
+    src: &ZSTD_CCtx,
+    pledgedSrcSize: u64,
+) -> usize {
+    dst.clone_from(src);
+    use crate::decompress::zstd_decompress::ZSTD_CONTENTSIZE_UNKNOWN;
+    dst.pledged_src_size = if pledgedSrcSize == 0 || pledgedSrcSize == ZSTD_CONTENTSIZE_UNKNOWN {
+        None
+    } else {
+        Some(pledgedSrcSize)
+    };
+    0
+}
+
+/// Port of `ZSTD_shouldAttachDict` (`zstd_compress.c:2333`). Decides
+/// whether the CDict's pre-digested match state should be attached
+/// in place (cheap reuse) versus copied into the CCtx (better for
+/// large inputs). Returns true when: the pledged source size fits
+/// within the strategy-specific cutoff, or the size is unknown.
+///
+/// Our simplified port fixes `attachDictPref = auto` and
+/// `forceWindow = false` (those fields aren't yet on `ZSTD_CCtx_params`),
+/// and drops the `dedicatedDictSearch` branch (our CDict doesn't yet
+/// carry that flag). Callers that don't want attach-mode can fall
+/// through to the copy path regardless.
+pub fn ZSTD_shouldAttachDict(
+    cdict: &ZSTD_CDict,
+    params: &ZSTD_CCtx_params,
+    pledgedSrcSize: u64,
+) -> bool {
+    use crate::decompress::zstd_decompress::ZSTD_CONTENTSIZE_UNKNOWN;
+    let strategy = cdict.cParams.strategy as usize;
+    let cutoff = attachDictSizeCutoffs
+        .get(strategy)
+        .copied()
+        .unwrap_or(attachDictSizeCutoffs[1]);
+    let fits = pledgedSrcSize <= cutoff as u64
+        || pledgedSrcSize == ZSTD_CONTENTSIZE_UNKNOWN
+        || params.attachDictPref == ZSTD_dictAttachPref_e::ZSTD_dictForceAttach;
+    fits && params.attachDictPref != ZSTD_dictAttachPref_e::ZSTD_dictForceCopy
+        && params.forceWindow == 0
+}
+
+/// Port of `ZSTD_getCParamsFromCDict` (`zstd_compress.c:5828`). Returns
+/// the cParams the CDict was created with. Used by
+/// `ZSTD_compressBegin_usingCDict_*` to seed the CCtx with the CDict's
+/// strategy before any compression begins.
+#[inline]
+pub fn ZSTD_getCParamsFromCDict(
+    cdict: &ZSTD_CDict,
+) -> crate::compress::match_state::ZSTD_compressionParameters {
+    cdict.cParams
 }
 
 /// Port of `ZSTD_freeCDict`. Drops the Box; returns 0.
 pub fn ZSTD_freeCDict(_cdict: Option<Box<ZSTD_CDict>>) -> usize {
     0
+}
+
+/// Port of `ZSTD_createCDict_advanced2` (`zstd_compress.c:5684`). Full
+/// variant: accepts explicit load method, content type, and an
+/// originating `ZSTD_CCtx_params` whose `enableDedicatedDictSearch`
+/// flag picks between plain and DDSS cParams.
+pub fn ZSTD_createCDict_advanced2(
+    dict: &[u8],
+    dictLoadMethod: crate::decompress::zstd_ddict::ZSTD_dictLoadMethod_e,
+    dictContentType: crate::decompress::zstd_ddict::ZSTD_dictContentType_e,
+    originalCctxParams: &ZSTD_CCtx_params,
+) -> Option<Box<ZSTD_CDict>> {
+    let mut cctxParams = *originalCctxParams;
+    let mut cParams = if cctxParams.enableDedicatedDictSearch != 0 {
+        let mut cp = ZSTD_dedicatedDictSearch_getCParams(
+            cctxParams.compressionLevel,
+            dict.len(),
+        );
+        ZSTD_overrideCParams(&mut cp, &cctxParams.cParams);
+        cp
+    } else {
+        use crate::decompress::zstd_decompress::ZSTD_CONTENTSIZE_UNKNOWN;
+        ZSTD_getCParamsFromCCtxParams(
+            &cctxParams,
+            ZSTD_CONTENTSIZE_UNKNOWN,
+            dict.len(),
+            ZSTD_CParamMode_e::ZSTD_cpm_createCDict,
+        )
+    };
+
+    if !ZSTD_dedicatedDictSearch_isSupported(&cParams) {
+        cctxParams.enableDedicatedDictSearch = 0;
+        use crate::decompress::zstd_decompress::ZSTD_CONTENTSIZE_UNKNOWN;
+        cParams = ZSTD_getCParamsFromCCtxParams(
+            &cctxParams,
+            ZSTD_CONTENTSIZE_UNKNOWN,
+            dict.len(),
+            ZSTD_CParamMode_e::ZSTD_cpm_createCDict,
+        );
+    }
+
+    cctxParams.cParams = cParams;
+    use crate::compress::match_state::ZSTD_resolveRowMatchFinderMode;
+    cctxParams.useRowMatchFinder =
+        ZSTD_resolveRowMatchFinderMode(cctxParams.useRowMatchFinder, &cParams);
+
+    // Store by copy vs by-ref; `ZSTD_dct_rawContent`/`ZSTD_dct_auto`
+    // treat the dict as raw content.
+    let _ = dictLoadMethod;
+    let _ = dictContentType;
+    let dictID = crate::decompress::zstd_ddict::ZSTD_getDictID_fromDict(dict);
+    Some(Box::new(ZSTD_CDict {
+        dictContent: dict.to_vec(),
+        compressionLevel: cctxParams.compressionLevel,
+        dictID,
+        cParams,
+    }))
 }
 
 /// Port of `ZSTD_estimateCDictSize_advanced`. Upstream sums the
@@ -1164,12 +3010,22 @@ pub fn ZSTD_freeCDict(_cdict: Option<Box<ZSTD_CDict>>) -> usize {
 pub fn ZSTD_estimateCDictSize_advanced(
     dictSize: usize,
     cParams: crate::compress::match_state::ZSTD_compressionParameters,
-    _dictLoadMethod: crate::decompress::zstd_ddict::ZSTD_dictLoadMethod_e,
+    dictLoadMethod: crate::decompress::zstd_ddict::ZSTD_dictLoadMethod_e,
 ) -> usize {
+    use crate::decompress::zstd_ddict::ZSTD_dictLoadMethod_e;
     // Hash/chain tables dominate — base on cParams.hashLog/chainLog.
     let hashBytes = (1usize << cParams.hashLog) * core::mem::size_of::<u32>();
     let chainBytes = (1usize << cParams.chainLog) * core::mem::size_of::<u32>();
-    core::mem::size_of::<ZSTD_CDict>() + dictSize + hashBytes + chainBytes
+    // Upstream (zstd_compress.c:5556): byRef borrows the caller's
+    // buffer, so no `dictSize` bytes are added to the estimate;
+    // byCopy owns its own copy so the estimate grows by `dictSize`.
+    // Symmetric with `ZSTD_estimateDDictSize` on the decompress side.
+    let owned_dict = if dictLoadMethod == ZSTD_dictLoadMethod_e::ZSTD_dlm_byRef {
+        0
+    } else {
+        dictSize
+    };
+    core::mem::size_of::<ZSTD_CDict>() + owned_dict + hashBytes + chainBytes
 }
 
 /// Port of `ZSTD_estimateCDictSize`. Wrapper: picks cParams for
@@ -1236,17 +3092,62 @@ pub fn ZSTD_compress_usingCDict(
     ZSTD_compress_usingDict(cctx, dst, src, &cdict.dictContent, cdict.compressionLevel)
 }
 
+/// Port of `ZSTD_compress_usingCDict_internal` (`zstd_compress.c:5911`).
+/// Internal helper: runs `ZSTD_compressBegin_usingCDict_advanced`
+/// then `ZSTD_compressEnd_public`. v0.1 doesn't have the full
+/// compressContinue/compressEnd pipeline; we delegate to the
+/// single-frame helper that already handles the dict + fParams.
+pub fn ZSTD_compress_usingCDict_internal(
+    cctx: &mut ZSTD_CCtx,
+    dst: &mut [u8],
+    src: &[u8],
+    cdict: &ZSTD_CDict,
+    fParams: ZSTD_FrameParameters,
+) -> usize {
+    ZSTD_compress_usingCDict_advanced(cctx, dst, src, cdict, fParams)
+}
+
+/// Port of `ZSTD_compress_usingCDict_advanced`. Compress with a
+/// pre-built CDict using caller-supplied `fParams`. Upstream
+/// (zstd_compress.c:5923) forwards to
+/// `ZSTD_compress_usingCDict_internal`; here we build the full frame
+/// directly so the explicit fParams propagate to the header.
+pub fn ZSTD_compress_usingCDict_advanced(
+    cctx: &mut ZSTD_CCtx,
+    dst: &mut [u8],
+    src: &[u8],
+    cdict: &ZSTD_CDict,
+    fParams: ZSTD_FrameParameters,
+) -> usize {
+    let mut cp = ZSTD_getCParams(cdict.compressionLevel, src.len() as u64, cdict.dictContent.len());
+    use crate::compress::zstd_compress_sequences::{ZSTD_btlazy2, ZSTD_fast};
+    cp.strategy = cp.strategy.clamp(ZSTD_fast, ZSTD_btlazy2);
+    // Thread the cctx-configured format through — upstream honors
+    // `cctx->requestedParams.format` on every CCtx-scoped entry
+    // point. Previously our port dropped the `&mut cctx` argument on
+    // the floor, so a caller who set `c_format = magicless` would
+    // silently get a zstd1 frame from the CDict one-shot path.
+    ZSTD_compressFrame_fast_with_prefix_advanced(
+        dst, src, &cdict.dictContent, cp, fParams, None, None, cctx.format,
+    )
+}
+
 /// Port of `ZSTD_compress_usingDict`. Compresses `src` with a raw
 /// (non-digested) `dict` as history — back-references from `src` may
 /// point into the dict. The resulting frame omits the dict bytes and
 /// declares `src.len()` as the content size, so the decoder side
 /// needs the same dict via `ZSTD_decompress_usingDict` to decode.
 ///
-/// v0.1 scope: raw-content dicts only (no pre-digested entropy tables).
-/// `ZSTD_dct_fullDict` dictionaries with embedded FSE/HUF tables will
-/// land alongside the ZSTD_CDict digest path in a later tick.
+/// v0.1 scope: dict is passed as a raw back-reference prefix. This
+/// entry-point doesn't pre-seed the compressor's entropy tables
+/// from a magic-prefixed zstd-format dict. The matching decoder
+/// entry point `ZSTD_decompress_usingDict` also takes the raw
+/// content path — DCtx-based callers that want magic-prefix entropy
+/// seeding should use `ZSTD_DCtx_loadDictionary` +
+/// `ZSTD_decompressDCtx`, which routes through
+/// `ZSTD_decompress_insertDictionary` / `ZSTD_loadDEntropy`.
 pub fn ZSTD_compress_usingDict(
-    _cctx: &mut ZSTD_CCtx,
+    cctx: &mut ZSTD_CCtx,
     dst: &mut [u8],
     src: &[u8],
     dict: &[u8],
@@ -1255,12 +3156,90 @@ pub fn ZSTD_compress_usingDict(
     let mut cp = ZSTD_getCParams(compressionLevel, src.len() as u64, dict.len());
     use crate::compress::zstd_compress_sequences::{ZSTD_btlazy2, ZSTD_fast};
     cp.strategy = cp.strategy.clamp(ZSTD_fast, ZSTD_btlazy2);
+    // Upstream's default `c_dictIDFlag == 1` means "include dictID in
+    // the frame header when applicable" (noDictIDFlag=0). Previously
+    // we forced noDictIDFlag=1, silently stripping the dictID even
+    // when the dict was magic-tagged.
     let fParams = ZSTD_FrameParameters {
         contentSizeFlag: 1,
         checksumFlag: 0,
-        noDictIDFlag: 1,
+        noDictIDFlag: 0,
     };
-    ZSTD_compressFrame_fast_with_prefix(dst, src, dict, cp, fParams)
+    // Honor `cctx.format` — previously the cctx argument was dropped
+    // on the floor, so `ZSTD_CCtx_setFormat` had no effect on the
+    // raw-dict one-shot path. Upstream respects the cctx-scoped
+    // format on every CCtx-bearing entry point.
+    ZSTD_compressFrame_fast_with_prefix_advanced(
+        dst, src, dict, cp, fParams, None, None, cctx.format,
+    )
+}
+
+/// Port of `ZSTD_compress_advanced` (`zstd_compress.c:5465`). Public
+/// caller-driven variant of `ZSTD_compress` that takes a full
+/// `ZSTD_parameters` bundle. Validates cParams, then delegates to
+/// the dict-aware compressor.
+///
+/// v0.1 ignores `params.fParams` beyond what our compressor already
+/// respects (contentSize / checksum / noDictID) — checksumFlag is
+/// forwarded via `param_checksum`, other flags stay at upstream
+/// defaults.
+pub fn ZSTD_compress_advanced(
+    cctx: &mut ZSTD_CCtx,
+    dst: &mut [u8],
+    src: &[u8],
+    dict: &[u8],
+    params: ZSTD_parameters,
+) -> usize {
+    let rc = ZSTD_checkCParams(params.cParams);
+    if ERR_isError(rc) {
+        return rc;
+    }
+    cctx.param_checksum = params.fParams.checksumFlag != 0;
+    cctx.param_contentSize = params.fParams.contentSizeFlag != 0;
+    cctx.param_dictID = params.fParams.noDictIDFlag == 0;
+
+    let cp = params.cParams;
+    use crate::compress::zstd_compress_sequences::{ZSTD_btlazy2, ZSTD_fast};
+    let clamped_strategy = cp.strategy.clamp(ZSTD_fast, ZSTD_btlazy2);
+    let mut cp = cp;
+    cp.strategy = clamped_strategy;
+    // Honor the caller's `cctx.format` so a CCtx configured with
+    // `c_format = magicless` before `ZSTD_compress_advanced` emits
+    // a magicless frame. `ZSTD_parameters` (the upstream public type)
+    // carries no `format` field; the CCtx-scoped slot is the only
+    // source of truth.
+    ZSTD_compressFrame_fast_with_prefix_advanced(
+        dst, src, dict, cp, params.fParams, None, None, cctx.format,
+    )
+}
+
+/// Port of `ZSTD_compress_advanced_internal` (`zstd_compress.c:5482`).
+/// Upstream variant that takes a `ZSTD_CCtx_params*` instead of a
+/// `ZSTD_parameters`. Our port unpacks `params.cParams` / `.fParams`
+/// and forwards to `ZSTD_compress_advanced`.
+pub fn ZSTD_compress_advanced_internal(
+    cctx: &mut ZSTD_CCtx,
+    dst: &mut [u8],
+    src: &[u8],
+    dict: &[u8],
+    params: &ZSTD_CCtx_params,
+) -> usize {
+    // Propagate the params-level `format` onto the cctx so
+    // `ZSTD_compress_advanced` (which reads `cctx.format`) sees it.
+    // Upstream's `ZSTD_parameters` has no format slot, so without
+    // this sync a caller who built a `CCtx_params` with magicless
+    // would silently get a zstd1 frame.
+    cctx.format = params.format;
+    ZSTD_compress_advanced(
+        cctx,
+        dst,
+        src,
+        dict,
+        ZSTD_parameters {
+            cParams: params.cParams,
+            fParams: params.fParams,
+        },
+    )
 }
 
 /// Port of upstream's `ZSTD_MAX_INPUT_SIZE` (see `lib/zstd.h`).
@@ -1329,6 +3308,80 @@ impl Default for ZSTD_fseCTables_t {
     }
 }
 
+/// Upstream `ZSTD_MAX_HUF_HEADER_SIZE` (`zstd_internal.h:115`).
+/// 128 = header (≤1 byte) + ≤127 byte Huffman tree description.
+pub const ZSTD_MAX_HUF_HEADER_SIZE: usize = 128;
+
+/// Upstream `ZSTD_MAX_FSE_HEADERS_SIZE` (`zstd_internal.h:117`).
+/// Tight bound on serialized FSE-table bytes for LL + ML + OF
+/// streams combined, rounded up to a byte.
+pub const ZSTD_MAX_FSE_HEADERS_SIZE: usize = {
+    use crate::decompress::zstd_decompress_block::{MaxLL, MaxML, MaxOff};
+    const LLFSELog: usize = 9;
+    const MLFSELog: usize = 9;
+    const OffFSELog: usize = 8;
+    ((MaxML as usize + 1) * MLFSELog
+        + (MaxLL as usize + 1) * LLFSELog
+        + (MaxOff as usize + 1) * OffFSELog)
+    .div_ceil(8)
+};
+
+/// Port of `ZSTD_hufCTablesMetadata_t` (`zstd_compress_internal.h:154`).
+/// Populated by `ZSTD_buildBlockEntropyStats_literals`. Carries the
+/// chosen literals-block type + serialized HUF tree description.
+#[derive(Debug, Clone, Copy)]
+pub struct ZSTD_hufCTablesMetadata_t {
+    pub hType: SymbolEncodingType_e,
+    pub hufDesBuffer: [u8; ZSTD_MAX_HUF_HEADER_SIZE],
+    pub hufDesSize: usize,
+}
+
+impl Default for ZSTD_hufCTablesMetadata_t {
+    fn default() -> Self {
+        Self {
+            hType: SymbolEncodingType_e::default(),
+            hufDesBuffer: [0u8; ZSTD_MAX_HUF_HEADER_SIZE],
+            hufDesSize: 0,
+        }
+    }
+}
+
+/// Port of `ZSTD_fseCTablesMetadata_t` (`zstd_compress_internal.h:165`).
+/// Populated by `ZSTD_buildBlockEntropyStats_sequences`. Holds
+/// per-symbol encoding modes for LL/OF/ML + serialized FSE tables.
+#[derive(Debug, Clone, Copy)]
+pub struct ZSTD_fseCTablesMetadata_t {
+    pub llType: SymbolEncodingType_e,
+    pub ofType: SymbolEncodingType_e,
+    pub mlType: SymbolEncodingType_e,
+    pub fseTablesBuffer: [u8; ZSTD_MAX_FSE_HEADERS_SIZE],
+    pub fseTablesSize: usize,
+    /// Carries upstream's 1.3.4 accounting hack — see
+    /// `ZSTD_entropyCompressSeqStore_internal` for context.
+    pub lastCountSize: usize,
+}
+
+impl Default for ZSTD_fseCTablesMetadata_t {
+    fn default() -> Self {
+        Self {
+            llType: SymbolEncodingType_e::default(),
+            ofType: SymbolEncodingType_e::default(),
+            mlType: SymbolEncodingType_e::default(),
+            fseTablesBuffer: [0u8; ZSTD_MAX_FSE_HEADERS_SIZE],
+            fseTablesSize: 0,
+            lastCountSize: 0,
+        }
+    }
+}
+
+/// Port of `ZSTD_entropyCTablesMetadata_t` (`zstd_compress_internal.h:174`).
+/// Bundles HUF + FSE metadata together.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ZSTD_entropyCTablesMetadata_t {
+    pub hufMetadata: ZSTD_hufCTablesMetadata_t,
+    pub fseMetadata: ZSTD_fseCTablesMetadata_t,
+}
+
 /// Port of `ZSTD_symbolEncodingTypeStats_t` — the return type of
 /// `ZSTD_buildSequencesStatistics`.
 #[derive(Debug, Clone, Copy, Default)]
@@ -1344,6 +3397,223 @@ pub struct ZSTD_symbolEncodingTypeStats_t {
     /// `set_compressed` encoding (upstream's "1.3.4 bug" accounting).
     pub lastCountSize: usize,
     pub longOffsets: i32,
+}
+
+/// Port of `ZSTD_estimateBlockSize_literal` (`zstd_compress.c:3853`).
+/// Given a literals buffer + HUF state + block-metadata, returns the
+/// byte count the encoder would emit for the literals block.
+///
+/// Dispatches on `hufMetadata.hType`:
+///   - `set_basic` → raw bytes, size = litSize
+///   - `set_rle` → 1 byte
+///   - `set_compressed` / `set_repeat` → histogram + HUF estimate +
+///     optional tree description bytes + optional 6-byte jump table
+///     for the 4-stream case.
+pub fn ZSTD_estimateBlockSize_literal(
+    literals: &[u8],
+    huf: &ZSTD_hufCTables_t,
+    hufMetadata: &ZSTD_hufCTablesMetadata_t,
+    workspace: &mut [u32],
+    writeEntropy: bool,
+) -> usize {
+    use crate::compress::hist::HIST_count_wksp;
+    use crate::compress::huf_compress::{HUF_estimateCompressedSize, HUF_SYMBOLVALUE_MAX};
+    use crate::decompress::zstd_decompress_block::SymbolEncodingType_e;
+
+    let litSize = literals.len();
+    let literalSectionHeaderSize =
+        3 + (litSize >= 1024) as usize + (litSize >= 16 * 1024) as usize;
+    let singleStream = litSize < 256;
+
+    match hufMetadata.hType {
+        SymbolEncodingType_e::set_basic => litSize,
+        SymbolEncodingType_e::set_rle => 1,
+        SymbolEncodingType_e::set_compressed | SymbolEncodingType_e::set_repeat => {
+            let mut maxSymbolValue = HUF_SYMBOLVALUE_MAX;
+            let mut count = vec![0u32; maxSymbolValue as usize + 1];
+            let largest = HIST_count_wksp(&mut count, &mut maxSymbolValue, literals, workspace);
+            if crate::common::error::ERR_isError(largest) {
+                return litSize;
+            }
+            let mut cLitSizeEstimate =
+                HUF_estimateCompressedSize(&huf.CTable, &count, maxSymbolValue);
+            if writeEntropy {
+                cLitSizeEstimate += hufMetadata.hufDesSize;
+            }
+            if !singleStream {
+                cLitSizeEstimate += 6;
+            }
+            cLitSizeEstimate + literalSectionHeaderSize
+        }
+    }
+}
+
+/// Port of `ZSTD_estimateBlockSize_symbolType` (`zstd_compress.c:3880`).
+/// Estimates the byte size of one of the three FSE-compressed code
+/// streams (of / ml / ll). Dispatches on the encoding mode:
+///   - `set_basic` → cross-entropy against default distribution
+///   - `set_rle` → 0 extra bits (1 symbol byte in the header)
+///   - `set_compressed` / `set_repeat` → FSE cost using the table
+///
+/// Adds the per-symbol extra-bits cost from `additionalBits`, or
+/// treats the code itself as the bit count when `additionalBits` is
+/// `None` (offset streams).
+pub fn ZSTD_estimateBlockSize_symbolType(
+    encType: crate::decompress::zstd_decompress_block::SymbolEncodingType_e,
+    codeTable: &[u8],
+    maxCode: u32,
+    fseCTable: &[crate::compress::fse_compress::FSE_CTable],
+    additionalBits: Option<&[u8]>,
+    defaultNorm: &[i16],
+    defaultNormLog: u32,
+    workspace: &mut [u32],
+) -> usize {
+    use crate::compress::hist::HIST_countFast_wksp;
+    use crate::compress::zstd_compress_sequences::{ZSTD_crossEntropyCost, ZSTD_fseBitCost};
+    use crate::decompress::zstd_decompress_block::SymbolEncodingType_e;
+
+    let nbSeq = codeTable.len();
+    let mut max = maxCode;
+    let mut count = vec![0u32; maxCode as usize + 1];
+    let _ = HIST_countFast_wksp(&mut count, &mut max, codeTable, workspace);
+
+    let mut cSymbolTypeSizeEstimateInBits: usize = match encType {
+        SymbolEncodingType_e::set_basic => ZSTD_crossEntropyCost(defaultNorm, defaultNormLog, &count, max),
+        SymbolEncodingType_e::set_rle => 0,
+        SymbolEncodingType_e::set_compressed | SymbolEncodingType_e::set_repeat => {
+            ZSTD_fseBitCost(fseCTable, &count, max)
+        }
+    };
+    if crate::common::error::ERR_isError(cSymbolTypeSizeEstimateInBits) {
+        return nbSeq * 10;
+    }
+    for &c in codeTable {
+        if let Some(bits) = additionalBits {
+            cSymbolTypeSizeEstimateInBits += bits[c as usize] as usize;
+        } else {
+            cSymbolTypeSizeEstimateInBits += c as usize;
+        }
+    }
+    cSymbolTypeSizeEstimateInBits >> 3
+}
+
+/// Port of `ZSTD_estimateBlockSize_sequences` (`zstd_compress.c:3918`).
+/// Estimates the byte size of the full sequences section: fixed-size
+/// header (1-4 bytes) + per-stream estimates for OF/LL/ML + optional
+/// serialized FSE tables.
+pub fn ZSTD_estimateBlockSize_sequences(
+    ofCodeTable: &[u8],
+    llCodeTable: &[u8],
+    mlCodeTable: &[u8],
+    nbSeq: usize,
+    fseTables: &ZSTD_fseCTables_t,
+    fseMetadata: &ZSTD_fseCTablesMetadata_t,
+    workspace: &mut [u32],
+    writeEntropy: bool,
+) -> usize {
+    use crate::decompress::zstd_decompress_block::{
+        DefaultMaxOff, LL_bits, LL_defaultNorm, LL_defaultNormLog, MaxLL, MaxML, MaxOff,
+        ML_bits, ML_defaultNorm, ML_defaultNormLog, OF_defaultNorm, OF_defaultNormLog,
+    };
+
+    const LONGNBSEQ: usize = 0x7F00;
+    let seqHeaderSize = 1 + 1 + (nbSeq >= 128) as usize + (nbSeq >= LONGNBSEQ) as usize;
+
+    let mut total: usize = 0;
+    total += ZSTD_estimateBlockSize_symbolType(
+        fseMetadata.ofType,
+        ofCodeTable,
+        MaxOff,
+        &fseTables.offcodeCTable,
+        None,
+        &OF_defaultNorm,
+        OF_defaultNormLog,
+        workspace,
+    );
+    total += ZSTD_estimateBlockSize_symbolType(
+        fseMetadata.llType,
+        llCodeTable,
+        MaxLL,
+        &fseTables.litlengthCTable,
+        Some(&LL_bits),
+        &LL_defaultNorm,
+        LL_defaultNormLog,
+        workspace,
+    );
+    total += ZSTD_estimateBlockSize_symbolType(
+        fseMetadata.mlType,
+        mlCodeTable,
+        MaxML,
+        &fseTables.matchlengthCTable,
+        Some(&ML_bits),
+        &ML_defaultNorm,
+        ML_defaultNormLog,
+        workspace,
+    );
+    let _ = DefaultMaxOff;
+    if writeEntropy {
+        total += fseMetadata.fseTablesSize;
+    }
+    total + seqHeaderSize
+}
+
+/// Port of `ZSTD_estimateBlockSize` (`zstd_compress.c:3947`). Combines
+/// literal + sequences estimates + the 3-byte block header into a
+/// full compressed-block size estimate.
+pub fn ZSTD_estimateBlockSize(
+    literals: &[u8],
+    ofCodeTable: &[u8],
+    llCodeTable: &[u8],
+    mlCodeTable: &[u8],
+    nbSeq: usize,
+    entropy: &ZSTD_entropyCTables_t,
+    entropyMetadata: &ZSTD_entropyCTablesMetadata_t,
+    workspace: &mut [u32],
+    writeLitEntropy: bool,
+    writeSeqEntropy: bool,
+) -> usize {
+    use crate::decompress::zstd_decompress_block::ZSTD_blockHeaderSize;
+    let literalsSize = ZSTD_estimateBlockSize_literal(
+        literals,
+        &entropy.huf,
+        &entropyMetadata.hufMetadata,
+        workspace,
+        writeLitEntropy,
+    );
+    let seqSize = ZSTD_estimateBlockSize_sequences(
+        ofCodeTable,
+        llCodeTable,
+        mlCodeTable,
+        nbSeq,
+        &entropy.fse,
+        &entropyMetadata.fseMetadata,
+        workspace,
+        writeSeqEntropy,
+    );
+    literalsSize + seqSize + ZSTD_blockHeaderSize
+}
+
+/// Port of `ZSTD_buildDummySequencesStatistics` (`zstd_compress.c:3767`).
+/// Fast-path that skips `ZSTD_buildSequencesStatistics` when the block
+/// has no sequences — emits `set_basic` for all three streams and
+/// clears `nextEntropy` repeatModes so the next block must re-emit
+/// fresh tables. Zero output bytes because default tables are
+/// implicit in the zstd format.
+pub fn ZSTD_buildDummySequencesStatistics(
+    nextEntropy: &mut ZSTD_fseCTables_t,
+) -> ZSTD_symbolEncodingTypeStats_t {
+    use crate::compress::zstd_compress_sequences::FSE_repeat;
+    nextEntropy.litlength_repeatMode = FSE_repeat::FSE_repeat_none;
+    nextEntropy.offcode_repeatMode = FSE_repeat::FSE_repeat_none;
+    nextEntropy.matchlength_repeatMode = FSE_repeat::FSE_repeat_none;
+    ZSTD_symbolEncodingTypeStats_t {
+        LLtype: SymbolEncodingType_e::set_basic,
+        Offtype: SymbolEncodingType_e::set_basic,
+        MLtype: SymbolEncodingType_e::set_basic,
+        size: 0,
+        lastCountSize: 0,
+        longOffsets: 0,
+    }
 }
 
 /// Port of `ZSTD_buildSequencesStatistics`. Runs histogram →
@@ -1602,6 +3872,22 @@ pub fn ZSTD_entropyCompressSeqStore_internal(
         0
     };
     let literals = seqStore.literals.clone();
+    // Upstream: `HUF_repeat repeat = prevHuf->repeatMode;` — the
+    // repeat-reuse signal comes from the PREVIOUS block's entropy
+    // (or from `ZSTD_loadCEntropy` when a dict seeded the tables).
+    // `nextEntropy.huf.CTable` already carries the previously-emitted
+    // table via the prev↔next swap in
+    // `ZSTD_blockState_confirmRepcodesAndEntropyTables`. Seed the
+    // repeat flag from prevEntropy so set_repeat mode activates when
+    // a valid table is available.
+    nextEntropy.huf.repeatMode = prevEntropy.huf.repeatMode;
+    // When the dict path set prevEntropy.huf.repeatMode=valid AND
+    // populated prevEntropy.huf.CTable (via ZSTD_loadCEntropy), we
+    // also need the CTable bytes in nextEntropy so set_repeat can
+    // reuse them.
+    if prevEntropy.huf.repeatMode == crate::compress::zstd_compress_literals::HUF_repeat::HUF_repeat_valid {
+        nextEntropy.huf.CTable.clone_from(&prevEntropy.huf.CTable);
+    }
     let cSize = ZSTD_compressLiterals(
         &mut dst[op..],
         &literals,
@@ -2090,6 +4376,154 @@ pub fn ZSTD_compressBlock_fast_framed(
     ZSTD_blockHeaderSize + cBodySize
 }
 
+/// Port of `ZSTD_CCtxParams_setZstdParams` (zstd_compress.c:423).
+/// Copies a `ZSTD_parameters` bundle into a `ZSTD_CCtx_params`
+/// struct. Upstream asserts cParams validity; we match that contract
+/// by calling `ZSTD_checkCParams` and propagating any error as a
+/// return value (upstream's `assert` relies on callers having already
+/// validated). Sets `compressionLevel` to `ZSTD_NO_CLEVEL` per
+/// upstream, since cParams are assumed fully defined.
+pub fn ZSTD_CCtxParams_setZstdParams(
+    cctxParams: &mut ZSTD_CCtx_params,
+    params: &ZSTD_parameters,
+) -> usize {
+    let rc = ZSTD_checkCParams(params.cParams);
+    if ERR_isError(rc) {
+        return rc;
+    }
+    cctxParams.cParams = params.cParams;
+    cctxParams.fParams = params.fParams;
+    cctxParams.compressionLevel = ZSTD_NO_CLEVEL;
+    0
+}
+
+/// Port of `BlockSummary` (zstd_compress_internal.h:1528).
+/// Summary of a single block's sequence list — returned by
+/// `ZSTD_get1BlockSummary` so the ZSTD_compressSequences driver can
+/// size the output block's header before emitting bytes.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BlockSummary {
+    pub nbSequences: usize,
+    pub blockSize: usize,
+    pub litSize: usize,
+}
+
+/// Port of `ZSTD_get1BlockSummary` (zstd_compress.c:7919 scalar).
+/// Sums `litLength + matchLength` across sequences until a terminator
+/// `(offset=0, litLength=0, matchLength=0)` is hit (or `nbSeqs` is
+/// exhausted). Returns the number of sequences consumed, the block's
+/// total size (lit + match), and the literals sum alone.
+///
+/// Upstream ships a 4-way unrolled + SIMD-vectorized variant; this
+/// port is a straight scalar loop, matching the `#else` fallback.
+pub fn ZSTD_get1BlockSummary(seqs: &[ZSTD_Sequence]) -> BlockSummary {
+    let mut nbSequences = 0usize;
+    let mut blockSize = 0usize;
+    let mut litSize = 0usize;
+    for s in seqs {
+        // Terminator: all three length/offset fields zero.
+        if s.offset == 0 && s.litLength == 0 && s.matchLength == 0 {
+            break;
+        }
+        blockSize += s.litLength as usize + s.matchLength as usize;
+        litSize += s.litLength as usize;
+        nbSequences += 1;
+    }
+    BlockSummary { nbSequences, blockSize, litSize }
+}
+
+/// Port of `ZSTD_initCCtx` (zstd_compress.c:110). Upstream zeros the
+/// whole struct and applies default parameters via
+/// `ZSTD_CCtx_reset(_parameters)`. Our port's CCtx is already
+/// default-constructed via `ZSTD_CCtx::default()`; this helper simply
+/// delegates to the reset path for API surface parity. `customMem`
+/// is accepted-but-ignored since v0.1 always routes through
+/// `std::alloc`.
+pub fn ZSTD_initCCtx(cctx: &mut ZSTD_CCtx, _customMem: ZSTD_customMem) {
+    *cctx = ZSTD_CCtx::default();
+    let _ = ZSTD_CCtx_reset(cctx, ZSTD_ResetDirective::ZSTD_reset_parameters);
+}
+
+/// Port of `ZSTD_useTargetCBlockSize` (zstd_compress.c:2749). True
+/// when `targetCBlockSize != 0` — enables the superblock compressor.
+#[inline]
+pub fn ZSTD_useTargetCBlockSize(cctxParams: &ZSTD_CCtx_params) -> bool {
+    cctxParams.targetCBlockSize != 0
+}
+
+/// Port of `ZSTD_blockSplitterEnabled` (zstd_compress.c:2760). True
+/// when `postBlockSplitter` is explicitly enabled. Upstream asserts
+/// `postBlockSplitter != ZSTD_ps_auto` here; `ps_auto` resolves via
+/// `ZSTD_resolveBlockSplitterMode` before this is called.
+#[inline]
+pub fn ZSTD_blockSplitterEnabled(cctxParams: &ZSTD_CCtx_params) -> bool {
+    cctxParams.postBlockSplitter == crate::compress::zstd_ldm::ZSTD_ParamSwitch_e::ZSTD_ps_enable
+}
+
+/// Port of `ZSTD_isUpdateAuthorized` (zstd_compress.c:674). Returns
+/// true if a given `ZSTD_cParameter` is safe to update mid-session
+/// (i.e. after `compressStream` has started), false if changing it
+/// would require resetting the CCtx. Upstream's full allow-list is
+/// long; of the ids currently surfaced in `ZSTD_cParameter`, only
+/// `ZSTD_c_compressionLevel` qualifies — header toggles
+/// (`checksumFlag`, `contentSizeFlag`, `dictIDFlag`, `format`) and
+/// worker-count changes all require re-init.
+#[inline]
+pub fn ZSTD_isUpdateAuthorized(param: ZSTD_cParameter) -> bool {
+    matches!(param, ZSTD_cParameter::ZSTD_c_compressionLevel)
+}
+
+/// Port of `ZSTD_freeCCtxContent` (zstd_compress.c:178). Drops the
+/// CCtx's heap-owned content — dicts, match-state tables, seq store,
+/// streaming buffers — leaving the outer struct itself intact.
+/// Upstream uses this when recycling a CCtx in-place; our port
+/// achieves the same via field-level resets. Kept as a named entry
+/// so C-compat call sites compile.
+pub fn ZSTD_freeCCtxContent(cctx: &mut ZSTD_CCtx) {
+    ZSTD_clearAllDicts(cctx);
+    cctx.ms = None;
+    cctx.seqStore = None;
+    cctx.stream_in_buffer.clear();
+    cctx.stream_out_buffer.clear();
+    cctx.stream_out_drained = 0;
+}
+
+/// Port of `ZSTD_CCtx_trace` (zstd_compress.c:5407). Upstream
+/// conditionally emits a trace event at the end of compression when
+/// `ZSTD_TRACE` is compiled in. Our port has no tracing infrastructure
+/// so this is an intentional no-op — kept for API surface parity.
+#[inline]
+pub fn ZSTD_CCtx_trace(_cctx: &mut ZSTD_CCtx, _extraCSize: usize) {}
+
+/// Port of `ZSTD_hasExtSeqProd` (zstd_compress_internal.h:1613).
+/// Upstream returns true iff the CCtxParams struct carries an
+/// external sequence producer callback. v0.1 doesn't support external
+/// sequence producers — always returns false.
+#[inline]
+pub fn ZSTD_hasExtSeqProd(_params: &ZSTD_CCtx_params) -> bool {
+    false
+}
+
+/// Port of `ZSTD_getSeqStore` (zstd_compress.c:230). Returns the
+/// CCtx's seq store, if it's been allocated. Upstream always has a
+/// `seqStore` field; our port defers allocation so the caller may
+/// see `None` on a freshly-created CCtx before the first compression
+/// call seeds it.
+#[inline]
+pub fn ZSTD_getSeqStore(
+    ctx: &ZSTD_CCtx,
+) -> Option<&crate::compress::seq_store::SeqStore_t> {
+    ctx.seqStore.as_ref()
+}
+
+/// Port of `ZSTD_maybeRLE`. Heuristic used by the block-splitter:
+/// a block with very few sequences and very few literals is a
+/// candidate for the `bt_rle` path. Upstream (zstd_compress.c:3622)
+/// returns true when `nbSeqs < 4 && nbLits < 10`.
+pub fn ZSTD_maybeRLE(seqStore: &crate::compress::seq_store::SeqStore_t) -> bool {
+    seqStore.sequences.len() < 4 && seqStore.literals.len() < 10
+}
+
 /// Port of `ZSTD_isRLE`. Returns `1` iff every byte of `src` equals
 /// `src[0]`. Upstream uses a size_t-strided unrolled loop; the Rust
 /// port uses `Iterator::all` which the compiler auto-vectorizes.
@@ -2194,14 +4628,28 @@ pub fn ZSTD_getFrameProgression(cctx: &ZSTD_CCtx) -> ZSTD_frameProgression {
     }
 }
 
-/// Port of `ZSTD_getBlockSize` (compressor side). Returns the max
-/// block size the CCtx is configured for — upstream computes
-/// `min(appliedParams.maxBlockSize, 1 << windowLog)`; v0.1 doesn't
-/// track `appliedParams` on the CCtx yet, so we return the default
-/// `ZSTD_BLOCKSIZE_MAX`.
+/// Port of `ZSTD_getBlockSize` (compressor side, `zstd_compress.c:4901`).
+/// Returns `min(appliedParams.maxBlockSize, 1 << windowLog)`. When
+/// `appliedParams.maxBlockSize == 0` (unset), treat as
+/// `ZSTD_BLOCKSIZE_MAX`. For callers that never set params, falls
+/// back to `requested_cParams.windowLog` when present, else to the
+/// hard `ZSTD_BLOCKSIZE_MAX`.
 #[inline]
-pub fn ZSTD_getBlockSize(_cctx: &ZSTD_CCtx) -> usize {
-    crate::decompress::zstd_decompress_block::ZSTD_BLOCKSIZE_MAX
+pub fn ZSTD_getBlockSize(cctx: &ZSTD_CCtx) -> usize {
+    use crate::decompress::zstd_decompress_block::ZSTD_BLOCKSIZE_MAX;
+    let maxBlockSize = if cctx.appliedParams.maxBlockSize != 0 {
+        cctx.appliedParams.maxBlockSize
+    } else {
+        ZSTD_BLOCKSIZE_MAX
+    };
+    let windowLog = if cctx.appliedParams.cParams.windowLog != 0 {
+        cctx.appliedParams.cParams.windowLog
+    } else if let Some(cp) = cctx.requested_cParams {
+        cp.windowLog
+    } else {
+        return maxBlockSize;
+    };
+    maxBlockSize.min(1usize << windowLog)
 }
 
 /// Port of `ZSTD_writeSkippableFrame`. Writes a skippable frame header
@@ -2246,13 +4694,45 @@ pub struct ZSTD_Sequence {
     pub rep: u32,
 }
 
+/// Port of `convertSequences_noRepcodes` scalar fallback
+/// (`zstd_compress.c:7674`). Transcodes a `ZSTD_Sequence[]` stream
+/// into the lower-level `SeqDef[]` — applying `OFFSET_TO_OFFBASE` and
+/// subtracting `MINMATCH` from each match length. Returns a "long
+/// length" index sentinel: 0 for none, `n+1` for a match-length
+/// overflow at position n, or `n+nbSequences+1` for a litLength
+/// overflow. `rep` field on input is ignored (noRepcodes contract).
+pub fn convertSequences_noRepcodes(
+    dstSeqs: &mut [crate::compress::seq_store::SeqDef],
+    inSeqs: &[ZSTD_Sequence],
+) -> usize {
+    use crate::compress::seq_store::{OFFSET_TO_OFFBASE, MINMATCH};
+    let nbSequences = inSeqs.len();
+    debug_assert!(dstSeqs.len() >= nbSequences);
+    let mut longLen: usize = 0;
+    for n in 0..nbSequences {
+        dstSeqs[n].offBase = OFFSET_TO_OFFBASE(inSeqs[n].offset);
+        dstSeqs[n].litLength = inSeqs[n].litLength as u16;
+        dstSeqs[n].mlBase = (inSeqs[n].matchLength - MINMATCH) as u16;
+        if inSeqs[n].matchLength > 65535 + MINMATCH {
+            debug_assert_eq!(longLen, 0);
+            longLen = n + 1;
+        }
+        if inSeqs[n].litLength > 65535 {
+            debug_assert_eq!(longLen, 0);
+            longLen = n + nbSequences + 1;
+        }
+    }
+    longLen
+}
+
 /// Port of `ZSTD_compressSequences`. Compresses a caller-provided
 /// sequence stream into a frame in `dst`.
 ///
-/// v0.1 status: **stub** — this API requires an entropy-compressor
-/// path that accepts pre-built sequences instead of running a match
-/// finder. Returns `ErrorCode::Generic` so callers can detect the
-/// gap. Full implementation arrives with the optimal parser port.
+/// v0.1 status: **stub** — this API needs the glue that converts
+/// `&[ZSTD_Sequence]` into a `SeqStore_t` and feeds it into
+/// `ZSTD_entropyCompressSeqStore` (both building blocks are already
+/// ported). Returns `ErrorCode::Generic` so callers can detect the
+/// gap without a silent wrong-output failure.
 pub fn ZSTD_compressSequences(
     _cctx: &mut ZSTD_CCtx,
     _dst: &mut [u8],
@@ -2286,11 +4766,11 @@ pub fn ZSTD_mergeBlockDelimiters(sequences: &mut [ZSTD_Sequence]) -> usize {
 /// Port of `ZSTD_generateSequences`. Scans `src` via the configured
 /// CCtx compressor and fills `outSeqs` with the discovered matches.
 ///
-/// v0.1 status: **stub** — the pipeline requires an exposed
-/// sequence-extraction path that the current `ZSTD_compressCCtx`
-/// doesn't surface. Returns `ErrorCode::Generic` so callers can
-/// detect the gap. Full implementation arrives with the optimal
-/// parser port.
+/// v0.1 status: **stub** — this API needs a hook that captures the
+/// `SeqStore_t` a match finder emits and projects it into
+/// `ZSTD_Sequence`. The match finders are ported but the
+/// capture-and-project glue isn't. Returns `ErrorCode::Generic` so
+/// callers can detect the gap without a silent wrong-output failure.
 pub fn ZSTD_generateSequences(
     _zc: &mut ZSTD_CCtx,
     _outSeqs: &mut [ZSTD_Sequence],
@@ -2305,6 +4785,12 @@ pub fn ZSTD_generateSequences(
 /// session.
 pub fn ZSTD_clearAllDicts(cctx: &mut ZSTD_CCtx) {
     cctx.stream_dict.clear();
+    cctx.dictID = 0;
+    cctx.dictContentSize = 0;
+    // Also clear the single-usage marker — after clearAllDicts the
+    // cctx has no dict at all, so the flag shouldn't report "there's
+    // a prefix waiting to be consumed" to the next compress.
+    cctx.prefix_is_single_use = false;
     // Our CCtx doesn't carry `localDict` / `prefixDict` / `cdict`
     // fields directly yet — upstream's cache is rebuilt on each
     // compression call so clearing `stream_dict` is the v0.1
@@ -2439,14 +4925,64 @@ pub fn ZSTD_toFlushNow(_cctx: &ZSTD_CCtx) -> usize {
 }
 
 /// Port of `ZSTD_CCtx_params`. Cut-down version exposing the public
-/// API surface (compressionLevel + cParams + fParams). Upstream
-/// carries many more fields (LDM params, block splitter mode, MT
-/// job size, etc.) — v0.1 stores only what the current port uses.
+/// API surface. Upstream carries many more fields (LDM params, MT
+/// job size, etc.) — v0.1 stores the policy knobs whose resolvers
+/// the init helpers consult.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ZSTD_CCtx_params {
     pub compressionLevel: i32,
     pub cParams: crate::compress::match_state::ZSTD_compressionParameters,
     pub fParams: ZSTD_FrameParameters,
+    /// Upstream `params.format`. Matches `ZSTD_CCtx.format`. Only
+    /// `CCtxParams_setParameter` / `_getParameter` consult this slot;
+    /// the compressor path reads from `cctx.format`.
+    pub format: crate::decompress::zstd_decompress::ZSTD_format_e,
+    /// `ZSTD_c_useRowMatchFinder` — picks the row-hash matcher family.
+    pub useRowMatchFinder: crate::compress::zstd_ldm::ZSTD_ParamSwitch_e,
+    /// `ZSTD_c_useBlockSplitter` — controls the post-compress
+    /// block-splitter pass.
+    pub postBlockSplitter: crate::compress::zstd_ldm::ZSTD_ParamSwitch_e,
+    /// `ZSTD_c_enableLongDistanceMatching` — turns on the LDM
+    /// long-distance matcher.
+    pub ldmEnable: crate::compress::zstd_ldm::ZSTD_ParamSwitch_e,
+    /// `ZSTD_c_validateSequences` — 1 to validate caller-supplied
+    /// sequences; 0 to trust them.
+    pub validateSequences: i32,
+    /// `ZSTD_c_maxBlockSize` — upper bound on block size in bytes;
+    /// 0 means "default to `ZSTD_BLOCKSIZE_MAX`".
+    pub maxBlockSize: usize,
+    /// `ZSTD_c_searchForExternalRepcodes` — auto / enable / disable.
+    pub searchForExternalRepcodes: crate::compress::zstd_ldm::ZSTD_ParamSwitch_e,
+    /// `ZSTD_c_targetCBlockSize` — when nonzero, aim for this compressed
+    /// block size (in bytes). Enables the superblock compressor path.
+    pub targetCBlockSize: usize,
+    /// `ZSTD_c_attachDictPref` — controls attach-vs-copy behavior for
+    /// CDicts. Default is `ZSTD_dictDefaultAttach` (auto).
+    pub attachDictPref: ZSTD_dictAttachPref_e,
+    /// `ZSTD_c_forceMaxWindow` — when set, the compressor forces its
+    /// window size to the frame's windowLog rather than shrinking to
+    /// the actual content size.
+    pub forceWindow: i32,
+    /// `ZSTD_c_srcSizeHint` — advisory source size passed to
+    /// `ZSTD_getCParams_internal` when the exact pledged size is
+    /// unknown.
+    pub srcSizeHint: i32,
+    /// `ZSTD_c_blockDelimiters` — picks between implicit and explicit
+    /// block delimiters in caller-supplied sequence mode.
+    pub blockDelimiters: ZSTD_SequenceFormat_e,
+    /// `ZSTD_c_literalCompressionMode` — auto / force-on / force-off
+    /// for HUF literal compression. Upstream deprecated; kept for
+    /// API parity.
+    pub literalCompressionMode: crate::compress::zstd_ldm::ZSTD_ParamSwitch_e,
+    /// `ZSTD_c_nbWorkers` — multithreading worker count. v0.1 is
+    /// single-threaded so this is an API-only knob.
+    pub nbWorkers: i32,
+    /// `ZSTD_c_enableDedicatedDictSearch` — opt-in to DDSS hash
+    /// inflation when building a CDict.
+    pub enableDedicatedDictSearch: i32,
+    /// `ZSTD_c_deterministicRefPrefix` — forces the `refPrefix` path
+    /// to use the same window-setup rules regardless of frame state.
+    pub deterministicRefPrefix: i32,
 }
 
 /// Port of `ZSTD_createCCtxParams`. Allocates + initializes with the
@@ -2478,6 +5014,197 @@ pub fn ZSTD_CCtxParams_init(params: &mut ZSTD_CCtx_params, compressionLevel: i32
     0
 }
 
+/// Port of upstream's `repStartValue` (`zstd_internal.h:65`). The
+/// canonical initial repcode history at frame start — also the value
+/// that `ZSTD_reset_compressedBlockState` restores.
+pub const ZSTD_REP_START_VALUE: [u32; 3] = [1, 4, 8];
+
+/// Port of `ZSTD_reset_compressedBlockState` (`zstd_compress.c:1942`).
+/// Restores the upstream-default repcode history and marks every
+/// entropy table's repeatMode as `none` so the next block must
+/// re-emit fresh tables rather than reusing stale ones.
+///
+/// Our CCtx carries `prev_rep` + `prevEntropy` directly (no shadowed
+/// `next` fields to rotate), so this helper operates on those.
+/// Caller should also reset `next_rep` + `nextEntropy` if they're
+/// about to start a fresh frame.
+pub fn ZSTD_reset_compressedBlockState(rep: &mut [u32; 3], entropy: &mut ZSTD_entropyCTables_t) {
+    *rep = ZSTD_REP_START_VALUE;
+    entropy.huf.repeatMode = crate::compress::zstd_compress_literals::HUF_repeat::HUF_repeat_none;
+    entropy.fse.offcode_repeatMode =
+        crate::compress::zstd_compress_sequences::FSE_repeat::FSE_repeat_none;
+    entropy.fse.matchlength_repeatMode =
+        crate::compress::zstd_compress_sequences::FSE_repeat::FSE_repeat_none;
+    entropy.fse.litlength_repeatMode =
+        crate::compress::zstd_compress_sequences::FSE_repeat::FSE_repeat_none;
+}
+
+/// Port of `writeBlockHeader` (`zstd_compress.c:3638`). Writes the
+/// 3-byte little-endian block header. `cSize == 1` signals an RLE
+/// block (`blockSize` carries the uncompressed length); otherwise
+/// signals a compressed block (`cSize` carries the compressed length).
+/// `lastBlock` is a bool encoded as 0/1 in the LSB.
+#[inline]
+pub fn writeBlockHeader(op: &mut [u8], cSize: usize, blockSize: usize, lastBlock: u32) {
+    use crate::common::mem::MEM_writeLE24;
+    use crate::decompress::zstd_decompress_block::blockType_e;
+    let cBlockHeader: u32 = if cSize == 1 {
+        lastBlock + ((blockType_e::bt_rle as u32) << 1) + ((blockSize as u32) << 3)
+    } else {
+        lastBlock + ((blockType_e::bt_compressed as u32) << 1) + ((cSize as u32) << 3)
+    };
+    MEM_writeLE24(op, cBlockHeader);
+}
+
+/// Port of `ZSTD_blockState_confirmRepcodesAndEntropyTables`
+/// (`zstd_compress.c:3630`). After a block is accepted upstream
+/// swaps the `prev`/`next` pointers so the newly-emitted entropy
+/// tables and repcodes become the baseline for the next block. Our
+/// CCtx owns `prev_*` + `next_*` directly (not as pointers), so we
+/// swap the contents with `std::mem::swap`.
+pub fn ZSTD_blockState_confirmRepcodesAndEntropyTables(cctx: &mut ZSTD_CCtx) {
+    core::mem::swap(&mut cctx.prev_rep, &mut cctx.next_rep);
+    core::mem::swap(&mut cctx.prevEntropy, &mut cctx.nextEntropy);
+}
+
+/// Port of `ZSTD_invalidateRepCodes` (`zstd_compress.c:2310`). Zeros
+/// every entry of the CCtx's live repcode history (the "previous
+/// block" view that the next block's rep-check will consult).
+pub fn ZSTD_invalidateRepCodes(cctx: &mut ZSTD_CCtx) {
+    for slot in cctx.prev_rep.iter_mut() {
+        *slot = 0;
+    }
+}
+
+/// Port of `ZSTD_getCParamsFromCCtxParams` (`zstd_compress.c:1653`).
+/// Derives the effective `ZSTD_compressionParameters` from a params
+/// struct + srcSizeHint + dictSize + mode. Flow:
+///   1. If srcSizeHint is UNKNOWN and `params.srcSizeHint > 0`, use
+///      that stored hint (v0.1 doesn't carry `srcSizeHint` on our
+///      params struct, so this branch is inert).
+///   2. Pick baseline cParams via `ZSTD_getCParams`.
+///   3. Upstream widens windowLog to `ZSTD_LDM_DEFAULT_WINDOW_LOG`
+///      when LDM is enabled (skipped — our params don't yet carry
+///      the LDM knob).
+///   4. Apply `ZSTD_overrideCParams` to fold in any explicitly-set
+///      fields from `params.cParams`.
+///   5. Final `ZSTD_adjustCParams_internal` clamp against window /
+///      dict / source constraints.
+pub fn ZSTD_getCParamsFromCCtxParams(
+    CCtxParams: &ZSTD_CCtx_params,
+    srcSizeHint: u64,
+    dictSize: usize,
+    mode: ZSTD_CParamMode_e,
+) -> crate::compress::match_state::ZSTD_compressionParameters {
+    use crate::compress::zstd_ldm::{ZSTD_LDM_DEFAULT_WINDOW_LOG, ZSTD_ParamSwitch_e};
+    use crate::decompress::zstd_decompress::ZSTD_CONTENTSIZE_UNKNOWN;
+    // Upstream: if srcSizeHint is UNKNOWN and params.srcSizeHint > 0,
+    // use the stored hint.
+    let effective_srcSizeHint = if srcSizeHint == ZSTD_CONTENTSIZE_UNKNOWN
+        && CCtxParams.srcSizeHint > 0
+    {
+        CCtxParams.srcSizeHint as u64
+    } else {
+        srcSizeHint
+    };
+    let mut cParams = ZSTD_getCParams(CCtxParams.compressionLevel, effective_srcSizeHint, dictSize);
+    // LDM widens windowLog when enabled.
+    if CCtxParams.ldmEnable == ZSTD_ParamSwitch_e::ZSTD_ps_enable {
+        cParams.windowLog = ZSTD_LDM_DEFAULT_WINDOW_LOG;
+    }
+    ZSTD_overrideCParams(&mut cParams, &CCtxParams.cParams);
+    ZSTD_adjustCParams_internal(
+        cParams,
+        effective_srcSizeHint,
+        dictSize as u64,
+        mode,
+        CCtxParams.useRowMatchFinder,
+    )
+}
+
+/// Port of `ZSTD_makeCCtxParamsFromCParams` (`zstd_compress.c:319`).
+/// Produces a `ZSTD_CCtx_params` struct seeded with the default level
+/// but overriding `cParams` to the caller-supplied value. The
+/// resolver calls (`ZSTD_resolveEnableLdm`, `ZSTD_resolveBlockSplitterMode`,
+/// …) run for their side-effect semantics and are discarded because
+/// our `ZSTD_CCtx_params` doesn't yet carry the policy-knob fields
+/// those resolvers fill in.
+pub fn ZSTD_makeCCtxParamsFromCParams(
+    cParams: crate::compress::match_state::ZSTD_compressionParameters,
+) -> ZSTD_CCtx_params {
+    use crate::compress::match_state::{
+        ZSTD_resolveBlockSplitterMode, ZSTD_resolveEnableLdm,
+        ZSTD_resolveExternalRepcodeSearch, ZSTD_resolveExternalSequenceValidation,
+        ZSTD_resolveMaxBlockSize, ZSTD_resolveRowMatchFinderMode,
+    };
+    use crate::compress::zstd_ldm::ZSTD_ParamSwitch_e;
+
+    let mut cctxParams = ZSTD_CCtx_params::default();
+    ZSTD_CCtxParams_init(&mut cctxParams, ZSTD_CLEVEL_DEFAULT);
+    cctxParams.cParams = cParams;
+
+    cctxParams.ldmEnable = ZSTD_resolveEnableLdm(ZSTD_ParamSwitch_e::ZSTD_ps_auto, &cParams);
+    cctxParams.postBlockSplitter =
+        ZSTD_resolveBlockSplitterMode(ZSTD_ParamSwitch_e::ZSTD_ps_auto, &cParams);
+    cctxParams.useRowMatchFinder =
+        ZSTD_resolveRowMatchFinderMode(ZSTD_ParamSwitch_e::ZSTD_ps_auto, &cParams);
+    cctxParams.validateSequences = ZSTD_resolveExternalSequenceValidation(0);
+    cctxParams.maxBlockSize = ZSTD_resolveMaxBlockSize(0);
+    cctxParams.searchForExternalRepcodes = ZSTD_resolveExternalRepcodeSearch(
+        ZSTD_ParamSwitch_e::ZSTD_ps_auto,
+        cctxParams.compressionLevel,
+    );
+
+    debug_assert!(!crate::common::error::ERR_isError(ZSTD_checkCParams(cParams)));
+    cctxParams
+}
+
+/// Port of `ZSTD_CCtxParams_init_internal` (`zstd_compress.c:388`).
+/// Zeroes the params, installs the caller's cParams / fParams, sets
+/// `compressionLevel`, and folds auto-resolvable policy knobs through
+/// their resolvers (`ZSTD_resolveRowMatchFinderMode`,
+/// `ZSTD_resolveBlockSplitterMode`, `ZSTD_resolveEnableLdm`,
+/// `ZSTD_resolveExternalSequenceValidation`, `ZSTD_resolveMaxBlockSize`,
+/// `ZSTD_resolveExternalRepcodeSearch`).
+///
+/// Our `ZSTD_CCtx_params` doesn't yet carry the full policy-knob set
+/// (`useRowMatchFinder`, `postBlockSplitter`, `ldmParams`,
+/// `validateSequences`, `maxBlockSize`, `searchForExternalRepcodes`).
+/// The port still runs the resolvers to preserve their side-effect
+/// semantics (they're pure) and discards the results — once the
+/// fields land, the discards become assignments and no call-site
+/// changes are needed.
+pub fn ZSTD_CCtxParams_init_internal(
+    cctxParams: &mut ZSTD_CCtx_params,
+    zstdParams: &ZSTD_parameters,
+    compressionLevel: i32,
+) {
+    debug_assert!(!crate::common::error::ERR_isError(ZSTD_checkCParams(
+        zstdParams.cParams
+    )));
+    use crate::compress::match_state::{
+        ZSTD_resolveBlockSplitterMode, ZSTD_resolveEnableLdm,
+        ZSTD_resolveExternalRepcodeSearch, ZSTD_resolveExternalSequenceValidation,
+        ZSTD_resolveMaxBlockSize, ZSTD_resolveRowMatchFinderMode,
+    };
+    use crate::compress::zstd_ldm::ZSTD_ParamSwitch_e;
+
+    *cctxParams = ZSTD_CCtx_params::default();
+    cctxParams.compressionLevel = compressionLevel;
+    cctxParams.cParams = zstdParams.cParams;
+    cctxParams.fParams = zstdParams.fParams;
+    cctxParams.useRowMatchFinder =
+        ZSTD_resolveRowMatchFinderMode(ZSTD_ParamSwitch_e::ZSTD_ps_auto, &zstdParams.cParams);
+    cctxParams.postBlockSplitter =
+        ZSTD_resolveBlockSplitterMode(ZSTD_ParamSwitch_e::ZSTD_ps_auto, &zstdParams.cParams);
+    cctxParams.ldmEnable =
+        ZSTD_resolveEnableLdm(ZSTD_ParamSwitch_e::ZSTD_ps_auto, &zstdParams.cParams);
+    cctxParams.validateSequences = ZSTD_resolveExternalSequenceValidation(0);
+    cctxParams.maxBlockSize = ZSTD_resolveMaxBlockSize(0);
+    cctxParams.searchForExternalRepcodes =
+        ZSTD_resolveExternalRepcodeSearch(ZSTD_ParamSwitch_e::ZSTD_ps_auto, compressionLevel);
+}
+
 /// Port of `ZSTD_CCtxParams_init_advanced`. Seeds from a full
 /// `ZSTD_parameters` struct after a bounds check.
 pub fn ZSTD_CCtxParams_init_advanced(
@@ -2492,6 +5219,7 @@ pub fn ZSTD_CCtxParams_init_advanced(
         compressionLevel: ZSTD_NO_CLEVEL,
         cParams: zstdParams.cParams,
         fParams: zstdParams.fParams,
+        ..ZSTD_CCtx_params::default()
     };
     0
 }
@@ -2506,20 +5234,73 @@ pub fn ZSTD_CCtxParams_setParameter(
 ) -> usize {
     match param {
         ZSTD_cParameter::ZSTD_c_compressionLevel => {
-            params.compressionLevel = value;
+            // Upstream clamps via `ZSTD_cParam_clampBounds` + maps 0
+            // to `ZSTD_CLEVEL_DEFAULT`. Mirror here so CCtxParams-
+            // level callers see the same readback as CCtx-level ones.
+            let mut clamped = value;
+            let rc = ZSTD_cParam_clampBounds(
+                ZSTD_cParameter::ZSTD_c_compressionLevel,
+                &mut clamped,
+            );
+            if ERR_isError(rc) {
+                return rc;
+            }
+            params.compressionLevel = if clamped == 0 {
+                ZSTD_CLEVEL_DEFAULT
+            } else {
+                clamped
+            };
             0
         }
         ZSTD_cParameter::ZSTD_c_checksumFlag => {
+            // Upstream: bounds-checked against `[0, 1]`. Out-of-range
+            // returns `ParameterOutOfBound`. We mirror so params-
+            // level callers see the same rejection as CCtx-level ones.
+            let bounds = ZSTD_cParam_getBounds(ZSTD_cParameter::ZSTD_c_checksumFlag);
+            if value < bounds.lowerBound || value > bounds.upperBound {
+                return ERROR(ErrorCode::ParameterOutOfBound);
+            }
             params.fParams.checksumFlag = value as u32;
             0
         }
         ZSTD_cParameter::ZSTD_c_contentSizeFlag => {
+            let bounds = ZSTD_cParam_getBounds(ZSTD_cParameter::ZSTD_c_contentSizeFlag);
+            if value < bounds.lowerBound || value > bounds.upperBound {
+                return ERROR(ErrorCode::ParameterOutOfBound);
+            }
             params.fParams.contentSizeFlag = value as u32;
             0
         }
         ZSTD_cParameter::ZSTD_c_dictIDFlag => {
+            let bounds = ZSTD_cParam_getBounds(ZSTD_cParameter::ZSTD_c_dictIDFlag);
+            if value < bounds.lowerBound || value > bounds.upperBound {
+                return ERROR(ErrorCode::ParameterOutOfBound);
+            }
             // Upstream stores noDictIDFlag, inverted — we mirror.
             params.fParams.noDictIDFlag = if value != 0 { 0 } else { 1 };
+            0
+        }
+        ZSTD_cParameter::ZSTD_c_format => {
+            let bounds = ZSTD_cParam_getBounds(ZSTD_cParameter::ZSTD_c_format);
+            if value < bounds.lowerBound || value > bounds.upperBound {
+                return ERROR(ErrorCode::ParameterOutOfBound);
+            }
+            params.format = match value {
+                v if v == crate::decompress::zstd_decompress::ZSTD_format_e::ZSTD_f_zstd1_magicless
+                    as i32 =>
+                {
+                    crate::decompress::zstd_decompress::ZSTD_format_e::ZSTD_f_zstd1_magicless
+                }
+                _ => crate::decompress::zstd_decompress::ZSTD_format_e::ZSTD_f_zstd1,
+            };
+            0
+        }
+        ZSTD_cParameter::ZSTD_c_nbWorkers => {
+            let bounds = ZSTD_cParam_getBounds(ZSTD_cParameter::ZSTD_c_nbWorkers);
+            if value < bounds.lowerBound || value > bounds.upperBound {
+                return ERROR(ErrorCode::ParameterOutOfBound);
+            }
+            params.nbWorkers = value;
             0
         }
     }
@@ -2535,6 +5316,8 @@ pub fn ZSTD_CCtxParams_getParameter(
         ZSTD_cParameter::ZSTD_c_compressionLevel => params.compressionLevel,
         ZSTD_cParameter::ZSTD_c_checksumFlag => params.fParams.checksumFlag as i32,
         ZSTD_cParameter::ZSTD_c_contentSizeFlag => params.fParams.contentSizeFlag as i32,
+        ZSTD_cParameter::ZSTD_c_format => params.format as i32,
+        ZSTD_cParameter::ZSTD_c_nbWorkers => params.nbWorkers,
         ZSTD_cParameter::ZSTD_c_dictIDFlag => {
             if params.fParams.noDictIDFlag != 0 {
                 0
@@ -2555,22 +5338,44 @@ pub struct ZSTD_parameters {
     pub fParams: ZSTD_FrameParameters,
 }
 
-/// Port of `ZSTD_getParams`. Convenience wrapper: picks baseline
-/// cParams via `ZSTD_getCParams` and pairs them with upstream's
-/// default `fParams` (contentSizeFlag = 1, others zero).
-pub fn ZSTD_getParams(
+/// Port of `ZSTD_getParams_internal` (`zstd_compress.c:8324`). Picks
+/// baseline cParams via `ZSTD_getCParams_internal` (mode-aware) and
+/// pairs them with upstream's default fParams.
+pub fn ZSTD_getParams_internal(
     compressionLevel: i32,
     srcSizeHint: u64,
     dictSize: usize,
+    mode: ZSTD_CParamMode_e,
 ) -> ZSTD_parameters {
     ZSTD_parameters {
-        cParams: ZSTD_getCParams(compressionLevel, srcSizeHint, dictSize),
+        cParams: ZSTD_getCParams_internal(compressionLevel, srcSizeHint, dictSize, mode),
         fParams: ZSTD_FrameParameters {
             contentSizeFlag: 1,
             checksumFlag: 0,
             noDictIDFlag: 0,
         },
     }
+}
+
+/// Port of `ZSTD_getParams`. Convenience wrapper:
+/// `srcSizeHint == 0` → UNKNOWN, mode = `ZSTD_cpm_unknown`.
+pub fn ZSTD_getParams(
+    compressionLevel: i32,
+    srcSizeHint: u64,
+    dictSize: usize,
+) -> ZSTD_parameters {
+    use crate::decompress::zstd_decompress::ZSTD_CONTENTSIZE_UNKNOWN;
+    let effective = if srcSizeHint == 0 {
+        ZSTD_CONTENTSIZE_UNKNOWN
+    } else {
+        srcSizeHint
+    };
+    ZSTD_getParams_internal(
+        compressionLevel,
+        effective,
+        dictSize,
+        ZSTD_CParamMode_e::ZSTD_cpm_unknown,
+    )
 }
 
 /// Port of `ZSTD_writeFrameHeader`. Emits the 4-byte magic number
@@ -2588,7 +5393,33 @@ pub fn ZSTD_writeFrameHeader(
     pledgedSrcSize: u64,
     dictID: u32,
 ) -> usize {
-    use crate::decompress::zstd_decompress::ZSTD_MAGICNUMBER;
+    ZSTD_writeFrameHeader_advanced(
+        dst,
+        fParams,
+        windowLog,
+        pledgedSrcSize,
+        dictID,
+        crate::decompress::zstd_decompress::ZSTD_format_e::ZSTD_f_zstd1,
+    )
+}
+
+/// Port of upstream's format-aware `ZSTD_writeFrameHeader`
+/// (`zstd_compress.c:4719`). When `format == ZSTD_f_zstd1_magicless` the
+/// 4-byte magic prefix is elided — the rest of the header layout
+/// (FHD, windowLog, dictID, FCS) is identical. Callers that don't
+/// need magicless frames should use the plain `ZSTD_writeFrameHeader`
+/// wrapper. Decoder side honors the symmetric `dctx.format` via
+/// `ZSTD_DCtx_setFormat`.
+#[allow(clippy::too_many_arguments)]
+pub fn ZSTD_writeFrameHeader_advanced(
+    dst: &mut [u8],
+    fParams: &ZSTD_FrameParameters,
+    windowLog: u32,
+    pledgedSrcSize: u64,
+    dictID: u32,
+    format: crate::decompress::zstd_decompress::ZSTD_format_e,
+) -> usize {
+    use crate::decompress::zstd_decompress::{ZSTD_format_e, ZSTD_MAGICNUMBER};
     if dst.len() < ZSTD_FRAMEHEADERSIZE_MAX {
         return ERROR(ErrorCode::DstSizeTooSmall);
     }
@@ -2612,8 +5443,11 @@ pub fn ZSTD_writeFrameHeader(
     let frameHeaderDescriptorByte: u8 =
         (dictIDSizeCode + (checksumFlag << 2) + (singleSegment << 5) + (fcsCode << 6)) as u8;
 
-    MEM_writeLE32(dst, ZSTD_MAGICNUMBER);
-    let mut pos = 4usize;
+    let mut pos = 0usize;
+    if format == ZSTD_format_e::ZSTD_f_zstd1 {
+        MEM_writeLE32(dst, ZSTD_MAGICNUMBER);
+        pos = 4;
+    }
     dst[pos] = frameHeaderDescriptorByte;
     pos += 1;
     if singleSegment == 0 {
@@ -2676,16 +5510,40 @@ pub fn ZSTD_writeLastEmptyBlock(dst: &mut [u8]) -> usize {
 ///   magic + header → sequence of block bodies (one per
 ///   ZSTD_BLOCKSIZE_MAX slice) → optional XXH64 trailer.
 ///
-/// Rust signature note: upstream's `ZSTD_compressCCtx` threads state
-/// through a `ZSTD_CCtx`. Until that lands, this helper creates its
-/// own match state + seq store + entropy state internally. The
-/// resulting frame is bitwise-identical to what upstream produces for
-/// the same input when using strategy=fast with matched `cParams`.
+/// Stateless helper: allocates its own match state + seq store +
+/// entropy state each call (no CCtx re-use). `ZSTD_compressCCtx`
+/// routes through the same body but amortizes allocations across
+/// calls. The resulting frame is bitwise-identical to what upstream
+/// produces for the same input when using strategy=fast with matched
+/// `cParams`.
+#[inline]
 pub fn ZSTD_compressFrame_fast(
     dst: &mut [u8],
     src: &[u8],
     cParams: crate::compress::match_state::ZSTD_compressionParameters,
     fParams: ZSTD_FrameParameters,
+) -> usize {
+    ZSTD_compressFrame_fast_advanced(
+        dst,
+        src,
+        cParams,
+        fParams,
+        crate::decompress::zstd_decompress::ZSTD_format_e::ZSTD_f_zstd1,
+    )
+}
+
+/// Format-aware variant of `ZSTD_compressFrame_fast`. When
+/// `format == ZSTD_f_zstd1_magicless` the emitted frame starts with
+/// the 1-byte Frame Header Descriptor instead of the 4-byte magic +
+/// FHD. Everything else (block bodies, optional XXH64 trailer) is
+/// identical. Pairs with the decoder's `ZSTD_DCtx_setFormat`.
+#[allow(clippy::too_many_arguments)]
+pub fn ZSTD_compressFrame_fast_advanced(
+    dst: &mut [u8],
+    src: &[u8],
+    cParams: crate::compress::match_state::ZSTD_compressionParameters,
+    fParams: ZSTD_FrameParameters,
+    format: crate::decompress::zstd_decompress::ZSTD_format_e,
 ) -> usize {
     use crate::common::xxhash::{XXH64_digest, XXH64_reset, XXH64_state_t, XXH64_update};
     use crate::compress::seq_store::{SeqStore_t, ZSTD_REP_NUM};
@@ -2693,12 +5551,13 @@ pub fn ZSTD_compressFrame_fast(
 
     let mut op = 0usize;
     // 1. Frame header.
-    let hdrSize = ZSTD_writeFrameHeader(
+    let hdrSize = ZSTD_writeFrameHeader_advanced(
         &mut dst[op..],
         &fParams,
         cParams.windowLog,
         src.len() as u64,
         0,
+        format,
     );
     if ERR_isError(hdrSize) {
         return hdrSize;
@@ -2793,25 +5652,68 @@ pub fn ZSTD_compressFrame_fast(
 /// `prefix` as history for back-references but does NOT include the
 /// prefix bytes in the frame's content size or in the output. Used by
 /// `ZSTD_compress_usingDict` for raw-content dictionaries.
+///
+/// `seed_entropy` / `seed_rep` optionally seed the compressor's
+/// per-frame entropy tables and repcode history — used when the caller
+/// has already parsed a magic-prefixed zstd-format dict via
+/// `ZSTD_compress_insertDictionary`. Upstream threads these through
+/// `cctx->blockState.prevCBlock->entropy` and `cctx->blockState.prevCBlock->rep`.
 #[allow(clippy::too_many_arguments)]
+#[inline]
 pub fn ZSTD_compressFrame_fast_with_prefix(
     dst: &mut [u8],
     src: &[u8],
     prefix: &[u8],
     cParams: crate::compress::match_state::ZSTD_compressionParameters,
     fParams: ZSTD_FrameParameters,
+    seed_entropy: Option<&ZSTD_entropyCTables_t>,
+    seed_rep: Option<[u32; crate::compress::seq_store::ZSTD_REP_NUM]>,
+) -> usize {
+    ZSTD_compressFrame_fast_with_prefix_advanced(
+        dst,
+        src,
+        prefix,
+        cParams,
+        fParams,
+        seed_entropy,
+        seed_rep,
+        crate::decompress::zstd_decompress::ZSTD_format_e::ZSTD_f_zstd1,
+    )
+}
+
+/// Format-aware variant of `_with_prefix`. Emits a magicless frame
+/// when `format == ZSTD_f_zstd1_magicless`. The prefix's back-ref
+/// history mechanics are unchanged — only the outer frame header's
+/// magic-prefix bytes are affected.
+#[allow(clippy::too_many_arguments)]
+pub fn ZSTD_compressFrame_fast_with_prefix_advanced(
+    dst: &mut [u8],
+    src: &[u8],
+    prefix: &[u8],
+    cParams: crate::compress::match_state::ZSTD_compressionParameters,
+    fParams: ZSTD_FrameParameters,
+    seed_entropy: Option<&ZSTD_entropyCTables_t>,
+    seed_rep: Option<[u32; crate::compress::seq_store::ZSTD_REP_NUM]>,
+    format: crate::decompress::zstd_decompress::ZSTD_format_e,
 ) -> usize {
     use crate::common::xxhash::{XXH64_digest, XXH64_reset, XXH64_state_t, XXH64_update};
     use crate::compress::seq_store::ZSTD_REP_NUM;
     use crate::decompress::zstd_decompress_block::ZSTD_BLOCKSIZE_MAX;
 
     let mut op = 0usize;
-    let hdrSize = ZSTD_writeFrameHeader(
+    // If the prefix is a magic-tagged dict, propagate its dictID into
+    // the frame header so `ZSTD_getDictID_fromFrame` round-trips.
+    // Upstream does the same through `ZSTD_getDictID_fromDict` during
+    // `ZSTD_CCtx_loadDictionary_advanced`; with `fParams.noDictIDFlag`
+    // set the writer suppresses the field regardless.
+    let dictID = crate::decompress::zstd_ddict::ZSTD_getDictID_fromDict(prefix);
+    let hdrSize = ZSTD_writeFrameHeader_advanced(
         &mut dst[op..],
         &fParams,
         cParams.windowLog,
         src.len() as u64,
-        0,
+        dictID,
+        format,
     );
     if ERR_isError(hdrSize) {
         return hdrSize;
@@ -2827,8 +5729,11 @@ pub fn ZSTD_compressFrame_fast_with_prefix(
 
     let mut seqStore = SeqStore_t::with_capacity(ZSTD_BLOCKSIZE_MAX / 3, ZSTD_BLOCKSIZE_MAX);
     let mut carry_ms = crate::compress::match_state::ZSTD_MatchState_t::new(cParams);
-    let mut rep: [u32; ZSTD_REP_NUM] = [1, 4, 8];
-    let mut prevEntropy = ZSTD_entropyCTables_t::default();
+    let mut rep: [u32; ZSTD_REP_NUM] = seed_rep.unwrap_or([1, 4, 8]);
+    let mut prevEntropy = match seed_entropy {
+        Some(s) => s.clone(),
+        None => ZSTD_entropyCTables_t::default(),
+    };
     let mut nextEntropy = ZSTD_entropyCTables_t::default();
 
     // Pre-seed the match state's hash tables from the prefix bytes by
@@ -2952,14 +5857,23 @@ pub fn ZSTD_compressFrame_fast_with_prefix(
 /// captures the compression level for subsequent `compressStream` /
 /// `endStream` calls. Returns 0 on success.
 pub fn ZSTD_initCStream(zcs: &mut ZSTD_CCtx, compressionLevel: i32) -> usize {
-    zcs.stream_level = Some(compressionLevel);
+    // Upstream (zstd_compress.c:6101) routes through
+    // `ZSTD_CCtx_setParameter(c_compressionLevel, value)`, picking up
+    // that setter's clamp + `value == 0 → CLEVEL_DEFAULT` behavior.
+    // Previously we raw-stored the level — left a C-compat caller
+    // that called `initCStream(cctx, 0)` with `getParameter` readback
+    // returning 0 (upstream returns 3).
     zcs.pledged_src_size = None;
     zcs.stream_in_buffer.clear();
     zcs.stream_out_buffer.clear();
     zcs.stream_out_drained = 0;
     zcs.stream_closed = false;
     zcs.stream_dict.clear();
-    0
+    ZSTD_CCtx_setParameter(
+        zcs,
+        ZSTD_cParameter::ZSTD_c_compressionLevel,
+        compressionLevel,
+    )
 }
 
 /// Port of `ZSTD_EndDirective`. Tells `ZSTD_compressStream2` whether
@@ -3077,11 +5991,18 @@ pub fn ZSTD_CCtx_setCParams(
     cctx: &mut ZSTD_CCtx,
     cParams: crate::compress::match_state::ZSTD_compressionParameters,
 ) -> usize {
+    // Upstream (zstd_compress.c:1211) rejects with `StageWrong` when
+    // not in init stage. Applying fresh cParams mid-session would
+    // desync the applied match-state from buffered input.
+    if !cctx_is_in_init_stage(cctx) {
+        return ERROR(ErrorCode::StageWrong);
+    }
     let rc = ZSTD_checkCParams(cParams);
     if ERR_isError(rc) {
         return rc;
     }
     cctx.requested_cParams = Some(cParams);
+    cctx.requestedParams.cParams = cParams;
     0
 }
 
@@ -3101,6 +6022,25 @@ pub fn ZSTD_CCtx_setParams(cctx: &mut ZSTD_CCtx, params: ZSTD_parameters) -> usi
     ZSTD_CCtx_setCParams(cctx, params.cParams)
 }
 
+/// Sibling of `ZSTD_DCtx_setFormat` on the compressor side. Flips the
+/// CCtx between `ZSTD_f_zstd1` (default, magic-prefixed frames) and
+/// `ZSTD_f_zstd1_magicless` (no 4-byte magic prefix). The stream
+/// compressor's `endStream` path (and `ZSTD_compress2`, which routes
+/// through the streaming compressor) threads this through
+/// `ZSTD_compressFrame_fast_advanced` / `_with_prefix_advanced` so
+/// emitted frames — dict-less and dict-bearing alike — respect the
+/// setting. `ZSTD_compress` / `ZSTD_compress_usingDict` stay on the
+/// zstd1 format since they don't accept a cctx-scoped format knob.
+pub fn ZSTD_CCtx_setFormat(
+    cctx: &mut ZSTD_CCtx,
+    format: crate::decompress::zstd_decompress::ZSTD_format_e,
+) -> usize {
+    // Sibling of `ZSTD_DCtx_setFormat`. Upstream routes through
+    // `ZSTD_CCtx_setParameter(ZSTD_c_format, value)` so bounds
+    // checking + enum casting lives in one spot.
+    ZSTD_CCtx_setParameter(cctx, ZSTD_cParameter::ZSTD_c_format, format as i32)
+}
+
 /// Port of `ZSTD_CCtx_setParametersUsingCCtxParams`. Applies a
 /// previously-prepared `ZSTD_CCtx_params` to the CCtx — pulls the
 /// level + cParams + fParams through the existing setters.
@@ -3108,7 +6048,19 @@ pub fn ZSTD_CCtx_setParametersUsingCCtxParams(
     cctx: &mut ZSTD_CCtx,
     params: &ZSTD_CCtx_params,
 ) -> usize {
+    // Upstream (zstd_compress.c:1198) rejects wholesale params
+    // replacement mid-session — that would desync appliedParams
+    // from buffered input. Gate matches the dict-family setters.
+    if !cctx_is_in_init_stage(cctx) {
+        return ERROR(ErrorCode::StageWrong);
+    }
     cctx.stream_level = Some(params.compressionLevel);
+    cctx.requestedParams = *params;
+    // Sync the direct `cctx.format` slot so the compressor path
+    // (which reads `cctx.format`) picks up params-level magicless
+    // mode. Without this, wholesale params replacement here would
+    // silently revert the active format to zstd1 on the cctx.
+    cctx.format = params.format;
     ZSTD_CCtx_setParams(
         cctx,
         ZSTD_parameters {
@@ -3124,6 +6076,7 @@ pub fn ZSTD_CCtx_setParametersUsingCCtxParams(
 /// Note: upstream flips `noDictIDFlag` when recording — if it's 0
 /// (dictID NOT suppressed) we set `dictIDFlag = 1`; if 1 we set 0.
 pub fn ZSTD_CCtx_setFParams(cctx: &mut ZSTD_CCtx, fparams: ZSTD_FrameParameters) -> usize {
+    cctx.requestedParams.fParams = fparams;
     let rc = ZSTD_CCtx_setParameter(
         cctx,
         ZSTD_cParameter::ZSTD_c_contentSizeFlag,
@@ -3205,37 +6158,111 @@ pub fn ZSTD_initCStream_usingDict(
     dict: &[u8],
     compressionLevel: i32,
 ) -> usize {
-    // Reuse the existing "buffer-until-endStream" approach — store
-    // the dict in a side slot of the CCtx. Easiest path: stash it
-    // on stream_in_buffer's capacity side. We just keep the dict in
-    // a new field; cheapest impl is to pre-populate stream_in_buffer
-    // with the dict bytes and track the split point, but that
-    // conflates input and dict. Instead, use the existing
-    // `stream_dict` field.
     let rc = ZSTD_initCStream(zcs, compressionLevel);
     if ERR_isError(rc) {
         return rc;
     }
-    zcs.stream_dict = dict.to_vec();
-    0
+    // Use the full loadDictionary path so dictID / dictContentSize
+    // are tracked alongside the bytes.
+    ZSTD_CCtx_loadDictionary(zcs, dict)
 }
 
-/// Port of `ZSTD_resetCStream`. Resets the stream for a new frame
-/// with the given pledged size (use `ZSTD_CONTENTSIZE_UNKNOWN` =
-/// u64::MAX if unknown). The compression level + dict configured via
-/// the last init call are preserved.
-pub fn ZSTD_resetCStream(zcs: &mut ZSTD_CCtx, pledgedSrcSize: u64) -> usize {
-    zcs.stream_in_buffer.clear();
-    zcs.stream_out_buffer.clear();
-    zcs.stream_out_drained = 0;
-    zcs.stream_closed = false;
-    // u64::MAX sentinel → UNKNOWN, leave pledged_src_size as None.
-    zcs.pledged_src_size = if pledgedSrcSize == u64::MAX {
-        None
+/// Port of `ZSTD_initCStream_usingCDict`. Streaming-init variant that
+/// links a pre-built CDict. Upstream (zstd_compress.c:6046): resets
+/// session state, then `refCDict`. Our `refCDict` copies the CDict's
+/// raw content onto `cctx.stream_dict` and records its level.
+pub fn ZSTD_initCStream_usingCDict(
+    zcs: &mut ZSTD_CCtx,
+    cdict: &ZSTD_CDict,
+) -> usize {
+    let rc = ZSTD_CCtx_reset(zcs, ZSTD_ResetDirective::ZSTD_reset_session_only);
+    if ERR_isError(rc) {
+        return rc;
+    }
+    ZSTD_CCtx_refCDict(zcs, cdict)
+}
+
+/// Port of `ZSTD_initCStream_usingCDict_advanced`. Streaming-init
+/// that pairs a CDict with explicit `fParams` + pledged src size.
+/// Upstream (zstd_compress.c:6032): reset → setPledgedSrcSize →
+/// copy fParams → refCDict.
+pub fn ZSTD_initCStream_usingCDict_advanced(
+    zcs: &mut ZSTD_CCtx,
+    cdict: &ZSTD_CDict,
+    fParams: ZSTD_FrameParameters,
+    pledgedSrcSize: u64,
+) -> usize {
+    let rc = ZSTD_CCtx_reset(zcs, ZSTD_ResetDirective::ZSTD_reset_session_only);
+    if ERR_isError(rc) {
+        return rc;
+    }
+    let rc = ZSTD_CCtx_setPledgedSrcSize(zcs, pledgedSrcSize);
+    if ERR_isError(rc) {
+        return rc;
+    }
+    let rc = ZSTD_CCtx_setFParams(zcs, fParams);
+    if ERR_isError(rc) {
+        return rc;
+    }
+    ZSTD_CCtx_refCDict(zcs, cdict)
+}
+
+/// Port of `ZSTD_initCStream_advanced`. Streaming-init with explicit
+/// `ZSTD_parameters` bundle + raw-content dict + pledged src size.
+/// Upstream (zstd_compress.c:6059) applies a legacy back-compat rule:
+/// `pss==0 && fParams.contentSizeFlag==0 → treat as CONTENTSIZE_UNKNOWN`.
+pub fn ZSTD_initCStream_advanced(
+    zcs: &mut ZSTD_CCtx,
+    dict: &[u8],
+    params: ZSTD_parameters,
+    pledgedSrcSize: u64,
+) -> usize {
+    use crate::decompress::zstd_decompress::ZSTD_CONTENTSIZE_UNKNOWN;
+    let effective_pledge = if pledgedSrcSize == 0 && params.fParams.contentSizeFlag == 0 {
+        ZSTD_CONTENTSIZE_UNKNOWN
     } else {
-        Some(pledgedSrcSize)
+        pledgedSrcSize
     };
-    0
+    let rc = ZSTD_CCtx_reset(zcs, ZSTD_ResetDirective::ZSTD_reset_session_only);
+    if ERR_isError(rc) {
+        return rc;
+    }
+    let rc = ZSTD_CCtx_setPledgedSrcSize(zcs, effective_pledge);
+    if ERR_isError(rc) {
+        return rc;
+    }
+    let rc = ZSTD_checkCParams(params.cParams);
+    if ERR_isError(rc) {
+        return rc;
+    }
+    let rc = ZSTD_CCtx_setParams(zcs, params);
+    if ERR_isError(rc) {
+        return rc;
+    }
+    ZSTD_CCtx_loadDictionary(zcs, dict)
+}
+
+/// Port of `ZSTD_resetCStream` (`zstd_compress.c:5993`). Resets the
+/// stream for a new frame with the given pledged size. The
+/// compression level + dict configured via the last init call are
+/// preserved.
+///
+/// Upstream applies a transitional back-compat rule: `pss == 0` is
+/// interpreted as `ZSTD_CONTENTSIZE_UNKNOWN` (a future release will
+/// reinterpret it as "empty"). Callers that explicitly want 0 bytes
+/// must pass `u64::MAX` (the `ZSTD_CONTENTSIZE_UNKNOWN` sentinel)
+/// themselves. This port mirrors that translation so the reset-then-
+/// feed-zero-bytes path matches upstream's pledged-size state.
+pub fn ZSTD_resetCStream(zcs: &mut ZSTD_CCtx, pss: u64) -> usize {
+    use crate::decompress::zstd_decompress::ZSTD_CONTENTSIZE_UNKNOWN;
+    // Upstream temporary: 0 is treated as "unknown" during the API
+    // transition (see zstd_compress.c:5995-5998 comment).
+    let pledgedSrcSize = if pss == 0 { ZSTD_CONTENTSIZE_UNKNOWN } else { pss };
+    let rc = ZSTD_CCtx_reset(zcs, ZSTD_ResetDirective::ZSTD_reset_session_only);
+    if ERR_isError(rc) {
+        return rc;
+    }
+    ZSTD_CCtx_setPledgedSrcSize(zcs, pledgedSrcSize)
 }
 
 /// Port of `ZSTD_CCtx_setPledgedSrcSize`. Declares the exact number
@@ -3249,11 +6276,23 @@ pub fn ZSTD_resetCStream(zcs: &mut ZSTD_CCtx, pledgedSrcSize: u64) -> usize {
 /// `ZSTD_CONTENTSIZE_UNKNOWN`) clears any prior pledge so the
 /// endStream size-match check is skipped.
 pub fn ZSTD_CCtx_setPledgedSrcSize(zcs: &mut ZSTD_CCtx, pledgedSrcSize: u64) -> usize {
+    // Upstream (zstd_compress.c:1249) rejects with `StageWrong` if the
+    // stream is past the init stage. Without this gate a caller who
+    // re-pledged mid-frame would silently desync
+    // `pledgedSrcSizePlusOne` from the already-buffered input,
+    // producing a frame header that lies about content size.
+    if !cctx_is_in_init_stage(zcs) {
+        return ERROR(ErrorCode::StageWrong);
+    }
     zcs.pledged_src_size = if pledgedSrcSize == u64::MAX {
         None
     } else {
         Some(pledgedSrcSize)
     };
+    // Upstream stores `pledgedSrcSize + 1` so 0 disambiguates
+    // "unknown" (stored as 0) from "pledged exactly 0 bytes" (stored
+    // as 1). UNKNOWN sentinel `u64::MAX` wraps via wrapping_add.
+    zcs.pledgedSrcSizePlusOne = pledgedSrcSize.wrapping_add(1);
     0
 }
 
@@ -3364,13 +6403,44 @@ pub fn ZSTD_endStream(
         let fp = ZSTD_FrameParameters {
             contentSizeFlag: if zcs.param_contentSize { 1 } else { 0 },
             checksumFlag: if zcs.param_checksum { 1 } else { 0 },
-            noDictIDFlag: 1,
+            // `param_dictID == true` (upstream default) → include dictID
+            // in the frame header. `noDictIDFlag` is the inverse bit.
+            // Previously hardcoded to 1 — any caller that flipped
+            // dictIDFlag would have been silently ignored.
+            noDictIDFlag: if zcs.param_dictID { 0 } else { 1 },
         };
-        let n = if zcs.stream_dict.is_empty() {
-            ZSTD_compressFrame_fast(&mut compressed, &src, cp, fp)
+        // Upstream (zstd_compress.c:6381) zeroes `prefixDict`
+        // BEFORE running the compress: a local copy carries the
+        // prefix into this frame, but the cctx slot is wiped
+        // eagerly so an error path still leaves the flag clean.
+        // Mirror by snapshotting the dict + flag, then wiping the
+        // cctx-side single-use state. The compress below consumes
+        // the snapshot; success-or-failure the flag is already gone.
+        let prefix_snapshot: Option<Vec<u8>> = if zcs.prefix_is_single_use {
+            let snap = std::mem::take(&mut zcs.stream_dict);
+            zcs.dictID = 0;
+            zcs.dictContentSize = 0;
+            zcs.prefix_is_single_use = false;
+            Some(snap)
         } else {
-            // Dict-aware compression: feed the dict as a prefix.
-            ZSTD_compressFrame_fast_with_prefix(&mut compressed, &src, &zcs.stream_dict, cp, fp)
+            None
+        };
+        // Pick the effective prefix: single-use snapshot if present,
+        // otherwise any persistent `stream_dict` binding.
+        let effective_prefix: &[u8] = prefix_snapshot
+            .as_deref()
+            .unwrap_or(zcs.stream_dict.as_slice());
+        let n = if effective_prefix.is_empty() {
+            // Thread the stream's configured format through so a
+            // caller who set `zcs.format = ZSTD_f_zstd1_magicless`
+            // gets a magicless frame on endStream.
+            ZSTD_compressFrame_fast_advanced(&mut compressed, &src, cp, fp, zcs.format)
+        } else {
+            // Dict-aware compression: feed the dict as a prefix —
+            // also format-threaded so dict + magicless combines.
+            ZSTD_compressFrame_fast_with_prefix_advanced(
+                &mut compressed, &src, effective_prefix, cp, fp, None, None, zcs.format,
+            )
         };
         if ERR_isError(n) {
             return n;
@@ -3408,6 +6478,45 @@ mod tests {
         let a = 200 * 1024;
         let b = 300 * 1024;
         assert!(ZSTD_compressBound(a + b) >= ZSTD_compressBound(a) + ZSTD_compressBound(b));
+    }
+
+    #[test]
+    fn zstd_max_input_size_matches_upstream_per_word_width() {
+        // Upstream `lib/zstd.h` defines:
+        //   ZSTD_MAX_INPUT_SIZE = 0xFF00FF00FF00FF00ULL on 64-bit
+        //   ZSTD_MAX_INPUT_SIZE = 0xFF00FF00 on 32-bit
+        // The literal pattern maximizes `ZSTD_COMPRESSBOUND` without
+        // risking arithmetic overflow on the inner `srcSize >> 8 +
+        // block_margin` terms. Drift would change the max payload
+        // size accepted, a silent ABI-level change.
+        if core::mem::size_of::<usize>() == 8 {
+            assert_eq!(ZSTD_MAX_INPUT_SIZE, 0xFF00FF00FF00FF00);
+        } else {
+            assert_eq!(ZSTD_MAX_INPUT_SIZE, 0xFF00FF00);
+        }
+    }
+
+    #[test]
+    fn zstd_compressbound_is_usable_in_const_context() {
+        // `ZSTD_COMPRESSBOUND` is a `const fn` so callers can size
+        // static buffers at compile time. Prove it by evaluating it
+        // in a const context AND using the results for a [u8; N]
+        // array declaration — if this ever becomes non-const, the
+        // compilation fails.
+        const B_0: usize   = ZSTD_COMPRESSBOUND(0);
+        const B_1K: usize  = ZSTD_COMPRESSBOUND(1024);
+        const B_1M: usize  = ZSTD_COMPRESSBOUND(1_000_000);
+        const B_TOO_LARGE: usize = ZSTD_COMPRESSBOUND(ZSTD_MAX_INPUT_SIZE);
+        // Sizing a compile-time array with the bound confirms `const` context.
+        let _buf0: [u8; B_0] = [0u8; B_0];
+        assert_eq!(_buf0.len(), 64);
+        // Move the const-fn comparisons into a const block so clippy
+        // doesn't flag them as `assertions_on_constants`.
+        const _: () = {
+            assert!(B_1K > 1024);
+            assert!(B_1M > 1_000_000);
+            assert!(B_TOO_LARGE == 0);
+        };
     }
 
     #[test]
@@ -3476,9 +6585,10 @@ mod tests {
 
     #[test]
     fn compressSequences_and_generateSequences_stubs_return_Generic_error() {
-        // Advanced sequence-level API is stubbed in v0.1 pending
-        // the optimal parser port. Contract: callers get a proper
-        // zstd error code, not a panic.
+        // Advanced sequence-level API is stubbed in v0.1 pending the
+        // `SeqStore_t` ↔ `&[ZSTD_Sequence]` capture-and-project glue
+        // (orthogonal to the optimal parser). Contract: callers get a
+        // proper zstd error code, not a panic.
         use crate::common::error::ERR_getErrorCode;
         let mut cctx = ZSTD_createCCtx().unwrap();
         let mut dst = [0u8; 64];
@@ -3653,6 +6763,138 @@ mod tests {
     }
 
     #[test]
+    fn two_independent_cctxs_produce_independent_output() {
+        // Isolation contract: per-CCtx state MUST NOT leak between
+        // CCtxes (no static shared state). Two CCtxes on the same
+        // payload with the same level produce byte-identical output;
+        // interleaving compresses on the second CCtx doesn't affect
+        // the first.
+        use crate::decompress::zstd_decompress::ZSTD_decompress;
+        let src = b"independence test payload. ".repeat(60);
+
+        let mut a = ZSTD_createCCtx().unwrap();
+        let mut b = ZSTD_createCCtx().unwrap();
+
+        let mut dst_a = vec![0u8; 2048];
+        let n_a = ZSTD_compressCCtx(&mut a, &mut dst_a, &src, 3);
+        assert!(!ERR_isError(n_a));
+
+        // Interleave: use `b` with a different level in between.
+        let mut dst_b = vec![0u8; 2048];
+        let n_b = ZSTD_compressCCtx(&mut b, &mut dst_b, &src, 5);
+        assert!(!ERR_isError(n_b));
+
+        // Now use `a` again. Should still produce level-3 output.
+        let mut dst_a2 = vec![0u8; 2048];
+        let n_a2 = ZSTD_compressCCtx(&mut a, &mut dst_a2, &src, 3);
+        assert!(!ERR_isError(n_a2));
+        // A fresh CCtx at level 3 on same payload should match.
+        let mut fresh = ZSTD_createCCtx().unwrap();
+        let mut dst_f = vec![0u8; 2048];
+        let n_f = ZSTD_compressCCtx(&mut fresh, &mut dst_f, &src, 3);
+        assert!(!ERR_isError(n_f));
+        assert_eq!(&dst_a2[..n_a2], &dst_f[..n_f],
+            "CCtx `a` drifted after interleaving with CCtx `b`");
+
+        // Both outputs roundtrip.
+        let mut out = vec![0u8; src.len() + 64];
+        let d_a = ZSTD_decompress(&mut out, &dst_a[..n_a]);
+        assert_eq!(&out[..d_a], &src[..]);
+        let d_b = ZSTD_decompress(&mut out, &dst_b[..n_b]);
+        assert_eq!(&out[..d_b], &src[..]);
+    }
+
+    #[test]
+    fn ZSTD_CStream_is_alias_for_ZSTD_CCtx() {
+        // Upstream `typedef ZSTD_CCtx ZSTD_CStream` — same struct,
+        // same API. Rust port mirrors via `pub type`. Verify size
+        // equality and that functions accepting either signature
+        // can be called interchangeably.
+        assert_eq!(
+            core::mem::size_of::<ZSTD_CStream>(),
+            core::mem::size_of::<ZSTD_CCtx>()
+        );
+        // A `Box<ZSTD_CStream>` can be passed where `&mut ZSTD_CCtx`
+        // is expected — the type alias guarantees this.
+        let mut cs: Box<ZSTD_CStream> = ZSTD_createCStream().unwrap();
+        assert_eq!(ZSTD_sizeof_CCtx(&cs), ZSTD_sizeof_CStream(&cs));
+        // Reusable via ZSTD_compressCCtx — same struct.
+        let src = b"alias probe";
+        let mut dst = vec![0u8; 64];
+        let n = ZSTD_compressCCtx(&mut cs, &mut dst, src, 1);
+        assert!(!ERR_isError(n));
+    }
+
+    #[test]
+    fn experimental_param_enum_discriminants_match_upstream() {
+        // Experimental decoder/encoder parameters interpret their
+        // int-valued settings as the corresponding *_e enum. Upstream
+        // pins every discriminant explicitly; drift here would mis-
+        // route e.g. a `ZSTD_d_forceIgnoreChecksum=1` request to the
+        // wrong branch. All four are part of the public advanced API.
+        assert_eq!(ZSTD_forceIgnoreChecksum_e::ZSTD_d_validateChecksum as u32, 0);
+        assert_eq!(ZSTD_forceIgnoreChecksum_e::ZSTD_d_ignoreChecksum as u32, 1);
+        assert_eq!(ZSTD_refMultipleDDicts_e::ZSTD_rmd_refSingleDDict as u32, 0);
+        assert_eq!(ZSTD_refMultipleDDicts_e::ZSTD_rmd_refMultipleDDicts as u32, 1);
+        assert_eq!(ZSTD_dictAttachPref_e::ZSTD_dictDefaultAttach as u32, 0);
+        assert_eq!(ZSTD_dictAttachPref_e::ZSTD_dictForceAttach as u32, 1);
+        assert_eq!(ZSTD_dictAttachPref_e::ZSTD_dictForceCopy as u32, 2);
+        assert_eq!(ZSTD_dictAttachPref_e::ZSTD_dictForceLoad as u32, 3);
+        assert_eq!(ZSTD_literalCompressionMode_e::ZSTD_lcm_auto as u32, 0);
+        assert_eq!(ZSTD_literalCompressionMode_e::ZSTD_lcm_huffman as u32, 1);
+        assert_eq!(ZSTD_literalCompressionMode_e::ZSTD_lcm_uncompressed as u32, 2);
+    }
+
+    #[test]
+    fn ZSTD_ParamSwitch_e_discriminants_match_upstream() {
+        // `ZSTD_ParamSwitch_e` is used across many `ZSTD_c_*` / `ZSTD_d_*`
+        // auto/enable/disable parameters (e.g. ZSTD_c_literalCompressionMode,
+        // ZSTD_c_useRowMatchFinder, ZSTD_d_disableHuffmanAssembly). A
+        // discriminant drift would silently flip enable↔disable.
+        use crate::compress::zstd_ldm::ZSTD_ParamSwitch_e;
+        assert_eq!(ZSTD_ParamSwitch_e::ZSTD_ps_auto as u32, 0);
+        assert_eq!(ZSTD_ParamSwitch_e::ZSTD_ps_enable as u32, 1);
+        assert_eq!(ZSTD_ParamSwitch_e::ZSTD_ps_disable as u32, 2);
+    }
+
+    #[test]
+    fn compressStream2_continue_with_zero_input_is_noop() {
+        // `ZSTD_e_continue` with zero input must be a valid no-op —
+        // the caller may legitimately poll the state with empty input
+        // (e.g. during a graceful shutdown). Must return 0 (success)
+        // and not corrupt the frame.
+        let mut cctx = ZSTD_createCCtx().unwrap();
+        ZSTD_initCStream(&mut cctx, 1);
+        let mut dst = vec![0u8; 256];
+        let mut dp = 0usize;
+        let mut sp = 0usize;
+        let rc = ZSTD_compressStream2(
+            &mut cctx, &mut dst, &mut dp, &[], &mut sp,
+            ZSTD_EndDirective::ZSTD_e_continue,
+        );
+        assert!(!ERR_isError(rc), "e_continue with 0 input err: {rc:#x}");
+        // No output drained (nothing to drain).
+        assert_eq!(dp, 0);
+        // No input consumed (nothing provided).
+        assert_eq!(sp, 0);
+
+        // Feed real data + finalize — confirms the no-op didn't
+        // break subsequent state.
+        let src = b"post-noop payload. ".repeat(20);
+        let mut sp = 0usize;
+        let rc = ZSTD_compressStream2(
+            &mut cctx, &mut dst, &mut dp, &src, &mut sp,
+            ZSTD_EndDirective::ZSTD_e_end,
+        );
+        assert!(!ERR_isError(rc));
+        dst.truncate(dp);
+        use crate::decompress::zstd_decompress::ZSTD_decompress;
+        let mut out = vec![0u8; src.len() + 64];
+        let d = ZSTD_decompress(&mut out, &dst);
+        assert_eq!(&out[..d], &src[..]);
+    }
+
+    #[test]
     fn compressStream2_simpleArgs_forwards_to_compressStream2() {
         // `_simpleArgs` is a thin forwarder over `compressStream2`.
         // Verify it produces byte-identical output to calling the
@@ -3682,6 +6924,22 @@ mod tests {
         let mut out = vec![0u8; src.len() + 64];
         let d = ZSTD_decompress(&mut out, &via_simple);
         assert_eq!(&out[..d], &src[..]);
+    }
+
+    #[test]
+    fn zstd_compress2_returns_error_on_too_small_dst() {
+        // Sibling of `zstd_compress_returns_error_on_too_small_dst`,
+        // for the parametric `ZSTD_compress2` entry. Must return a
+        // ZSTD_isError when dst can't hold the compressed frame,
+        // not panic.
+        let mut cctx = ZSTD_createCCtx().unwrap();
+        let src: Vec<u8> = b"compress2 tiny-dst test ".repeat(30);
+        let mut tiny = [0u8; 8];
+        let rc = ZSTD_compress2(&mut cctx, &mut tiny, &src);
+        assert!(ERR_isError(rc), "expected error, got {rc}");
+
+        let mut empty: [u8; 0] = [];
+        assert!(ERR_isError(ZSTD_compress2(&mut cctx, &mut empty, &src)));
     }
 
     #[test]
@@ -3732,6 +6990,1368 @@ mod tests {
     }
 
     #[test]
+    fn writeFrameHeader_advanced_elides_magic_under_magicless_format() {
+        // Parity gate for the compressor-side magicless path. Upstream
+        // (zstd_compress.c:4740): `if (format == ZSTD_f_zstd1) write magic`.
+        // Magicless output must (a) lack the 4-byte magic prefix and
+        // (b) be accepted by a dctx whose `format` was flipped to
+        // `ZSTD_f_zstd1_magicless`.
+        use crate::decompress::zstd_decompress::{
+            ZSTD_format_e, ZSTD_FrameHeader, ZSTD_getFrameHeader_advanced, ZSTD_MAGICNUMBER,
+        };
+        let windowLog = 17u32;
+        let fParams = ZSTD_FrameParameters {
+            contentSizeFlag: 1,
+            checksumFlag: 0,
+            noDictIDFlag: 1,
+        };
+        // Pick pledged > (1 << windowLog) so the single-segment code
+        // path isn't triggered — when it is, the decoded windowSize
+        // collapses to pledgedSrcSize and the round-trip check below
+        // becomes ambiguous.
+        let pledged = (1u64 << windowLog) * 4;
+
+        // Plain (zstd1) variant: first 4 bytes must be the magic.
+        let mut dst_zstd1 = [0u8; ZSTD_FRAMEHEADERSIZE_MAX];
+        let n_zstd1 = ZSTD_writeFrameHeader_advanced(
+            &mut dst_zstd1,
+            &fParams,
+            windowLog,
+            pledged,
+            0,
+            ZSTD_format_e::ZSTD_f_zstd1,
+        );
+        assert!(!ERR_isError(n_zstd1));
+        assert_eq!(
+            crate::common::mem::MEM_readLE32(&dst_zstd1[..4]),
+            ZSTD_MAGICNUMBER,
+        );
+
+        // Magicless variant: same FHD layout but 4 bytes shorter.
+        let mut dst_noMagic = [0u8; ZSTD_FRAMEHEADERSIZE_MAX];
+        let n_noMagic = ZSTD_writeFrameHeader_advanced(
+            &mut dst_noMagic,
+            &fParams,
+            windowLog,
+            pledged,
+            0,
+            ZSTD_format_e::ZSTD_f_zstd1_magicless,
+        );
+        assert!(!ERR_isError(n_noMagic));
+        assert_eq!(n_zstd1, n_noMagic + 4, "magicless output must be 4 bytes shorter");
+        // The body after the magic in zstd1 must equal the full
+        // magicless output byte-for-byte.
+        assert_eq!(&dst_zstd1[4..n_zstd1], &dst_noMagic[..n_noMagic]);
+
+        // Decoder symmetry: a magicless-mode dctx must parse the
+        // magicless header and recover the pledged content size +
+        // windowLog.
+        let mut zfh = ZSTD_FrameHeader::default();
+        let rc = ZSTD_getFrameHeader_advanced(
+            &mut zfh,
+            &dst_noMagic[..n_noMagic],
+            ZSTD_format_e::ZSTD_f_zstd1_magicless,
+        );
+        assert_eq!(rc, 0, "getFrameHeader_advanced err: {rc:#x}");
+        assert_eq!(zfh.frameContentSize, pledged);
+        assert_eq!(zfh.windowSize, 1u64 << windowLog);
+    }
+
+    #[test]
+    fn CCtx_setParametersUsingCCtxParams_syncs_format_onto_cctx() {
+        // Wholesale params replacement must also update the direct
+        // `cctx.format` slot the compressor path reads. Without the
+        // sync, a magicless-configured CCtx_params dropped onto the
+        // cctx would silently revert the active format to zstd1.
+        use crate::decompress::zstd_decompress::ZSTD_format_e;
+        let mut params = ZSTD_CCtx_params::default();
+        ZSTD_CCtxParams_init(&mut params, 3);
+        assert_eq!(
+            ZSTD_CCtxParams_setParameter(
+                &mut params,
+                ZSTD_cParameter::ZSTD_c_format,
+                ZSTD_format_e::ZSTD_f_zstd1_magicless as i32,
+            ),
+            0,
+        );
+        params.cParams = ZSTD_getCParams(3, 0, 0);
+
+        let mut cctx = ZSTD_createCCtx().unwrap();
+        // Pre-condition: default zstd1.
+        assert_eq!(cctx.format, ZSTD_format_e::ZSTD_f_zstd1);
+        assert_eq!(ZSTD_CCtx_setParametersUsingCCtxParams(&mut cctx, &params), 0);
+        // Post-condition: params.format surfaced on the cctx.
+        assert_eq!(cctx.format, ZSTD_format_e::ZSTD_f_zstd1_magicless);
+        assert_eq!(cctx.requestedParams.format, ZSTD_format_e::ZSTD_f_zstd1_magicless);
+    }
+
+    #[test]
+    fn compressBegin_internal_propagates_format_from_params() {
+        // When the caller drives compression through the params
+        // surface (`ZSTD_CCtxParams_setParameter(c_format, ...)`
+        // → `ZSTD_compressBegin_internal`), the params-level format
+        // must land on `cctx.format` so the compressor path picks it
+        // up. Missing this propagation meant a params-driven init
+        // would silently fall back to zstd1.
+        use crate::decompress::zstd_ddict::ZSTD_dictContentType_e;
+        use crate::decompress::zstd_decompress::ZSTD_format_e;
+
+        let mut cctx = ZSTD_createCCtx().unwrap();
+        // Start from a valid baseline: init params at level 3.
+        let mut params = ZSTD_CCtx_params::default();
+        ZSTD_CCtxParams_init(&mut params, 3);
+        // Flip format via the params setter.
+        assert_eq!(
+            ZSTD_CCtxParams_setParameter(
+                &mut params,
+                ZSTD_cParameter::ZSTD_c_format,
+                ZSTD_format_e::ZSTD_f_zstd1_magicless as i32,
+            ),
+            0,
+        );
+        assert_eq!(params.format, ZSTD_format_e::ZSTD_f_zstd1_magicless);
+
+        // Resolve cParams since compressBegin_internal asserts they
+        // were set. ZSTD_CCtxParams_init leaves cParams at defaults
+        // which may fail `ZSTD_checkCParams`.
+        params.cParams = ZSTD_getCParams(3, 0, 0);
+
+        let rc = ZSTD_compressBegin_internal(
+            &mut cctx,
+            &[],
+            ZSTD_dictContentType_e::ZSTD_dct_auto,
+            None,
+            &params,
+            crate::decompress::zstd_decompress::ZSTD_CONTENTSIZE_UNKNOWN,
+            ZSTD_buffered_policy_e::ZSTDb_not_buffered,
+        );
+        assert!(!ERR_isError(rc));
+        assert_eq!(cctx.format, ZSTD_format_e::ZSTD_f_zstd1_magicless);
+    }
+
+    #[test]
+    fn CCtx_magicless_compress2_roundtrips() {
+        // Parity gate for the one-shot `compress2` path with
+        // magicless format. `compress2` resets the session (which
+        // must preserve `cctx.format`) and routes through the
+        // streaming compressor — so a magicless-configured cctx
+        // should produce a magicless frame end-to-end.
+        use crate::decompress::zstd_decompress::{
+            ZSTD_DCtx_setFormat, ZSTD_decompressStream, ZSTD_format_e,
+        };
+        use crate::decompress::zstd_decompress_block::ZSTD_DCtx;
+
+        let src = b"compress2-magicless-one-shot-roundtrip ".repeat(8);
+        let mut cctx = ZSTD_createCCtx().unwrap();
+        // Use the parametric setter to also exercise that path.
+        assert_eq!(
+            ZSTD_CCtx_setParameter(
+                &mut cctx,
+                ZSTD_cParameter::ZSTD_c_format,
+                ZSTD_format_e::ZSTD_f_zstd1_magicless as i32,
+            ),
+            0,
+        );
+        let mut compressed = vec![0u8; ZSTD_compressBound(src.len())];
+        let n = ZSTD_compress2(&mut cctx, &mut compressed, &src);
+        assert!(!ERR_isError(n));
+        compressed.truncate(n);
+        assert_ne!(
+            crate::common::mem::MEM_readLE32(&compressed[..4]),
+            crate::decompress::zstd_decompress::ZSTD_MAGICNUMBER,
+            "compress2 leaked zstd1 magic after c_format = magicless",
+        );
+
+        let mut dctx = ZSTD_DCtx::new();
+        assert_eq!(
+            ZSTD_DCtx_setFormat(&mut dctx, ZSTD_format_e::ZSTD_f_zstd1_magicless),
+            0,
+        );
+        let mut out = vec![0u8; src.len() + 64];
+        let mut in_pos = 0usize;
+        let mut out_pos = 0usize;
+        let _ = ZSTD_decompressStream(
+            &mut dctx, &mut out, &mut out_pos, &compressed, &mut in_pos,
+        );
+        for _ in 0..8 {
+            if out_pos >= src.len() { break; }
+            let _ = ZSTD_decompressStream(
+                &mut dctx, &mut out, &mut out_pos, &[], &mut 0usize,
+            );
+        }
+        assert_eq!(&out[..out_pos], &src[..]);
+    }
+
+    #[test]
+    fn CCtx_magicless_endStream_roundtrips_through_magicless_dctx() {
+        // End-to-end parity gate for compressor-side magicless mode:
+        //   caller → setFormat(magicless) → compressStream/endStream
+        //   → bytes with no 4-byte magic prefix
+        //   → decoder setFormat(magicless) → recovers original.
+        // Before the format threading this roundtrip couldn't exist —
+        // compressor always emitted zstd1 frames with magic.
+        use crate::decompress::zstd_decompress::{
+            ZSTD_DCtx_setFormat, ZSTD_decompressStream, ZSTD_format_e,
+        };
+        use crate::decompress::zstd_decompress_block::ZSTD_DCtx;
+
+        let src = b"CCtx-magicless-endStream-parity payload ".repeat(12);
+        let mut cctx = ZSTD_createCCtx().unwrap();
+        assert_eq!(
+            ZSTD_CCtx_setFormat(&mut cctx, ZSTD_format_e::ZSTD_f_zstd1_magicless),
+            0,
+        );
+        ZSTD_initCStream(&mut cctx, 3);
+
+        let mut compressed = vec![0u8; 4096];
+        let mut cp = 0usize;
+        let mut sp = 0usize;
+        let _ = ZSTD_compressStream(&mut cctx, &mut compressed, &mut cp, &src, &mut sp);
+        loop {
+            let r = ZSTD_endStream(&mut cctx, &mut compressed, &mut cp);
+            assert!(!ERR_isError(r));
+            if r == 0 {
+                break;
+            }
+        }
+        compressed.truncate(cp);
+        // The magicless frame must NOT start with the 4-byte zstd1
+        // magic (0xFD2FB528 little-endian).
+        let magic_le = crate::common::mem::MEM_readLE32(&compressed[..4]);
+        assert_ne!(
+            magic_le, crate::decompress::zstd_decompress::ZSTD_MAGICNUMBER,
+            "magicless frame leaked a zstd1 magic prefix",
+        );
+
+        // Decode via a magicless-mode streaming dctx.
+        let mut dctx = ZSTD_DCtx::new();
+        assert_eq!(
+            ZSTD_DCtx_setFormat(&mut dctx, ZSTD_format_e::ZSTD_f_zstd1_magicless),
+            0,
+        );
+        let mut out = vec![0u8; src.len() + 64];
+        let mut in_pos = 0usize;
+        let mut out_pos = 0usize;
+        let _ = ZSTD_decompressStream(
+            &mut dctx, &mut out, &mut out_pos, &compressed, &mut in_pos,
+        );
+        for _ in 0..8 {
+            if out_pos >= src.len() {
+                break;
+            }
+            let _ = ZSTD_decompressStream(
+                &mut dctx, &mut out, &mut out_pos, &[], &mut 0usize,
+            );
+        }
+        assert_eq!(&out[..out_pos], &src[..]);
+    }
+
+    #[test]
+    fn compress_usingDict_honors_cctx_format() {
+        // Raw-dict one-shot path: `ZSTD_compress_usingDict(cctx, dst,
+        // src, dict, level)` must honor the cctx's format slot.
+        // Previously the cctx arg was dropped (`_cctx`), so setFormat
+        // had no effect on this entry point.
+        use crate::decompress::zstd_decompress::{
+            ZSTD_DCtx_setFormat, ZSTD_decompress_usingDict, ZSTD_format_e, ZSTD_MAGICNUMBER,
+        };
+        use crate::decompress::zstd_decompress_block::ZSTD_DCtx;
+
+        let dict = b"usingDict-magicless-raw-dict ".repeat(3);
+        let src = b"usingDict-magicless-raw-dict payload ".repeat(4);
+
+        let mut cctx = ZSTD_createCCtx().unwrap();
+        assert_eq!(
+            ZSTD_CCtx_setFormat(&mut cctx, ZSTD_format_e::ZSTD_f_zstd1_magicless),
+            0,
+        );
+        let mut dst = vec![0u8; ZSTD_compressBound(src.len())];
+        let n = ZSTD_compress_usingDict(&mut cctx, &mut dst, &src, &dict, 3);
+        assert!(!ERR_isError(n));
+        dst.truncate(n);
+        assert_ne!(
+            crate::common::mem::MEM_readLE32(&dst[..4]),
+            ZSTD_MAGICNUMBER,
+            "usingDict leaked magic after setFormat(magicless)",
+        );
+
+        let mut dctx = ZSTD_DCtx::new();
+        assert_eq!(
+            ZSTD_DCtx_setFormat(&mut dctx, ZSTD_format_e::ZSTD_f_zstd1_magicless),
+            0,
+        );
+        let mut out = vec![0u8; src.len() + 128];
+        let d = ZSTD_decompress_usingDict(&mut dctx, &mut out, &dst, &dict);
+        assert!(!ERR_isError(d), "decode err: {d:#x}");
+        assert_eq!(&out[..d], &src[..]);
+    }
+
+    #[test]
+    fn compress_usingCDict_advanced_honors_cctx_format() {
+        // CDict one-shot path parity gate: when the caller flipped
+        // magicless on the cctx, the emitted frame must be magicless
+        // and the matching dctx + dict must decode it back to the
+        // original payload. Previously the cctx argument was
+        // ignored entirely (`_cctx`) so the cctx-scoped format slot
+        // couldn't influence the output.
+        use crate::decompress::zstd_decompress::{
+            ZSTD_DCtx_setFormat, ZSTD_decompress_usingDict, ZSTD_format_e, ZSTD_MAGICNUMBER,
+        };
+        use crate::decompress::zstd_decompress_block::ZSTD_DCtx;
+
+        let dict = b"cdict-magicless-one-shot ".repeat(3);
+        let src = b"cdict-magicless-one-shot payload ".repeat(4);
+        let cdict = ZSTD_createCDict(&dict, 3).expect("cdict");
+        let mut cctx = ZSTD_createCCtx().unwrap();
+        assert_eq!(
+            ZSTD_CCtx_setFormat(&mut cctx, ZSTD_format_e::ZSTD_f_zstd1_magicless),
+            0,
+        );
+        let mut dst = vec![0u8; ZSTD_compressBound(src.len())];
+        let fp = ZSTD_FrameParameters {
+            contentSizeFlag: 1,
+            checksumFlag: 0,
+            noDictIDFlag: 0,
+        };
+        let n = ZSTD_compress_usingCDict_advanced(&mut cctx, &mut dst, &src, &cdict, fp);
+        assert!(!ERR_isError(n));
+        dst.truncate(n);
+        assert_ne!(
+            crate::common::mem::MEM_readLE32(&dst[..4]),
+            ZSTD_MAGICNUMBER,
+            "usingCDict_advanced leaked magic after setFormat(magicless)",
+        );
+
+        let mut dctx = ZSTD_DCtx::new();
+        assert_eq!(
+            ZSTD_DCtx_setFormat(&mut dctx, ZSTD_format_e::ZSTD_f_zstd1_magicless),
+            0,
+        );
+        let mut out = vec![0u8; src.len() + 128];
+        let d = ZSTD_decompress_usingDict(&mut dctx, &mut out, &dst, &dict);
+        assert!(!ERR_isError(d), "decode err: {d:#x}");
+        assert_eq!(&out[..d], &src[..]);
+    }
+
+    #[test]
+    fn compressCCtx_honors_cctx_format() {
+        // `ZSTD_compressCCtx` takes a level directly but must still
+        // honor the cctx's format slot. Without this, a caller who
+        // set `c_format = magicless` would see a zstd1 frame come
+        // out of the level-driven one-shot — silent divergence from
+        // the parametric API contract.
+        use crate::decompress::zstd_decompress::{
+            ZSTD_DCtx_setFormat, ZSTD_decompressStream, ZSTD_format_e, ZSTD_MAGICNUMBER,
+        };
+        use crate::decompress::zstd_decompress_block::ZSTD_DCtx;
+
+        let src = b"compressCCtx-magicless-level-path ".repeat(4);
+        let mut cctx = ZSTD_createCCtx().unwrap();
+        assert_eq!(
+            ZSTD_CCtx_setFormat(&mut cctx, ZSTD_format_e::ZSTD_f_zstd1_magicless),
+            0,
+        );
+        let mut dst = vec![0u8; ZSTD_compressBound(src.len())];
+        let n = ZSTD_compressCCtx(&mut cctx, &mut dst, &src, 3);
+        assert!(!ERR_isError(n));
+        dst.truncate(n);
+        assert_ne!(
+            crate::common::mem::MEM_readLE32(&dst[..4]),
+            ZSTD_MAGICNUMBER,
+            "compressCCtx leaked magic after setFormat(magicless)",
+        );
+
+        let mut dctx = ZSTD_DCtx::new();
+        assert_eq!(
+            ZSTD_DCtx_setFormat(&mut dctx, ZSTD_format_e::ZSTD_f_zstd1_magicless),
+            0,
+        );
+        let mut out = vec![0u8; src.len() + 64];
+        let mut in_pos = 0usize;
+        let mut out_pos = 0usize;
+        let _ = ZSTD_decompressStream(&mut dctx, &mut out, &mut out_pos, &dst, &mut in_pos);
+        for _ in 0..8 {
+            if out_pos >= src.len() { break; }
+            let _ = ZSTD_decompressStream(
+                &mut dctx, &mut out, &mut out_pos, &[], &mut 0usize,
+            );
+        }
+        assert_eq!(&out[..out_pos], &src[..]);
+    }
+
+    #[test]
+    fn compress_advanced_internal_propagates_params_format_onto_cctx() {
+        // Sibling of `compress_advanced_honors_cctx_format`: when
+        // the caller configures format on a `ZSTD_CCtx_params`
+        // (the upstream-canonical slot), `compress_advanced_internal`
+        // must push that onto the cctx so the emitter path reads it.
+        use crate::decompress::zstd_decompress::{ZSTD_format_e, ZSTD_MAGICNUMBER};
+
+        let src = b"compress_advanced_internal-magicless-propagation ".repeat(3);
+        let mut cctx = ZSTD_createCCtx().unwrap();
+        // Caller leaves cctx.format at zstd1 default.
+        assert_eq!(cctx.format, ZSTD_format_e::ZSTD_f_zstd1);
+
+        // But builds a params struct with magicless flipped via the
+        // parametric API.
+        let mut params = ZSTD_CCtx_params::default();
+        ZSTD_CCtxParams_init(&mut params, 3);
+        assert_eq!(
+            ZSTD_CCtxParams_setParameter(
+                &mut params,
+                ZSTD_cParameter::ZSTD_c_format,
+                ZSTD_format_e::ZSTD_f_zstd1_magicless as i32,
+            ),
+            0,
+        );
+        params.cParams = ZSTD_getCParams(3, src.len() as u64, 0);
+        params.fParams = ZSTD_FrameParameters {
+            contentSizeFlag: 1,
+            checksumFlag: 0,
+            noDictIDFlag: 1,
+        };
+
+        let mut dst = vec![0u8; ZSTD_compressBound(src.len())];
+        let n = ZSTD_compress_advanced_internal(&mut cctx, &mut dst, &src, &[], &params);
+        assert!(!ERR_isError(n));
+        dst.truncate(n);
+        // params-level magicless landed — no zstd1 magic.
+        assert_ne!(
+            crate::common::mem::MEM_readLE32(&dst[..4]),
+            ZSTD_MAGICNUMBER,
+        );
+        // And the cctx's format slot was updated by the propagation.
+        assert_eq!(cctx.format, ZSTD_format_e::ZSTD_f_zstd1_magicless);
+    }
+
+    #[test]
+    fn compress_advanced_honors_cctx_format() {
+        // `ZSTD_compress_advanced` takes a `ZSTD_parameters` (no
+        // format field) alongside a `&mut cctx`. The format must come
+        // from the cctx's slot — otherwise a caller who flipped
+        // magicless via `c_format` would be surprised to get a zstd1
+        // frame back.
+        use crate::decompress::zstd_decompress::{
+            ZSTD_DCtx_setFormat, ZSTD_decompressStream, ZSTD_format_e, ZSTD_MAGICNUMBER,
+        };
+        use crate::decompress::zstd_decompress_block::ZSTD_DCtx;
+
+        let src = b"compress_advanced-magicless-honors-cctx ".repeat(5);
+        let mut cctx = ZSTD_createCCtx().unwrap();
+        assert_eq!(
+            ZSTD_CCtx_setFormat(&mut cctx, ZSTD_format_e::ZSTD_f_zstd1_magicless),
+            0,
+        );
+        let params = ZSTD_parameters {
+            cParams: ZSTD_getCParams(3, src.len() as u64, 0),
+            fParams: ZSTD_FrameParameters {
+                contentSizeFlag: 1,
+                checksumFlag: 0,
+                noDictIDFlag: 1,
+            },
+        };
+        let mut dst = vec![0u8; ZSTD_compressBound(src.len())];
+        let n = ZSTD_compress_advanced(&mut cctx, &mut dst, &src, &[], params);
+        assert!(!ERR_isError(n));
+        dst.truncate(n);
+
+        // No magic prefix.
+        assert_ne!(
+            crate::common::mem::MEM_readLE32(&dst[..4]),
+            ZSTD_MAGICNUMBER,
+            "compress_advanced leaked magic prefix",
+        );
+
+        // Magicless dctx round-trips.
+        let mut dctx = ZSTD_DCtx::new();
+        assert_eq!(
+            ZSTD_DCtx_setFormat(&mut dctx, ZSTD_format_e::ZSTD_f_zstd1_magicless),
+            0,
+        );
+        let mut out = vec![0u8; src.len() + 64];
+        let mut in_pos = 0usize;
+        let mut out_pos = 0usize;
+        let _ = ZSTD_decompressStream(&mut dctx, &mut out, &mut out_pos, &dst, &mut in_pos);
+        for _ in 0..8 {
+            if out_pos >= src.len() { break; }
+            let _ = ZSTD_decompressStream(
+                &mut dctx, &mut out, &mut out_pos, &[], &mut 0usize,
+            );
+        }
+        assert_eq!(&out[..out_pos], &src[..]);
+    }
+
+    #[test]
+    fn createCDict_clamps_level_and_applies_default_mapping() {
+        // Upstream: `ZSTD_createCDict` routes through the level
+        // clamp/default helpers before deriving cParams. Previously
+        // our port stashed `compressionLevel` verbatim. Pin the
+        // clamp-then-derive contract so a future regression is
+        // detected loudly.
+        let dict = b"createCDict-clamp-guard".to_vec();
+
+        // Level 0 maps to CLEVEL_DEFAULT.
+        let c = ZSTD_createCDict(&dict, 0).expect("cdict");
+        assert_eq!(c.compressionLevel, ZSTD_CLEVEL_DEFAULT);
+
+        // Out-of-range levels clamp to [minCLevel, maxCLevel].
+        let c_high = ZSTD_createCDict(&dict, i32::MAX).expect("cdict");
+        assert_eq!(c_high.compressionLevel, ZSTD_MAX_CLEVEL);
+
+        let c_low = ZSTD_createCDict(&dict, i32::MIN).expect("cdict");
+        assert_eq!(c_low.compressionLevel, ZSTD_minCLevel());
+
+        // Mid-range level stored as-is.
+        let c_mid = ZSTD_createCDict(&dict, 5).expect("cdict");
+        assert_eq!(c_mid.compressionLevel, 5);
+    }
+
+    #[test]
+    fn CCtx_reset_parameters_only_rejects_mid_stream_but_combined_variant_always_accepts() {
+        // Upstream semantics: `reset_parameters` alone requires init
+        // stage; `reset_session_and_parameters` is always safe because
+        // it clears the session first. Pin both behaviors so a
+        // future refactor doesn't flip the distinction.
+        use crate::common::error::{ERR_getErrorCode, ERR_isError};
+        let mut cctx = ZSTD_createCCtx().unwrap();
+        ZSTD_initCStream(&mut cctx, 3);
+        let src = b"mid-stream-reset-semantics ".repeat(3);
+        let mut dst = vec![0u8; 1024];
+        let mut cp = 0usize;
+        let mut sp = 0usize;
+        let _ = ZSTD_compressStream(&mut cctx, &mut dst, &mut cp, &src, &mut sp);
+
+        // reset_parameters alone: rejected mid-stream.
+        let rc = ZSTD_CCtx_reset(&mut cctx, ZSTD_ResetDirective::ZSTD_reset_parameters);
+        assert!(ERR_isError(rc));
+        assert_eq!(ERR_getErrorCode(rc), ErrorCode::StageWrong);
+
+        // reset_session_only: always OK (clears the session).
+        assert_eq!(
+            ZSTD_CCtx_reset(&mut cctx, ZSTD_ResetDirective::ZSTD_reset_session_only),
+            0,
+        );
+        // Now we're back in init stage, so reset_parameters succeeds.
+        assert_eq!(
+            ZSTD_CCtx_reset(&mut cctx, ZSTD_ResetDirective::ZSTD_reset_parameters),
+            0,
+        );
+
+        // reset_session_and_parameters is always OK even mid-stream:
+        // re-simulate and verify.
+        ZSTD_initCStream(&mut cctx, 3);
+        let mut dst = vec![0u8; 1024];
+        let mut cp = 0usize;
+        let mut sp = 0usize;
+        let _ = ZSTD_compressStream(&mut cctx, &mut dst, &mut cp, &src, &mut sp);
+        assert_eq!(
+            ZSTD_CCtx_reset(
+                &mut cctx,
+                ZSTD_ResetDirective::ZSTD_reset_session_and_parameters,
+            ),
+            0,
+        );
+    }
+
+    #[test]
+    fn setCParams_and_setParametersUsingCCtxParams_reject_mid_stream() {
+        // Complement to the setParameter / dict-family gates: the
+        // wholesale-replacement APIs must also stage-gate. A
+        // mid-session cParams swap would leave the match-state
+        // desynced from buffered bytes.
+        use crate::common::error::{ERR_getErrorCode, ERR_isError};
+        let src = b"mid-stream-params-replace ".repeat(2);
+
+        // setCParams.
+        {
+            let mut cctx = ZSTD_createCCtx().unwrap();
+            ZSTD_initCStream(&mut cctx, 3);
+            let cp = ZSTD_getCParams(3, 0, 0);
+            assert_eq!(ZSTD_CCtx_setCParams(&mut cctx, cp), 0);
+            let mut dst = vec![0u8; 1024];
+            let mut cpos = 0usize;
+            let mut sp = 0usize;
+            let _ = ZSTD_compressStream(&mut cctx, &mut dst, &mut cpos, &src, &mut sp);
+            let rc = ZSTD_CCtx_setCParams(&mut cctx, cp);
+            assert!(ERR_isError(rc));
+            assert_eq!(ERR_getErrorCode(rc), ErrorCode::StageWrong);
+        }
+        // setParametersUsingCCtxParams.
+        {
+            let mut cctx = ZSTD_createCCtx().unwrap();
+            ZSTD_initCStream(&mut cctx, 3);
+            let mut params = ZSTD_CCtx_params::default();
+            ZSTD_CCtxParams_init(&mut params, 3);
+            params.cParams = ZSTD_getCParams(3, 0, 0);
+            assert_eq!(ZSTD_CCtx_setParametersUsingCCtxParams(&mut cctx, &params), 0);
+            let mut dst = vec![0u8; 1024];
+            let mut cpos = 0usize;
+            let mut sp = 0usize;
+            let _ = ZSTD_compressStream(&mut cctx, &mut dst, &mut cpos, &src, &mut sp);
+            let rc = ZSTD_CCtx_setParametersUsingCCtxParams(&mut cctx, &params);
+            assert!(ERR_isError(rc));
+            assert_eq!(ERR_getErrorCode(rc), ErrorCode::StageWrong);
+        }
+    }
+
+    #[test]
+    fn CCtx_setParameter_unauthorized_params_reject_mid_stream() {
+        // Upstream (zstd_compress.c:727): only `c_compressionLevel`
+        // (and future cParams knobs) can change mid-session. Format,
+        // frame flags, and nbWorkers must reject with `StageWrong`
+        // once input has been staged. Level IS authorized so the
+        // caller can tune compression pressure per frame.
+        use crate::common::error::{ERR_getErrorCode, ERR_isError};
+        let mut cctx = ZSTD_createCCtx().unwrap();
+        ZSTD_initCStream(&mut cctx, 3);
+        let src = b"mid-stream-param-update ".repeat(4);
+        let mut dst = vec![0u8; 1024];
+        let mut cp = 0usize;
+        let mut sp = 0usize;
+        let _ = ZSTD_compressStream(&mut cctx, &mut dst, &mut cp, &src, &mut sp);
+
+        // compressionLevel is authorized: still succeeds.
+        assert_eq!(
+            ZSTD_CCtx_setParameter(
+                &mut cctx,
+                ZSTD_cParameter::ZSTD_c_compressionLevel,
+                5,
+            ),
+            0,
+        );
+
+        // format, contentSizeFlag, checksumFlag, dictIDFlag,
+        // nbWorkers — all rejected.
+        for param in [
+            ZSTD_cParameter::ZSTD_c_format,
+            ZSTD_cParameter::ZSTD_c_contentSizeFlag,
+            ZSTD_cParameter::ZSTD_c_checksumFlag,
+            ZSTD_cParameter::ZSTD_c_dictIDFlag,
+            ZSTD_cParameter::ZSTD_c_nbWorkers,
+        ] {
+            let rc = ZSTD_CCtx_setParameter(&mut cctx, param, 0);
+            assert!(ERR_isError(rc), "[{param:?}] silent success mid-stream");
+            assert_eq!(
+                ERR_getErrorCode(rc),
+                ErrorCode::StageWrong,
+                "[{param:?}] wrong error",
+            );
+        }
+    }
+
+    #[test]
+    fn dict_family_setters_reject_mid_stream_with_StageWrong() {
+        // Upstream contract: once input has been staged into the
+        // stream, dict / prefix / CDict rebinding must error out with
+        // `StageWrong`. Without the gate a caller could swap the
+        // dict between compressStream() calls, silently decoupling
+        // the back-reference substrate from the bytes already
+        // buffered for this frame.
+        use crate::common::error::{ERR_getErrorCode, ERR_isError};
+        let dict = b"init-stage-dict-bytes ".repeat(3);
+        let src = b"mid-stream-swap payload ".repeat(2);
+
+        // loadDictionary.
+        {
+            let mut cctx = ZSTD_createCCtx().unwrap();
+            ZSTD_initCStream(&mut cctx, 3);
+            assert_eq!(ZSTD_CCtx_loadDictionary(&mut cctx, &dict), 0);
+            let mut dst = vec![0u8; 1024];
+            let mut cp = 0usize;
+            let mut sp = 0usize;
+            let _ = ZSTD_compressStream(&mut cctx, &mut dst, &mut cp, &src, &mut sp);
+            let rc = ZSTD_CCtx_loadDictionary(&mut cctx, &dict);
+            assert!(ERR_isError(rc));
+            assert_eq!(ERR_getErrorCode(rc), ErrorCode::StageWrong);
+        }
+        // refPrefix.
+        {
+            let mut cctx = ZSTD_createCCtx().unwrap();
+            ZSTD_initCStream(&mut cctx, 3);
+            assert_eq!(ZSTD_CCtx_refPrefix(&mut cctx, &dict), 0);
+            let mut dst = vec![0u8; 1024];
+            let mut cp = 0usize;
+            let mut sp = 0usize;
+            let _ = ZSTD_compressStream(&mut cctx, &mut dst, &mut cp, &src, &mut sp);
+            let rc = ZSTD_CCtx_refPrefix(&mut cctx, &dict);
+            assert!(ERR_isError(rc));
+            assert_eq!(ERR_getErrorCode(rc), ErrorCode::StageWrong);
+        }
+        // refCDict.
+        {
+            let cdict = ZSTD_createCDict(&dict, 3).expect("cdict alloc");
+            let mut cctx = ZSTD_createCCtx().unwrap();
+            ZSTD_initCStream(&mut cctx, 3);
+            assert_eq!(ZSTD_CCtx_refCDict(&mut cctx, &cdict), 0);
+            let mut dst = vec![0u8; 1024];
+            let mut cp = 0usize;
+            let mut sp = 0usize;
+            let _ = ZSTD_compressStream(&mut cctx, &mut dst, &mut cp, &src, &mut sp);
+            let rc = ZSTD_CCtx_refCDict(&mut cctx, &cdict);
+            assert!(ERR_isError(rc));
+            assert_eq!(ERR_getErrorCode(rc), ErrorCode::StageWrong);
+        }
+    }
+
+    #[test]
+    fn setPledgedSrcSize_rejects_mid_stream_call_with_StageWrong() {
+        // Upstream contract (zstd_compress.c:1249): re-pledging mid-
+        // session must return `StageWrong`. Without the gate a caller
+        // who restaged a new pledge after already buffering input
+        // would end up with a frame header advertising the NEW size
+        // despite the OLD buffered bytes being compressed — a silent
+        // data-corruption vector.
+        use crate::common::error::{ERR_getErrorCode, ERR_isError};
+        let mut cctx = ZSTD_createCCtx().unwrap();
+        ZSTD_initCStream(&mut cctx, 3);
+        // Init stage — pledge accepted.
+        assert_eq!(ZSTD_CCtx_setPledgedSrcSize(&mut cctx, 100), 0);
+        // Stage some input via compressStream.
+        let src = b"mid-stream-pledge-parity-gate ".repeat(3);
+        let mut dst = vec![0u8; 1024];
+        let mut cp = 0usize;
+        let mut sp = 0usize;
+        let _ = ZSTD_compressStream(&mut cctx, &mut dst, &mut cp, &src, &mut sp);
+        // Post-ingest: stage is no longer init — re-pledge rejected.
+        let rc = ZSTD_CCtx_setPledgedSrcSize(&mut cctx, 200);
+        assert!(ERR_isError(rc));
+        assert_eq!(ERR_getErrorCode(rc), ErrorCode::StageWrong);
+    }
+
+    #[test]
+    fn CCtx_setParameter_boolean_flags_reject_out_of_range() {
+        // Upstream contract: `c_checksumFlag` / `c_contentSizeFlag` /
+        // `c_dictIDFlag` are bounds-checked against `[0, 1]`. Out-of-
+        // range values (e.g. -1, 2) return `ParameterOutOfBound`.
+        // Previously our port cast `value as u32`, so passing -1
+        // produced `0xFFFFFFFF` on the frame-header flag — silently
+        // wrong rather than loud.
+        use crate::common::error::{ERR_getErrorCode, ERR_isError};
+        let mut cctx = ZSTD_createCCtx().unwrap();
+        for param in [
+            ZSTD_cParameter::ZSTD_c_checksumFlag,
+            ZSTD_cParameter::ZSTD_c_contentSizeFlag,
+            ZSTD_cParameter::ZSTD_c_dictIDFlag,
+        ] {
+            // In-range values accepted.
+            assert_eq!(ZSTD_CCtx_setParameter(&mut cctx, param, 0), 0);
+            assert_eq!(ZSTD_CCtx_setParameter(&mut cctx, param, 1), 0);
+            // Out-of-range values rejected.
+            for bad in [-1, 2, i32::MAX, i32::MIN] {
+                let rc = ZSTD_CCtx_setParameter(&mut cctx, param, bad);
+                assert!(ERR_isError(rc), "[{param:?}] silent success for {bad}");
+                assert_eq!(
+                    ERR_getErrorCode(rc),
+                    ErrorCode::ParameterOutOfBound,
+                    "[{param:?}] wrong error for {bad}",
+                );
+            }
+        }
+        // `CCtxParams_setParameter` mirrors.
+        let mut params = ZSTD_CCtx_params::default();
+        for param in [
+            ZSTD_cParameter::ZSTD_c_checksumFlag,
+            ZSTD_cParameter::ZSTD_c_contentSizeFlag,
+            ZSTD_cParameter::ZSTD_c_dictIDFlag,
+        ] {
+            assert_eq!(ZSTD_CCtxParams_setParameter(&mut params, param, 1), 0);
+            let rc = ZSTD_CCtxParams_setParameter(&mut params, param, 3);
+            assert!(ERR_isError(rc));
+            assert_eq!(ERR_getErrorCode(rc), ErrorCode::ParameterOutOfBound);
+        }
+    }
+
+    #[test]
+    fn CCtxParams_init_defaults_match_upstream() {
+        // Upstream `ZSTD_CCtxParams_init` sets the caller-supplied
+        // level + defaults the struct. Pin the defaults so a future
+        // change to `ZSTD_CCtx_params::default` or the init body
+        // doesn't silently shift any parametric readback.
+        use crate::decompress::zstd_decompress::ZSTD_format_e;
+        let mut params = ZSTD_CCtx_params::default();
+        ZSTD_CCtxParams_init(&mut params, 5);
+        let mut v = 0i32;
+
+        assert_eq!(
+            ZSTD_CCtxParams_getParameter(&params, ZSTD_cParameter::ZSTD_c_compressionLevel, &mut v),
+            0,
+        );
+        assert_eq!(v, 5);
+
+        assert_eq!(
+            ZSTD_CCtxParams_getParameter(&params, ZSTD_cParameter::ZSTD_c_contentSizeFlag, &mut v),
+            0,
+        );
+        assert_eq!(v, 1);
+
+        assert_eq!(
+            ZSTD_CCtxParams_getParameter(&params, ZSTD_cParameter::ZSTD_c_checksumFlag, &mut v),
+            0,
+        );
+        assert_eq!(v, 0);
+
+        assert_eq!(
+            ZSTD_CCtxParams_getParameter(&params, ZSTD_cParameter::ZSTD_c_dictIDFlag, &mut v),
+            0,
+        );
+        assert_eq!(v, 1);
+
+        assert_eq!(
+            ZSTD_CCtxParams_getParameter(&params, ZSTD_cParameter::ZSTD_c_format, &mut v),
+            0,
+        );
+        assert_eq!(v, ZSTD_format_e::ZSTD_f_zstd1 as i32);
+
+        assert_eq!(
+            ZSTD_CCtxParams_getParameter(&params, ZSTD_cParameter::ZSTD_c_nbWorkers, &mut v),
+            0,
+        );
+        assert_eq!(v, 0);
+    }
+
+    #[test]
+    fn CCtx_getParameter_defaults_on_fresh_cctx_match_upstream() {
+        // Upstream contract (zstd_compress.c:780 `ZSTD_CCtxParams_init`
+        // + `CCtx_params_default`): a fresh CCtx reports
+        //   - compressionLevel: CLEVEL_DEFAULT (3)
+        //   - contentSizeFlag: 1 (content size written when known)
+        //   - checksumFlag:    0 (no trailer by default)
+        //   - dictIDFlag:      1 (dictID included when applicable)
+        //   - format:          ZSTD_f_zstd1 (magic-prefixed)
+        //   - nbWorkers:       0 (single-threaded default)
+        // Pin these so a future refactor touching `ZSTD_CCtx::default`
+        // or the getter shadow fields doesn't silently change the
+        // API contract.
+        use crate::decompress::zstd_decompress::ZSTD_format_e;
+        let cctx = ZSTD_createCCtx().unwrap();
+        let mut v = 0i32;
+
+        assert_eq!(
+            ZSTD_CCtx_getParameter(
+                &cctx,
+                ZSTD_cParameter::ZSTD_c_compressionLevel,
+                &mut v,
+            ),
+            0,
+        );
+        assert_eq!(v, ZSTD_CLEVEL_DEFAULT);
+
+        assert_eq!(
+            ZSTD_CCtx_getParameter(&cctx, ZSTD_cParameter::ZSTD_c_contentSizeFlag, &mut v),
+            0,
+        );
+        assert_eq!(v, 1);
+
+        assert_eq!(
+            ZSTD_CCtx_getParameter(&cctx, ZSTD_cParameter::ZSTD_c_checksumFlag, &mut v),
+            0,
+        );
+        assert_eq!(v, 0);
+
+        assert_eq!(
+            ZSTD_CCtx_getParameter(&cctx, ZSTD_cParameter::ZSTD_c_dictIDFlag, &mut v),
+            0,
+        );
+        assert_eq!(v, 1);
+
+        assert_eq!(
+            ZSTD_CCtx_getParameter(&cctx, ZSTD_cParameter::ZSTD_c_format, &mut v),
+            0,
+        );
+        assert_eq!(v, ZSTD_format_e::ZSTD_f_zstd1 as i32);
+
+        assert_eq!(
+            ZSTD_CCtx_getParameter(&cctx, ZSTD_cParameter::ZSTD_c_nbWorkers, &mut v),
+            0,
+        );
+        assert_eq!(v, 0);
+    }
+
+    #[test]
+    fn reset_policy_enums_match_upstream_ordering() {
+        // Upstream's internal reset-policy enums at
+        // `zstd_compress.c:1974-1988`. These drive the match-state
+        // reset dispatch (`makeClean` zeros tables; `leaveDirty`
+        // leaves them for the next-frame seed path). Discriminants
+        // are ordinal; our port fixes them explicitly so a silent
+        // reorder would trip this gate.
+        assert_eq!(ZSTD_compResetPolicy_e::ZSTDcrp_makeClean as u32, 0);
+        assert_eq!(ZSTD_compResetPolicy_e::ZSTDcrp_leaveDirty as u32, 1);
+        assert_eq!(ZSTD_indexResetPolicy_e::ZSTDirp_continue as u32, 0);
+        assert_eq!(ZSTD_indexResetPolicy_e::ZSTDirp_reset as u32, 1);
+    }
+
+    #[test]
+    fn SequenceFormat_e_and_buffered_policy_e_discriminants_match_upstream() {
+        // Upstream values:
+        //   ZSTD_sf_noBlockDelimiters = 0, ZSTD_sf_explicitBlockDelimiters = 1 (zstd.h:1582)
+        //   ZSTDb_not_buffered = 0, ZSTDb_buffered = 1 (zstd_compress_internal.h)
+        // These feed `ZSTD_c_blockDelimiters` setParameter and the
+        // compressBegin buffered-policy dispatch respectively.
+        assert_eq!(ZSTD_SequenceFormat_e::ZSTD_sf_noBlockDelimiters as i32, 0);
+        assert_eq!(ZSTD_SequenceFormat_e::ZSTD_sf_explicitBlockDelimiters as i32, 1);
+        assert_eq!(ZSTD_buffered_policy_e::ZSTDb_not_buffered as i32, 0);
+        assert_eq!(ZSTD_buffered_policy_e::ZSTDb_buffered as i32, 1);
+    }
+
+    #[test]
+    fn internal_stage_enums_match_upstream_zstd_compress_internal_h() {
+        // Upstream `zstd_compress_internal.h:46-47`:
+        //   ZSTDcs_created=0, ZSTDcs_init=1, ZSTDcs_ongoing=2, ZSTDcs_ending=3
+        //   zcss_init=0, zcss_load=1, zcss_flush=2
+        // These feed the CCtx stage machine in the C implementation.
+        // Our port's `cctx_is_in_init_stage` helper, gate checks, and
+        // `writeEpilogue` dispatch all consume these discriminants, so
+        // a silent reordering would compile but mis-route the control
+        // flow.
+        assert_eq!(ZSTD_compressionStage_e::ZSTDcs_created as u32, 0);
+        assert_eq!(ZSTD_compressionStage_e::ZSTDcs_init as u32, 1);
+        assert_eq!(ZSTD_compressionStage_e::ZSTDcs_ongoing as u32, 2);
+        assert_eq!(ZSTD_compressionStage_e::ZSTDcs_ending as u32, 3);
+        assert_eq!(ZSTD_cStreamStage::zcss_init as u32, 0);
+        assert_eq!(ZSTD_cStreamStage::zcss_load as u32, 1);
+        assert_eq!(ZSTD_cStreamStage::zcss_flush as u32, 2);
+    }
+
+    #[test]
+    fn ResetDirective_discriminants_match_upstream() {
+        // Upstream (zstd.h:589) fixes the discriminants at 1/2/3 —
+        // NOT 0/1/2. C callers passing the numeric values directly
+        // would mis-route if the enum ever drifts.
+        assert_eq!(ZSTD_ResetDirective::ZSTD_reset_session_only as i32, 1);
+        assert_eq!(ZSTD_ResetDirective::ZSTD_reset_parameters as i32, 2);
+        assert_eq!(
+            ZSTD_ResetDirective::ZSTD_reset_session_and_parameters as i32,
+            3,
+        );
+    }
+
+    #[test]
+    fn EndDirective_discriminants_match_upstream() {
+        // `ZSTD_EndDirective` is the return / argument type for the
+        // `compressStream2` family. Upstream (zstd.h:480) fixes the
+        // discriminants at 0/1/2 — mismatch here silently mis-routes
+        // C callers passing the numeric values directly.
+        assert_eq!(ZSTD_EndDirective::ZSTD_e_continue as i32, 0);
+        assert_eq!(ZSTD_EndDirective::ZSTD_e_flush as i32, 1);
+        assert_eq!(ZSTD_EndDirective::ZSTD_e_end as i32, 2);
+    }
+
+    #[test]
+    fn cParameter_discriminants_match_upstream_zstd_h() {
+        // `ZSTD_cParameter` values are part of the public C ABI. Drift
+        // here would silently mis-route C callers through FFI bridges
+        // — e.g. a caller passing `ZSTD_c_format` (= 10 upstream)
+        // into a Rust-port FFI wrapper that defined it as 1001 would
+        // hit the wrong handler. Pin the discriminants here so any
+        // future rearrangement trips the gate.
+        assert_eq!(ZSTD_cParameter::ZSTD_c_compressionLevel as i32, 100);
+        assert_eq!(ZSTD_cParameter::ZSTD_c_contentSizeFlag as i32, 200);
+        assert_eq!(ZSTD_cParameter::ZSTD_c_checksumFlag as i32, 201);
+        assert_eq!(ZSTD_cParameter::ZSTD_c_dictIDFlag as i32, 202);
+        assert_eq!(ZSTD_cParameter::ZSTD_c_nbWorkers as i32, 400);
+        // `ZSTD_c_format` = `ZSTD_c_experimentalParam2` = 10.
+        assert_eq!(ZSTD_cParameter::ZSTD_c_format as i32, 10);
+    }
+
+    #[test]
+    fn CCtx_setParameter_c_nbWorkers_rejects_non_zero_in_single_threaded_build() {
+        // Upstream's single-threaded build contract: `c_nbWorkers`
+        // bounds cap at `[0, 0]`, so any positive request errors out
+        // with `ParameterOutOfBound`. Callers probe this to detect
+        // MT support at runtime — a silent clamp would make
+        // MT-expecting code run serially without warning.
+        use crate::common::error::{ERR_getErrorCode, ERR_isError};
+        let mut cctx = ZSTD_createCCtx().unwrap();
+        let mut value = 0i32;
+
+        // Default is 0, getter reports 0.
+        assert_eq!(
+            ZSTD_CCtx_getParameter(&cctx, ZSTD_cParameter::ZSTD_c_nbWorkers, &mut value),
+            0,
+        );
+        assert_eq!(value, 0);
+
+        // Setting 0 is the identity.
+        assert_eq!(
+            ZSTD_CCtx_setParameter(&mut cctx, ZSTD_cParameter::ZSTD_c_nbWorkers, 0),
+            0,
+        );
+
+        // Setting 1+ rejects with ParameterOutOfBound.
+        let rc = ZSTD_CCtx_setParameter(&mut cctx, ZSTD_cParameter::ZSTD_c_nbWorkers, 4);
+        assert!(ERR_isError(rc));
+        assert_eq!(ERR_getErrorCode(rc), ErrorCode::ParameterOutOfBound);
+
+        // Bounds getter reports [0, 0].
+        let bounds = ZSTD_cParam_getBounds(ZSTD_cParameter::ZSTD_c_nbWorkers);
+        assert_eq!(bounds.lowerBound, 0);
+        assert_eq!(bounds.upperBound, 0);
+    }
+
+    #[test]
+    fn CCtx_setParameter_c_format_round_trips_through_getParameter() {
+        // Parametric API parity for the compressor-side format knob.
+        // Callers using `ZSTD_CCtx_setParameter(ZSTD_c_format, value)`
+        // must land on the same state as `ZSTD_CCtx_setFormat`.
+        use crate::common::error::{ERR_getErrorCode, ERR_isError};
+        use crate::decompress::zstd_decompress::ZSTD_format_e;
+        let mut cctx = ZSTD_createCCtx().unwrap();
+        let mut value = 0i32;
+
+        assert_eq!(
+            ZSTD_CCtx_getParameter(&cctx, ZSTD_cParameter::ZSTD_c_format, &mut value),
+            0,
+        );
+        assert_eq!(value, ZSTD_format_e::ZSTD_f_zstd1 as i32);
+
+        assert_eq!(
+            ZSTD_CCtx_setParameter(
+                &mut cctx,
+                ZSTD_cParameter::ZSTD_c_format,
+                ZSTD_format_e::ZSTD_f_zstd1_magicless as i32,
+            ),
+            0,
+        );
+        assert_eq!(cctx.format, ZSTD_format_e::ZSTD_f_zstd1_magicless);
+
+        assert_eq!(
+            ZSTD_CCtx_getParameter(&cctx, ZSTD_cParameter::ZSTD_c_format, &mut value),
+            0,
+        );
+        assert_eq!(value, ZSTD_format_e::ZSTD_f_zstd1_magicless as i32);
+
+        // Out-of-bounds → `ParameterOutOfBound`, not silent clamp.
+        let rc = ZSTD_CCtx_setParameter(&mut cctx, ZSTD_cParameter::ZSTD_c_format, 99);
+        assert!(ERR_isError(rc));
+        assert_eq!(ERR_getErrorCode(rc), ErrorCode::ParameterOutOfBound);
+
+        // Bounds getter exposes the same [zstd1, magicless] range.
+        let bounds = ZSTD_cParam_getBounds(ZSTD_cParameter::ZSTD_c_format);
+        assert_eq!(bounds.lowerBound, ZSTD_format_e::ZSTD_f_zstd1 as i32);
+        assert_eq!(bounds.upperBound, ZSTD_format_e::ZSTD_f_zstd1_magicless as i32);
+    }
+
+    #[test]
+    fn CCtx_refPrefix_auto_clears_after_one_endStream_frame() {
+        // Compressor-side sibling of the decoder `refPrefix` one-shot
+        // auto-clear. Upstream (zstd_compress.c:6381) zeroes
+        // `cctx->prefixDict` after each single-usage compress.
+        // Without this, a second frame compressed on the same stream
+        // dctx would silently carry the prior prefix as back-ref
+        // history even though the caller only asked for one use.
+        use crate::common::error::ERR_isError;
+        let prefix = b"cctx-refPrefix-one-shot".to_vec();
+        let src = b"payload-that-may-back-reference-prefix-bytes ".repeat(3);
+
+        let mut cctx = ZSTD_createCCtx().unwrap();
+        ZSTD_initCStream(&mut cctx, 3);
+        assert_eq!(ZSTD_CCtx_refPrefix(&mut cctx, &prefix), 0);
+        assert!(cctx.prefix_is_single_use);
+
+        // Feed + finalize a frame.
+        let mut dst = vec![0u8; 4096];
+        let mut cp = 0usize;
+        let mut sp = 0usize;
+        let _ = ZSTD_compressStream(&mut cctx, &mut dst, &mut cp, &src, &mut sp);
+        loop {
+            let r = ZSTD_endStream(&mut cctx, &mut dst, &mut cp);
+            assert!(!ERR_isError(r));
+            if r == 0 { break; }
+        }
+
+        // After the single-usage frame the prefix bits are all wiped.
+        assert!(cctx.stream_dict.is_empty(), "refPrefix dict persisted");
+        assert_eq!(cctx.dictID, 0);
+        assert_eq!(cctx.dictContentSize, 0);
+        assert!(!cctx.prefix_is_single_use);
+    }
+
+    #[test]
+    fn CCtx_refCDict_after_refPrefix_wipes_single_use_flag() {
+        // Upstream (zstd_compress.c:1348) clears all dicts before
+        // installing a new cdict. Pin: a `refPrefix` → `refCDict`
+        // transition on the same cctx must leave the single-use
+        // flag cleared — a persistent CDict binding mustn't inherit
+        // the prior prefix's one-shot lifetime.
+        let dict = b"persistent-cdict".to_vec();
+        let cdict = ZSTD_createCDict(&dict, 3).expect("cdict");
+
+        let mut cctx = ZSTD_createCCtx().unwrap();
+        assert_eq!(ZSTD_CCtx_refPrefix(&mut cctx, b"one-shot-first"), 0);
+        assert!(cctx.prefix_is_single_use);
+
+        assert_eq!(ZSTD_CCtx_refCDict(&mut cctx, &cdict), 0);
+        assert!(
+            !cctx.prefix_is_single_use,
+            "refCDict inherited prior refPrefix's single-use flag",
+        );
+        // The CDict content took over.
+        assert_eq!(cctx.stream_dict, dict);
+    }
+
+    #[test]
+    fn CCtx_loadDictionary_empty_slice_clears_dict_state() {
+        // Upstream `zstd_compress.c:1308`: empty-dict load acts as
+        // `clearAllDicts`. Pin so a caller using `loadDictionary(&[])`
+        // gets the same effect as `reset(parameters)`-level wipe of
+        // dict state without having to reset the whole ctx.
+        let mut cctx = ZSTD_createCCtx().unwrap();
+        assert_eq!(ZSTD_CCtx_loadDictionary(&mut cctx, b"real-dict-bytes"), 0);
+        assert_eq!(cctx.stream_dict, b"real-dict-bytes");
+
+        // Empty reload clears everything.
+        assert_eq!(ZSTD_CCtx_loadDictionary(&mut cctx, &[]), 0);
+        assert!(cctx.stream_dict.is_empty());
+        assert_eq!(cctx.dictID, 0);
+        assert_eq!(cctx.dictContentSize, 0);
+        assert!(!cctx.prefix_is_single_use);
+    }
+
+    #[test]
+    fn CCtx_refPrefix_empty_slice_clears_dict_state() {
+        // Upstream (zstd_compress.c:1372): `refPrefix` calls
+        // `ZSTD_clearAllDicts` before installing — if the prefix is
+        // empty, the install is skipped and the cctx ends up with
+        // no dict at all. Pin this behavior so `refPrefix(&[])`
+        // doesn't silently leave `prefix_is_single_use = true` with
+        // an empty stream_dict.
+        let mut cctx = ZSTD_createCCtx().unwrap();
+        // Pre-seed with a real prefix.
+        assert_eq!(ZSTD_CCtx_refPrefix(&mut cctx, b"pre-existing-prefix"), 0);
+        assert!(cctx.prefix_is_single_use);
+        assert!(!cctx.stream_dict.is_empty());
+
+        // Re-bind with an empty prefix: must reset everything.
+        // (Needs a reset first since the prior refPrefix put us past
+        // init stage in terms of dict state. Actually we're still in
+        // init stage — no compressStream yet.)
+        assert_eq!(ZSTD_CCtx_refPrefix(&mut cctx, &[]), 0);
+        assert!(
+            !cctx.prefix_is_single_use,
+            "empty refPrefix left single-use flag set",
+        );
+        assert!(cctx.stream_dict.is_empty());
+        assert_eq!(cctx.dictID, 0);
+        assert_eq!(cctx.dictContentSize, 0);
+    }
+
+    #[test]
+    fn CCtx_refPrefix_cycle_across_session_resets() {
+        // Flag-lifecycle integration test:
+        //   refPrefix → flag=true
+        //   compress2 → flag=false (auto-cleared)
+        //   session_reset → allows new refPrefix
+        //   refPrefix(different prefix) → flag=true again
+        //   compress2 → flag=false
+        // Proves the single-use state cycles cleanly rather than
+        // staying stuck or corrupting the next cycle.
+        use crate::common::error::ERR_isError;
+        let src = b"short".to_vec();
+        let mut cctx = ZSTD_createCCtx().unwrap();
+
+        // Cycle 1.
+        assert_eq!(ZSTD_CCtx_refPrefix(&mut cctx, b"prefix-one"), 0);
+        assert!(cctx.prefix_is_single_use);
+        let mut dst = vec![0u8; ZSTD_compressBound(src.len())];
+        let n = ZSTD_compress2(&mut cctx, &mut dst, &src);
+        assert!(!ERR_isError(n));
+        assert!(!cctx.prefix_is_single_use);
+        assert!(cctx.stream_dict.is_empty());
+
+        // After compress2 the stream is closed — a direct refPrefix
+        // would fail the init-stage gate. Caller must reset first.
+        assert!(
+            crate::common::error::ERR_isError(
+                ZSTD_CCtx_refPrefix(&mut cctx, b"prefix-two-pre-reset")
+            ),
+            "refPrefix must reject before session reset",
+        );
+
+        // After reset_session_only we're back in init stage.
+        ZSTD_CCtx_reset(&mut cctx, ZSTD_ResetDirective::ZSTD_reset_session_only);
+
+        // Cycle 2 with a different prefix.
+        assert_eq!(ZSTD_CCtx_refPrefix(&mut cctx, b"prefix-two"), 0);
+        assert!(cctx.prefix_is_single_use);
+        assert_eq!(cctx.stream_dict, b"prefix-two");
+        let mut dst = vec![0u8; ZSTD_compressBound(src.len())];
+        let n = ZSTD_compress2(&mut cctx, &mut dst, &src);
+        assert!(!ERR_isError(n));
+        assert!(!cctx.prefix_is_single_use);
+        assert!(cctx.stream_dict.is_empty());
+    }
+
+    #[test]
+    fn CCtx_refPrefix_auto_clears_through_compress2_entry() {
+        // Complement to the endStream-specific test: `ZSTD_compress2`
+        // resets the session + routes through `compressStream2`,
+        // which internally reaches endStream. The one-shot auto-clear
+        // must fire through that chain too.
+        use crate::common::error::ERR_isError;
+        let prefix = b"compress2-refPrefix-one-shot".to_vec();
+        let src = b"short payload".to_vec();
+
+        let mut cctx = ZSTD_createCCtx().unwrap();
+        assert_eq!(ZSTD_CCtx_refPrefix(&mut cctx, &prefix), 0);
+        assert!(cctx.prefix_is_single_use);
+
+        let mut dst = vec![0u8; ZSTD_compressBound(src.len())];
+        let n = ZSTD_compress2(&mut cctx, &mut dst, &src);
+        assert!(!ERR_isError(n));
+
+        // The prefix is consumed after compress2 completes.
+        assert!(cctx.stream_dict.is_empty());
+        assert!(!cctx.prefix_is_single_use);
+    }
+
+    #[test]
+    fn CCtx_loadDictionary_persists_across_endStream_frames() {
+        // Counterpart: `loadDictionary` is a persistent attach.
+        // The dict must survive across endStream boundaries, matching
+        // upstream's `localDict` / `cdict` fields which aren't
+        // zeroed at compress start.
+        let dict = b"cctx-loadDictionary-persists".to_vec();
+        let src = b"payload-for-persistent-dict ".repeat(2);
+
+        let mut cctx = ZSTD_createCCtx().unwrap();
+        ZSTD_initCStream(&mut cctx, 3);
+        assert_eq!(ZSTD_CCtx_loadDictionary(&mut cctx, &dict), 0);
+        assert!(!cctx.prefix_is_single_use);
+
+        let mut dst = vec![0u8; 4096];
+        let mut cp = 0usize;
+        let mut sp = 0usize;
+        let _ = ZSTD_compressStream(&mut cctx, &mut dst, &mut cp, &src, &mut sp);
+        loop {
+            let r = ZSTD_endStream(&mut cctx, &mut dst, &mut cp);
+            if r == 0 { break; }
+        }
+
+        // Dict survives the first frame.
+        assert_eq!(cctx.stream_dict, dict);
+        assert!(!cctx.prefix_is_single_use);
+    }
+
+    #[test]
+    fn CCtx_reset_parameters_clears_single_use_prefix_flag() {
+        // `ZSTD_clearAllDicts` must wipe the single-usage flag too.
+        // A `reset(parameters)` that wipes the dict but leaves the
+        // flag set would make the next compress auto-clear an
+        // already-empty stream_dict (harmless) but confuse state
+        // assertions and break future optimizations that read the
+        // flag as a dict-presence hint.
+        let mut cctx = ZSTD_createCCtx().unwrap();
+        assert_eq!(ZSTD_CCtx_refPrefix(&mut cctx, b"one-shot"), 0);
+        assert!(cctx.prefix_is_single_use);
+
+        assert_eq!(
+            ZSTD_CCtx_reset(&mut cctx, ZSTD_ResetDirective::ZSTD_reset_parameters),
+            0,
+        );
+        assert!(!cctx.prefix_is_single_use);
+        assert!(cctx.stream_dict.is_empty());
+    }
+
+    #[test]
+    fn CCtx_reset_parameters_clears_every_dict_slot_via_clearAllDicts_helper() {
+        // Symmetric to the decoder-side gate. After routing
+        // `reset(parameters)` through `ZSTD_clearAllDicts` +
+        // `ZSTD_CCtxParams_reset`, the param reset must wipe every
+        // dict slot — `stream_dict`, `dictID`, `dictContentSize` —
+        // rather than just the subset the older field-by-field body
+        // covered.
+        let mut cctx = ZSTD_createCCtx().unwrap();
+        cctx.stream_dict = b"cctx-reset-wipe-test".to_vec();
+        cctx.dictID = 0xBE_EF_C0_DE;
+        cctx.dictContentSize = 42;
+
+        assert_eq!(
+            ZSTD_CCtx_reset(&mut cctx, ZSTD_ResetDirective::ZSTD_reset_parameters),
+            0,
+        );
+        assert!(cctx.stream_dict.is_empty());
+        assert_eq!(cctx.dictID, 0);
+        assert_eq!(cctx.dictContentSize, 0);
+    }
+
+    #[test]
+    fn CCtx_reset_parameters_clears_magicless_format() {
+        // A `reset(parameters)` or `reset(session_and_parameters)`
+        // must restore the default zstd1 format. Without this, a
+        // CCtx re-used after magicless work silently produces
+        // magicless frames for the next caller.
+        use crate::decompress::zstd_decompress::ZSTD_format_e;
+        let mut cctx = ZSTD_createCCtx().unwrap();
+        ZSTD_CCtx_setFormat(&mut cctx, ZSTD_format_e::ZSTD_f_zstd1_magicless);
+        assert_eq!(cctx.format, ZSTD_format_e::ZSTD_f_zstd1_magicless);
+
+        // session_only must NOT clear format — upstream keeps the
+        // parameter across session resets.
+        ZSTD_CCtx_reset(&mut cctx, ZSTD_ResetDirective::ZSTD_reset_session_only);
+        assert_eq!(cctx.format, ZSTD_format_e::ZSTD_f_zstd1_magicless);
+
+        // parameters reset must wipe it back to zstd1.
+        ZSTD_CCtx_reset(&mut cctx, ZSTD_ResetDirective::ZSTD_reset_parameters);
+        assert_eq!(cctx.format, ZSTD_format_e::ZSTD_f_zstd1);
+
+        // session_and_parameters reset must also wipe it.
+        ZSTD_CCtx_setFormat(&mut cctx, ZSTD_format_e::ZSTD_f_zstd1_magicless);
+        ZSTD_CCtx_reset(&mut cctx, ZSTD_ResetDirective::ZSTD_reset_session_and_parameters);
+        assert_eq!(cctx.format, ZSTD_format_e::ZSTD_f_zstd1);
+    }
+
+    #[test]
+    fn CCtx_magicless_plus_dict_endStream_roundtrips() {
+        // Parity gate for the dict + magicless combination. Before
+        // `_with_prefix_advanced` landed, a dict-bearing stream would
+        // still emit a zstd1-format frame even when the caller set
+        // magicless mode — roundtrip against a magicless dctx would
+        // fail because of the leaked magic prefix.
+        use crate::decompress::zstd_decompress::{
+            ZSTD_DCtx_setFormat, ZSTD_decompress_usingDict, ZSTD_format_e,
+        };
+        use crate::decompress::zstd_decompress_block::ZSTD_DCtx;
+
+        let dict = b"dict-bytes-for-magicless-stream-compression ".repeat(4);
+        let src = b"payload-referencing-dict-bytes-for-magicless-stream-compression ".repeat(8);
+        let mut cctx = ZSTD_createCCtx().unwrap();
+        assert_eq!(
+            ZSTD_CCtx_setFormat(&mut cctx, ZSTD_format_e::ZSTD_f_zstd1_magicless),
+            0,
+        );
+        ZSTD_initCStream_usingDict(&mut cctx, &dict, 3);
+
+        let mut compressed = vec![0u8; 4096];
+        let mut cp = 0usize;
+        let mut sp = 0usize;
+        let _ = ZSTD_compressStream(&mut cctx, &mut compressed, &mut cp, &src, &mut sp);
+        loop {
+            let r = ZSTD_endStream(&mut cctx, &mut compressed, &mut cp);
+            assert!(!ERR_isError(r));
+            if r == 0 {
+                break;
+            }
+        }
+        compressed.truncate(cp);
+        let magic_le = crate::common::mem::MEM_readLE32(&compressed[..4]);
+        assert_ne!(
+            magic_le, crate::decompress::zstd_decompress::ZSTD_MAGICNUMBER,
+            "magicless + dict frame leaked a zstd1 magic prefix",
+        );
+
+        let mut dctx = ZSTD_DCtx::new();
+        assert_eq!(
+            ZSTD_DCtx_setFormat(&mut dctx, ZSTD_format_e::ZSTD_f_zstd1_magicless),
+            0,
+        );
+        let mut out = vec![0u8; src.len() + 128];
+        let d = ZSTD_decompress_usingDict(&mut dctx, &mut out, &compressed, &dict);
+        assert!(!ERR_isError(d), "decode err: {d:#x}");
+        assert_eq!(&out[..d], &src[..]);
+    }
+
+    #[test]
     fn seq_to_codes_fills_three_code_tables() {
         use crate::compress::seq_store::{
             SeqStore_t, SeqDef, OFFSET_TO_OFFBASE, REPCODE_TO_OFFBASE,
@@ -3775,9 +8395,12 @@ mod tests {
 
     #[test]
     fn get_cparams_small_src_uses_smaller_tables() {
-        // Tiny src → tableID 3, row 1.
+        // Tiny src → tableID 3, row 1. Upstream's
+        // `ZSTD_adjustCParams_internal` then shrinks windowLog to
+        // `highbit32(srcSize-1)+1` = 10 for a 1000-byte input, since
+        // the configured windowLog (14) exceeds what's needed.
         let cp = ZSTD_getCParams(1, 1000, 0);
-        assert_eq!(cp.windowLog, 14);
+        assert_eq!(cp.windowLog, 10);
     }
 
     #[test]
@@ -4538,6 +9161,22 @@ mod tests {
         assert_eq!(cctx.stream_level, None);
         assert!(cctx.stream_dict.is_empty());
         assert!(!cctx.param_checksum);
+
+        // session_and_parameters: superset — does both. Re-seed
+        // with non-default state and confirm one call restores
+        // defaults (contentSize=true, checksum=false, dictID=true,
+        // level=None, dict empty).
+        cctx.stream_level = Some(11);
+        cctx.stream_dict = b"different".to_vec();
+        cctx.param_checksum = true;
+        cctx.param_contentSize = false;
+        cctx.param_dictID = false;
+        ZSTD_CCtx_reset(&mut cctx, ZSTD_ResetDirective::ZSTD_reset_session_and_parameters);
+        assert_eq!(cctx.stream_level, None);
+        assert!(cctx.stream_dict.is_empty());
+        assert!(!cctx.param_checksum);
+        assert!(cctx.param_contentSize, "contentSize default is true");
+        assert!(cctx.param_dictID, "dictID default is true");
     }
 
     #[test]
@@ -4586,6 +9225,894 @@ mod tests {
     }
 
     #[test]
+    fn LLcode_MLcode_boundary_behavior_matches_upstream() {
+        // LL/ML code tables are small (64/128 entries) with closed-form
+        // fallback (`highbit32(val) + DELTA`) for values past the end.
+        // Pin the in-table lookups + the crossover behaviour; either
+        // LL_DELTA=19 or ML_DELTA=36 drifting would misroute every
+        // symbol in that range.
+        // LL: identity for 0..=15.
+        for v in 0u32..=15 {
+            assert_eq!(ZSTD_LLcode(v), v);
+        }
+        // LL: table value 16 at lits=16, 17, then 17 at 18, 19, ...
+        assert_eq!(ZSTD_LLcode(16), 16);
+        assert_eq!(ZSTD_LLcode(17), 16);
+        assert_eq!(ZSTD_LLcode(18), 17);
+        // LL: boundary — table up to 63, then highbit+19.
+        assert_eq!(ZSTD_LLcode(63), 24);
+        // For litLength=64: highbit32(64)=6, code=6+19=25.
+        assert_eq!(ZSTD_LLcode(64), 25);
+        assert_eq!(ZSTD_LLcode(128), 26); // highbit=7, 7+19=26
+
+        // ML: identity for 0..=31.
+        for v in 0u32..=31 {
+            assert_eq!(ZSTD_MLcode(v), v);
+        }
+        // ML: table at 32, 33 → 32; 34, 35 → 33; 127 stays in table.
+        assert_eq!(ZSTD_MLcode(32), 32);
+        assert_eq!(ZSTD_MLcode(33), 32);
+        assert_eq!(ZSTD_MLcode(34), 33);
+        // ML: boundary — table up to 127 (= 42), then highbit+36.
+        assert_eq!(ZSTD_MLcode(127), 42);
+        // For mlBase=128: highbit32(128)=7, 7+36=43.
+        assert_eq!(ZSTD_MLcode(128), 43);
+        assert_eq!(ZSTD_MLcode(256), 44);
+    }
+
+    #[test]
+    fn streaming_buffer_size_hints_match_upstream_formulas() {
+        // Exact upstream formulas (zstd_compress.c:5976/5980,
+        // zstd_decompress.c:1696/1697):
+        //   CStreamInSize  = ZSTD_BLOCKSIZE_MAX
+        //   CStreamOutSize = compressBound(BLOCKSIZE_MAX) + blockHeaderSize + 4
+        //   DStreamInSize  = ZSTD_BLOCKSIZE_MAX + blockHeaderSize
+        //   DStreamOutSize = ZSTD_BLOCKSIZE_MAX
+        // Previously only loose ordering was checked; pin exact
+        // equality so future refactors can't introduce over/under-
+        // estimates silently.
+        use crate::decompress::zstd_decompress::{ZSTD_DStreamInSize, ZSTD_DStreamOutSize};
+        use crate::decompress::zstd_decompress_block::{ZSTD_BLOCKSIZE_MAX, ZSTD_blockHeaderSize};
+        assert_eq!(ZSTD_CStreamInSize(), ZSTD_BLOCKSIZE_MAX);
+        assert_eq!(
+            ZSTD_CStreamOutSize(),
+            ZSTD_compressBound(ZSTD_BLOCKSIZE_MAX) + ZSTD_blockHeaderSize + 4,
+        );
+        assert_eq!(ZSTD_DStreamInSize(), ZSTD_BLOCKSIZE_MAX + ZSTD_blockHeaderSize);
+        assert_eq!(ZSTD_DStreamOutSize(), ZSTD_BLOCKSIZE_MAX);
+    }
+
+    #[test]
+    fn setPledgedSrcSize_cleared_by_reset_session_only() {
+        // Upstream (zstd_compress.c:1386-1389) clears
+        // `pledgedSrcSizePlusOne` on `reset_session_only` — the next
+        // frame starts fresh with UNKNOWN pledged size. Our port
+        // clears `pledged_src_size` to `None`. Previously unpinned;
+        // keep the contract visible so session-reuse callers can rely
+        // on clean per-frame state.
+        let mut cctx = ZSTD_createCCtx().unwrap();
+        ZSTD_CCtx_setPledgedSrcSize(&mut cctx, 500);
+        assert_eq!(cctx.pledged_src_size, Some(500));
+        ZSTD_CCtx_reset(&mut cctx, ZSTD_ResetDirective::ZSTD_reset_session_only);
+        assert_eq!(cctx.pledged_src_size, None);
+        // Same after `session_and_parameters`.
+        ZSTD_CCtx_setPledgedSrcSize(&mut cctx, 999);
+        ZSTD_CCtx_reset(
+            &mut cctx,
+            ZSTD_ResetDirective::ZSTD_reset_session_and_parameters,
+        );
+        assert_eq!(cctx.pledged_src_size, None);
+    }
+
+    #[test]
+    fn CDict_and_DDict_from_same_magic_dict_expose_same_content_and_id() {
+        // Parity probe: a magic-tagged dict loaded via `ZSTD_createCDict`
+        // and `ZSTD_createDDict` should expose identical dict content
+        // bytes and identical dictID — any divergence means asymmetric
+        // parsing. `ZSTD_DDict_dictContent` on our port returns the
+        // whole buffer (including magic + dictID), and CDict stores
+        // the whole buffer in `dictContent`; equivalence should hold.
+        use crate::common::mem::MEM_writeLE32;
+        use crate::decompress::zstd_ddict::{
+            ZSTD_createDDict, ZSTD_DDict_dictContent, ZSTD_getDictID_fromDDict,
+        };
+        use crate::decompress::zstd_decompress::ZSTD_MAGIC_DICTIONARY;
+        let mut magic_dict = vec![0u8; 64];
+        MEM_writeLE32(&mut magic_dict[..4], ZSTD_MAGIC_DICTIONARY);
+        MEM_writeLE32(&mut magic_dict[4..8], 0x5A5A_5A5A);
+        for (i, b) in magic_dict[8..].iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(23);
+        }
+        let cdict = ZSTD_createCDict(&magic_dict, 5).unwrap();
+        let ddict = ZSTD_createDDict(&magic_dict).unwrap();
+        assert_eq!(cdict.dictContent, ZSTD_DDict_dictContent(&ddict));
+        assert_eq!(
+            ZSTD_getDictID_fromCDict(&cdict),
+            ZSTD_getDictID_fromDDict(&ddict),
+        );
+        assert_eq!(ZSTD_getDictID_fromCDict(&cdict), 0x5A5A_5A5A);
+    }
+
+    #[test]
+    fn CCtxParams_reset_restores_init_defaults() {
+        // `ZSTD_CCtxParams_reset` should drop any customized fields
+        // back to what `CCtxParams_init(CLEVEL_DEFAULT)` produces:
+        // zeroed struct + `compressionLevel=3`, `contentSizeFlag=1`.
+        // Regression gate in case someone removes the init call from
+        // reset and leaves stale state.
+        let mut params = ZSTD_CCtx_params::default();
+        ZSTD_CCtxParams_setParameter(
+            &mut params, ZSTD_cParameter::ZSTD_c_compressionLevel, 9,
+        );
+        ZSTD_CCtxParams_setParameter(
+            &mut params, ZSTD_cParameter::ZSTD_c_checksumFlag, 1,
+        );
+        ZSTD_CCtxParams_setParameter(
+            &mut params, ZSTD_cParameter::ZSTD_c_contentSizeFlag, 0,
+        );
+        assert_eq!(params.compressionLevel, 9);
+        assert_eq!(params.fParams.checksumFlag, 1);
+        assert_eq!(params.fParams.contentSizeFlag, 0);
+
+        let rc = ZSTD_CCtxParams_reset(&mut params);
+        assert_eq!(rc, 0);
+        assert_eq!(params.compressionLevel, ZSTD_CLEVEL_DEFAULT);
+        assert_eq!(params.fParams.checksumFlag, 0);
+        assert_eq!(params.fParams.contentSizeFlag, 1);
+        assert_eq!(params.fParams.noDictIDFlag, 0);
+    }
+
+    #[test]
+    fn CCtxParams_init_advanced_preserves_zstdParams_fParams() {
+        // `ZSTD_CCtxParams_init_advanced` must copy fParams verbatim
+        // (contentSizeFlag, checksumFlag, noDictIDFlag). Easy to break
+        // if refactoring fParams plumbing — pin the roundtrip explicitly
+        // so drift shows up immediately rather than as a subtle frame-
+        // header bit flip on downstream compression.
+        let mut params = ZSTD_CCtx_params::default();
+        let cp = ZSTD_getCParams(3, 0, 0);
+        let fp = ZSTD_FrameParameters {
+            contentSizeFlag: 0,
+            checksumFlag: 1,
+            noDictIDFlag: 1,
+        };
+        let rc = ZSTD_CCtxParams_init_advanced(
+            &mut params,
+            ZSTD_parameters { cParams: cp, fParams: fp },
+        );
+        assert_eq!(rc, 0);
+        assert_eq!(params.fParams.contentSizeFlag, 0);
+        assert_eq!(params.fParams.checksumFlag, 1);
+        assert_eq!(params.fParams.noDictIDFlag, 1);
+        // And cParams propagates too.
+        assert_eq!(params.cParams.windowLog, cp.windowLog);
+        assert_eq!(params.cParams.strategy, cp.strategy);
+    }
+
+    #[test]
+    fn compressStream2_respects_contentSizeFlag_off() {
+        // With `c_contentSizeFlag=0`, the emitted frame header must
+        // NOT declare the frame content size — `getFrameContentSize`
+        // should report `ZSTD_CONTENTSIZE_UNKNOWN`. Default flag=1 is
+        // well covered; pin the "turned off" path too in case the
+        // plumbing that ties `param_contentSize → fParams.contentSizeFlag`
+        // ever regresses.
+        use crate::decompress::zstd_decompress::{
+            ZSTD_getFrameContentSize, ZSTD_CONTENTSIZE_UNKNOWN,
+        };
+        let mut cctx = ZSTD_createCCtx().unwrap();
+        ZSTD_CCtx_setParameter(
+            &mut cctx, ZSTD_cParameter::ZSTD_c_contentSizeFlag, 0,
+        );
+        let src = b"contentSizeFlag off path ".repeat(20);
+        let mut dst = vec![0u8; 4096];
+        let n = ZSTD_compress2(&mut cctx, &mut dst, &src);
+        assert!(!ERR_isError(n));
+        assert_eq!(ZSTD_getFrameContentSize(&dst[..n]), ZSTD_CONTENTSIZE_UNKNOWN);
+
+        // Sanity contrast: with flag ON (default), FCS matches src.len.
+        let mut cctx2 = ZSTD_createCCtx().unwrap();
+        let mut dst2 = vec![0u8; 4096];
+        let n2 = ZSTD_compress2(&mut cctx2, &mut dst2, &src);
+        assert!(!ERR_isError(n2));
+        assert_eq!(ZSTD_getFrameContentSize(&dst2[..n2]), src.len() as u64);
+    }
+
+    #[test]
+    fn endStream_second_call_after_complete_frame_is_noop_success() {
+        // Contract: once a frame has been fully emitted via
+        // `ZSTD_endStream`, a second call must be a safe no-op (no
+        // spurious error, no extra bytes). Callers commonly keep
+        // calling endStream in a loop until it returns 0 — the very
+        // last iteration is this no-op case.
+        let mut cctx = ZSTD_createCCtx().unwrap();
+        ZSTD_initCStream(&mut cctx, 3);
+        let src = b"endStream-idempotency-probe ".repeat(20);
+        let mut out = vec![0u8; 4096];
+        let mut dp = 0usize;
+        let mut sp = 0usize;
+        // First: feed + end.
+        let rc1 = ZSTD_compressStream2(
+            &mut cctx, &mut out, &mut dp, &src, &mut sp,
+            ZSTD_EndDirective::ZSTD_e_end,
+        );
+        assert!(!ERR_isError(rc1));
+        assert_eq!(rc1, 0, "first endStream should fully flush");
+        let written_after_first = dp;
+        // Second: zero input, e_end. Must return 0 and add no bytes.
+        let mut empty_pos = 0usize;
+        let rc2 = ZSTD_compressStream2(
+            &mut cctx, &mut out, &mut dp, &[], &mut empty_pos,
+            ZSTD_EndDirective::ZSTD_e_end,
+        );
+        assert!(!ERR_isError(rc2));
+        assert_eq!(rc2, 0);
+        assert_eq!(dp, written_after_first, "no extra bytes on 2nd endStream");
+    }
+
+    #[test]
+    fn compress2_rejects_tiny_dst_with_DstSizeTooSmall() {
+        // Contract: `ZSTD_compress2` must not silently truncate — if
+        // the destination buffer can't hold the full frame, the call
+        // returns `DstSizeTooSmall` (not a partial write + success).
+        // Covers the wrap-around in the `result != 0` branch.
+        use crate::common::error::{ERR_getErrorCode, ERR_isError};
+        let mut cctx = ZSTD_createCCtx().unwrap();
+        let src = b"compress2 tiny dst ".repeat(50);
+        let mut dst = vec![0u8; 4]; // way too small for any frame
+        let rc = ZSTD_compress2(&mut cctx, &mut dst, &src);
+        assert!(ERR_isError(rc));
+        assert_eq!(ERR_getErrorCode(rc), ErrorCode::DstSizeTooSmall);
+    }
+
+    #[test]
+    fn fresh_CCtx_getParameter_returns_upstream_defaults() {
+        // Upstream `ZSTD_createCCtx` calls `ZSTD_CCtxParams_init(..,
+        // CLEVEL_DEFAULT)` which sets `compressionLevel=3`,
+        // `contentSizeFlag=1`, others=0. A fresh CCtx readback via
+        // `getParameter` should match those defaults — previously
+        // `stream_level=None` would be observed as 3 (via unwrap_or),
+        // but the flag defaults needed an explicit pin too.
+        let cctx = ZSTD_createCCtx().unwrap();
+        let mut got = -1i32;
+        ZSTD_CCtx_getParameter(
+            &cctx, ZSTD_cParameter::ZSTD_c_compressionLevel, &mut got,
+        );
+        assert_eq!(got, ZSTD_CLEVEL_DEFAULT);
+        ZSTD_CCtx_getParameter(
+            &cctx, ZSTD_cParameter::ZSTD_c_contentSizeFlag, &mut got,
+        );
+        assert_eq!(got, 1, "contentSizeFlag default: 1");
+        ZSTD_CCtx_getParameter(
+            &cctx, ZSTD_cParameter::ZSTD_c_checksumFlag, &mut got,
+        );
+        assert_eq!(got, 0, "checksumFlag default: 0");
+        ZSTD_CCtx_getParameter(
+            &cctx, ZSTD_cParameter::ZSTD_c_dictIDFlag, &mut got,
+        );
+        assert_eq!(got, 1, "dictIDFlag default: 1");
+    }
+
+    #[test]
+    fn CCtxParams_setParameter_matches_CCtx_level_semantics() {
+        // Both entry points must yield the same `compressionLevel`
+        // readback for every value — upstream routes CCtx_set through
+        // CCtxParams_set. Cover 0 (maps to default), high clamp,
+        // low clamp, and a normal in-range value.
+        let cases: &[(i32, i32)] = &[
+            (0, ZSTD_CLEVEL_DEFAULT),
+            (9999, ZSTD_maxCLevel()),
+            (i32::MIN, ZSTD_minCLevel()),
+            (5, 5),
+        ];
+        for &(input, expected) in cases {
+            let mut params = ZSTD_CCtx_params::default();
+            ZSTD_CCtxParams_setParameter(
+                &mut params,
+                ZSTD_cParameter::ZSTD_c_compressionLevel,
+                input,
+            );
+            let mut got = 0i32;
+            ZSTD_CCtxParams_getParameter(
+                &params,
+                ZSTD_cParameter::ZSTD_c_compressionLevel,
+                &mut got,
+            );
+            assert_eq!(got, expected, "CCtxParams level {input} → {got}");
+        }
+    }
+
+    #[test]
+    fn CCtxParams_setParameter_flag_values_coerce_to_zero_or_one() {
+        // Upstream: `fParams.checksumFlag = (value != 0)`. Previously
+        // we did `value as u32` which made negatives wrap to
+        // 0xFFFFFFFF and break downstream flag-comparison logic.
+        let mut params = ZSTD_CCtx_params::default();
+        for (input, expected) in [
+            (0i32, 0u32),
+            (1, 1),
+            (2, 1),
+            (-1, 1),
+            (i32::MAX, 1),
+        ] {
+            ZSTD_CCtxParams_setParameter(
+                &mut params,
+                ZSTD_cParameter::ZSTD_c_checksumFlag,
+                input,
+            );
+            assert_eq!(
+                params.fParams.checksumFlag, expected,
+                "checksumFlag({input}) stored as {}",
+                params.fParams.checksumFlag,
+            );
+        }
+    }
+
+    #[test]
+    fn CCtx_refPrefix_magic_dict_roundtrips_dictID_through_streaming() {
+        // Close a gap: `ZSTD_CCtx_refPrefix` routes through the
+        // streaming endStream path, which wires `cctx.param_dictID`
+        // → `fParams.noDictIDFlag` and parses dictID from the prefix.
+        // End-to-end roundtrip confirms the full integration (fresh
+        // CCtx → refPrefix + magic dict → compressStream2(e_end) →
+        // frame header preserves dictID).
+        use crate::common::mem::MEM_writeLE32;
+        use crate::decompress::zstd_decompress::{
+            ZSTD_MAGIC_DICTIONARY, ZSTD_getDictID_fromFrame,
+        };
+        let mut magic_dict = vec![0u8; 64];
+        MEM_writeLE32(&mut magic_dict[..4], ZSTD_MAGIC_DICTIONARY);
+        MEM_writeLE32(&mut magic_dict[4..8], 0x5555AAAA);
+        for (i, b) in magic_dict[8..].iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(11);
+        }
+        let src = b"refPrefix streaming roundtrip ".repeat(15);
+
+        let mut cctx = ZSTD_createCCtx().unwrap();
+        ZSTD_CCtx_refPrefix(&mut cctx, &magic_dict);
+        // default `param_dictID == true` ⇒ include dictID in header
+        let mut dst = vec![0u8; 4096];
+        let n = ZSTD_compress2(&mut cctx, &mut dst, &src);
+        assert!(!ERR_isError(n));
+        assert_eq!(ZSTD_getDictID_fromFrame(&dst[..n]), 0x5555AAAA);
+    }
+
+    #[test]
+    fn compress_usingCDict_also_propagates_magic_dictID() {
+        // Sibling coverage for the CDict path: `ZSTD_compress_usingCDict`
+        // forwards to `ZSTD_compress_usingDict` under the hood, so the
+        // same `noDictIDFlag=0` fix must carry through. Confirms no
+        // separate hardcoded-dictID site exists on the CDict track.
+        use crate::common::mem::MEM_writeLE32;
+        use crate::decompress::zstd_decompress::{
+            ZSTD_MAGIC_DICTIONARY, ZSTD_getDictID_fromFrame,
+        };
+        let mut magic_dict = vec![0u8; 64];
+        MEM_writeLE32(&mut magic_dict[..4], ZSTD_MAGIC_DICTIONARY);
+        MEM_writeLE32(&mut magic_dict[4..8], 0xABBA5757);
+        for (i, b) in magic_dict[8..].iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(29);
+        }
+        let cdict = ZSTD_createCDict(&magic_dict, 5).unwrap();
+        let src = b"ZSTD_compress_usingCDict dictID parity ".repeat(20);
+        let mut cctx = ZSTD_createCCtx().unwrap();
+        let mut dst = vec![0u8; 4096];
+        let n = ZSTD_compress_usingCDict(&mut cctx, &mut dst, &src, &cdict);
+        assert!(!ERR_isError(n));
+        assert_eq!(ZSTD_getDictID_fromFrame(&dst[..n]), 0xABBA5757);
+    }
+
+    #[test]
+    fn ZSTD_CParamMode_e_discriminants_match_upstream() {
+        // Upstream (zstd_compress_internal.h:558-573):
+        //   ZSTD_cpm_noAttachDict=0, ZSTD_cpm_attachDict=1,
+        //   ZSTD_cpm_createCDict=2,  ZSTD_cpm_unknown=3
+        // `ZSTD_adjustCParams_internal` dispatches on this enum via
+        // equality checks to decide whether srcSize, dictSize, or
+        // both contribute to parameter-selection math.
+        assert_eq!(ZSTD_CParamMode_e::ZSTD_cpm_noAttachDict as u32, 0);
+        assert_eq!(ZSTD_CParamMode_e::ZSTD_cpm_attachDict as u32, 1);
+        assert_eq!(ZSTD_CParamMode_e::ZSTD_cpm_createCDict as u32, 2);
+        assert_eq!(ZSTD_CParamMode_e::ZSTD_cpm_unknown as u32, 3);
+    }
+
+    #[test]
+    fn getBlockSize_reverts_to_BLOCKSIZE_MAX_after_reset_parameters() {
+        // After `ZSTD_CCtx_reset(parameters)`, `requested_cParams` is
+        // cleared — `getBlockSize` should revert from the small-window
+        // value back to `BLOCKSIZE_MAX`. Guards against stale cparam
+        // state surviving a reset.
+        use crate::compress::match_state::ZSTD_compressionParameters;
+        use crate::decompress::zstd_decompress_block::ZSTD_BLOCKSIZE_MAX;
+        let mut cctx = ZSTD_createCCtx().unwrap();
+        let small_cp = ZSTD_compressionParameters {
+            windowLog: 10, chainLog: 10, hashLog: 10, searchLog: 1,
+            minMatch: 4, targetLength: 0, strategy: 1,
+        };
+        ZSTD_CCtx_setCParams(&mut cctx, small_cp);
+        assert_eq!(ZSTD_getBlockSize(&cctx), 1024);
+        ZSTD_CCtx_reset(&mut cctx, ZSTD_ResetDirective::ZSTD_reset_parameters);
+        assert_eq!(ZSTD_getBlockSize(&cctx), ZSTD_BLOCKSIZE_MAX);
+    }
+
+    #[test]
+    fn getBlockSize_honors_requested_windowLog_min_with_BLOCKSIZE_MAX() {
+        // Upstream `ZSTD_getBlockSize(cctx)` returns
+        // `min(BLOCKSIZE_MAX, 1 << cParams.windowLog)`. Previously our
+        // port returned `BLOCKSIZE_MAX` regardless of windowLog, over-
+        // reporting for small-window configs. Pin both regimes:
+        //   - small windowLog (10) → 1 << 10 = 1024
+        //   - default / unconfigured → BLOCKSIZE_MAX (128 KB)
+        use crate::compress::match_state::ZSTD_compressionParameters;
+        use crate::decompress::zstd_decompress_block::ZSTD_BLOCKSIZE_MAX;
+
+        // Fresh CCtx (no requested_cParams): returns BLOCKSIZE_MAX.
+        let cctx_fresh = ZSTD_createCCtx().unwrap();
+        assert_eq!(ZSTD_getBlockSize(&cctx_fresh), ZSTD_BLOCKSIZE_MAX);
+
+        // Configured with windowLog=10: returns 1024.
+        let mut cctx_small = ZSTD_createCCtx().unwrap();
+        let small_cp = ZSTD_compressionParameters {
+            windowLog: 10, chainLog: 10, hashLog: 10, searchLog: 1,
+            minMatch: 4, targetLength: 0, strategy: 1,
+        };
+        assert_eq!(ZSTD_CCtx_setCParams(&mut cctx_small, small_cp), 0);
+        assert_eq!(ZSTD_getBlockSize(&cctx_small), 1024);
+
+        // Configured with windowLog=17 (== log2(BLOCKSIZE_MAX)): returns
+        // BLOCKSIZE_MAX.
+        let mut cctx_edge = ZSTD_createCCtx().unwrap();
+        let edge_cp = ZSTD_compressionParameters {
+            windowLog: 17, chainLog: 17, hashLog: 17, searchLog: 4,
+            minMatch: 4, targetLength: 32, strategy: 3,
+        };
+        assert_eq!(ZSTD_CCtx_setCParams(&mut cctx_edge, edge_cp), 0);
+        assert_eq!(ZSTD_getBlockSize(&cctx_edge), ZSTD_BLOCKSIZE_MAX);
+    }
+
+    #[test]
+    fn adjustCParams_internal_attachDict_mode_clears_dictSize() {
+        // In `ZSTD_cpm_attachDict` mode, `ZSTD_adjustCParams_internal`
+        // treats `dictSize` as 0 — sizing decisions only consult
+        // `srcSize`. This is the code path upstream uses when a
+        // dictMatchState is attached. Pin the behavior differential
+        // against noAttachDict where dictSize DOES contribute.
+        use crate::compress::match_state::ZSTD_compressionParameters;
+        use crate::compress::zstd_ldm::ZSTD_ParamSwitch_e;
+
+        let base = ZSTD_compressionParameters {
+            windowLog: 20,
+            hashLog: 20,
+            chainLog: 20,
+            searchLog: 5,
+            minMatch: 4,
+            targetLength: 32,
+            strategy: 3,
+        };
+        let src_small: u64 = 500;
+        let dict_large: u64 = 500_000;
+
+        // noAttachDict: dict contributes to sizing → windowLog may
+        // shrink more than if dict were ignored.
+        let cp_no = ZSTD_adjustCParams_internal(
+            base, src_small, dict_large,
+            ZSTD_CParamMode_e::ZSTD_cpm_noAttachDict,
+            ZSTD_ParamSwitch_e::ZSTD_ps_auto,
+        );
+        // attachDict: dict is dropped → sizing uses srcSize alone.
+        let cp_attach = ZSTD_adjustCParams_internal(
+            base, src_small, dict_large,
+            ZSTD_CParamMode_e::ZSTD_cpm_attachDict,
+            ZSTD_ParamSwitch_e::ZSTD_ps_auto,
+        );
+        // With 500 B src and no dict-contribution, attachDict should
+        // shrink windowLog more aggressively than noAttachDict (which
+        // still accounts for the 500 KB dict).
+        assert!(
+            cp_attach.windowLog <= cp_no.windowLog,
+            "attachDict should shrink window no less than noAttachDict: \
+             attach={} no={}",
+            cp_attach.windowLog, cp_no.windowLog,
+        );
+    }
+
+    #[test]
+    fn ZSTD_seqToCodes_promotes_long_length_flag_to_max_code() {
+        // When `seqStore.longLengthType != none`, `seqToCodes` must
+        // bump the code at `longLengthPos` to `MaxLL` or `MaxML`
+        // respectively. Upstream does this as a post-loop fixup so
+        // the FSE encoder emits the sentinel code + extra-bits tail.
+        use crate::compress::seq_store::{
+            SeqDef, SeqStore_t, OFFSET_TO_OFFBASE,
+        };
+        use crate::decompress::zstd_decompress_block::{MaxLL, MaxML};
+
+        // Seed two sequences: one with a modest litLength/mlBase,
+        // and one marked as "long" at index 1.
+        let mut ss = SeqStore_t::with_capacity(8, 256);
+        ss.sequences.push(SeqDef {
+            offBase: OFFSET_TO_OFFBASE(17),
+            litLength: 5,
+            mlBase: 10,
+        });
+        ss.sequences.push(SeqDef {
+            offBase: OFFSET_TO_OFFBASE(17),
+            litLength: 7,
+            mlBase: 12,
+        });
+        ss.longLengthType =
+            crate::compress::seq_store::ZSTD_longLengthType_e::ZSTD_llt_literalLength;
+        ss.longLengthPos = 1;
+        ZSTD_seqToCodes(&mut ss);
+        assert_eq!(ss.llCode[1], MaxLL as u8);
+        // Non-long index 0 stays normal (ZSTD_LLcode(5) = 5).
+        assert_eq!(ss.llCode[0], 5);
+
+        // Match-length promotion.
+        let mut ss2 = SeqStore_t::with_capacity(8, 256);
+        ss2.sequences.push(SeqDef {
+            offBase: OFFSET_TO_OFFBASE(17),
+            litLength: 5,
+            mlBase: 10,
+        });
+        ss2.longLengthType =
+            crate::compress::seq_store::ZSTD_longLengthType_e::ZSTD_llt_matchLength;
+        ss2.longLengthPos = 0;
+        ZSTD_seqToCodes(&mut ss2);
+        assert_eq!(ss2.mlCode[0], MaxML as u8);
+    }
+
+    #[test]
+    fn negative_levels_compress_and_decompress_roundtrip() {
+        // Negative levels must produce valid frames that decompress
+        // back to the original bytes. Covers the accelerator path
+        // (`targetLength = -level`) through the full public API.
+        use crate::decompress::zstd_decompress::ZSTD_decompress;
+        let src = b"negative-level-roundtrip ".repeat(40);
+        for level in [-1i32, -5, -20, -1000] {
+            let mut dst = vec![0u8; 4096];
+            let n = ZSTD_compress(&mut dst, &src, level);
+            assert!(
+                !ERR_isError(n),
+                "compress err at level={level}: {n:#x}",
+            );
+            let mut out = vec![0u8; src.len() + 64];
+            let d = ZSTD_decompress(&mut out, &dst[..n]);
+            assert!(!ERR_isError(d));
+            assert_eq!(&out[..d], &src[..]);
+        }
+    }
+
+    #[test]
+    fn ZSTD_sequenceBound_matches_upstream_formula() {
+        // Upstream (zstd_compress.c:3538):
+        //   (srcSize / ZSTD_MINMATCH_MIN=3) + 1 + (srcSize / BLOCKSIZE_MAX_MIN=1024) + 1
+        // Pin the formula against a few sizes including zero.
+        for sz in [0usize, 1, 100, 1024, 65_536, 200_000] {
+            let expected = (sz / 3) + 1 + (sz / 1024) + 1;
+            assert_eq!(
+                ZSTD_sequenceBound(sz),
+                expected,
+                "sequenceBound({sz})",
+            );
+        }
+    }
+
+    #[test]
+    fn CCtx_loadDictionary_empty_slice_clears_previous_dict() {
+        // Upstream semantics: loading an empty dict is equivalent to
+        // clearing any previously-loaded dict (ZSTD_clearAllDicts path).
+        // Guards against a regression where the empty-dict assign
+        // would leave the old bytes intact.
+        let mut cctx = ZSTD_createCCtx().unwrap();
+        ZSTD_CCtx_loadDictionary(&mut cctx, b"sticky-dict");
+        assert_eq!(cctx.stream_dict, b"sticky-dict");
+        ZSTD_CCtx_loadDictionary(&mut cctx, &[]);
+        assert!(cctx.stream_dict.is_empty());
+    }
+
+    #[test]
+    fn ZSTD_isRLE_true_for_uniform_buffers_and_empty_and_single_byte() {
+        // Edge cases:
+        //   - empty src → 1 (defensive, upstream's UB case)
+        //   - single byte → 1
+        //   - all-same bytes → 1
+        //   - any differing byte → 0
+        assert_eq!(ZSTD_isRLE(&[]), 1);
+        assert_eq!(ZSTD_isRLE(&[0xAB]), 1);
+        assert_eq!(ZSTD_isRLE(&[0xAA; 16]), 1);
+        assert_eq!(ZSTD_isRLE(&[0xAA; 1024]), 1);
+        // One byte different near the end of an otherwise-uniform buf
+        let mut mostly_uniform = vec![0xAA; 1024];
+        mostly_uniform[1020] = 0xAB;
+        assert_eq!(ZSTD_isRLE(&mostly_uniform), 0);
+        // One byte different at the very start.
+        let mut v = vec![0xAA; 1024];
+        v[0] = 0xAB;
+        assert_eq!(ZSTD_isRLE(&v), 0);
+        // Two bytes, different.
+        assert_eq!(ZSTD_isRLE(&[0xAA, 0xAB]), 0);
+    }
+
+    #[test]
+    fn compress_and_decompress_roundtrip_empty_and_single_byte() {
+        // Corner-case sizes: ZSTD_compress must produce a valid frame
+        // for both src=[] (zero bytes) and src=[0xAB] (one byte), and
+        // the roundtrip must recover exact bytes.
+        use crate::decompress::zstd_decompress::{
+            ZSTD_decompress, ZSTD_getFrameContentSize,
+        };
+
+        for &src in &[b"".as_ref(), b"\xAB".as_ref()] {
+            let mut cbuf = vec![0u8; 128];
+            let n = ZSTD_compress(&mut cbuf, src, 3);
+            assert!(!ERR_isError(n), "compress err for len={}: {n:#x}", src.len());
+            // FCS should equal src.len().
+            assert_eq!(
+                ZSTD_getFrameContentSize(&cbuf[..n]),
+                src.len() as u64,
+                "FCS mismatch for len={}",
+                src.len(),
+            );
+            // Decompress roundtrip.
+            let mut out = vec![0u8; src.len().max(1)];
+            let d = ZSTD_decompress(&mut out, &cbuf[..n]);
+            assert!(!ERR_isError(d));
+            assert_eq!(&out[..d], src);
+        }
+    }
+
+    #[test]
+    fn compress_usingDict_level_zero_produces_default_level_frame() {
+        // `ZSTD_compress_usingDict(level=0)` must map to the default
+        // level via `ZSTD_getCParams`'s 0→CLEVEL_DEFAULT branch — output
+        // should be byte-identical to an explicit `level=3` call.
+        // Guards the "level 0 means default" contract on the one-shot
+        // dict-aware path as well as the no-dict path.
+        let dict = b"shared-dict-for-level-zero ".repeat(6);
+        let src = b"level-zero-usingDict-parity ".repeat(20);
+        let mut cctx_a = ZSTD_createCCtx().unwrap();
+        let mut cctx_b = ZSTD_createCCtx().unwrap();
+        let mut dst_a = vec![0u8; 4096];
+        let mut dst_b = vec![0u8; 4096];
+        let na = ZSTD_compress_usingDict(&mut cctx_a, &mut dst_a, &src, &dict, 0);
+        let nb = ZSTD_compress_usingDict(
+            &mut cctx_b, &mut dst_b, &src, &dict, ZSTD_CLEVEL_DEFAULT,
+        );
+        assert!(!ERR_isError(na));
+        assert!(!ERR_isError(nb));
+        assert_eq!(&dst_a[..na], &dst_b[..nb]);
+    }
+
+    #[test]
+    fn compress_usingDict_propagates_magic_dictID_by_default() {
+        // One-shot `ZSTD_compress_usingDict` must preserve the dict's
+        // dictID in the frame header (upstream's default dictIDFlag=1).
+        // Previously our port forced `noDictIDFlag=1`, silently
+        // stripping the ID for every magic-tagged dict.
+        use crate::common::mem::MEM_writeLE32;
+        use crate::decompress::zstd_decompress::{
+            ZSTD_MAGIC_DICTIONARY, ZSTD_getDictID_fromFrame,
+        };
+        let mut magic_dict = vec![0u8; 64];
+        MEM_writeLE32(&mut magic_dict[..4], ZSTD_MAGIC_DICTIONARY);
+        MEM_writeLE32(&mut magic_dict[4..8], 0xCAFEBABE);
+        for (i, b) in magic_dict[8..].iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(13);
+        }
+        let src = b"one-shot-compress-usingDict-dictID-parity ".repeat(25);
+        let mut cctx = ZSTD_createCCtx().unwrap();
+        let mut dst = vec![0u8; 4096];
+        let n = ZSTD_compress_usingDict(&mut cctx, &mut dst, &src, &magic_dict, 3);
+        assert!(!ERR_isError(n));
+        assert_eq!(ZSTD_getDictID_fromFrame(&dst[..n]), 0xCAFEBABE);
+    }
+
+    #[test]
+    fn compressStream_respects_param_dictID_flag_endToEnd() {
+        // With a magic-prefixed dict, the frame's dictID field should
+        // be present iff `param_dictID == true`. Previously the
+        // streaming endStream hardcoded `noDictIDFlag=1`, AND
+        // `compressFrame_fast_with_prefix` hardcoded dictID=0 to the
+        // writer — so the flag was silently ignored either way.
+        use crate::common::mem::MEM_writeLE32;
+        use crate::decompress::zstd_decompress::{
+            ZSTD_MAGIC_DICTIONARY, ZSTD_getDictID_fromFrame,
+        };
+
+        let mut magic_dict = vec![0u8; 64];
+        MEM_writeLE32(&mut magic_dict[..4], ZSTD_MAGIC_DICTIONARY);
+        MEM_writeLE32(&mut magic_dict[4..8], 0xDEADBEEF); // dictID
+        for (i, b) in magic_dict[8..].iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(17);
+        }
+
+        let src = b"dictID-flag-roundtrip ".repeat(30);
+
+        // dictIDFlag = 1 (default): dictID must appear in the frame.
+        let mut c_on = ZSTD_createCCtx().unwrap();
+        ZSTD_CCtx_loadDictionary(&mut c_on, &magic_dict);
+        ZSTD_CCtx_setParameter(&mut c_on, ZSTD_cParameter::ZSTD_c_compressionLevel, 3);
+        ZSTD_CCtx_setParameter(&mut c_on, ZSTD_cParameter::ZSTD_c_dictIDFlag, 1);
+        let mut dst_on = vec![0u8; 4096];
+        let n_on = ZSTD_compress2(&mut c_on, &mut dst_on, &src);
+        assert!(!ERR_isError(n_on));
+        assert_eq!(ZSTD_getDictID_fromFrame(&dst_on[..n_on]), 0xDEADBEEF);
+
+        // dictIDFlag = 0: dictID must be suppressed.
+        let mut c_off = ZSTD_createCCtx().unwrap();
+        ZSTD_CCtx_loadDictionary(&mut c_off, &magic_dict);
+        ZSTD_CCtx_setParameter(&mut c_off, ZSTD_cParameter::ZSTD_c_compressionLevel, 3);
+        ZSTD_CCtx_setParameter(&mut c_off, ZSTD_cParameter::ZSTD_c_dictIDFlag, 0);
+        let mut dst_off = vec![0u8; 4096];
+        let n_off = ZSTD_compress2(&mut c_off, &mut dst_off, &src);
+        assert!(!ERR_isError(n_off));
+        assert_eq!(ZSTD_getDictID_fromFrame(&dst_off[..n_off]), 0);
+    }
+
+    #[test]
+    fn CCtx_setParametersUsingCCtxParams_propagates_level_cparams_and_fparams() {
+        // Upstream copies the whole `ZSTD_CCtx_params` struct onto the
+        // CCtx's `requestedParams`. Our port plumbs the three
+        // components (level, cParams, fParams) separately; verify all
+        // three round-trip through the aggregate setter.
+        let mut params = ZSTD_CCtx_params::default();
+        ZSTD_CCtxParams_setParameter(
+            &mut params, ZSTD_cParameter::ZSTD_c_compressionLevel, 7,
+        );
+        ZSTD_CCtxParams_setParameter(
+            &mut params, ZSTD_cParameter::ZSTD_c_checksumFlag, 1,
+        );
+        params.cParams = ZSTD_getCParams(7, 0, 0);
+
+        let mut cctx = ZSTD_createCCtx().unwrap();
+        let rc = ZSTD_CCtx_setParametersUsingCCtxParams(&mut cctx, &params);
+        assert_eq!(rc, 0);
+        assert_eq!(cctx.stream_level, Some(7));
+        assert!(cctx.param_checksum);
+        assert_eq!(cctx.requested_cParams.map(|c| c.windowLog), Some(params.cParams.windowLog));
+    }
+
+    #[test]
+    fn compressBegin_usingDict_stashes_both_dict_and_level() {
+        // Legacy begin/end-style initializer: stores the dict on
+        // `cctx.stream_dict` and routes the level through the fixed
+        // `compressBegin` path (which now goes through setParameter →
+        // clamp + 0-default). Previously no dedicated test.
+        let mut cctx = ZSTD_createCCtx().unwrap();
+        let dict = b"begin-usingDict-test".to_vec();
+        let rc = ZSTD_compressBegin_usingDict(&mut cctx, &dict, 9);
+        assert_eq!(rc, 0);
+        assert_eq!(cctx.stream_dict, dict);
+        assert_eq!(cctx.stream_level, Some(9));
+
+        // Level=0 goes through the default-mapping path.
+        let mut cctx2 = ZSTD_createCCtx().unwrap();
+        ZSTD_compressBegin_usingDict(&mut cctx2, b"", 0);
+        assert_eq!(cctx2.stream_level, Some(ZSTD_CLEVEL_DEFAULT));
+    }
+
+    #[test]
+    fn compressBegin_level_zero_getParameter_returns_CLEVEL_DEFAULT() {
+        // Sibling of `initCStream_level_zero_...` — `ZSTD_compressBegin(0)`
+        // must also map 0 to `CLEVEL_DEFAULT`. Upstream routes through
+        // the CCtxParams setter which applies the mapping; Rust port
+        // was previously a raw field assignment.
+        let mut cctx = ZSTD_createCCtx().unwrap();
+        ZSTD_compressBegin(&mut cctx, 0);
+        let mut got = -1i32;
+        ZSTD_CCtx_getParameter(
+            &cctx,
+            ZSTD_cParameter::ZSTD_c_compressionLevel,
+            &mut got,
+        );
+        assert_eq!(got, ZSTD_CLEVEL_DEFAULT);
+    }
+
+    #[test]
+    fn initCStream_level_zero_getParameter_returns_CLEVEL_DEFAULT() {
+        // `ZSTD_initCStream` upstream routes through
+        // `ZSTD_CCtx_setParameter(c_compressionLevel, 0)`, which maps
+        // 0 → `CLEVEL_DEFAULT`. Previously we raw-stored 0, so
+        // getParameter readback after initCStream(0) was 0 instead
+        // of 3 — divergent from upstream's `initCStream(0)` return
+        // behavior.
+        let mut cctx = ZSTD_createCCtx().unwrap();
+        ZSTD_initCStream(&mut cctx, 0);
+        let mut got = -1i32;
+        ZSTD_CCtx_getParameter(
+            &cctx,
+            ZSTD_cParameter::ZSTD_c_compressionLevel,
+            &mut got,
+        );
+        assert_eq!(got, ZSTD_CLEVEL_DEFAULT);
+    }
+
+    #[test]
+    fn setParameter_level_zero_compresses_identically_to_CLEVEL_DEFAULT() {
+        // End-to-end check of the level-0-maps-to-default fix:
+        // a full roundtrip with setParameter(level=0) followed by
+        // compressStream2/endStream must produce bit-identical output
+        // to the same sequence with setParameter(level=CLEVEL_DEFAULT).
+        let src = b"level-zero end-to-end parity ".repeat(40);
+        let mut cctx_a = ZSTD_createCCtx().unwrap();
+        ZSTD_CCtx_setParameter(
+            &mut cctx_a,
+            ZSTD_cParameter::ZSTD_c_compressionLevel,
+            0,
+        );
+        let mut cctx_b = ZSTD_createCCtx().unwrap();
+        ZSTD_CCtx_setParameter(
+            &mut cctx_b,
+            ZSTD_cParameter::ZSTD_c_compressionLevel,
+            ZSTD_CLEVEL_DEFAULT,
+        );
+        let mut dst_a = vec![0u8; 4096];
+        let mut dst_b = vec![0u8; 4096];
+        let na = ZSTD_compress2(&mut cctx_a, &mut dst_a, &src);
+        let nb = ZSTD_compress2(&mut cctx_b, &mut dst_b, &src);
+        assert!(!ERR_isError(na));
+        assert!(!ERR_isError(nb));
+        assert_eq!(&dst_a[..na], &dst_b[..nb]);
+    }
+
+    #[test]
+    fn CCtx_setParameter_level_zero_getParameter_returns_CLEVEL_DEFAULT() {
+        // Upstream: `ZSTD_CCtx_setParameter(c_compressionLevel, 0)`
+        // stores `ZSTD_CLEVEL_DEFAULT` (3), not 0. Any C-compat
+        // caller doing setParameter(0) followed by getParameter
+        // expects 3 back. Previously our port stored Some(0) and
+        // returned 0 on readback — silent ABI divergence.
+        let mut cctx = ZSTD_createCCtx().unwrap();
+        let rc = ZSTD_CCtx_setParameter(
+            &mut cctx,
+            ZSTD_cParameter::ZSTD_c_compressionLevel,
+            0,
+        );
+        assert_eq!(rc, 0);
+        let mut got = -999i32;
+        ZSTD_CCtx_getParameter(
+            &cctx,
+            ZSTD_cParameter::ZSTD_c_compressionLevel,
+            &mut got,
+        );
+        assert_eq!(got, ZSTD_CLEVEL_DEFAULT);
+    }
+
+    #[test]
+    fn CCtx_setParameter_level_clamps_to_cParam_bounds() {
+        // Upstream: `ZSTD_cParam_clampBounds` silently clamps
+        // out-of-range level inputs (mirroring the documented
+        // "level above MAX → treated as MAX" contract). Verify
+        // above-MAX and below-MIN both land at the boundary.
+        let mut cctx = ZSTD_createCCtx().unwrap();
+        ZSTD_CCtx_setParameter(
+            &mut cctx,
+            ZSTD_cParameter::ZSTD_c_compressionLevel,
+            9999,
+        );
+        let mut got = 0i32;
+        ZSTD_CCtx_getParameter(
+            &cctx,
+            ZSTD_cParameter::ZSTD_c_compressionLevel,
+            &mut got,
+        );
+        assert_eq!(got, ZSTD_maxCLevel());
+
+        ZSTD_CCtx_setParameter(
+            &mut cctx,
+            ZSTD_cParameter::ZSTD_c_compressionLevel,
+            i32::MIN,
+        );
+        ZSTD_CCtx_getParameter(
+            &cctx,
+            ZSTD_cParameter::ZSTD_c_compressionLevel,
+            &mut got,
+        );
+        assert_eq!(got, ZSTD_minCLevel());
+    }
+
+    #[test]
     fn compress_one_shot_level_zero_equals_default() {
         // ZSTD_compress (one-shot) should also honor level 0 = default.
         let src = b"one-shot-level-zero test".repeat(30);
@@ -4620,6 +10147,60 @@ mod tests {
             let cp = ZSTD_getCParams(level, 0, 0);
             assert_eq!(ZSTD_checkCParams(cp), 0, "level {level} invalid cParams");
             assert_eq!(cp.strategy, 1, "level {level} unexpectedly > fast");
+        }
+    }
+
+    #[test]
+    fn checkCParams_rejects_each_field_one_past_its_bound() {
+        // Exhaustive boundary sweep: pick one valid baseline cParams,
+        // then perturb each individual field to one-past its upstream
+        // bound and confirm `ZSTD_checkCParams` flips to
+        // `ParameterOutOfBound`. Pins every branch of the validator
+        // against the zstd.h-defined bounds.
+        use crate::common::error::{ERR_getErrorCode, ERR_isError};
+        use crate::compress::match_state::ZSTD_compressionParameters;
+        use crate::compress::zstd_ldm::{ZSTD_HASHLOG_MAX, ZSTD_HASHLOG_MIN};
+
+        let max_wlog = ZSTD_WINDOWLOG_MAX();
+        let max_chainlog = if crate::common::mem::MEM_32bits() != 0 { 28 } else { 29 };
+
+        let base = ZSTD_compressionParameters {
+            windowLog: ZSTD_WINDOWLOG_ABSOLUTEMIN,
+            chainLog: 6,
+            hashLog: ZSTD_HASHLOG_MIN,
+            searchLog: 1,
+            minMatch: 3,
+            targetLength: 0,
+            strategy: 1,
+        };
+        assert_eq!(ZSTD_checkCParams(base), 0, "baseline cParams must pass");
+
+        // Build one-past-bound perturbations for every validated field,
+        // covering both the low and high edges where applicable.
+        let bad_cases: &[(&str, ZSTD_compressionParameters)] = &[
+            ("windowLog below min", ZSTD_compressionParameters { windowLog: ZSTD_WINDOWLOG_ABSOLUTEMIN - 1, ..base }),
+            ("windowLog above max", ZSTD_compressionParameters { windowLog: max_wlog + 1, ..base }),
+            ("chainLog below min", ZSTD_compressionParameters { chainLog: 5, ..base }),
+            ("chainLog above max", ZSTD_compressionParameters { chainLog: max_chainlog + 1, ..base }),
+            ("hashLog below min", ZSTD_compressionParameters { hashLog: ZSTD_HASHLOG_MIN - 1, ..base }),
+            ("hashLog above max", ZSTD_compressionParameters { hashLog: ZSTD_HASHLOG_MAX + 1, ..base }),
+            ("searchLog below min", ZSTD_compressionParameters { searchLog: 0, ..base }),
+            ("searchLog above max", ZSTD_compressionParameters { searchLog: max_wlog, ..base }),
+            ("minMatch below min", ZSTD_compressionParameters { minMatch: 2, ..base }),
+            ("minMatch above max", ZSTD_compressionParameters { minMatch: 8, ..base }),
+            ("targetLength above max", ZSTD_compressionParameters { targetLength: 131073, ..base }),
+            ("strategy below min", ZSTD_compressionParameters { strategy: 0, ..base }),
+            ("strategy above max", ZSTD_compressionParameters { strategy: 10, ..base }),
+        ];
+
+        for (label, cp) in bad_cases {
+            let rc = ZSTD_checkCParams(*cp);
+            assert!(ERR_isError(rc), "expected error for `{label}`");
+            assert_eq!(
+                ERR_getErrorCode(rc),
+                ErrorCode::ParameterOutOfBound,
+                "wrong error for `{label}`",
+            );
         }
     }
 
@@ -4843,6 +10424,20 @@ mod tests {
         ZSTD_cParam_clampBounds(ZSTD_cParameter::ZSTD_c_checksumFlag, &mut v);
         assert_eq!(v, 0);
 
+        // compressionLevel has a large asymmetric range — clamping
+        // extreme positive + extreme negative both succeed and land
+        // at MAX/MIN respectively.
+        let mut v = 99_999;
+        ZSTD_cParam_clampBounds(ZSTD_cParameter::ZSTD_c_compressionLevel, &mut v);
+        assert_eq!(v, ZSTD_maxCLevel());
+        let mut v = -99_999_999;
+        ZSTD_cParam_clampBounds(ZSTD_cParameter::ZSTD_c_compressionLevel, &mut v);
+        assert_eq!(v, ZSTD_minCLevel());
+        // In-range values pass through unchanged.
+        let mut v = 7;
+        ZSTD_cParam_clampBounds(ZSTD_cParameter::ZSTD_c_compressionLevel, &mut v);
+        assert_eq!(v, 7);
+
         // maxNbSeq: minMatch=3 → blockSize/3, otherwise /4.
         assert_eq!(ZSTD_maxNbSeq(120, 3, false), 40);
         assert_eq!(ZSTD_maxNbSeq(120, 4, false), 30);
@@ -4877,6 +10472,11 @@ mod tests {
             let mut buf = vec![0u8; 1 << 20];
             assert!(ZSTD_initStaticCCtx(&mut buf).is_none());
             assert!(ZSTD_initStaticCStream(&mut buf).is_none());
+            // CDict variant — previously uncovered. Contract
+            // matches: v0.1 always returns None regardless of dict
+            // size or cParams.
+            let cp = ZSTD_getCParams(3, 0, 0);
+            assert!(ZSTD_initStaticCDict(&mut buf, b"dict", cp).is_none());
         }
 
         // estimateCCtxSize_usingCCtxParams + CStream variant.
@@ -4961,7 +10561,8 @@ mod tests {
             assert_eq!(seqs[1].litLength, 3 + 5);
         }
 
-        // ZSTD_generateSequences currently stubbed (optimal parser WIP).
+        // ZSTD_generateSequences currently stubbed — needs the
+        // SeqStore-capture glue (not the optimal parser).
         {
             let mut cctx = ZSTD_createCCtx().unwrap();
             let mut seqs = vec![ZSTD_Sequence::default(); 16];
@@ -5110,6 +10711,23 @@ mod tests {
         let est_big = ZSTD_estimateCDictSize(128 * 1024, 3);
         assert!(est_small > 0);
         assert!(est_big > est_small);
+        // `_advanced` with byRef must NOT add the dict bytes — the
+        // caller retains ownership. Mirrors upstream zstd_compress.c:5556.
+        {
+            use crate::compress::match_state::ZSTD_compressionParameters;
+            use crate::decompress::zstd_ddict::ZSTD_dictLoadMethod_e;
+            let cp = ZSTD_compressionParameters {
+                windowLog: 20, chainLog: 16, hashLog: 17, searchLog: 4,
+                minMatch: 4, targetLength: 32, strategy: 3,
+            };
+            let by_ref = ZSTD_estimateCDictSize_advanced(
+                64 * 1024, cp, ZSTD_dictLoadMethod_e::ZSTD_dlm_byRef,
+            );
+            let by_copy = ZSTD_estimateCDictSize_advanced(
+                64 * 1024, cp, ZSTD_dictLoadMethod_e::ZSTD_dlm_byCopy,
+            );
+            assert_eq!(by_copy - by_ref, 64 * 1024);
+        }
 
         // getDictID_fromCDict: raw dict → 0, magic-prefixed → parsed.
         {
@@ -5340,6 +10958,57 @@ mod tests {
         let _ = ZSTD_dParam_getBounds(ZSTD_dParameter::ZSTD_d_windowLogMax);
         assert!(ZSTD_estimateCCtxSize(1) > 0);
         assert!(ZSTD_estimateDCtxSize() > 0);
+
+        // Touch recently-surfaced prelude entries so reachability
+        // regressions (a typo in `lib.rs` re-export list) fire here.
+        let _ = ZSTD_dedicatedDictSearch_getCParams(3, 0);
+        let _ = ZSTD_compressBlock(&mut ZSTD_createCCtx().unwrap(), &mut dst, &src);
+        let _ = ZSTD_compressBlock_deprecated(&mut ZSTD_createCCtx().unwrap(), &mut dst, &src);
+        let _ = ZSTD_compressContinue_public(&mut ZSTD_createCCtx().unwrap(), &mut dst, &src);
+        let _ = ZSTD_compressEnd_public(&mut ZSTD_createCCtx().unwrap(), &mut dst, &src);
+        {
+            let mut a = ZSTD_createCCtx().unwrap();
+            let b = ZSTD_createCCtx().unwrap();
+            assert_eq!(ZSTD_copyCCtx(&mut a, &b, u64::MAX), 0);
+        }
+        {
+            let mut a = ZSTD_createCCtx().unwrap();
+            let params = ZSTD_parameters {
+                cParams: ZSTD_getCParams(3, 0, 0),
+                fParams: ZSTD_FrameParameters {
+                    contentSizeFlag: 1,
+                    checksumFlag: 0,
+                    noDictIDFlag: 1,
+                },
+            };
+            let _ = ZSTD_compress_advanced(&mut a, &mut dst, &src, b"", params);
+        }
+
+        let dctx = ZSTD_createDCtx();
+        assert_eq!(ZSTD_freeDCtx(dctx), 0);
+        assert!(ZSTD_dParam_withinBounds(ZSTD_dParameter::ZSTD_d_windowLogMax, 20) != 0);
+        let _ = ZSTD_estimateDStreamSize_fromFrame(&dst);
+
+        {
+            use crate::decompress::zstd_ddict::{ZSTD_copyDDictParameters, ZSTD_freeDDict};
+            let mut dctx = ZSTD_createDCtx();
+            let ddict = ZSTD_createDDict(&dict).unwrap();
+            ZSTD_copyDDictParameters(&mut dctx, &ddict);
+            assert_eq!(ZSTD_freeDCtx(dctx), 0);
+            assert_eq!(ZSTD_freeDDict(Some(ddict)), 0);
+        }
+
+        {
+            let mut dctx = ZSTD_createDCtx();
+            let _ = ZSTD_decompressBlock(&mut dctx, &mut out, &dst);
+            let _ = ZSTD_decompressBlock_deprecated(&mut dctx, &mut out, &dst);
+            let _ = ZSTD_getBlockSize(&dctx);
+            let _ = ZSTD_insertBlock(&mut dctx, &dst);
+            assert_eq!(ZSTD_freeDCtx(dctx), 0);
+        }
+
+        assert!(ZSTD_cycleLog(17, 6) < 17);
+        assert!(ZSTD_dictAndWindowLog(20, 1 << 10, 0) >= 1);
     }
 
     #[test]
@@ -5383,6 +11052,22 @@ mod tests {
         assert!(ZSTD_minCLevel() < 0);
         assert!(ZSTD_CStreamInSize() > 0);
         assert!(ZSTD_CStreamOutSize() > ZSTD_CStreamInSize());
+        // Pin the exact upstream formula for CStreamOutSize — previously
+        // used ZSTD_FRAMEHEADERSIZE_MAX (18) instead of blockHeaderSize
+        // (3), over-estimating the stream-end margin by 15 bytes.
+        use crate::decompress::zstd_decompress_block::{ZSTD_BLOCKSIZE_MAX, ZSTD_blockHeaderSize};
+        assert_eq!(
+            ZSTD_CStreamOutSize(),
+            ZSTD_compressBound(ZSTD_BLOCKSIZE_MAX) + ZSTD_blockHeaderSize + 4,
+        );
+        // Pin the underlying level constants (MAX=22 per upstream,
+        // DEFAULT=3, NO_CLEVEL=0 — the sentinel used by
+        // CCtxParams_init_advanced to mean "use explicit cParams").
+        assert_eq!(ZSTD_MAX_CLEVEL, 22);
+        assert_eq!(ZSTD_CLEVEL_DEFAULT, 3);
+        assert_eq!(ZSTD_NO_CLEVEL, 0);
+        // And the min-level formula: 1 - (1 << 17) = -131071.
+        assert_eq!(ZSTD_minCLevel(), 1 - (1 << 17));
     }
 
     #[test]
@@ -5434,6 +11119,15 @@ mod tests {
         cctx.stream_in_buffer.extend_from_slice(b"pending");
         ZSTD_CCtx_reset(&mut cctx, ZSTD_ResetDirective::ZSTD_reset_session_only);
         assert!(cctx.stream_in_buffer.is_empty());
+    }
+
+    #[test]
+    fn zstd_estimate_cctx_size_level_0_matches_default_level() {
+        // Level 0 means "use ZSTD_CLEVEL_DEFAULT (3)". The estimate
+        // should match level 3's estimate exactly.
+        let s_default = ZSTD_estimateCCtxSize(ZSTD_CLEVEL_DEFAULT);
+        let s_zero = ZSTD_estimateCCtxSize(0);
+        assert_eq!(s_zero, s_default);
     }
 
     #[test]
@@ -5606,6 +11300,62 @@ mod tests {
     }
 
     #[test]
+    fn initCStream_clears_previously_loaded_dict() {
+        // Upstream's `ZSTD_initCStream` internally calls
+        // `ZSTD_CCtx_refCDict(zcs, NULL)` which drops any dict
+        // reference. Asymmetric with `ZSTD_initDStream` (decompress
+        // side), which preserves the dict across an init — caller
+        // must call `ZSTD_initCStream_usingDict` to re-seed.
+        let mut cctx = ZSTD_createCCtx().unwrap();
+        cctx.stream_dict = b"pre-init-dict".to_vec();
+        ZSTD_initCStream(&mut cctx, 3);
+        assert!(
+            cctx.stream_dict.is_empty(),
+            "initCStream must clear the dict (matches upstream refCDict(NULL))"
+        );
+    }
+
+    #[test]
+    fn initCStream_srcSize_with_UNKNOWN_clears_pledge() {
+        // `ZSTD_initCStream_srcSize(cctx, level, u64::MAX)` should
+        // leave the pledge unset, matching `setPledgedSrcSize(u64::MAX)`
+        // semantics. Prevents a regression if `initCStream_srcSize`
+        // ever reimplements the pledge path differently.
+        let mut cctx = ZSTD_createCCtx().unwrap();
+        let rc = ZSTD_initCStream_srcSize(&mut cctx, 1, u64::MAX);
+        assert_eq!(rc, 0);
+        assert!(cctx.pledged_src_size.is_none());
+    }
+
+    #[test]
+    fn resetCStream_with_zero_pledge_accepts_zero_bytes_and_produces_empty_frame() {
+        // `ZSTD_resetCStream(0)` is a distinct path from
+        // `setPledgedSrcSize(0)` (the first sets per-frame state
+        // AND the pledge, the second only the pledge). Verify that
+        // feeding 0 bytes after resetCStream(0) + endStream produces
+        // a valid empty frame whose FCS is 0.
+        use crate::decompress::zstd_decompress::{
+            ZSTD_decompress, ZSTD_getFrameContentSize,
+        };
+        let mut cctx = ZSTD_createCCtx().unwrap();
+        ZSTD_initCStream(&mut cctx, 1);
+        ZSTD_resetCStream(&mut cctx, 0);
+
+        let mut dst = vec![0u8; 256];
+        let mut dp = 0usize;
+        loop {
+            let r = ZSTD_endStream(&mut cctx, &mut dst, &mut dp);
+            assert!(!ERR_isError(r), "endStream err: {r:#x}");
+            if r == 0 { break; }
+        }
+        dst.truncate(dp);
+        assert_eq!(ZSTD_getFrameContentSize(&dst), 0);
+        let mut out = vec![0u8; 32];
+        let d = ZSTD_decompress(&mut out, &dst);
+        assert_eq!(d, 0);
+    }
+
+    #[test]
     fn setPledgedSrcSize_zero_with_empty_input_roundtrips() {
         // Edge case: pledge 0, feed 0 bytes, endStream → should
         // produce a valid empty frame whose decompressed output is
@@ -5730,7 +11480,7 @@ mod tests {
         // frames in one init+feed cycle (the drain loop's
         // re-probe-next-frame step handles it). Expect
         // payload_a || payload_b.
-        let mut expected = payload_a.clone();
+        let mut expected = payload_a;
         expected.extend_from_slice(&payload_b);
         assert_eq!(&decoded[..dp], &expected[..], "multi-frame mismatch");
     }
@@ -6179,6 +11929,38 @@ mod tests {
         assert_eq!(props.blockType, blockType_e::bt_raw);
         assert_eq!(props.lastBlock, 1);
         assert_eq!(&dst[3..3 + src.len()], src);
+    }
+
+    #[test]
+    fn createCCtx_advanced_produces_functional_cctx_for_end_to_end_roundtrip() {
+        // `ZSTD_createCCtx_advanced(customMem)` must produce a CCtx
+        // that compresses + roundtrips identically to a plain
+        // `createCCtx()`. Proves the _advanced variant isn't just
+        // returning a broken stub — it must be a real, usable CCtx.
+        use crate::decompress::zstd_decompress::ZSTD_decompress;
+
+        let mut cctx_adv = ZSTD_createCCtx_advanced(ZSTD_customMem).unwrap();
+        let src: Vec<u8> = b"createCCtx_advanced probe payload ".repeat(30);
+        let mut dst = vec![0u8; 2048];
+        let n = ZSTD_compressCCtx(&mut cctx_adv, &mut dst, &src, 3);
+        assert!(!ERR_isError(n));
+        dst.truncate(n);
+
+        let mut out = vec![0u8; src.len() + 64];
+        let d = ZSTD_decompress(&mut out, &dst);
+        assert_eq!(&out[..d], &src[..]);
+    }
+
+    #[test]
+    fn createCDict_accepts_level_0_and_max_level() {
+        // Upstream: `createCDict(dict, 0)` defaults to CLEVEL_DEFAULT;
+        // `createCDict(dict, ZSTD_MAX_CLEVEL)` also succeeds. Both
+        // must return `Some` and store the dict content.
+        let dict = b"level-edge-test".to_vec();
+        let cd_0 = ZSTD_createCDict(&dict, 0).expect("level 0 must work");
+        let cd_max = ZSTD_createCDict(&dict, ZSTD_MAX_CLEVEL).expect("max level must work");
+        assert_eq!(cd_0.dictContent, dict);
+        assert_eq!(cd_max.dictContent, dict);
     }
 
     #[test]

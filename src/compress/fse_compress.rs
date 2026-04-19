@@ -9,17 +9,13 @@
 //! state + symbol emit (`FSE_initCState{,2}`, `FSE_encodeSymbol`,
 //! `FSE_flushCState`).
 
-#![allow(unused_variables)]
-
 use crate::common::bits::ZSTD_highbit32;
-use crate::common::fse_decompress::FSE_MIN_TABLELOG;
+pub use crate::common::fse_decompress::{
+    FSE_MAX_MEMORY_USAGE, FSE_MAX_TABLELOG, FSE_MIN_TABLELOG,
+};
 
-/// Upstream `FSE_MAX_MEMORY_USAGE`.
-pub const FSE_MAX_MEMORY_USAGE: u32 = 14;
 /// Upstream `FSE_DEFAULT_MEMORY_USAGE`.
 pub const FSE_DEFAULT_MEMORY_USAGE: u32 = 13;
-/// Upstream `FSE_MAX_TABLELOG`.
-pub const FSE_MAX_TABLELOG: u32 = FSE_MAX_MEMORY_USAGE - 2;
 /// Upstream `FSE_DEFAULT_TABLELOG`.
 pub const FSE_DEFAULT_TABLELOG: u32 = FSE_DEFAULT_MEMORY_USAGE - 2;
 /// Upstream `FSE_NCOUNTBOUND`.
@@ -975,6 +971,76 @@ mod tests {
         let mut norm = [0i16; 8];
         let rc = FSE_normalizeCount(&mut norm, 4, &count, 60, 5, 0);
         assert!(crate::common::error::ERR_isError(rc));
+    }
+
+    #[test]
+    fn FSE_DTABLE_SIZE_U32_and_WKSP_SIZE_match_upstream_formula() {
+        // Upstream macros (fse.h):
+        //   FSE_DTABLE_SIZE_U32(maxTableLog) = 1 + (1 << maxTableLog)
+        //   FSE_BUILD_DTABLE_WKSP_SIZE(mtl, msv) = 2*(msv+1) + (1<<mtl) + 8
+        // These drive every FSE DTable allocation the decoder makes
+        // on behalf of callers; silent drift would cause buffer sizing
+        // mismatches and either waste memory or under-allocate.
+        use crate::common::fse_decompress::{FSE_BUILD_DTABLE_WKSP_SIZE, FSE_DTABLE_SIZE_U32};
+        for tl in [5u32, 9, 12] {
+            assert_eq!(FSE_DTABLE_SIZE_U32(tl), 1 + (1 << tl));
+        }
+        for (tl, msv) in [(6u32, 35u32), (9, 35), (12, 255)] {
+            let expected =
+                2 * (msv as usize + 1) + (1usize << tl) + 8;
+            assert_eq!(FSE_BUILD_DTABLE_WKSP_SIZE(tl, msv), expected);
+        }
+    }
+
+    #[test]
+    fn FSE_CTABLE_SIZE_U32_matches_upstream_formula() {
+        // Upstream `FSE_CTABLE_SIZE_U32(maxTableLog, maxSymbolValue)`
+        // evaluates to:
+        //   1 + (1 << (maxTableLog - 1)) + (maxSymbolValue + 1) * 2
+        // for maxTableLog >= 1. Our port uses `1 + tableSize/2 + ...`
+        // which is equivalent for positive logs and also defined for
+        // tableLog=0 (produces `1 + 0 + 2*(maxSymbolValue+1)` — the
+        // RLE-CTable size we actually use). Pin both cases so any
+        // future refactor can't drift the memory budget.
+        for (tl, max_sym) in [(6u32, 35u32), (9, 35), (11, 255), (12, 255)] {
+            let expected: usize =
+                1 + (1usize << (tl - 1)) + (max_sym as usize + 1) * 2;
+            assert_eq!(
+                FSE_CTABLE_SIZE_U32(tl, max_sym),
+                expected,
+                "FSE_CTABLE_SIZE_U32({tl}, {max_sym})",
+            );
+        }
+        // tableLog=0 → RLE case: allocator must still return a
+        // positive slot count (our port yields `1 + 0 + 2*(sym+1)`).
+        assert_eq!(FSE_CTABLE_SIZE_U32(0, 0), 3);
+        assert_eq!(FSE_CTABLE_SIZE_U32(0, 255), 1 + 2 * 256);
+    }
+
+    #[test]
+    fn fse_memory_and_tablelog_constants_match_upstream() {
+        // Pin the format-level FSE constants. Upstream defaults:
+        //   FSE_MAX_MEMORY_USAGE = 14 → MAX_TABLELOG = 12
+        //   FSE_DEFAULT_MEMORY_USAGE = 13 → DEFAULT_TABLELOG = 11
+        //   FSE_NCOUNTBOUND = 512
+        assert_eq!(FSE_MAX_MEMORY_USAGE, 14);
+        assert_eq!(FSE_DEFAULT_MEMORY_USAGE, 13);
+        assert_eq!(FSE_MAX_TABLELOG, 12);
+        assert_eq!(FSE_DEFAULT_TABLELOG, 11);
+        assert_eq!(FSE_NCOUNTBOUND, 512);
+        // Verify the arithmetic relationship (memory_usage - 2).
+        assert_eq!(FSE_MAX_TABLELOG, FSE_MAX_MEMORY_USAGE - 2);
+        assert_eq!(FSE_DEFAULT_TABLELOG, FSE_DEFAULT_MEMORY_USAGE - 2);
+        // MIN_TABLELOG = 5 and TABLELOG_ABSOLUTE_MAX = 15
+        // — spec-defined bounds that the decoder enforces.
+        assert_eq!(FSE_MIN_TABLELOG, 5);
+        assert_eq!(crate::common::fse_decompress::FSE_TABLELOG_ABSOLUTE_MAX, 15);
+        // The relationship: FSE_MAX_TABLELOG (12) must stay within
+        // the absolute max (15) — else the decoder couldn't accept
+        // our encoded streams.
+        const _: () = assert!(
+            FSE_MAX_TABLELOG <= crate::common::fse_decompress::FSE_TABLELOG_ABSOLUTE_MAX
+        );
     }
 
     #[test]

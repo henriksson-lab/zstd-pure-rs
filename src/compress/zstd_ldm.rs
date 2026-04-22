@@ -8,20 +8,24 @@
 //! `ZSTD_ldm_fillHashTable`), match utilities
 //! (`countBackwardsMatch`, `countBackwardsMatch_2segments`,
 //! `reduceTable`, `limitTableUpdate`, `fillFastTables`),
-//! prefix-only sequence generator
-//! (`ZSTD_ldm_generateSequences_internal_prefixOnly`) + chunked
+//! sequence generator
+//! (`ZSTD_ldm_generateSequences_internal`) + chunked
 //! outer driver (`ZSTD_ldm_generateSequences`), skip / split
 //! helpers (`skipSequences`, `skipRawSeqStoreBytes`,
 //! `maybeSplitSequence`).
 //!
-//! **Still skeletal**: ext-dict branch of
-//! `generateSequences_internal`, `ZSTD_ldm_blockCompress`, window
-//! overflow correction wiring.
+//! **Still skeletal**: no known bottom-up matcher gaps remain here;
+//! the remaining work is mostly cross-module / overflow-management
+//! integration polish.
 
 #![allow(non_snake_case)]
 
 use crate::common::xxhash::XXH64;
-use crate::compress::match_state::{ZSTD_compressionParameters, ZSTD_MatchState_t, ZSTD_window_t};
+use crate::compress::match_state::{
+    ZSTD_compressionParameters, ZSTD_MatchState_t, ZSTD_window_correctOverflow,
+    ZSTD_window_enforceMaxDist, ZSTD_window_hasExtDict, ZSTD_window_needOverflowCorrection,
+    ZSTD_window_t,
+};
 use crate::compress::zstd_compress_sequences::{
     ZSTD_btlazy2, ZSTD_btopt, ZSTD_btultra, ZSTD_btultra2, ZSTD_dfast, ZSTD_fast, ZSTD_greedy,
     ZSTD_lazy, ZSTD_lazy2,
@@ -30,7 +34,7 @@ use crate::compress::zstd_double_fast::ZSTD_fillDoubleHashTable;
 use crate::compress::zstd_fast::{
     ZSTD_dictTableLoadMethod_e, ZSTD_fillHashTable, ZSTD_tableFillPurpose_e, HASH_READ_SIZE,
 };
-use crate::compress::zstd_hashes::ZSTD_count;
+use crate::compress::zstd_hashes::{ZSTD_count, ZSTD_count_2segments};
 
 /// Upstream `LDM_BUCKET_SIZE_LOG`.
 pub const LDM_BUCKET_SIZE_LOG: u32 = 4;
@@ -475,7 +479,7 @@ pub struct rawSeq {
 
 /// Port of `RawSeqStore_t`. Upstream carries a raw `rawSeq*` + sizes;
 /// the Rust port owns a `Vec<rawSeq>` and tracks the read cursor.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct RawSeqStore_t {
     pub seq: Vec<rawSeq>,
     pub pos: usize,
@@ -618,7 +622,7 @@ pub fn ZSTD_ldm_limitTableUpdate(ms: &mut ZSTD_MatchState_t, curr: u32) {
     }
 }
 
-/// Port of the prefix-only branch of `ZSTD_ldm_generateSequences_internal`.
+/// Port of `ZSTD_ldm_generateSequences_internal`.
 ///
 /// Upstream takes `void const* src + size_t srcSize` and a window-base
 /// pointer; the port here takes a `window_buf` view of the whole
@@ -626,16 +630,14 @@ pub fn ZSTD_ldm_limitTableUpdate(ms: &mut ZSTD_MatchState_t, curr: u32) {
 /// fields are buffer-relative indexes into `window_buf`, matching
 /// upstream's `split - window.base` semantics.
 ///
-/// `lowestIndex` is the minimum valid buffer offset (upstream's
-/// `ldmState->window.dictLimit` when no ext-dict is in use).
+/// `lowestIndex` is the minimum valid buffer offset in the active
+/// search domain. When an ext-dict is attached, this is
+/// `ldmState.window.lowLimit`; otherwise it is `dictLimit`.
 ///
 /// Returns the number of unconsumed literal bytes between the last
 /// emitted sequence's anchor and `iend_pos` (upstream's `iend - anchor`).
 ///
-/// The ext-dict path is still deferred; until LDM is wired into the
-/// compressor, callers set `lowestIndex` to constrain matches to the
-/// contiguous prefix region.
-pub fn ZSTD_ldm_generateSequences_internal_prefixOnly(
+pub fn ZSTD_ldm_generateSequences_internal(
     ldmState: &mut ldmState_t,
     rawSeqStore: &mut RawSeqStore_t,
     params: &ldmParams_t,
@@ -648,6 +650,20 @@ pub fn ZSTD_ldm_generateSequences_internal_prefixOnly(
     let entsPerBucket = 1u32 << params.bucketSizeLog;
     let hBits = params.hashLog - params.bucketSizeLog;
     let hashMask: u32 = if hBits >= 32 { u32::MAX } else { (1u32 << hBits) - 1 };
+    let extDict = ZSTD_window_hasExtDict(&ldmState.window);
+    let dictLimit = ldmState.window.dictLimit as usize;
+    let lowestIndex = lowestIndex as usize;
+    let lowPrefixPtr = dictLimit;
+    let dictStart = if extDict {
+        ldmState.window.lowLimit.saturating_sub(ldmState.window.dictBase_offset) as usize
+    } else {
+        0
+    };
+    let dictEnd = if extDict {
+        dictLimit.saturating_sub(ldmState.window.dictBase_offset as usize)
+    } else {
+        0
+    };
 
     let istart = ip_pos;
     if iend_pos - istart < minMatchLength {
@@ -707,23 +723,61 @@ pub fn ZSTD_ldm_generateSequences_internal_prefixOnly(
 
             for k in 0..entsPerBucket as usize {
                 let cur = ldmState.hashTable[bucket_base + k];
-                if cur.checksum != checksum || cur.offset <= lowestIndex {
+                if cur.checksum != checksum || cur.offset as usize <= lowestIndex {
                     continue;
                 }
-                let pMatch = cur.offset as usize;
-                // Forward count: bytes from split_pos / pMatch to iend_pos.
-                let cur_fwd = ZSTD_count(window_buf, split_pos, pMatch, iend_pos);
-                if cur_fwd < minMatchLength {
-                    continue;
-                }
-                let cur_bwd = ZSTD_ldm_countBackwardsMatch(
-                    window_buf,
-                    split_pos,
-                    anchor,
-                    window_buf,
-                    pMatch,
-                    lowestIndex as usize,
-                );
+                let (cur_fwd, cur_bwd) = if extDict {
+                    let curMatchBase =
+                        if cur.offset < ldmState.window.dictLimit { 0usize } else { 1usize };
+                    let pMatch = if curMatchBase == 0 {
+                        cur.offset
+                            .saturating_sub(ldmState.window.dictBase_offset) as usize
+                    } else {
+                        cur.offset
+                            .saturating_sub(ldmState.window.base_offset) as usize
+                    };
+                    let matchEnd = if curMatchBase == 0 { dictEnd } else { iend_pos };
+                    let lowMatchPtr = if curMatchBase == 0 { dictStart } else { lowPrefixPtr };
+                    let cur_fwd = ZSTD_count_2segments(
+                        window_buf,
+                        split_pos,
+                        iend_pos,
+                        lowPrefixPtr,
+                        window_buf,
+                        pMatch,
+                        matchEnd,
+                    );
+                    if cur_fwd < minMatchLength {
+                        continue;
+                    }
+                    let cur_bwd = ZSTD_ldm_countBackwardsMatch_2segments(
+                        window_buf,
+                        split_pos,
+                        anchor,
+                        window_buf,
+                        pMatch,
+                        lowMatchPtr,
+                        window_buf,
+                        dictStart,
+                        dictEnd,
+                    );
+                    (cur_fwd, cur_bwd)
+                } else {
+                    let pMatch = cur.offset as usize;
+                    let cur_fwd = ZSTD_count(window_buf, split_pos, pMatch, iend_pos);
+                    if cur_fwd < minMatchLength {
+                        continue;
+                    }
+                    let cur_bwd = ZSTD_ldm_countBackwardsMatch(
+                        window_buf,
+                        split_pos,
+                        anchor,
+                        window_buf,
+                        pMatch,
+                        lowestIndex,
+                    );
+                    (cur_fwd, cur_bwd)
+                };
                 let cur_total = cur_fwd + cur_bwd;
                 if cur_total > best_total {
                     best_total = cur_total;
@@ -883,14 +937,6 @@ pub fn ZSTD_ldm_skipSequences(
 /// stitching leftover literals from one chunk onto the first sequence
 /// emitted by the next.
 ///
-/// Overflow correction (upstream steps 1 + 2) is currently skipped —
-/// the window-management helpers it depends on
-/// (`ZSTD_window_needOverflowCorrection` / `correctOverflow` /
-/// `enforceMaxDist`) aren't yet ported. Callers that push more than
-/// ~2 GiB of total input through a single `ldmState_t` will see index
-/// wraparound; v0.1 compressor paths call `ldmState_t::new` per frame
-/// so this is OK in practice.
-///
 /// `window_buf` covers the full compressor window; `src_pos` /
 /// `src_end` are offsets into it. `lowestIndex` is the minimum valid
 /// buffer offset (upstream's `ldmState->window.dictLimit`).
@@ -905,6 +951,7 @@ pub fn ZSTD_ldm_generateSequences(
     lowestIndex: u32,
 ) -> usize {
     let srcSize = src_end - src_pos;
+    let maxDist = 1u32 << params.windowLog;
     const K_MAX_CHUNK_SIZE: usize = 1 << 20;
     let nbChunks = srcSize.div_ceil(K_MAX_CHUNK_SIZE).max(1);
     let mut leftoverSize: usize = 0;
@@ -925,9 +972,37 @@ pub fn ZSTD_ldm_generateSequences(
         };
         let chunkSize = chunkEnd - chunkStart;
         let prevSize = sequences.size;
+        let chunkStartAbs = chunkStart as u32;
+        let chunkEndAbs = chunkEnd as u32;
 
-        let newLeftoverSize = ZSTD_ldm_generateSequences_internal_prefixOnly(
-            ldmState, sequences, params, window_buf, chunkStart, chunkEnd, lowestIndex,
+        if ZSTD_window_needOverflowCorrection(
+            &ldmState.window,
+            0,
+            maxDist,
+            ldmState.loadedDictEnd,
+            chunkStartAbs,
+            chunkEndAbs,
+        ) {
+            let correction =
+                ZSTD_window_correctOverflow(&mut ldmState.window, 0, maxDist, chunkStartAbs);
+            ZSTD_ldm_reduceTable(&mut ldmState.hashTable, correction);
+            ldmState.loadedDictEnd = 0;
+        }
+
+        ZSTD_window_enforceMaxDist(
+            &mut ldmState.window,
+            chunkEndAbs,
+            maxDist,
+            &mut ldmState.loadedDictEnd,
+        );
+
+        let chunkLowest = if ZSTD_window_hasExtDict(&ldmState.window) {
+            ldmState.window.lowLimit
+        } else {
+            lowestIndex
+        };
+        let newLeftoverSize = ZSTD_ldm_generateSequences_internal(
+            ldmState, sequences, params, window_buf, chunkStart, chunkEnd, chunkLowest,
         );
 
         if prevSize < sequences.size {
@@ -941,22 +1016,68 @@ pub fn ZSTD_ldm_generateSequences(
     0
 }
 
-/// Port of `ZSTD_ldm_blockCompress`. Skeletal — compresses a block
-/// using LDM-discovered sequences, wrapping a block-compressor call
-/// per match run. Still returns `ErrorCode::Generic` because the
-/// per-run wrapping (maybeSplitSequence + `ms.ldmSeqStore` linkage +
-/// nbSeq accounting) isn't ported yet. `ZSTD_selectBlockCompressor`
-/// itself IS available and wired into `ZSTD_compressFrame_fast`
-/// dispatch; the stub guards callers that accidentally hit the
-/// LDM-active path before the wrapper lands.
 pub fn ZSTD_ldm_blockCompress(
-    _rawSeqStore: &mut RawSeqStore_t,
-    _ms: &mut ZSTD_MatchState_t,
-    _seqStore: &mut crate::compress::seq_store::SeqStore_t,
-    _rep: &mut [u32; 3],
-    _src: &[u8],
+    rawSeqStore: &mut RawSeqStore_t,
+    ms: &mut ZSTD_MatchState_t,
+    seqStore: &mut crate::compress::seq_store::SeqStore_t,
+    rep: &mut [u32; 3],
+    src: &[u8],
 ) -> usize {
-    crate::common::error::ERROR(crate::common::error::ErrorCode::Generic)
+    use crate::compress::match_state::ZSTD_matchState_dictMode;
+    use crate::compress::seq_store::{OFFSET_TO_OFFBASE, ZSTD_storeSeq, ZSTD_updateRep};
+    use crate::compress::zstd_compress::ZSTD_selectBlockCompressor;
+
+    let cParams = ms.cParams;
+    let minMatch = cParams.minMatch;
+    let blockCompressor = ZSTD_selectBlockCompressor(
+        cParams.strategy,
+        ZSTD_ParamSwitch_e::ZSTD_ps_disable,
+        ZSTD_matchState_dictMode(ms),
+    );
+    let istart = 0usize;
+    let iend = src.len();
+    let mut ip = istart;
+
+    if cParams.strategy >= ZSTD_btopt {
+        let lastLLSize = blockCompressor(ms, seqStore, rep, src);
+        ZSTD_ldm_skipRawSeqStoreBytes(rawSeqStore, src.len());
+        return lastLLSize;
+    }
+
+    debug_assert!(rawSeqStore.pos <= rawSeqStore.size);
+    debug_assert!(rawSeqStore.size <= rawSeqStore.capacity);
+
+    while rawSeqStore.pos < rawSeqStore.size && ip < iend {
+        let sequence = maybeSplitSequence(rawSeqStore, (iend - ip) as u32, minMatch);
+        if sequence.offset == 0 {
+            break;
+        }
+        if ip + sequence.litLength as usize + sequence.matchLength as usize > iend {
+            return crate::common::error::ERROR(crate::common::error::ErrorCode::Generic);
+        }
+
+        ZSTD_ldm_limitTableUpdate(ms, ip as u32);
+        ZSTD_ldm_fillFastTables(ms, &src[..ip + sequence.litLength as usize]);
+
+        let newLitLength = blockCompressor(ms, seqStore, rep, &src[ip..ip + sequence.litLength as usize]);
+        if crate::common::error::ERR_isError(newLitLength) {
+            return newLitLength;
+        }
+        ip += sequence.litLength as usize;
+        ZSTD_updateRep(rep, OFFSET_TO_OFFBASE(sequence.offset), 0);
+        ZSTD_storeSeq(
+            seqStore,
+            newLitLength,
+            &src[ip - newLitLength..],
+            OFFSET_TO_OFFBASE(sequence.offset),
+            sequence.matchLength as usize,
+        );
+        ip += sequence.matchLength as usize;
+    }
+
+    ZSTD_ldm_limitTableUpdate(ms, ip as u32);
+    ZSTD_ldm_fillFastTables(ms, &src[..ip]);
+    blockCompressor(ms, seqStore, rep, &src[ip..])
 }
 
 #[cfg(test)]
@@ -1290,7 +1411,7 @@ mod tests {
         let mut st = ldmState_t::new(&lp);
         let mut store = RawSeqStore_t::with_capacity(1024);
 
-        let leftover = ZSTD_ldm_generateSequences_internal_prefixOnly(
+        let leftover = ZSTD_ldm_generateSequences_internal(
             &mut st, &mut store, &lp, &buf, 0, buf.len(), 0,
         );
         assert!(leftover <= buf.len());
@@ -1327,7 +1448,7 @@ mod tests {
         let mut st = ldmState_t::new(&lp);
         let mut store = RawSeqStore_t::with_capacity(1024);
 
-        let leftover = ZSTD_ldm_generateSequences_internal_prefixOnly(
+        let leftover = ZSTD_ldm_generateSequences_internal(
             &mut st, &mut store, &lp, &buf, 0, buf.len(), 0,
         );
         // Allowed to be zero sequences; most of the buffer stays
@@ -1339,6 +1460,44 @@ mod tests {
                 .sum::<u64>()
                 + leftover as u64,
             buf.len() as u64,
+        );
+    }
+
+    #[test]
+    fn generateSequences_extdict_finds_dictionary_match() {
+        let dict = b"TTGACCATGGTACCTA".repeat(16);
+        let src = [b"noise-".as_slice(), &dict[..96], b"-tail".as_slice()].concat();
+        let buf = [dict.clone(), src.clone()].concat();
+
+        let lp = ldm_params_for(3);
+        let mut st = ldmState_t::new(&lp);
+        st.window.dictBase_offset = 0;
+        st.window.lowLimit = 0;
+        st.window.dictLimit = dict.len() as u32;
+        st.window.base_offset = dict.len() as u32;
+        st.window.nextSrc = buf.len() as u32;
+
+        ZSTD_ldm_fillHashTable(&mut st, &buf[..dict.len()], 0, &lp);
+
+        let mut store = RawSeqStore_t::with_capacity(1024);
+        let lowest = st.window.lowLimit;
+        let leftover = ZSTD_ldm_generateSequences_internal(
+            &mut st,
+            &mut store,
+            &lp,
+            &buf,
+            dict.len(),
+            buf.len(),
+            lowest,
+        );
+
+        assert!(leftover < src.len(), "expected ext-dict path to consume source bytes");
+        assert!(store.size > 0, "expected at least one ext-dict-backed LDM sequence");
+        assert!(
+            store.seq[..store.size]
+                .iter()
+                .any(|s| s.matchLength >= lp.minMatchLength && s.offset > 0),
+            "expected a real ext-dict match candidate"
         );
     }
 
@@ -1494,26 +1653,88 @@ mod tests {
     }
 
     #[test]
-    fn blockCompress_stub_returns_Generic_error() {
-        // `ZSTD_ldm_blockCompress` is stubbed in v0.1 (needs the
-        // per-run wrapping: `maybeSplitSequence` + `ms.ldmSeqStore`
-        // linkage + nbSeq accounting). `ZSTD_selectBlockCompressor`
-        // itself is ported and wired. Contract: callers that
-        // accidentally hit the LDM-active path get a proper zstd
-        // error, not a panic.
-        use crate::common::error::{ERR_getErrorCode, ERR_isError, ErrorCode};
+    fn generateSequences_enforces_max_distance_on_window_state() {
+        let lp = ldmParams_t {
+            enableLdm: ZSTD_ParamSwitch_e::ZSTD_ps_enable,
+            hashLog: 8,
+            bucketSizeLog: 4,
+            minMatchLength: 8,
+            hashRateLog: 4,
+            windowLog: 10,
+        };
+        let mut st = ldmState_t::new(&lp);
+        st.window.lowLimit = 5;
+        st.window.dictLimit = 10;
+        st.loadedDictEnd = 50;
+
+        let data = vec![0u8; 2048];
+        let rc = ZSTD_ldm_generateSequences(
+            &mut st,
+            &mut RawSeqStore_t::with_capacity(8),
+            &lp,
+            &data,
+            0,
+            data.len(),
+            0,
+        );
+
+        assert_eq!(rc, 0);
+        assert_eq!(st.window.lowLimit, 2048 - (1u32 << lp.windowLog));
+        assert_eq!(st.window.dictLimit, st.window.lowLimit);
+        assert_eq!(st.loadedDictEnd, 0);
+    }
+
+    #[test]
+    fn blockCompress_accepts_empty_ldm_store_and_literals_only_input() {
         use crate::compress::match_state::{ZSTD_MatchState_t, ZSTD_compressionParameters};
         use crate::compress::seq_store::SeqStore_t;
 
         let mut store = RawSeqStore_t::with_capacity(4);
         let mut ms = ZSTD_MatchState_t::new(ZSTD_compressionParameters {
-            hashLog: 10, chainLog: 10, minMatch: 4,
+            windowLog: 20, hashLog: 10, chainLog: 10, minMatch: 4, strategy: ZSTD_fast,
             ..Default::default()
         });
         let mut seq = SeqStore_t::with_capacity(16, 256);
         let mut rep = [1u32, 4, 8];
         let rc = ZSTD_ldm_blockCompress(&mut store, &mut ms, &mut seq, &mut rep, b"x");
-        assert!(ERR_isError(rc));
-        assert_eq!(ERR_getErrorCode(rc), ErrorCode::Generic);
+        assert_eq!(rc, 1);
+    }
+
+    #[test]
+    fn blockCompress_materializes_queued_ldm_sequence_into_seqstore() {
+        use crate::compress::match_state::{ZSTD_MatchState_t, ZSTD_compressionParameters};
+        use crate::compress::seq_store::{OFFSET_TO_OFFBASE, SeqStore_t, ZSTD_getSequenceLength};
+
+        let mut store = RawSeqStore_t::with_capacity(4);
+        store.seq[0] = rawSeq {
+            offset: 9,
+            litLength: 4,
+            matchLength: 8,
+        };
+        store.size = 1;
+
+        let mut ms = ZSTD_MatchState_t::new(ZSTD_compressionParameters {
+            windowLog: 20,
+            hashLog: 10,
+            chainLog: 10,
+            minMatch: 4,
+            strategy: ZSTD_fast,
+            ..Default::default()
+        });
+        let mut seq = SeqStore_t::with_capacity(16, 256);
+        let mut rep = [1u32, 4, 8];
+        let src = b"abcdEFGHIJKLMNOPQRST";
+
+        let trailing = ZSTD_ldm_blockCompress(&mut store, &mut ms, &mut seq, &mut rep, src);
+
+        assert!(store.pos >= store.size, "queued raw sequence should be consumed");
+        let ldm_idx = seq
+            .sequences
+            .iter()
+            .position(|s| s.offBase == OFFSET_TO_OFFBASE(9))
+            .expect("queued LDM offset should be emitted");
+        let seq_len = ZSTD_getSequenceLength(&seq, ldm_idx);
+        assert_eq!(seq_len.matchLength, 8);
+        assert!(trailing <= src.len());
     }
 }

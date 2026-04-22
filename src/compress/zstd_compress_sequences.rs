@@ -222,6 +222,7 @@ pub fn ZSTD_selectEncodingType(
     isDefaultAllowed: ZSTD_DefaultPolicy_e,
     strategy: u32,
 ) -> SymbolEncodingType_e {
+    const UNAVAILABLE_COST: usize = usize::MAX / 4;
     let defaultsAllowed = isDefaultAllowed == ZSTD_DefaultPolicy_e::ZSTD_defaultAllowed;
 
     if mostFrequent == nbSeq {
@@ -253,12 +254,12 @@ pub fn ZSTD_selectEncodingType(
         let basicCost = if defaultsAllowed {
             ZSTD_crossEntropyCost(defaultNorm, defaultNormLog, count, max)
         } else {
-            ERROR(ErrorCode::Generic)
+            UNAVAILABLE_COST
         };
         let repeatCost = if *repeatMode != FSE_repeat::FSE_repeat_none {
             ZSTD_fseBitCost(prevCTable, count, max)
         } else {
-            ERROR(ErrorCode::Generic)
+            UNAVAILABLE_COST
         };
         let NCountCost = ZSTD_NCountCost(count, max, nbSeq, FSELog);
         let compressedCost = (NCountCost << 3) + ZSTD_entropyCost(count, max, nbSeq);
@@ -513,7 +514,7 @@ pub fn ZSTD_encodeSequences_body(
 /// Port of `ZSTD_encodeSequences`. BMI2 variant is a no-op dispatch in
 /// upstream's scalar build — we collapse to a single body call.
 #[allow(clippy::too_many_arguments)]
-pub fn ZSTD_encodeSequences(
+pub fn ZSTD_encodeSequences_default(
     dst: &mut [u8],
     CTable_MatchLength: &[FSE_CTable],
     mlCodeTable: &[u8],
@@ -524,7 +525,6 @@ pub fn ZSTD_encodeSequences(
     sequences: &[SeqDef],
     nbSeq: usize,
     longOffsets: i32,
-    _bmi2: i32,
 ) -> usize {
     ZSTD_encodeSequences_body(
         dst,
@@ -538,6 +538,81 @@ pub fn ZSTD_encodeSequences(
         nbSeq,
         longOffsets,
     )
+}
+
+/// Port of `ZSTD_encodeSequences_bmi2` (`zstd_compress_sequences.c:403`).
+/// In this pure-Rust build there is no alternate BMI2 body, so this
+/// is a one-shot alias of the default scalar path.
+#[allow(clippy::too_many_arguments)]
+pub fn ZSTD_encodeSequences_bmi2(
+    dst: &mut [u8],
+    CTable_MatchLength: &[FSE_CTable],
+    mlCodeTable: &[u8],
+    CTable_OffsetBits: &[FSE_CTable],
+    ofCodeTable: &[u8],
+    CTable_LitLength: &[FSE_CTable],
+    llCodeTable: &[u8],
+    sequences: &[SeqDef],
+    nbSeq: usize,
+    longOffsets: i32,
+) -> usize {
+    ZSTD_encodeSequences_default(
+        dst,
+        CTable_MatchLength,
+        mlCodeTable,
+        CTable_OffsetBits,
+        ofCodeTable,
+        CTable_LitLength,
+        llCodeTable,
+        sequences,
+        nbSeq,
+        longOffsets,
+    )
+}
+
+/// Port of `ZSTD_encodeSequences`. BMI2 variant is a no-op dispatch in
+/// upstream's scalar build — we collapse to a single body call.
+#[allow(clippy::too_many_arguments)]
+pub fn ZSTD_encodeSequences(
+    dst: &mut [u8],
+    CTable_MatchLength: &[FSE_CTable],
+    mlCodeTable: &[u8],
+    CTable_OffsetBits: &[FSE_CTable],
+    ofCodeTable: &[u8],
+    CTable_LitLength: &[FSE_CTable],
+    llCodeTable: &[u8],
+    sequences: &[SeqDef],
+    nbSeq: usize,
+    longOffsets: i32,
+    bmi2: i32,
+) -> usize {
+    if bmi2 != 0 {
+        ZSTD_encodeSequences_bmi2(
+            dst,
+            CTable_MatchLength,
+            mlCodeTable,
+            CTable_OffsetBits,
+            ofCodeTable,
+            CTable_LitLength,
+            llCodeTable,
+            sequences,
+            nbSeq,
+            longOffsets,
+        )
+    } else {
+        ZSTD_encodeSequences_default(
+            dst,
+            CTable_MatchLength,
+            mlCodeTable,
+            CTable_OffsetBits,
+            ofCodeTable,
+            CTable_LitLength,
+            llCodeTable,
+            sequences,
+            nbSeq,
+            longOffsets,
+        )
+    }
 }
 
 #[cfg(test)]
@@ -694,6 +769,31 @@ mod tests {
             ZSTD_fast,
         );
         assert_eq!(out, SymbolEncodingType_e::set_basic);
+    }
+
+    #[test]
+    fn select_encoding_type_high_strategy_uses_cost_sentinels_not_error_codes() {
+        use crate::compress::fse_compress::FSE_CTABLE_SIZE_U32;
+
+        let mut rm = FSE_repeat::FSE_repeat_none;
+        let count = [3u32, 3, 2, 2];
+        let prev = vec![0u32; FSE_CTABLE_SIZE_U32(6, 3)];
+        let default_norm = [4i16, 2, 1, 1];
+        let out = ZSTD_selectEncodingType(
+            &mut rm,
+            &count,
+            3,
+            3,
+            10,
+            6,
+            &prev,
+            &default_norm,
+            3,
+            ZSTD_DefaultPolicy_e::ZSTD_defaultDisallowed,
+            ZSTD_btopt,
+        );
+        assert_eq!(out, SymbolEncodingType_e::set_compressed);
+        assert_eq!(rm, FSE_repeat::FSE_repeat_check);
     }
 
     #[test]

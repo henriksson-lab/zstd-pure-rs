@@ -9,21 +9,24 @@ pub struct POOL_ctx {
     _priv: PhantomData<()>,
 }
 
-/// Port of `POOL_create`. Returns `None` — the MT path is not yet
-/// active; callers should fall back to single-threaded execution.
+/// Port of `POOL_create`. Allocates the pool header for positive
+/// thread counts; the actual worker backend remains a no-op.
 pub fn POOL_create(numThreads: usize, queueSize: usize) -> Option<Box<POOL_ctx>> {
     POOL_create_advanced(numThreads, queueSize, crate::compress::zstd_compress::ZSTD_customMem)
 }
 
 /// Port of `POOL_create_advanced` (pool.c:115). Same as `POOL_create`
 /// but accepts an explicit `customMem` allocator. v0.1 ignores the
-/// allocator and routes through `POOL_create`'s stub.
+/// allocator and only constructs the context header.
 pub fn POOL_create_advanced(
-    _numThreads: usize,
+    numThreads: usize,
     _queueSize: usize,
     _customMem: crate::compress::zstd_compress::ZSTD_customMem,
 ) -> Option<Box<POOL_ctx>> {
-    None
+    if numThreads == 0 {
+        return None;
+    }
+    Some(Box::new(POOL_ctx { _priv: PhantomData }))
 }
 
 /// Port of `POOL_free`. Drops the Box.
@@ -55,10 +58,8 @@ pub fn POOL_resize(_ctx: &mut POOL_ctx, _numThreads: usize) -> usize {
 pub fn POOL_joinJobs(_ctx: &mut POOL_ctx) {}
 
 /// Port of `ZSTD_createThreadPool`. Public wrapper over `POOL_create`.
-/// MT compression is stubbed in v0.1, so this always returns `None` —
-/// callers fall back to single-threaded.
-pub fn ZSTD_createThreadPool(_numThreads: usize) -> Option<Box<POOL_ctx>> {
-    None
+pub fn ZSTD_createThreadPool(numThreads: usize) -> Option<Box<POOL_ctx>> {
+    POOL_create(numThreads, 1)
 }
 
 /// Port of `ZSTD_freeThreadPool`. Drops a pool allocated via
@@ -88,13 +89,13 @@ mod tests {
     }
 
     #[test]
-    fn pool_and_thread_pool_creators_return_none_in_v0_1() {
-        // Contract: v0.1 has no MT backend. Both creators must
-        // return None regardless of thread count / queue size so
-        // callers fall back to single-threaded execution.
-        assert!(POOL_create(4, 8).is_none());
+    fn pool_and_thread_pool_creators_construct_headers_for_positive_counts() {
+        // Even before the worker backend lands, the constructor
+        // surface can return real opaque handles for positive counts.
+        assert!(POOL_create(4, 8).is_some());
+        assert!(POOL_create(1, 0).is_some());
         assert!(POOL_create(0, 0).is_none());
-        assert!(ZSTD_createThreadPool(4).is_none());
+        assert!(ZSTD_createThreadPool(4).is_some());
         assert!(ZSTD_createThreadPool(0).is_none());
         // free variants accept None without panicking.
         POOL_free(None);

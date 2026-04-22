@@ -148,6 +148,7 @@ pub const ZSTD_DUBT_UNSORTED_MARK: u32 = 1;
 /// `ZSTD_ROWSIZE`-wide strides for auto-vectorization; table sizes
 /// must be a multiple.
 pub const ZSTD_ROWSIZE: usize = 16;
+pub const ZSTD_ROW_HASH_CACHE_SIZE: usize = 8;
 
 /// Port of `ZSTD_reduceTable_internal`. Shifts every hash-table entry
 /// down by `reducerValue` (floor 0), optionally preserving the
@@ -450,6 +451,54 @@ pub fn ZSTD_window_clear(window: &mut ZSTD_window_t) {
     window.dictLimit = end;
 }
 
+/// Port of `ZSTD_window_update`. Appends a new segment onto the
+/// logical window, rotating the previous prefix into ext-dict mode
+/// when the segment is non-contiguous.
+///
+/// In the pointer-based C code `src` is a raw pointer; in this index-
+/// based Rust port the caller supplies the new segment's absolute
+/// start index in the same coordinate space as `window.nextSrc`.
+///
+/// Returns `true` when the segment is contiguous, `false` when the
+/// window had to pivot into ext-dict mode.
+pub fn ZSTD_window_update(
+    window: &mut ZSTD_window_t,
+    src_abs: u32,
+    srcSize: usize,
+    forceNonContiguous: bool,
+) -> bool {
+    let mut contiguous = true;
+    if srcSize == 0 {
+        return contiguous;
+    }
+
+    if src_abs != window.nextSrc || forceNonContiguous {
+        let distanceFromBase = window.nextSrc.wrapping_sub(window.base_offset);
+        window.lowLimit = window.dictLimit;
+        window.dictLimit = distanceFromBase;
+        window.dictBase_offset = window.base_offset;
+        window.base_offset = src_abs.wrapping_sub(distanceFromBase);
+        if window.dictLimit.wrapping_sub(window.lowLimit)
+            < crate::compress::zstd_fast::HASH_READ_SIZE as u32
+        {
+            window.lowLimit = window.dictLimit;
+        }
+        contiguous = false;
+    }
+
+    let src_end_abs = src_abs.wrapping_add(srcSize as u32);
+    window.nextSrc = src_end_abs;
+
+    if src_end_abs > window.dictBase_offset.wrapping_add(window.lowLimit)
+        && src_abs < window.dictBase_offset.wrapping_add(window.dictLimit)
+    {
+        let highInputIdx = src_end_abs.wrapping_sub(window.dictBase_offset);
+        window.lowLimit = highInputIdx.min(window.dictLimit);
+    }
+
+    contiguous
+}
+
 /// Port of `ZSTD_window_isEmpty`. True on a freshly initialized
 /// window — all three bookkeeping values still sit at their starting
 /// sentinel.
@@ -703,13 +752,26 @@ pub fn ZSTD_overflowCorrectIfNeeded(
 
 /// Cut-down `ZSTD_MatchState_t`. Covers the primary hash table, the
 /// `hashTable3` short-hash leg, and the `chainTable` used by
-/// `zstd_lazy` / `zstd_opt`. Fields still absent: the `tagTable` /
-/// `rowHashLog` row-hash cache, the `ZSTD_optimal_t` opt-parser
-/// state, and the `dictMatchState` linkage — all will land with
-/// their consumers.
+/// `zstd_lazy` / `zstd_opt`. Row-hash scratch fields are live for the
+/// greedy/lazy/lazy2 matchfinders; only optimal-parser row mode
+/// remains out of scope, matching upstream's strategy coverage.
 #[derive(Debug, Clone)]
 pub struct ZSTD_MatchState_t {
     pub window: ZSTD_window_t,
+
+    /// Optional entropy-table seed for first-block optimal-parser
+    /// pricing. Callers stash the prior block or dictionary entropy
+    /// here before invoking `zstd_opt`.
+    pub entropySeed: Option<crate::compress::zstd_compress::ZSTD_entropyCTables_t>,
+
+    /// Upstream `dictMatchState`. When present, points at the loaded
+    /// dictionary's match-state tables for DMS / DDSS search modes.
+    pub dictMatchState: Option<Box<ZSTD_MatchState_t>>,
+    /// Raw dictionary bytes associated with this match state. This is
+    /// separate from `dictMatchState`: ext-dict modes dereference the
+    /// local state's external dictionary bytes, while dictMatchState
+    /// modes dereference the attached dictionary state's bytes.
+    pub dictContent: Vec<u8>,
 
     /// Upstream `loadedDictEnd`. Non-zero while a dictionary is in
     /// use.
@@ -732,12 +794,25 @@ pub struct ZSTD_MatchState_t {
     /// table isn't allocated.
     pub hashLog3: u32,
 
+    /// Upstream `rowHashLog`. Log2 number of rows in the row-hash table.
+    pub rowHashLog: u32,
+
+    /// Upstream `tagTable`. Row-hash tags plus per-row head slot.
+    pub tagTable: Vec<u8>,
+
+    /// Upstream `hashCache`. Small rolling cache for row-hash updates.
+    pub hashCache: [u32; ZSTD_ROW_HASH_CACHE_SIZE],
+
     /// Row-hash matcher salt — reseeded via `ZSTD_advanceHashSalt`
     /// so reused tables don't collide across compressions.
     pub hashSalt: u64,
 
     /// Entropy mixed into `hashSalt` on each reset.
     pub hashSaltEntropy: u32,
+
+    /// Upstream `lazySkipping`. Non-zero tells lazy matchfinders to
+    /// stop inserting every intermediate position.
+    pub lazySkipping: u32,
 
     /// Chain table for `zstd_lazy` / `zstd_opt`. Zero-sized until
     /// allocated.
@@ -762,13 +837,20 @@ impl ZSTD_MatchState_t {
                 lowLimit: ZSTD_WINDOW_START_INDEX,
                 nbOverflowCorrections: 0,
             },
+            entropySeed: None,
+            dictMatchState: None,
+            dictContent: Vec::new(),
             loadedDictEnd: 0,
             nextToUpdate: ZSTD_WINDOW_START_INDEX,
             hashTable: vec![0u32; hashSize],
             hashTable3: Vec::new(),
             hashLog3: 0,
+            rowHashLog: 0,
+            tagTable: Vec::new(),
+            hashCache: [0; ZSTD_ROW_HASH_CACHE_SIZE],
             hashSalt: 0,
             hashSaltEntropy: 0,
+            lazySkipping: 0,
             chainTable: Vec::new(),
             cParams,
         }
@@ -784,6 +866,9 @@ impl ZSTD_MatchState_t {
             lowLimit: ZSTD_WINDOW_START_INDEX,
             nbOverflowCorrections: 0,
         };
+        self.entropySeed = None;
+        self.dictMatchState = None;
+        self.dictContent.clear();
         self.loadedDictEnd = 0;
         self.nextToUpdate = ZSTD_WINDOW_START_INDEX;
         for c in self.hashTable.iter_mut() {
@@ -792,9 +877,17 @@ impl ZSTD_MatchState_t {
         for c in self.hashTable3.iter_mut() {
             *c = 0;
         }
+        for c in self.tagTable.iter_mut() {
+            *c = 0;
+        }
         for c in self.chainTable.iter_mut() {
             *c = 0;
         }
+        self.rowHashLog = 0;
+        self.hashCache = [0; ZSTD_ROW_HASH_CACHE_SIZE];
+        self.hashSalt = 0;
+        self.hashSaltEntropy = 0;
+        self.lazySkipping = 0;
     }
 }
 
@@ -897,6 +990,44 @@ mod tests {
         ZSTD_window_clear(&mut w);
         assert_eq!(w.dictLimit, 1000);
         assert_eq!(w.lowLimit, 1000);
+    }
+
+    #[test]
+    fn window_update_contiguous_only_advances_nextsrc() {
+        let mut w = ZSTD_window_t {
+            base_offset: 100,
+            dictBase_offset: 80,
+            dictLimit: 120,
+            lowLimit: 90,
+            nextSrc: 150,
+            nbOverflowCorrections: 0,
+        };
+        let contiguous = ZSTD_window_update(&mut w, 150, 20, false);
+        assert!(contiguous);
+        assert_eq!(w.base_offset, 100);
+        assert_eq!(w.dictBase_offset, 80);
+        assert_eq!(w.dictLimit, 120);
+        assert_eq!(w.lowLimit, 90);
+        assert_eq!(w.nextSrc, 170);
+    }
+
+    #[test]
+    fn window_update_non_contiguous_rotates_prefix_into_extdict() {
+        let mut w = ZSTD_window_t {
+            base_offset: 100,
+            dictBase_offset: 50,
+            dictLimit: 110,
+            lowLimit: 70,
+            nextSrc: 180,
+            nbOverflowCorrections: 0,
+        };
+        let contiguous = ZSTD_window_update(&mut w, 300, 16, true);
+        assert!(!contiguous);
+        assert_eq!(w.dictBase_offset, 100);
+        assert_eq!(w.dictLimit, 80);
+        assert_eq!(w.base_offset, 220);
+        assert_eq!(w.lowLimit, 110);
+        assert_eq!(w.nextSrc, 316);
     }
 
     #[test]

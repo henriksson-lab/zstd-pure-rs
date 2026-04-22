@@ -32,6 +32,7 @@ pub enum ZSTD_dictContentType_e {
 /// are copied (`byCopy` semantics).
 pub struct ZSTD_DDict {
     pub dictBuffer: Vec<u8>,
+    pub dictContent: *const u8,
     pub dictSize: usize,
     pub dictID: u32,
     pub entropyPresent: u32,
@@ -40,7 +41,11 @@ pub struct ZSTD_DDict {
 /// Port of `ZSTD_DDict_dictContent`.
 #[inline]
 pub fn ZSTD_DDict_dictContent(ddict: &ZSTD_DDict) -> &[u8] {
-    &ddict.dictBuffer[..ddict.dictSize]
+    if ddict.dictSize == 0 {
+        &[]
+    } else {
+        unsafe { core::slice::from_raw_parts(ddict.dictContent, ddict.dictSize) }
+    }
 }
 
 /// Port of `ZSTD_DDict_dictSize`.
@@ -101,7 +106,7 @@ pub fn ZSTD_sizeof_DDict(ddict: Option<&ZSTD_DDict>) -> usize {
 /// Returns 0 on success or an error code. For magic-tagged dicts with
 /// `ZSTD_dct_fullDict`, we currently return
 /// `DictionaryCreationFailed` to flag the unimplemented path.
-fn ZSTD_loadEntropy_intoDDict(
+pub(crate) fn ZSTD_loadEntropy_intoDDict(
     ddict: &mut ZSTD_DDict,
     dictContentType: ZSTD_dictContentType_e,
 ) -> usize {
@@ -154,10 +159,12 @@ pub fn ZSTD_createDDict_advanced(
 ) -> Option<Box<ZSTD_DDict>> {
     let mut ddict = Box::new(ZSTD_DDict {
         dictBuffer: dict.to_vec(),
+        dictContent: core::ptr::null(),
         dictSize: dict.len(),
         dictID: 0,
         entropyPresent: 0,
     });
+    ddict.dictContent = ddict.dictBuffer.as_ptr();
     let rc = ZSTD_loadEntropy_intoDDict(&mut ddict, dictContentType);
     if crate::common::error::ERR_isError(rc) {
         return None;
@@ -230,10 +237,12 @@ mod byref_tests {
         use crate::decompress::zstd_decompress_block::ZSTD_DCtx;
         let mut ddict = ZSTD_DDict {
             dictBuffer: b"copy-params-dict".to_vec(),
+            dictContent: core::ptr::null(),
             dictSize: 16,
             dictID: 0xDEAD_BEEF,
             entropyPresent: 1,
         };
+        ddict.dictContent = ddict.dictBuffer.as_ptr();
         let mut dctx = ZSTD_DCtx::new();
         ZSTD_copyDDictParameters(&mut dctx, &ddict);
         assert_eq!(dctx.dictID, 0xDEAD_BEEF);

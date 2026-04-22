@@ -16,5 +16,6 @@ pub mod zstd_lazy;
 pub mod zstd_ldm;
 pub mod zstd_opt;
 pub mod zstd_presplit;
+pub mod zstd_cwksp;
 #[cfg(feature = "mt")]
 pub mod zstdmt_compress;

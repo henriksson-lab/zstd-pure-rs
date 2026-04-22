@@ -78,6 +78,12 @@ impl FPStats {
     }
 }
 
+/// Port of `initStats`.
+fn initStats(fpstats: &mut FPStats) {
+    fpstats.pastEvents.reset(HASHLOG_MAX);
+    fpstats.newEvents.reset(HASHLOG_MAX);
+}
+
 /// Port of `addEvents_generic`.
 fn addEvents_generic(fp: &mut Fingerprint, src: &[u8], samplingRate: usize, hashLog: u32) {
     const HASHLENGTH: usize = 2;
@@ -93,9 +99,29 @@ fn addEvents_generic(fp: &mut Fingerprint, src: &[u8], samplingRate: usize, hash
 }
 
 /// Port of `recordFingerprint_generic`.
-fn recordFingerprint(fp: &mut Fingerprint, src: &[u8], samplingRate: usize, hashLog: u32) {
+fn recordFingerprint_generic(fp: &mut Fingerprint, src: &[u8], samplingRate: usize, hashLog: u32) {
     fp.reset(hashLog);
     addEvents_generic(fp, src, samplingRate, hashLog);
+}
+
+/// Port of `ZSTD_recordFingerprint_1`.
+fn ZSTD_recordFingerprint_1(fp: &mut Fingerprint, src: &[u8]) {
+    recordFingerprint_generic(fp, src, 1, 10);
+}
+
+/// Port of `ZSTD_recordFingerprint_5`.
+fn ZSTD_recordFingerprint_5(fp: &mut Fingerprint, src: &[u8]) {
+    recordFingerprint_generic(fp, src, 5, 10);
+}
+
+/// Port of `ZSTD_recordFingerprint_11`.
+fn ZSTD_recordFingerprint_11(fp: &mut Fingerprint, src: &[u8]) {
+    recordFingerprint_generic(fp, src, 11, 9);
+}
+
+/// Port of `ZSTD_recordFingerprint_43`.
+fn ZSTD_recordFingerprint_43(fp: &mut Fingerprint, src: &[u8]) {
+    recordFingerprint_generic(fp, src, 43, 8);
 }
 
 #[inline]
@@ -142,6 +168,22 @@ fn mergeEvents(acc: &mut Fingerprint, newfp: &Fingerprint) {
     acc.nbEvents += newfp.nbEvents;
 }
 
+/// Port of `flushEvents`.
+fn flushEvents(fpstats: &mut FPStats) {
+    fpstats.pastEvents.events.copy_from_slice(&fpstats.newEvents.events);
+    fpstats.pastEvents.nbEvents = fpstats.newEvents.nbEvents;
+    fpstats.newEvents.reset(HASHLOG_MAX);
+}
+
+/// Port of `removeEvents`.
+fn removeEvents(acc: &mut Fingerprint, slice: &Fingerprint) {
+    for n in 0..HASHTABLESIZE {
+        debug_assert!(acc.events[n] >= slice.events[n]);
+        acc.events[n] -= slice.events[n];
+    }
+    acc.nbEvents -= slice.nbEvents;
+}
+
 const CHUNKSIZE: usize = 8 << 10;
 
 /// Port of `ZSTD_splitBlock_byChunks`. `level` selects the sampling
@@ -152,33 +194,27 @@ const CHUNKSIZE: usize = 8 << 10;
 ///   - 3 → (rate=1,  hashLog=10)  — most accurate
 fn ZSTD_splitBlock_byChunks(block: &[u8], level: i32) -> usize {
     debug_assert!((0..=3).contains(&level));
-    let (rate, hashLog) = match level {
-        0 => (43usize, 8u32),
-        1 => (11, 9),
-        2 => (5, 10),
-        _ => (1, 10),
+    let (record_f, hashLog): (fn(&mut Fingerprint, &[u8]), u32) = match level {
+        0 => (ZSTD_recordFingerprint_43, 8),
+        1 => (ZSTD_recordFingerprint_11, 9),
+        2 => (ZSTD_recordFingerprint_5, 10),
+        _ => (ZSTD_recordFingerprint_1, 10),
     };
     debug_assert_eq!(block.len(), 128 << 10);
 
     let mut fpstats = FPStats::new();
     let mut penalty = THRESHOLD_PENALTY;
 
-    recordFingerprint(&mut fpstats.pastEvents, &block[..CHUNKSIZE], rate, hashLog);
+    initStats(&mut fpstats);
+    record_f(&mut fpstats.pastEvents, &block[..CHUNKSIZE]);
 
     let mut pos = CHUNKSIZE;
     while pos <= block.len() - CHUNKSIZE {
-        recordFingerprint(
-            &mut fpstats.newEvents,
-            &block[pos..pos + CHUNKSIZE],
-            rate,
-            hashLog,
-        );
+        record_f(&mut fpstats.newEvents, &block[pos..pos + CHUNKSIZE]);
         if compareFingerprints(&fpstats.pastEvents, &fpstats.newEvents, penalty, hashLog) {
             return pos;
         }
-        // Take a copy to sidestep borrow conflicts on `fpstats`.
-        let newfp = fpstats.newEvents.clone();
-        mergeEvents(&mut fpstats.pastEvents, &newfp);
+        mergeEvents(&mut fpstats.pastEvents, &fpstats.newEvents);
         if penalty > 0 {
             penalty -= 1;
         }
@@ -195,6 +231,7 @@ fn ZSTD_splitBlock_fromBorders(block: &[u8]) -> usize {
     debug_assert_eq!(block.len(), 128 << 10);
 
     let mut fpstats = FPStats::new();
+    initStats(&mut fpstats);
     HIST_add(&mut fpstats.pastEvents.events, &block[..SEGMENT_SIZE]);
     HIST_add(
         &mut fpstats.newEvents.events,
@@ -314,5 +351,39 @@ mod tests {
         assert_ne!(hash2(&buf, 10), hash2(&buf, 9));
         // Hash fits within the 1<<hashLog range.
         assert!(h1 < (1usize << 10));
+    }
+
+    #[test]
+    fn flushEvents_copies_new_into_past_and_zeros_new() {
+        let mut stats = FPStats::new();
+        stats.newEvents.events[7] = 3;
+        stats.newEvents.events[99] = 11;
+        stats.newEvents.nbEvents = 14;
+
+        flushEvents(&mut stats);
+
+        assert_eq!(stats.pastEvents.events[7], 3);
+        assert_eq!(stats.pastEvents.events[99], 11);
+        assert_eq!(stats.pastEvents.nbEvents, 14);
+        assert_eq!(stats.newEvents.nbEvents, 0);
+        assert!(stats.newEvents.events.iter().all(|&x| x == 0));
+    }
+
+    #[test]
+    fn removeEvents_subtracts_bucketwise() {
+        let mut acc = Fingerprint::new();
+        let mut slice = Fingerprint::new();
+        acc.events[3] = 9;
+        acc.events[8] = 5;
+        acc.nbEvents = 14;
+        slice.events[3] = 4;
+        slice.events[8] = 1;
+        slice.nbEvents = 5;
+
+        removeEvents(&mut acc, &slice);
+
+        assert_eq!(acc.events[3], 5);
+        assert_eq!(acc.events[8], 4);
+        assert_eq!(acc.nbEvents, 9);
     }
 }

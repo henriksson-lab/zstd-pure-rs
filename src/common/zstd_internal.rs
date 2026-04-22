@@ -5,6 +5,8 @@ use crate::common::mem::{MEM_read32, MEM_read64, MEM_write32, MEM_write64};
 
 pub const WILDCOPY_OVERLENGTH: usize = 32;
 pub const WILDCOPY_VECLEN: usize = 16;
+pub const ZSTD_WORKSPACETOOLARGE_FACTOR: usize = 3;
+pub const ZSTD_WORKSPACETOOLARGE_MAXDURATION: usize = 128;
 
 /// Upstream `repStartValue[ZSTD_REP_NUM]`. The default repcode
 /// history that every compressed block inherits before its first
@@ -45,6 +47,19 @@ pub fn ZSTD_reset_compressedBlockState_rep(rep: &mut [u32; 3]) {
 pub enum ZSTD_overlap_e {
     ZSTD_no_overlap,
     ZSTD_overlap_src_before_dst,
+}
+
+/// Port of `ZSTD_selectAddr`. Upstream uses x86-specific inline asm
+/// to encourage branchless codegen; semantically it is just a
+/// conditional address select.
+#[inline]
+pub fn ZSTD_selectAddr<'a, T>(
+    index: u32,
+    lowLimit: u32,
+    candidate: &'a T,
+    backup: &'a T,
+) -> &'a T {
+    if index >= lowLimit { candidate } else { backup }
 }
 
 /// Port of `ZSTD_safecopyLiterals` (`zstd_compress_internal.h:700`).
@@ -224,6 +239,14 @@ mod tests {
         ZSTD_copy4(&mut dst, &src);
         assert_eq!(&dst[..4], &[0xAA, 0xBB, 0xCC, 0xDD]);
         assert_eq!(&dst[4..], &[0u8, 0, 0, 0]); // bytes 4..8 untouched
+    }
+
+    #[test]
+    fn selectAddr_returns_candidate_only_when_index_in_range() {
+        let candidate = 11u32;
+        let backup = 22u32;
+        assert_eq!(*ZSTD_selectAddr(9, 9, &candidate, &backup), 11);
+        assert_eq!(*ZSTD_selectAddr(8, 9, &candidate, &backup), 22);
     }
 
     #[test]

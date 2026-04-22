@@ -1395,6 +1395,7 @@ mod tests {
         // Ref an empty DDict (zero-length content).
         let empty_ddict = ZSTD_DDict {
             dictBuffer: Vec::new(),
+            dictContent: core::ptr::null(),
             dictSize: 0,
             dictID: 0,
             entropyPresent: 0,
@@ -1922,19 +1923,68 @@ mod tests {
     }
 
     #[test]
-    fn decompressContinue_stub_returns_Generic_error() {
-        // Symmetric with the compress-side continue/end stub test.
-        // `ZSTD_decompressContinue` is stubbed in v0.1 (our port
-        // uses the buffer-until-complete-frame streaming instead of
-        // the legacy block-level state machine). Callers must see a
-        // proper zstd error code rather than a panic.
+    fn decompressContinue_rejects_wrong_chunk_size() {
         let mut dctx = ZSTD_DCtx::default();
         let mut dst = [0u8; 64];
         let src = b"some-input";
         let rc = ZSTD_decompressContinue(&mut dctx, &mut dst, src);
         assert!(crate::common::error::ERR_isError(rc));
         use crate::common::error::ERR_getErrorCode;
-        assert_eq!(ERR_getErrorCode(rc), ErrorCode::Generic);
+        assert_eq!(ERR_getErrorCode(rc), ErrorCode::SrcSizeWrong);
+    }
+
+    #[test]
+    fn decompressContinue_roundtrips_single_raw_block_frame() {
+        use crate::common::mem::MEM_writeLE24;
+        use crate::compress::zstd_compress::{
+            ZSTD_FrameParameters, ZSTD_FRAMEHEADERSIZE_MAX, ZSTD_writeFrameHeader,
+        };
+
+        let payload = b"legacy continue raw block";
+        let fparams = ZSTD_FrameParameters {
+            contentSizeFlag: 1,
+            checksumFlag: 0,
+            noDictIDFlag: 1,
+        };
+        let mut header = [0u8; ZSTD_FRAMEHEADERSIZE_MAX];
+        let hsize = ZSTD_writeFrameHeader(&mut header, &fparams, 17, payload.len() as u64, 0);
+        assert!(!crate::common::error::ERR_isError(hsize));
+
+        let mut frame = Vec::with_capacity(hsize + 3 + payload.len());
+        frame.extend_from_slice(&header[..hsize]);
+        let blockHeader = 1u32 | ((payload.len() as u32) << 3);
+        let mut bh = [0u8; 3];
+        MEM_writeLE24(&mut bh, blockHeader);
+        frame.extend_from_slice(&bh);
+        frame.extend_from_slice(payload);
+
+        let mut dctx = ZSTD_DCtx::default();
+        let mut out = vec![0u8; payload.len()];
+        let mut ip = 0usize;
+        let mut op = 0usize;
+
+        while ip < frame.len() {
+            let chunk = ZSTD_nextSrcSizeToDecompress(&dctx);
+            let produced = ZSTD_decompressContinue(
+                &mut dctx,
+                &mut out[op..],
+                &frame[ip..ip + chunk],
+            );
+            assert!(
+                !crate::common::error::ERR_isError(produced),
+                "decompressContinue failed at ip={ip}: {}",
+                crate::common::error::ERR_getErrorName(produced)
+            );
+            ip += chunk;
+            op += produced;
+        }
+
+        assert_eq!(op, payload.len());
+        assert_eq!(&out[..op], payload);
+        assert_eq!(
+            ZSTD_nextSrcSizeToDecompress(&dctx),
+            ZSTD_startingInputLength(ZSTD_format_e::ZSTD_f_zstd1)
+        );
     }
 
     #[test]
@@ -2700,9 +2750,31 @@ mod tests {
     }
 
     #[test]
-    fn nextSrcSizeToDecompress_returns_block_hint() {
+    fn nextSrcSizeToDecompress_starts_at_frame_header_prefix() {
         let dctx = ZSTD_DCtx::default();
-        assert_eq!(ZSTD_nextSrcSizeToDecompress(&dctx), ZSTD_DStreamInSize());
+        assert_eq!(
+            ZSTD_nextSrcSizeToDecompress(&dctx),
+            ZSTD_startingInputLength(ZSTD_format_e::ZSTD_f_zstd1)
+        );
+    }
+
+    #[test]
+    fn insertBlock_updates_history_end_and_contiguity_state() {
+        let mut dctx = ZSTD_DCtx::default();
+        let a = vec![1u8; 8];
+        let b = vec![2u8; 5];
+
+        let n = ZSTD_insertBlock(&mut dctx, &a);
+        assert_eq!(n, a.len());
+        assert_eq!(dctx.prefixStart, Some(a.as_ptr() as usize));
+        assert_eq!(dctx.previousDstEnd, Some(a.as_ptr() as usize + a.len()));
+        assert_eq!(dctx.dictEnd, None);
+
+        let n = ZSTD_insertBlock(&mut dctx, &b);
+        assert_eq!(n, b.len());
+        assert_eq!(dctx.dictEnd, Some(a.as_ptr() as usize + a.len()));
+        assert_eq!(dctx.prefixStart, Some(b.as_ptr() as usize));
+        assert_eq!(dctx.previousDstEnd, Some(b.as_ptr() as usize + b.len()));
     }
 
     #[test]
@@ -3183,16 +3255,27 @@ mod tests {
     }
 
     #[test]
-    fn initStatic_decompression_variants_return_none() {
-        // Contract: v0.1 has no static-buffer init support. All
-        // decompression-side initStatic* must return None regardless
-        // of workspace size so callers fall back to heap-allocated
-        // creators.
-        let mut buf = vec![0u8; 1 << 20];
-        assert!(ZSTD_initStaticDCtx(&mut buf).is_none());
-        assert!(ZSTD_initStaticDStream(&mut buf).is_none());
+    fn initStatic_decompression_variants_construct_ctx_and_ddict() {
+        let mut buf = vec![0u64; (1 << 20) / core::mem::size_of::<u64>()];
+        let bytes = unsafe {
+            core::slice::from_raw_parts_mut(
+                buf.as_mut_ptr() as *mut u8,
+                buf.len() * core::mem::size_of::<u64>(),
+            )
+        };
+        let dctx = ZSTD_initStaticDCtx(bytes).expect("static dctx");
+        assert_eq!(
+            ZSTD_nextSrcSizeToDecompress(dctx),
+            ZSTD_startingInputLength(ZSTD_format_e::ZSTD_f_zstd1)
+        );
+        let dstream = ZSTD_initStaticDStream(bytes).expect("static dstream");
+        assert_eq!(
+            ZSTD_nextSrcSizeToDecompress(dstream),
+            ZSTD_startingInputLength(ZSTD_format_e::ZSTD_f_zstd1)
+        );
         let dict_bytes = b"dict";
-        assert!(ZSTD_initStaticDDict(&mut buf, dict_bytes).is_none());
+        let ddict = ZSTD_initStaticDDict(bytes, dict_bytes).expect("static ddict");
+        assert_eq!(crate::decompress::zstd_ddict::ZSTD_DDict_dictContent(ddict), dict_bytes);
     }
 
     #[test]
@@ -4432,13 +4515,11 @@ pub fn ZSTD_estimateDStreamSize_fromFrame(src: &[u8]) -> usize {
 }
 
 /// Port of `ZSTD_insertBlock` (`zstd_decompress.c:887`). Inserts
-/// `src` as raw history into the DCtx — useful when a frameless
-/// protocol is tracking uncompressed blocks alongside compressed
-/// ones. Upstream updates `previousDstEnd` and runs
-/// `ZSTD_checkContinuity`; our DCtx doesn't carry those pointer-
-/// tracking fields (ext-dict plumbing), so this is a documentation
-/// stub that returns `blockSize` per upstream's contract.
-pub fn ZSTD_insertBlock(_dctx: &mut ZSTD_DCtx, block: &[u8]) -> usize {
+/// `block` as raw history into the DCtx — useful when a frameless
+/// protocol tracks uncompressed blocks alongside compressed ones.
+pub fn ZSTD_insertBlock(dctx: &mut ZSTD_DCtx, block: &[u8]) -> usize {
+    crate::decompress::zstd_decompress_block::ZSTD_checkContinuity(dctx, block, block.len());
+    dctx.previousDstEnd = Some(block.as_ptr() as usize + block.len());
     block.len()
 }
 
@@ -5111,27 +5192,70 @@ pub fn ZSTD_createDStream_advanced(
     Some(ZSTD_createDCtx())
 }
 
-/// Port of `ZSTD_initStaticDCtx`. v0.1 doesn't support the
-/// static-buffer init pattern (all `Vec`s are heap-allocated). Always
-/// returns `None`.
+/// Port of `ZSTD_initStaticDCtx`. Places a `ZSTD_DCtx` header inside
+/// the caller's workspace when alignment and size allow it.
 pub fn ZSTD_initStaticDCtx(workspace: &mut [u8]) -> Option<&mut ZSTD_DCtx> {
-    let _ = workspace;
-    None
+    use core::mem::{align_of, size_of};
+    use core::ptr;
+
+    if (workspace.as_mut_ptr() as usize) & (align_of::<u64>() - 1) != 0 {
+        return None;
+    }
+    if workspace.len() < size_of::<ZSTD_DCtx>() {
+        return None;
+    }
+
+    let dctx = unsafe { &mut *(workspace.as_mut_ptr() as *mut ZSTD_DCtx) };
+    unsafe {
+        ptr::write(dctx, ZSTD_DCtx::default());
+    }
+    ZSTD_initDCtx_internal(dctx);
+    Some(dctx)
 }
 
-/// Port of `ZSTD_initStaticDStream`. Always `None`.
+/// Port of `ZSTD_initStaticDStream`. Alias for `ZSTD_initStaticDCtx`.
 pub fn ZSTD_initStaticDStream(workspace: &mut [u8]) -> Option<&mut ZSTD_DStream> {
-    let _ = workspace;
-    None
+    ZSTD_initStaticDCtx(workspace)
 }
 
-/// Port of `ZSTD_initStaticDDict`. Always `None`.
+/// Port of `ZSTD_initStaticDDict`. Places a `ZSTD_DDict` header in
+/// caller workspace and references the caller's `dict` bytes.
 pub fn ZSTD_initStaticDDict<'a>(
     workspace: &'a mut [u8],
     dict: &[u8],
 ) -> Option<&'a mut crate::decompress::zstd_ddict::ZSTD_DDict> {
-    let _ = (workspace, dict);
-    None
+    use crate::decompress::zstd_ddict::{ZSTD_DDict, ZSTD_dictContentType_e};
+    use core::mem::{align_of, size_of};
+    use core::ptr;
+
+    if (workspace.as_mut_ptr() as usize) & (align_of::<u64>() - 1) != 0 {
+        return None;
+    }
+    if workspace.len() < size_of::<ZSTD_DDict>() {
+        return None;
+    }
+
+    let ddict = unsafe { &mut *(workspace.as_mut_ptr() as *mut ZSTD_DDict) };
+    unsafe {
+        ptr::write(
+            ddict,
+            ZSTD_DDict {
+                dictBuffer: Vec::new(),
+                dictContent: dict.as_ptr(),
+                dictSize: dict.len(),
+                dictID: 0,
+                entropyPresent: 0,
+            },
+        );
+    }
+    let rc = crate::decompress::zstd_ddict::ZSTD_loadEntropy_intoDDict(
+        ddict,
+        ZSTD_dictContentType_e::ZSTD_dct_auto,
+    );
+    if crate::common::error::ERR_isError(rc) {
+        return None;
+    }
+    Some(ddict)
 }
 
 /// Port of `ZSTD_nextInputType_e`. Tells `ZSTD_decompressContinue`
@@ -5148,12 +5272,21 @@ pub enum ZSTD_nextInputType_e {
 }
 
 /// Port of `ZSTD_nextInputType`. Reports what kind of chunk the
-/// decompressor expects next. v0.1 doesn't drive a block-level state
-/// machine — returns `frameHeader` so callers that politely consult
-/// this helper aren't misled.
+/// block-level legacy decoder expects next from `decompressContinue`.
 #[inline]
-pub fn ZSTD_nextInputType(_dctx: &ZSTD_DCtx) -> ZSTD_nextInputType_e {
-    ZSTD_nextInputType_e::ZSTDnit_frameHeader
+pub fn ZSTD_nextInputType(dctx: &ZSTD_DCtx) -> ZSTD_nextInputType_e {
+    match dctx.stage {
+        ZSTD_dStage::ZSTDds_getFrameHeaderSize | ZSTD_dStage::ZSTDds_decodeFrameHeader => {
+            ZSTD_nextInputType_e::ZSTDnit_frameHeader
+        }
+        ZSTD_dStage::ZSTDds_decodeBlockHeader => ZSTD_nextInputType_e::ZSTDnit_blockHeader,
+        ZSTD_dStage::ZSTDds_decompressBlock => ZSTD_nextInputType_e::ZSTDnit_block,
+        ZSTD_dStage::ZSTDds_decompressLastBlock => ZSTD_nextInputType_e::ZSTDnit_lastBlock,
+        ZSTD_dStage::ZSTDds_checkChecksum => ZSTD_nextInputType_e::ZSTDnit_checksum,
+        ZSTD_dStage::ZSTDds_decodeSkippableHeader | ZSTD_dStage::ZSTDds_skipFrame => {
+            ZSTD_nextInputType_e::ZSTDnit_skippableFrame
+        }
+    }
 }
 
 /// Port of `ZSTD_decompressBegin`. Legacy continue-style init — v0.1
@@ -5161,6 +5294,7 @@ pub fn ZSTD_nextInputType(_dctx: &ZSTD_DCtx) -> ZSTD_nextInputType_e {
 /// returning 0.
 #[inline]
 pub fn ZSTD_decompressBegin(dctx: &mut ZSTD_DCtx) -> usize {
+    use crate::common::xxhash::XXH64_reset;
     // Upstream (zstd_decompress.c:1560) resets per-frame state:
     // clear entropy flags, zero dictID, set stage to "awaiting
     // frame header", rebuild default FSE DTables so set_basic
@@ -5169,6 +5303,10 @@ pub fn ZSTD_decompressBegin(dctx: &mut ZSTD_DCtx) -> usize {
     dctx.fseEntropy = 0;
     dctx.dictID = 0;
     dctx.isFrameDecompression = 1;
+    dctx.previousDstEnd = None;
+    dctx.prefixStart = None;
+    dctx.virtualStart = None;
+    dctx.dictEnd = None;
     // `repStartValue = {1, 4, 8}`.
     dctx.ddict_rep = [1, 4, 8];
     // Seed default FSE DTables so that `set_basic` blocks (the
@@ -5177,6 +5315,17 @@ pub fn ZSTD_decompressBegin(dctx: &mut ZSTD_DCtx) -> usize {
     // have done this, but session resets (`reset_session_only`)
     // also need to re-seed without re-creating the whole DCtx.
     crate::decompress::zstd_decompress_block::ZSTD_buildDefaultSeqTables(dctx);
+    dctx.expected = ZSTD_startingInputLength(dctx.format);
+    dctx.stage = ZSTD_dStage::ZSTDds_getFrameHeaderSize;
+    dctx.processedCSize = 0;
+    dctx.decodedSize = 0;
+    dctx.headerSize = 0;
+    dctx.rleSize = 0;
+    dctx.bType = crate::decompress::zstd_decompress_block::blockType_e::bt_raw;
+    dctx.validateChecksum = 0;
+    dctx.fParams = ZSTD_FrameHeader::default();
+    dctx.headerBuffer.fill(0);
+    XXH64_reset(&mut dctx.xxhState, 0);
     0
 }
 
@@ -5222,17 +5371,200 @@ pub fn ZSTD_decompressBegin_usingDDict(
 }
 
 /// Port of `ZSTD_decompressContinue`. Legacy block-level decode —
-/// expected input shape follows `ZSTD_nextInputType` transitions.
-/// v0.1 doesn't drive that state machine; returns
-/// `ErrorCode::Generic` so callers fall back to
-/// `ZSTD_decompressStream`.
+/// callers must feed exactly the chunk kind and size reported by
+/// `ZSTD_nextInputType()` / `ZSTD_nextSrcSizeToDecompress()`.
 pub fn ZSTD_decompressContinue(
-    _dctx: &mut ZSTD_DCtx,
-    _dst: &mut [u8],
-    _src: &[u8],
+    dctx: &mut ZSTD_DCtx,
+    dst: &mut [u8],
+    src: &[u8],
 ) -> usize {
     use crate::common::error::{ERROR, ErrorCode};
-    ERROR(ErrorCode::Generic)
+    use crate::common::mem::MEM_readLE32;
+    use crate::common::xxhash::{XXH64_digest, XXH64_update};
+    use crate::decompress::zstd_decompress_block::{
+        blockProperties_t, blockType_e, streaming_operation, ZSTD_blockHeaderSize,
+        ZSTD_decoder_entropy_rep, ZSTD_decompressBlock_internal, ZSTD_getcBlockSize,
+    };
+
+    if src.len() != ZSTD_nextSrcSizeToDecompress(dctx) {
+        return ERROR(ErrorCode::SrcSizeWrong);
+    }
+
+    dctx.processedCSize = dctx.processedCSize.wrapping_add(src.len() as u64);
+
+    match dctx.stage {
+        ZSTD_dStage::ZSTDds_getFrameHeaderSize => {
+            if dctx.format == ZSTD_format_e::ZSTD_f_zstd1
+                && src.len() >= ZSTD_FRAMEIDSIZE
+                && (MEM_readLE32(src) & ZSTD_MAGIC_SKIPPABLE_MASK) == ZSTD_MAGIC_SKIPPABLE_START
+            {
+                dctx.headerBuffer[..src.len()].copy_from_slice(src);
+                dctx.expected = ZSTD_SKIPPABLEHEADERSIZE - src.len();
+                dctx.stage = ZSTD_dStage::ZSTDds_decodeSkippableHeader;
+                return 0;
+            }
+            let headerSize = ZSTD_frameHeaderSize_internal(src, dctx.format);
+            if crate::common::error::ERR_isError(headerSize) {
+                return headerSize;
+            }
+            dctx.headerSize = headerSize;
+            dctx.headerBuffer[..src.len()].copy_from_slice(src);
+            dctx.expected = headerSize - src.len();
+            dctx.stage = ZSTD_dStage::ZSTDds_decodeFrameHeader;
+            0
+        }
+        ZSTD_dStage::ZSTDds_decodeFrameHeader => {
+            let offset = dctx.headerSize - src.len();
+            dctx.headerBuffer[offset..offset + src.len()].copy_from_slice(src);
+            let rc = ZSTD_getFrameHeader_advanced(
+                &mut dctx.fParams,
+                &dctx.headerBuffer[..dctx.headerSize],
+                dctx.format,
+            );
+            if crate::common::error::ERR_isError(rc) {
+                return rc;
+            }
+            if rc != 0 {
+                return ERROR(ErrorCode::SrcSizeWrong);
+            }
+            if dctx.fParams.frameType != ZSTD_FrameType_e::ZSTD_frame {
+                return ERROR(ErrorCode::PrefixUnknown);
+            }
+            dctx.isFrameDecompression = 1;
+            dctx.blockSizeMax = dctx.fParams.blockSizeMax as usize;
+            dctx.validateChecksum = dctx.fParams.checksumFlag;
+            if dctx.validateChecksum != 0 {
+                crate::common::xxhash::XXH64_reset(&mut dctx.xxhState, 0);
+            }
+            dctx.expected = ZSTD_blockHeaderSize;
+            dctx.stage = ZSTD_dStage::ZSTDds_decodeBlockHeader;
+            0
+        }
+        ZSTD_dStage::ZSTDds_decodeBlockHeader => {
+            let mut bp = blockProperties_t {
+                blockType: blockType_e::bt_raw,
+                lastBlock: 0,
+                origSize: 0,
+            };
+            let cBlockSize = ZSTD_getcBlockSize(src, &mut bp);
+            if crate::common::error::ERR_isError(cBlockSize) {
+                return cBlockSize;
+            }
+            if cBlockSize > dctx.fParams.blockSizeMax as usize {
+                return ERROR(ErrorCode::CorruptionDetected);
+            }
+            dctx.expected = cBlockSize;
+            dctx.bType = bp.blockType;
+            dctx.rleSize = bp.origSize as usize;
+            if cBlockSize != 0 {
+                dctx.stage = if bp.lastBlock != 0 {
+                    ZSTD_dStage::ZSTDds_decompressLastBlock
+                } else {
+                    ZSTD_dStage::ZSTDds_decompressBlock
+                };
+                return 0;
+            }
+            if bp.lastBlock != 0 {
+                if dctx.fParams.checksumFlag != 0 {
+                    dctx.expected = 4;
+                    dctx.stage = ZSTD_dStage::ZSTDds_checkChecksum;
+                } else {
+                    dctx.expected = ZSTD_startingInputLength(dctx.format);
+                    dctx.stage = ZSTD_dStage::ZSTDds_getFrameHeaderSize;
+                }
+            } else {
+                dctx.expected = ZSTD_blockHeaderSize;
+            }
+            0
+        }
+        ZSTD_dStage::ZSTDds_decompressLastBlock | ZSTD_dStage::ZSTDds_decompressBlock => {
+            let mut entropy_rep = ZSTD_decoder_entropy_rep { rep: dctx.ddict_rep };
+            let rSize = match dctx.bType {
+                blockType_e::bt_compressed => {
+                    let r = ZSTD_decompressBlock_internal(
+                        dctx,
+                        &mut entropy_rep,
+                        dst,
+                        0,
+                        src,
+                        streaming_operation::is_streaming,
+                    );
+                    dctx.expected = 0;
+                    r
+                }
+                blockType_e::bt_raw => {
+                    let r = ZSTD_copyRawBlock(dst, src);
+                    if crate::common::error::ERR_isError(r) {
+                        return r;
+                    }
+                    dctx.expected -= r;
+                    r
+                }
+                blockType_e::bt_rle => {
+                    let r = ZSTD_setRleBlock(dst, src[0], dctx.rleSize);
+                    dctx.expected = 0;
+                    r
+                }
+                blockType_e::bt_reserved => return ERROR(ErrorCode::CorruptionDetected),
+            };
+            if crate::common::error::ERR_isError(rSize) {
+                return rSize;
+            }
+            if rSize > dctx.fParams.blockSizeMax as usize {
+                return ERROR(ErrorCode::CorruptionDetected);
+            }
+            dctx.ddict_rep = entropy_rep.rep;
+            dctx.decodedSize = dctx.decodedSize.wrapping_add(rSize as u64);
+            if dctx.validateChecksum != 0 && rSize > 0 {
+                XXH64_update(&mut dctx.xxhState, &dst[..rSize]);
+            }
+            if dctx.expected > 0 {
+                return rSize;
+            }
+            if dctx.stage == ZSTD_dStage::ZSTDds_decompressLastBlock {
+                if dctx.fParams.frameContentSize != ZSTD_CONTENTSIZE_UNKNOWN
+                    && dctx.decodedSize != dctx.fParams.frameContentSize
+                {
+                    return ERROR(ErrorCode::CorruptionDetected);
+                }
+                if dctx.fParams.checksumFlag != 0 {
+                    dctx.expected = 4;
+                    dctx.stage = ZSTD_dStage::ZSTDds_checkChecksum;
+                } else {
+                    dctx.expected = ZSTD_startingInputLength(dctx.format);
+                    dctx.stage = ZSTD_dStage::ZSTDds_getFrameHeaderSize;
+                }
+            } else {
+                dctx.expected = ZSTD_blockHeaderSize;
+                dctx.stage = ZSTD_dStage::ZSTDds_decodeBlockHeader;
+            }
+            rSize
+        }
+        ZSTD_dStage::ZSTDds_checkChecksum => {
+            if dctx.validateChecksum != 0 {
+                let h32 = XXH64_digest(&dctx.xxhState) as u32;
+                let check32 = MEM_readLE32(src);
+                if check32 != h32 {
+                    return ERROR(ErrorCode::ChecksumWrong);
+                }
+            }
+            dctx.expected = ZSTD_startingInputLength(dctx.format);
+            dctx.stage = ZSTD_dStage::ZSTDds_getFrameHeaderSize;
+            0
+        }
+        ZSTD_dStage::ZSTDds_decodeSkippableHeader => {
+            let offset = ZSTD_SKIPPABLEHEADERSIZE - src.len();
+            dctx.headerBuffer[offset..offset + src.len()].copy_from_slice(src);
+            dctx.expected = MEM_readLE32(&dctx.headerBuffer[ZSTD_FRAMEIDSIZE..]) as usize;
+            dctx.stage = ZSTD_dStage::ZSTDds_skipFrame;
+            0
+        }
+        ZSTD_dStage::ZSTDds_skipFrame => {
+            dctx.expected = ZSTD_startingInputLength(dctx.format);
+            dctx.stage = ZSTD_dStage::ZSTDds_getFrameHeaderSize;
+            0
+        }
+    }
 }
 
 /// Port of `ZSTD_copyDCtx`. Deep-copies `src` into `dst`. Upstream
@@ -5275,13 +5607,11 @@ pub fn ZSTD_initDStream_usingDDict(
     ZSTD_startingInputLength(zds.format)
 }
 
-/// Port of `ZSTD_nextSrcSizeToDecompress`. Returns a hint for how
-/// many more input bytes the decompressor needs to make progress. In
-/// v0.1 we don't track granular expected-size state, so we simply
-/// return `ZSTD_DStreamInSize` (upstream's advisory block-worst-case).
+/// Port of `ZSTD_nextSrcSizeToDecompress`. Returns the exact byte
+/// count the legacy block-level decoder expects next.
 #[inline]
-pub fn ZSTD_nextSrcSizeToDecompress(_dctx: &ZSTD_DCtx) -> usize {
-    ZSTD_DStreamInSize()
+pub fn ZSTD_nextSrcSizeToDecompress(dctx: &ZSTD_DCtx) -> usize {
+    dctx.expected
 }
 
 /// Port of `ZSTD_resetDStream`. Clears per-frame state (input/output

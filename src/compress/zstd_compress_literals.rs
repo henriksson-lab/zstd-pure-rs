@@ -52,6 +52,14 @@ pub enum HUF_repeat {
     HUF_repeat_valid,
 }
 
+/// Port of `showHexa`. Debug-only upstream helper which returns the
+/// walked size after dumping bytes. The Rust port keeps only the
+/// return-value contract.
+#[inline]
+pub fn showHexa(src: &[u8]) -> usize {
+    src.len()
+}
+
 /// Port of `ZSTD_noCompressLiterals`. Emits a `set_basic` literals
 /// block — raw bytes prefixed by a 1-/2-/3-byte header. The returned
 /// value is the total bytes written.

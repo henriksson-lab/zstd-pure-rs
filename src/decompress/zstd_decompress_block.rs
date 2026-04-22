@@ -77,15 +77,23 @@ pub enum ZSTD_longOffset_e {
 }
 
 /// Port of `ZSTD_checkContinuity` (`zstd_decompress_block.c:2280`).
-/// When decoding multiple blocks into distinct dst regions, upstream
-/// rotates its `previousDstEnd` / `prefixStart` / `virtualStart` /
-/// `dictEnd` pointers so that cross-block back-references still
-/// resolve. Our port doesn't yet track those pointer fields — the
-/// single-buffer decoder path handles cross-block references by
-/// passing an `op_start` offset into the same dst slice. This is a
-/// no-op stub preserving the upstream call-site signature.
+/// Rotates the DCtx's history-segment pointer-equivalents when the
+/// caller switches to a non-contiguous destination buffer.
 #[inline]
-pub fn ZSTD_checkContinuity(_dctx: &mut ZSTD_DCtx, _dst: &[u8], _dstSize: usize) {}
+pub fn ZSTD_checkContinuity(dctx: &mut ZSTD_DCtx, dst: &[u8], dstSize: usize) {
+    if dstSize == 0 {
+        return;
+    }
+    let dst_start = dst.as_ptr() as usize;
+    if Some(dst_start) != dctx.previousDstEnd {
+        dctx.dictEnd = dctx.previousDstEnd;
+        let previous_end = dctx.previousDstEnd.unwrap_or(dst_start);
+        let prefix_start = dctx.prefixStart.unwrap_or(previous_end);
+        dctx.virtualStart = Some(dst_start.wrapping_sub(previous_end.wrapping_sub(prefix_start)));
+        dctx.prefixStart = Some(dst_start);
+        dctx.previousDstEnd = Some(dst_start);
+    }
+}
 
 /// Port of `ZSTD_DCtx_get_bmi2` (`zstd_decompress_internal.h:213`).
 /// Reads back the DCtx's `bmi2` detection flag. Upstream guards this
@@ -551,6 +559,16 @@ pub struct ZSTD_DCtx {
     /// Upstream `dctx->ddict_rep[ZSTD_REP_NUM]`. Rep values parsed
     /// from a zstd-format dict's trailing 12-byte rep section.
     pub ddict_rep: [u32; 3],
+    /// End pointer-equivalent of the prior decode/insert destination.
+    pub previousDstEnd: Option<usize>,
+    /// Start pointer-equivalent of the current history segment.
+    pub prefixStart: Option<usize>,
+    /// Virtual start pointer-equivalent spanning the current segment
+    /// plus the immediately-previous contiguous one.
+    pub virtualStart: Option<usize>,
+    /// End pointer-equivalent of the previous segment once continuity
+    /// is broken and it becomes an external dictionary.
+    pub dictEnd: Option<usize>,
 
     /// isFrameDecompression toggles `ZSTD_blockSizeMax` behaviour;
     /// for standalone block decode (our current scope) it's 0.
@@ -593,6 +611,29 @@ pub struct ZSTD_DCtx {
     /// magic) or zstd1_magicless (for embedded / streaming contexts
     /// where the 4-byte magic is known redundantly).
     pub format: crate::decompress::zstd_decompress::ZSTD_format_e,
+    /// Legacy `decompressContinue()` expected compressed-byte count
+    /// for the next state-machine transition.
+    pub expected: usize,
+    /// Legacy block/frame decode stage.
+    pub stage: crate::decompress::zstd_decompress::ZSTD_dStage,
+    /// Running compressed bytes consumed by the legacy continue API.
+    pub processedCSize: u64,
+    /// Running decompressed bytes produced for the current frame.
+    pub decodedSize: u64,
+    /// Frame header decoded for the current frame.
+    pub fParams: crate::decompress::zstd_decompress::ZSTD_FrameHeader,
+    /// Block type latched from the most recent block header.
+    pub bType: blockType_e,
+    /// Whether to validate the checksum trailer for the current frame.
+    pub validateChecksum: u32,
+    /// XXH64 state for checksum validation in the legacy continue API.
+    pub xxhState: crate::common::xxhash::XXH64_state_t,
+    /// Full frame/skippable header bytes staged across split calls.
+    pub headerBuffer: [u8; crate::compress::zstd_compress::ZSTD_FRAMEHEADERSIZE_MAX],
+    /// Full header size expected for `headerBuffer`.
+    pub headerSize: usize,
+    /// Current RLE block's regenerated size.
+    pub rleSize: usize,
 
     /// Upstream `dctx->dictUses` (`zstd_decompress_internal.h:97`).
     /// Tracks the dict lifecycle: `ZSTD_dont_use` = no dict attached;
@@ -669,6 +710,10 @@ impl Default for ZSTD_DCtx {
             litEntropy: 0,
             dictID: 0,
             ddict_rep: [0; 3],
+            previousDstEnd: None,
+            prefixStart: None,
+            virtualStart: None,
+            dictEnd: None,
             isFrameDecompression: 0,
             blockSizeMax: ZSTD_BLOCKSIZE_MAX,
             disableHufAsm: 0,
@@ -687,6 +732,19 @@ impl Default for ZSTD_DCtx {
             stream_dict: Vec::new(),
             d_windowLogMax: crate::decompress::zstd_decompress::ZSTD_WINDOWLOG_LIMIT_DEFAULT,
             format: crate::decompress::zstd_decompress::ZSTD_format_e::ZSTD_f_zstd1,
+            expected: crate::decompress::zstd_decompress::ZSTD_startingInputLength(
+                crate::decompress::zstd_decompress::ZSTD_format_e::ZSTD_f_zstd1,
+            ),
+            stage: crate::decompress::zstd_decompress::ZSTD_dStage::ZSTDds_getFrameHeaderSize,
+            processedCSize: 0,
+            decodedSize: 0,
+            fParams: crate::decompress::zstd_decompress::ZSTD_FrameHeader::default(),
+            bType: blockType_e::bt_raw,
+            validateChecksum: 0,
+            xxhState: crate::common::xxhash::XXH64_state_t::default(),
+            headerBuffer: [0u8; crate::compress::zstd_compress::ZSTD_FRAMEHEADERSIZE_MAX],
+            headerSize: 0,
+            rleSize: 0,
             dictUses: crate::decompress::zstd_decompress::ZSTD_dictUses_e::ZSTD_dont_use,
         }
     }
@@ -1708,6 +1766,24 @@ pub fn ZSTD_decodeSeqHeaders(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checkContinuity_rotates_history_when_destination_changes() {
+        let mut dctx = ZSTD_DCtx::default();
+        let a = vec![0u8; 8];
+        let b = vec![0u8; 4];
+
+        ZSTD_checkContinuity(&mut dctx, &a, a.len());
+        assert_eq!(dctx.prefixStart, Some(a.as_ptr() as usize));
+        assert_eq!(dctx.previousDstEnd, Some(a.as_ptr() as usize));
+        assert_eq!(dctx.dictEnd, None);
+
+        ZSTD_checkContinuity(&mut dctx, &b, b.len());
+        assert_eq!(dctx.dictEnd, Some(a.as_ptr() as usize));
+        assert_eq!(dctx.prefixStart, Some(b.as_ptr() as usize));
+        assert_eq!(dctx.previousDstEnd, Some(b.as_ptr() as usize));
+        assert!(dctx.virtualStart.is_some());
+    }
 
     #[test]
     fn blockType_e_discriminants_match_upstream_spec() {

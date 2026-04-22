@@ -23,6 +23,12 @@ pub enum HIST_checkInput_e {
     CheckMaxSymbolValue,
 }
 
+/// Port of `min_size` (`hist.c:75`).
+#[inline]
+pub fn min_size(a: usize, b: usize) -> usize {
+    if a < b { a } else { b }
+}
+
 /// Port of `HIST_isError`.
 #[inline]
 pub fn HIST_isError(code: usize) -> u32 {
@@ -232,6 +238,73 @@ pub fn HIST_countFast(count: &mut [u32], maxSymbolValuePtr: &mut u32, src: &[u8]
 pub fn HIST_count(count: &mut [u32], maxSymbolValuePtr: &mut u32, src: &[u8]) -> usize {
     let mut tmp = [0u32; HIST_WKSP_SIZE_U32];
     HIST_count_wksp(count, maxSymbolValuePtr, src, &mut tmp)
+}
+
+/// Port of `HIST_count_6_sve2`.
+pub fn HIST_count_6_sve2(
+    src: &[u8],
+    count: &mut [u32],
+    maxSymbolValuePtr: &mut u32,
+    workSpace: &mut [u32],
+) -> usize {
+    if src.is_empty() {
+        for c in count.iter_mut().take((*maxSymbolValuePtr as usize) + 1) {
+            *c = 0;
+        }
+        *maxSymbolValuePtr = 0;
+        return 0;
+    }
+    if workSpace.len() < HIST_WKSP_SIZE_U32 {
+        return ERROR(ErrorCode::WorkSpaceTooSmall);
+    }
+
+    let largest = HIST_count_parallel_wksp(
+        count,
+        maxSymbolValuePtr,
+        src,
+        HIST_checkInput_e::CheckMaxSymbolValue,
+        workSpace,
+    );
+    if HIST_isError(largest) != 0 {
+        return largest;
+    }
+    largest
+}
+
+/// Port of `HIST_count_sve2`.
+pub fn HIST_count_sve2(
+    count: &mut [u32],
+    maxSymbolValuePtr: &mut u32,
+    source: &[u8],
+    workSpace: &mut [u32],
+) -> usize {
+    debug_assert!(*maxSymbolValuePtr <= 255);
+    if source.is_empty() {
+        let maxCount = (*maxSymbolValuePtr as usize) + 1;
+        for c in count.iter_mut().take(maxCount) {
+            *c = 0;
+        }
+        *maxSymbolValuePtr = 0;
+        return 0;
+    }
+    if source.len() < HIST_FAST_THRESHOLD {
+        return HIST_count_simple(count, maxSymbolValuePtr, source) as usize;
+    }
+    if workSpace.len() < HIST_WKSP_SIZE_U32 {
+        return ERROR(ErrorCode::WorkSpaceTooSmall);
+    }
+
+    let check = if *maxSymbolValuePtr < 255 {
+        HIST_checkInput_e::CheckMaxSymbolValue
+    } else {
+        *maxSymbolValuePtr = 255;
+        HIST_checkInput_e::TrustInput
+    };
+    let largest = HIST_count_parallel_wksp(count, maxSymbolValuePtr, source, check, workSpace);
+    if HIST_isError(largest) != 0 {
+        return largest;
+    }
+    largest
 }
 
 #[cfg(test)]

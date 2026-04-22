@@ -75,6 +75,23 @@ pub const fn HUF_DTABLE_SIZE(maxTableLog: u32) -> usize {
 /// `BIT_addBitsFast` without a separate lookup).
 pub type HUF_CElt = u64;
 
+/// Port of `showU32`. Debug helper in upstream; retained here so the
+/// function surface matches even though Rust tests don't log through it.
+#[inline]
+pub fn showU32(arr: &[u32]) -> usize {
+    arr.len()
+}
+
+/// Port of `showCTableBits`. Debug helper that walks the same `nbBits`
+/// projection upstream logs; retained so the helper surface matches.
+#[inline]
+pub fn showCTableBits(ctable: &[HUF_CElt]) -> usize {
+    for &elt in ctable {
+        let _ = HUF_getNbBits(elt);
+    }
+    ctable.len()
+}
+
 /// `HUF_COMPRESSBOUND` — mirror of the header macro.
 /// Compact worst-case: 129 bytes header + srcSize + 1 + 1 + 2 = srcSize + 129.
 #[inline]
@@ -337,6 +354,41 @@ pub struct nodeElt {
     pub nbBits: u8,
 }
 
+/// Port of `showHNodeSymbols`.
+#[inline]
+pub fn showHNodeSymbols(hnode: &[nodeElt]) -> usize {
+    hnode.len()
+}
+
+/// Port of `showHNodeBits`.
+#[inline]
+pub fn showHNodeBits(hnode: &[nodeElt]) -> usize {
+    hnode.len()
+}
+
+/// Upstream `HUF_WORKSPACE_MAX_ALIGNMENT`.
+pub const HUF_WORKSPACE_MAX_ALIGNMENT: usize = 8;
+
+/// Port of `HUF_alignUpWorkspace`.
+pub fn HUF_alignUpWorkspace(
+    workspace: usize,
+    workspaceSize: &mut usize,
+    align: usize,
+) -> Option<usize> {
+    let mask = align - 1;
+    let rem = workspace & mask;
+    let add = (align - rem) & mask;
+    debug_assert!(align.is_power_of_two());
+    debug_assert!(align <= HUF_WORKSPACE_MAX_ALIGNMENT);
+    if *workspaceSize >= add {
+        *workspaceSize -= add;
+        Some(workspace + add)
+    } else {
+        *workspaceSize = 0;
+        None
+    }
+}
+
 // ---- HUF_sort (radix + per-bucket insertion) ---------------------------
 
 /// Mirror of upstream `rankPos`.
@@ -364,8 +416,16 @@ pub fn HUF_getIndex(count: u32) -> u32 {
     }
 }
 
-/// Helper: insertion sort a slice of `nodeElt` by descending `count`.
-fn HUF_insertionSort(slice: &mut [nodeElt]) {
+/// Port of `HUF_swapNodes`.
+#[inline]
+pub fn HUF_swapNodes(a: &mut nodeElt, b: &mut nodeElt) {
+    core::mem::swap(a, b);
+}
+
+/// Port of `HUF_insertionSort`.
+fn HUF_insertionSort(huffNode: &mut [nodeElt], low: i32, high: i32) {
+    let size = (high - low + 1) as usize;
+    let slice = &mut huffNode[low as usize..low as usize + size];
     for i in 1..slice.len() {
         let key = slice[i];
         let mut j = i;
@@ -374,6 +434,41 @@ fn HUF_insertionSort(slice: &mut [nodeElt]) {
             j -= 1;
         }
         slice[j] = key;
+    }
+}
+
+/// Port of `HUF_quickSortPartition`.
+fn HUF_quickSortPartition(arr: &mut [nodeElt], low: i32, high: i32) -> i32 {
+    let pivot = arr[high as usize].count;
+    let mut i = low - 1;
+    let mut j = low;
+    while j < high {
+        if arr[j as usize].count > pivot {
+            i += 1;
+            arr.swap(i as usize, j as usize);
+        }
+        j += 1;
+    }
+    arr.swap((i + 1) as usize, high as usize);
+    i + 1
+}
+
+/// Port of `HUF_simpleQuickSort`.
+fn HUF_simpleQuickSort(arr: &mut [nodeElt], mut low: i32, mut high: i32) {
+    const K_INSERTION_SORT_THRESHOLD: i32 = 8;
+    if high - low < K_INSERTION_SORT_THRESHOLD {
+        HUF_insertionSort(arr, low, high);
+        return;
+    }
+    while low < high {
+        let idx = HUF_quickSortPartition(arr, low, high);
+        if idx - low < high - idx {
+            HUF_simpleQuickSort(arr, low, idx - 1);
+            low = idx + 1;
+        } else {
+            HUF_simpleQuickSort(arr, idx + 1, high);
+            high = idx - 1;
+        }
     }
 }
 
@@ -426,7 +521,7 @@ pub fn HUF_sort(
         let start = rankPosition[n].base as usize;
         let end = rankPosition[n].curr as usize;
         if end > start + 1 {
-            HUF_insertionSort(&mut huffNode[start..end]);
+            HUF_simpleQuickSort(&mut huffNode[start..end], 0, (end - start - 1) as i32);
         }
     }
 }
@@ -1134,6 +1229,18 @@ pub fn HUF_compress1X_usingCTable_body_loop(
     }
 }
 
+/// Exact-name wrapper for upstream's
+/// `HUF_compress1X_usingCTable_internal_body_loop`.
+#[inline]
+pub fn HUF_compress1X_usingCTable_internal_body_loop(
+    bitC: &mut HUF_CStream_t,
+    ip: &[u8],
+    srcSize: usize,
+    ctable: &[HUF_CElt],
+) {
+    HUF_compress1X_usingCTable_body_loop(bitC, ip, srcSize, ctable)
+}
+
 /// Port of `HUF_compress1X_usingCTable_internal_body`.
 pub fn HUF_compress1X_usingCTable_internal_body(
     dst: &mut [u8],
@@ -1155,13 +1262,46 @@ pub fn HUF_compress1X_usingCTable_internal_body(
 /// Port of `HUF_compress1X_usingCTable`. `_flags` accepts the upstream
 /// flags bitmask (`HUF_flags_*`); BMI2 / asm variants are not yet
 /// wired so we always take the scalar path.
-pub fn HUF_compress1X_usingCTable(
+pub fn HUF_compress1X_usingCTable_internal_default(
     dst: &mut [u8],
     src: &[u8],
     ctable: &[HUF_CElt],
     _flags: i32,
 ) -> usize {
     HUF_compress1X_usingCTable_internal_body(dst, src, ctable)
+}
+
+/// Exact-name wrapper for upstream's
+/// `HUF_compress1X_usingCTable_internal_bmi2`. The current Rust port
+/// uses the same scalar encoder regardless of the BMI2 flag.
+#[inline]
+pub fn HUF_compress1X_usingCTable_internal_bmi2(
+    dst: &mut [u8],
+    src: &[u8],
+    ctable: &[HUF_CElt],
+) -> usize {
+    HUF_compress1X_usingCTable_internal_body(dst, src, ctable)
+}
+
+/// Port of `HUF_compress1X_usingCTable_internal`.
+pub fn HUF_compress1X_usingCTable(
+    dst: &mut [u8],
+    src: &[u8],
+    ctable: &[HUF_CElt],
+    flags: i32,
+) -> usize {
+    HUF_compress1X_usingCTable_internal(dst, src, ctable, flags)
+}
+
+/// Port of `HUF_compress1X_usingCTable_internal`.
+pub fn HUF_compress1X_usingCTable_internal(
+    dst: &mut [u8],
+    src: &[u8],
+    ctable: &[HUF_CElt],
+    flags: i32,
+) -> usize {
+    let _ = flags;
+    HUF_compress1X_usingCTable_internal_default(dst, src, ctable, flags)
 }
 
 /// Port of `HUF_compress4X_usingCTable`. Splits `src` into four
@@ -1173,15 +1313,16 @@ pub fn HUF_compress1X_usingCTable(
 /// The segment-sizes are computed as `(srcSize + 3) / 4` for the
 /// first three; the last segment is whatever's left. Minimum dst size
 /// = jump table + 1 byte per segment + 8-byte wildcopy slack.
-pub fn HUF_compress4X_usingCTable(
+pub fn HUF_compress4X_usingCTable_internal(
     dst: &mut [u8],
     src: &[u8],
     ctable: &[HUF_CElt],
-    _flags: i32,
+    flags: i32,
 ) -> usize {
     use crate::common::mem::MEM_writeLE16;
     let srcSize = src.len();
     let dstSize = dst.len();
+    let _ = flags;
     if dstSize < 6 + 1 + 1 + 1 + 8 {
         return 0;
     }
@@ -1231,6 +1372,16 @@ pub fn HUF_compress4X_usingCTable(
     }
     op += c4;
     op
+}
+
+/// Port of `HUF_compress4X_usingCTable`.
+pub fn HUF_compress4X_usingCTable(
+    dst: &mut [u8],
+    src: &[u8],
+    ctable: &[HUF_CElt],
+    flags: i32,
+) -> usize {
+    HUF_compress4X_usingCTable_internal(dst, src, ctable, flags)
 }
 
 /// Port of `HUF_nbStreams_e`.

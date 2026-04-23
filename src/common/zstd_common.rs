@@ -5,7 +5,7 @@
 //! values exactly so `ZSTD_versionNumber()` returns the same integer and
 //! `ZSTD_versionString()` the same characters.
 
-use crate::common::error::{ErrorCode, ERR_getErrorCode, ERR_getErrorName, ERR_isError};
+use crate::common::error::{ERR_getErrorCode, ERR_getErrorName, ERR_isError, ErrorCode};
 
 pub const ZSTD_VERSION_MAJOR: u32 = 1;
 pub const ZSTD_VERSION_MINOR: u32 = 6;

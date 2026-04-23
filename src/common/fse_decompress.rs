@@ -13,11 +13,11 @@
 //! inside each `u32` so that code-complexity-comparator sees the same
 //! two-step build → decode structure.
 
+use crate::common::bits::ZSTD_highbit32;
 use crate::common::bitstream::{
     BIT_DStream_overflow, BIT_DStream_t, BIT_DStream_unfinished, BIT_endOfDStream, BIT_initDStream,
     BIT_readBits, BIT_readBitsFast, BIT_reloadDStream,
 };
-use crate::common::bits::ZSTD_highbit32;
 use crate::common::error::{ErrorCode, ERROR};
 
 // Upstream defaults (matching lib/common/fse.h when built without
@@ -280,7 +280,14 @@ pub fn FSE_buildDTable_wksp(
     workSpace: &mut [u8],
 ) -> usize {
     let sz = workSpace.len();
-    FSE_buildDTable_internal(dt, normalizedCounter, maxSymbolValue, tableLog, workSpace, sz)
+    FSE_buildDTable_internal(
+        dt,
+        normalizedCounter,
+        maxSymbolValue,
+        tableLog,
+        workSpace,
+        sz,
+    )
 }
 
 /// Port of legacy `FSE_buildDTable_raw`. Builds a trivial FSE DTable
@@ -540,21 +547,24 @@ mod tests {
     fn build_dtable_rle_rejects_tiny_dt() {
         // RLE DTable requires at least 2 slots (header + 1 entry).
         let mut dt_empty: Vec<u32> = Vec::new();
-        assert!(crate::common::error::ERR_isError(
-            FSE_buildDTable_rle(&mut dt_empty, 0)
-        ));
+        assert!(crate::common::error::ERR_isError(FSE_buildDTable_rle(
+            &mut dt_empty,
+            0
+        )));
         let mut dt_one = vec![0u32; 1];
-        assert!(crate::common::error::ERR_isError(
-            FSE_buildDTable_rle(&mut dt_one, 0)
-        ));
+        assert!(crate::common::error::ERR_isError(FSE_buildDTable_rle(
+            &mut dt_one,
+            0
+        )));
     }
 
     #[test]
     fn build_dtable_raw_rejects_too_small_dt() {
         // Raw DTable at nbBits=3 needs 1 + 2^3 = 9 slots. 8 is short.
         let mut dt_short = vec![0u32; 8];
-        assert!(crate::common::error::ERR_isError(
-            FSE_buildDTable_raw(&mut dt_short, 3)
-        ));
+        assert!(crate::common::error::ERR_isError(FSE_buildDTable_raw(
+            &mut dt_short,
+            3
+        )));
     }
 }

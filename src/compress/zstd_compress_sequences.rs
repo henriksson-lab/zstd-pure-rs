@@ -8,21 +8,16 @@
 
 #![allow(non_snake_case)]
 
-use crate::common::bitstream::{
-    BIT_addBits, BIT_closeCStream, BIT_flushBits, BIT_initCStream,
-};
-use crate::common::error::{ErrorCode, ERROR, ERR_isError};
+use crate::common::bitstream::{BIT_addBits, BIT_closeCStream, BIT_flushBits, BIT_initCStream};
+use crate::common::error::{ERR_isError, ErrorCode, ERROR};
 use crate::common::mem::MEM_32bits;
 use crate::compress::fse_compress::{
-    ct_header_maxSV, FSE_bitCost, FSE_buildCTable_rle,
-    FSE_buildCTable_wksp, FSE_CState_t, FSE_CTable, FSE_encodeSymbol, FSE_flushCState,
-    FSE_initCState, FSE_initCState2, FSE_NCOUNTBOUND, FSE_normalizeCount,
-    FSE_optimalTableLog, FSE_writeNCount,
+    ct_header_maxSV, FSE_CState_t, FSE_CTable, FSE_bitCost, FSE_buildCTable_rle,
+    FSE_buildCTable_wksp, FSE_encodeSymbol, FSE_flushCState, FSE_initCState, FSE_initCState2,
+    FSE_normalizeCount, FSE_optimalTableLog, FSE_writeNCount, FSE_NCOUNTBOUND,
 };
 use crate::compress::seq_store::SeqDef;
-use crate::decompress::zstd_decompress_block::{
-    LL_bits, LLFSELog, ML_bits, MLFSELog, OffFSELog,
-};
+use crate::decompress::zstd_decompress_block::{LLFSELog, LL_bits, MLFSELog, ML_bits, OffFSELog};
 
 /// Port of `FSE_repeat`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,12 +122,7 @@ pub fn ZSTD_entropyCost(count: &[u32], max: u32, total: usize) -> usize {
 
 /// Port of `ZSTD_crossEntropyCost`. Cost of encoding `count` under a
 /// table described by `norm` with the given `accuracyLog`.
-pub fn ZSTD_crossEntropyCost(
-    norm: &[i16],
-    accuracyLog: u32,
-    count: &[u32],
-    max: u32,
-) -> usize {
+pub fn ZSTD_crossEntropyCost(norm: &[i16], accuracyLog: u32, count: &[u32], max: u32) -> usize {
     debug_assert!(accuracyLog <= 8);
     let shift = 8u32 - accuracyLog;
     let mut cost: u32 = 0;
@@ -140,7 +130,8 @@ pub fn ZSTD_crossEntropyCost(
         let norm_acc = if n != -1 { n as u32 } else { 1 };
         let norm256 = norm_acc << shift;
         debug_assert!(norm256 > 0 && norm256 < 256);
-        cost = cost.wrapping_add(count[s].wrapping_mul(kInverseProbabilityLog256[norm256 as usize]));
+        cost =
+            cost.wrapping_add(count[s].wrapping_mul(kInverseProbabilityLog256[norm256 as usize]));
     }
     (cost >> 8) as usize
 }
@@ -179,7 +170,10 @@ pub fn ZSTD_NCountCost(count: &[u32], max: u32, nbSeq: usize, FSELog: u32) -> us
 /// already been built via `FSE_buildCTable_wksp`.
 pub fn ZSTD_fseBitCost(ctable: &[FSE_CTable], count: &[u32], max: u32) -> usize {
     let kAccuracyLog = 8u32;
-    let mut cstate = FSE_CState_t { value: 0, stateLog: 0 };
+    let mut cstate = FSE_CState_t {
+        value: 0,
+        stateLog: 0,
+    };
     FSE_initCState(&mut cstate, ctable);
     if ZSTD_getFSEMaxSymbolValue(ctable) < max {
         return ERROR(ErrorCode::Generic);
@@ -243,9 +237,7 @@ pub fn ZSTD_selectEncodingType(
             if *repeatMode == FSE_repeat::FSE_repeat_valid && nbSeq < staticFse_nbSeq_max {
                 return SymbolEncodingType_e::set_repeat;
             }
-            if nbSeq < dynamicFse_nbSeq_min
-                || mostFrequent < (nbSeq >> (defaultNormLog - 1))
-            {
+            if nbSeq < dynamicFse_nbSeq_min || mostFrequent < (nbSeq >> (defaultNormLog - 1)) {
                 *repeatMode = FSE_repeat::FSE_repeat_none;
                 return SymbolEncodingType_e::set_basic;
             }
@@ -336,8 +328,7 @@ pub fn ZSTD_buildCTable(
                 nbSeq_1 -= 1;
             }
             debug_assert!(nbSeq_1 > 1);
-            let mut norm = [0i16;
-                (crate::decompress::zstd_decompress_block::MaxSeq + 1) as usize];
+            let mut norm = [0i16; (crate::decompress::zstd_decompress_block::MaxSeq + 1) as usize];
             let rc = FSE_normalizeCount(
                 &mut norm,
                 tableLog,
@@ -353,13 +344,7 @@ pub fn ZSTD_buildCTable(
             if ERR_isError(NCountSize) {
                 return NCountSize;
             }
-            let rc2 = FSE_buildCTable_wksp(
-                nextCTable,
-                &norm,
-                max,
-                tableLog,
-                entropyWorkspace,
-            );
+            let rc2 = FSE_buildCTable_wksp(nextCTable, &norm, max, tableLog, entropyWorkspace);
             if ERR_isError(rc2) {
                 return rc2;
             }
@@ -372,7 +357,11 @@ pub fn ZSTD_buildCTable(
 /// Drives the long-offset split threshold in `ZSTD_encodeSequences`.
 #[inline]
 const fn STREAM_ACCUMULATOR_MIN() -> u32 {
-    if MEM_32bits() != 0 { 25 } else { 57 }
+    if MEM_32bits() != 0 {
+        25
+    } else {
+        57
+    }
 }
 
 /// Port of `ZSTD_encodeSequences_body`. Emits the FSE-coded sequence
@@ -407,15 +396,36 @@ pub fn ZSTD_encodeSequences_body(
     if rc != 0 {
         return ERROR(ErrorCode::DstSizeTooSmall);
     }
-    let mut stateMatchLength = FSE_CState_t { value: 0, stateLog: 0 };
-    let mut stateOffsetBits = FSE_CState_t { value: 0, stateLog: 0 };
-    let mut stateLitLength = FSE_CState_t { value: 0, stateLog: 0 };
+    let mut stateMatchLength = FSE_CState_t {
+        value: 0,
+        stateLog: 0,
+    };
+    let mut stateOffsetBits = FSE_CState_t {
+        value: 0,
+        stateLog: 0,
+    };
+    let mut stateLitLength = FSE_CState_t {
+        value: 0,
+        stateLog: 0,
+    };
 
     // --- first symbols (the last sequence in the array) ---
     let last = nbSeq - 1;
-    FSE_initCState2(&mut stateMatchLength, CTable_MatchLength, mlCodeTable[last] as u32);
-    FSE_initCState2(&mut stateOffsetBits,  CTable_OffsetBits,  ofCodeTable[last] as u32);
-    FSE_initCState2(&mut stateLitLength,   CTable_LitLength,   llCodeTable[last] as u32);
+    FSE_initCState2(
+        &mut stateMatchLength,
+        CTable_MatchLength,
+        mlCodeTable[last] as u32,
+    );
+    FSE_initCState2(
+        &mut stateOffsetBits,
+        CTable_OffsetBits,
+        ofCodeTable[last] as u32,
+    );
+    FSE_initCState2(
+        &mut stateLitLength,
+        CTable_LitLength,
+        llCodeTable[last] as u32,
+    );
     BIT_addBits(
         &mut blockStream,
         sequences[last].litLength as usize,
@@ -436,7 +446,11 @@ pub fn ZSTD_encodeSequences_body(
         let ofBits = ofCodeTable[last] as u32;
         let extraBits = ofBits - ofBits.min(STREAM_ACCUMULATOR_MIN() - 1);
         if extraBits != 0 {
-            BIT_addBits(&mut blockStream, sequences[last].offBase as usize, extraBits);
+            BIT_addBits(
+                &mut blockStream,
+                sequences[last].offBase as usize,
+                extraBits,
+            );
             BIT_flushBits(&mut blockStream);
         }
         BIT_addBits(
@@ -462,15 +476,29 @@ pub fn ZSTD_encodeSequences_body(
             let llBits = LL_bits[llCode as usize] as u32;
             let ofBits = ofCode as u32;
             let mlBits = ML_bits[mlCode as usize] as u32;
-            FSE_encodeSymbol(&mut blockStream, &mut stateOffsetBits, CTable_OffsetBits, ofCode as u32);
-            FSE_encodeSymbol(&mut blockStream, &mut stateMatchLength, CTable_MatchLength, mlCode as u32);
+            FSE_encodeSymbol(
+                &mut blockStream,
+                &mut stateOffsetBits,
+                CTable_OffsetBits,
+                ofCode as u32,
+            );
+            FSE_encodeSymbol(
+                &mut blockStream,
+                &mut stateMatchLength,
+                CTable_MatchLength,
+                mlCode as u32,
+            );
             if MEM_32bits() != 0 {
                 BIT_flushBits(&mut blockStream);
             }
-            FSE_encodeSymbol(&mut blockStream, &mut stateLitLength, CTable_LitLength, llCode as u32);
+            FSE_encodeSymbol(
+                &mut blockStream,
+                &mut stateLitLength,
+                CTable_LitLength,
+                llCode as u32,
+            );
             if MEM_32bits() != 0
-                || ofBits + mlBits + llBits
-                    >= 64 - 7 - (LLFSELog + MLFSELog + OffFSELog)
+                || ofBits + mlBits + llBits >= 64 - 7 - (LLFSELog + MLFSELog + OffFSELog)
             {
                 BIT_flushBits(&mut blockStream);
             }
@@ -647,8 +675,15 @@ mod tests {
         assert_eq!(ZSTD_btultra2, 9);
         // Strict ordering (fast→strong) must hold.
         let order: [u32; 9] = [
-            ZSTD_fast, ZSTD_dfast, ZSTD_greedy, ZSTD_lazy, ZSTD_lazy2,
-            ZSTD_btlazy2, ZSTD_btopt, ZSTD_btultra, ZSTD_btultra2,
+            ZSTD_fast,
+            ZSTD_dfast,
+            ZSTD_greedy,
+            ZSTD_lazy,
+            ZSTD_lazy2,
+            ZSTD_btlazy2,
+            ZSTD_btopt,
+            ZSTD_btultra,
+            ZSTD_btultra2,
         ];
         for pair in order.windows(2) {
             assert!(pair[0] < pair[1]);
@@ -832,8 +867,8 @@ mod tests {
         use crate::compress::fse_compress::{FSE_buildCTable_wksp, FSE_CTABLE_SIZE_U32};
         use crate::compress::seq_store::SeqDef;
         use crate::decompress::zstd_decompress_block::{
-            LL_defaultNorm, LL_defaultNormLog, ML_defaultNorm, ML_defaultNormLog,
-            OF_defaultNorm, OF_defaultNormLog, DefaultMaxOff, MaxLL, MaxML,
+            DefaultMaxOff, LL_defaultNorm, LL_defaultNormLog, ML_defaultNorm, ML_defaultNormLog,
+            MaxLL, MaxML, OF_defaultNorm, OF_defaultNormLog,
         };
 
         // Build FSE CTables from the default norms (zstd's baseline —
@@ -843,21 +878,45 @@ mod tests {
         let mut of_ct = vec![0u32; FSE_CTABLE_SIZE_U32(OF_defaultNormLog, DefaultMaxOff)];
         let mut wksp = vec![0u8; 4096];
         assert!(!ERR_isError(FSE_buildCTable_wksp(
-            &mut ll_ct, &LL_defaultNorm, MaxLL, LL_defaultNormLog, &mut wksp,
+            &mut ll_ct,
+            &LL_defaultNorm,
+            MaxLL,
+            LL_defaultNormLog,
+            &mut wksp,
         )));
         assert!(!ERR_isError(FSE_buildCTable_wksp(
-            &mut ml_ct, &ML_defaultNorm, MaxML, ML_defaultNormLog, &mut wksp,
+            &mut ml_ct,
+            &ML_defaultNorm,
+            MaxML,
+            ML_defaultNormLog,
+            &mut wksp,
         )));
         assert!(!ERR_isError(FSE_buildCTable_wksp(
-            &mut of_ct, &OF_defaultNorm, DefaultMaxOff, OF_defaultNormLog, &mut wksp,
+            &mut of_ct,
+            &OF_defaultNorm,
+            DefaultMaxOff,
+            OF_defaultNormLog,
+            &mut wksp,
         )));
 
         // Tiny sequence stream: 3 entries with small in-table ll/ml/of
         // codes (pick indices with LL_defaultNorm != -1).
         let sequences = [
-            SeqDef { offBase: 0b10, litLength: 3, mlBase: 4 },
-            SeqDef { offBase: 0b100, litLength: 0, mlBase: 2 },
-            SeqDef { offBase: 0b1000, litLength: 7, mlBase: 10 },
+            SeqDef {
+                offBase: 0b10,
+                litLength: 3,
+                mlBase: 4,
+            },
+            SeqDef {
+                offBase: 0b100,
+                litLength: 0,
+                mlBase: 2,
+            },
+            SeqDef {
+                offBase: 0b1000,
+                litLength: 7,
+                mlBase: 10,
+            },
         ];
         let llCodes = [3u8, 0, 5];
         let mlCodes = [4u8, 2, 6];
@@ -865,9 +924,12 @@ mod tests {
         let mut dst = vec![0u8; 512];
         let n = ZSTD_encodeSequences(
             &mut dst,
-            &ml_ct, &mlCodes,
-            &of_ct, &ofCodes,
-            &ll_ct, &llCodes,
+            &ml_ct,
+            &mlCodes,
+            &of_ct,
+            &ofCodes,
+            &ll_ct,
+            &llCodes,
             &sequences,
             sequences.len(),
             0,
@@ -891,9 +953,6 @@ mod tests {
         let cost = ZSTD_crossEntropyCost(&norm, 1, &count, 1);
         // Expected: shift = 7; norm256 = 1<<7 = 128. Each of 256
         // occurrences costs table[128] = 256. Total >> 8 = 256.
-        assert!(
-            (250..=260).contains(&cost),
-            "cross entropy cost was {cost}"
-        );
+        assert!((250..=260).contains(&cost), "cross entropy cost was {cost}");
     }
 }

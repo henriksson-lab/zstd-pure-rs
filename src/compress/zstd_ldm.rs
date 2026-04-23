@@ -14,15 +14,16 @@
 //! helpers (`skipSequences`, `skipRawSeqStoreBytes`,
 //! `maybeSplitSequence`).
 //!
-//! **Still skeletal**: no known bottom-up matcher gaps remain here;
-//! the remaining work is mostly cross-module / overflow-management
-//! integration polish.
+//! `ZSTD_ldm_blockCompress` is wired into both parser families:
+//! fast/lazy strategies materialize LDM sequences directly, while
+//! btopt/btultra receive them through the match-state `ldmSeqStore`
+//! bridge as upstream candidate matches.
 
 #![allow(non_snake_case)]
 
 use crate::common::xxhash::XXH64;
 use crate::compress::match_state::{
-    ZSTD_compressionParameters, ZSTD_MatchState_t, ZSTD_window_correctOverflow,
+    ZSTD_MatchState_t, ZSTD_compressionParameters, ZSTD_window_correctOverflow,
     ZSTD_window_enforceMaxDist, ZSTD_window_hasExtDict, ZSTD_window_needOverflowCorrection,
     ZSTD_window_t,
 };
@@ -157,9 +158,16 @@ pub fn ZSTD_ldm_fillHashTable(
     let minMatchLength = params.minMatchLength;
     let bucketSizeLog = params.bucketSizeLog;
     let hBits = params.hashLog - bucketSizeLog;
-    let mask: u32 = if hBits >= 32 { u32::MAX } else { (1u32 << hBits) - 1 };
+    let mask: u32 = if hBits >= 32 {
+        u32::MAX
+    } else {
+        (1u32 << hBits) - 1
+    };
 
-    let mut hashState = ldmRollingHashState_t { rolling: 0, stopMask: 0 };
+    let mut hashState = ldmRollingHashState_t {
+        rolling: 0,
+        stopMask: 0,
+    };
     ZSTD_ldm_gear_init(&mut hashState, params);
 
     let mut ip: usize = 0;
@@ -168,21 +176,14 @@ pub fn ZSTD_ldm_fillHashTable(
 
     while ip < iend {
         let mut numSplits: u32 = 0;
-        let hashed = ZSTD_ldm_gear_feed(
-            &mut hashState,
-            &data[ip..iend],
-            &mut splits,
-            &mut numSplits,
-        );
+        let hashed =
+            ZSTD_ldm_gear_feed(&mut hashState, &data[ip..iend], &mut splits, &mut numSplits);
 
         for &split in splits.iter().take(numSplits as usize) {
             let split_abs_in_data = ip + split;
             if split_abs_in_data >= minMatchLength as usize {
                 let split_pos = split_abs_in_data - minMatchLength as usize;
-                let xxhash = XXH64(
-                    &data[split_pos..split_pos + minMatchLength as usize],
-                    0,
-                );
+                let xxhash = XXH64(&data[split_pos..split_pos + minMatchLength as usize], 0);
                 let hash = (xxhash as u32) & mask;
                 let entry = ldmEntry_t {
                     offset: abs_start + split_pos as u32,
@@ -217,10 +218,7 @@ pub struct ldmParams_t {
 ///     for btultra+ strategies).
 ///   - `bucketSizeLog`: capped at `hashLog` and clamped to
 ///     `[LDM_BUCKET_SIZE_LOG, ZSTD_LDM_BUCKETSIZELOG_MAX]`.
-pub fn ZSTD_ldm_adjustParameters(
-    params: &mut ldmParams_t,
-    cParams: &ZSTD_compressionParameters,
-) {
+pub fn ZSTD_ldm_adjustParameters(params: &mut ldmParams_t, cParams: &ZSTD_compressionParameters) {
     params.windowLog = cParams.windowLog;
     if params.hashRateLog == 0 {
         if params.hashLog > 0 {
@@ -237,8 +235,8 @@ pub fn ZSTD_ldm_adjustParameters(
         if params.windowLog <= params.hashRateLog {
             params.hashLog = ZSTD_HASHLOG_MIN;
         } else {
-            params.hashLog = (params.windowLog - params.hashRateLog)
-                .clamp(ZSTD_HASHLOG_MIN, ZSTD_HASHLOG_MAX);
+            params.hashLog =
+                (params.windowLog - params.hashRateLog).clamp(ZSTD_HASHLOG_MIN, ZSTD_HASHLOG_MAX);
         }
     }
     if params.minMatchLength == 0 {
@@ -250,7 +248,9 @@ pub fn ZSTD_ldm_adjustParameters(
     }
     if params.bucketSizeLog == 0 {
         debug_assert!((1..=9).contains(&cParams.strategy));
-        params.bucketSizeLog = cParams.strategy.clamp(LDM_BUCKET_SIZE_LOG, ZSTD_LDM_BUCKETSIZELOG_MAX);
+        params.bucketSizeLog = cParams
+            .strategy
+            .clamp(LDM_BUCKET_SIZE_LOG, ZSTD_LDM_BUCKETSIZELOG_MAX);
     }
     params.bucketSizeLog = params.bucketSizeLog.min(params.hashLog);
 }
@@ -401,11 +401,7 @@ pub fn ZSTD_ldm_gear_init(state: &mut ldmRollingHashState_t, params: &ldmParams_
 /// Port of `ZSTD_ldm_gear_reset`. Feeds `minMatchLength` bytes into
 /// the rolling state WITHOUT recording any splits — used to "warm up"
 /// the hash window before entering the main feed loop.
-pub fn ZSTD_ldm_gear_reset(
-    state: &mut ldmRollingHashState_t,
-    data: &[u8],
-    minMatchLength: usize,
-) {
+pub fn ZSTD_ldm_gear_reset(state: &mut ldmRollingHashState_t, data: &[u8], minMatchLength: usize) {
     let mut hash = state.rolling;
     let mut n = 0usize;
     while n + 3 < minMatchLength {
@@ -542,7 +538,12 @@ pub fn ZSTD_ldm_countBackwardsMatch_2segments(
     pExtDictEnd_pos: usize,
 ) -> usize {
     let matchLength = ZSTD_ldm_countBackwardsMatch(
-        pIn, pIn_pos, pAnchor_pos, pMatch, pMatch_pos, pMatchBase_pos,
+        pIn,
+        pIn_pos,
+        pAnchor_pos,
+        pMatch,
+        pMatch_pos,
+        pMatchBase_pos,
     );
     // Match either entirely inside segment, or segment *is* ext-dict.
     if pMatch_pos.saturating_sub(matchLength) != pMatchBase_pos
@@ -649,13 +650,20 @@ pub fn ZSTD_ldm_generateSequences_internal(
     let minMatchLength = params.minMatchLength as usize;
     let entsPerBucket = 1u32 << params.bucketSizeLog;
     let hBits = params.hashLog - params.bucketSizeLog;
-    let hashMask: u32 = if hBits >= 32 { u32::MAX } else { (1u32 << hBits) - 1 };
+    let hashMask: u32 = if hBits >= 32 {
+        u32::MAX
+    } else {
+        (1u32 << hBits) - 1
+    };
     let extDict = ZSTD_window_hasExtDict(&ldmState.window);
     let dictLimit = ldmState.window.dictLimit as usize;
     let lowestIndex = lowestIndex as usize;
     let lowPrefixPtr = dictLimit;
     let dictStart = if extDict {
-        ldmState.window.lowLimit.saturating_sub(ldmState.window.dictBase_offset) as usize
+        ldmState
+            .window
+            .lowLimit
+            .saturating_sub(ldmState.window.dictBase_offset) as usize
     } else {
         0
     };
@@ -674,9 +682,16 @@ pub fn ZSTD_ldm_generateSequences_internal(
     let mut anchor = istart;
     let mut ip = istart;
 
-    let mut hashState = ldmRollingHashState_t { rolling: 0, stopMask: 0 };
+    let mut hashState = ldmRollingHashState_t {
+        rolling: 0,
+        stopMask: 0,
+    };
     ZSTD_ldm_gear_init(&mut hashState, params);
-    ZSTD_ldm_gear_reset(&mut hashState, &window_buf[ip..ip + minMatchLength], minMatchLength);
+    ZSTD_ldm_gear_reset(
+        &mut hashState,
+        &window_buf[ip..ip + minMatchLength],
+        minMatchLength,
+    );
     ip += minMatchLength;
 
     let mut splits = [0usize; LDM_BATCH_SIZE];
@@ -727,17 +742,22 @@ pub fn ZSTD_ldm_generateSequences_internal(
                     continue;
                 }
                 let (cur_fwd, cur_bwd) = if extDict {
-                    let curMatchBase =
-                        if cur.offset < ldmState.window.dictLimit { 0usize } else { 1usize };
-                    let pMatch = if curMatchBase == 0 {
-                        cur.offset
-                            .saturating_sub(ldmState.window.dictBase_offset) as usize
+                    let curMatchBase = if cur.offset < ldmState.window.dictLimit {
+                        0usize
                     } else {
-                        cur.offset
-                            .saturating_sub(ldmState.window.base_offset) as usize
+                        1usize
+                    };
+                    let pMatch = if curMatchBase == 0 {
+                        cur.offset.saturating_sub(ldmState.window.dictBase_offset) as usize
+                    } else {
+                        cur.offset.saturating_sub(ldmState.window.base_offset) as usize
                     };
                     let matchEnd = if curMatchBase == 0 { dictEnd } else { iend_pos };
-                    let lowMatchPtr = if curMatchBase == 0 { dictStart } else { lowPrefixPtr };
+                    let lowMatchPtr = if curMatchBase == 0 {
+                        dictStart
+                    } else {
+                        lowPrefixPtr
+                    };
                     let cur_fwd = ZSTD_count_2segments(
                         window_buf,
                         split_pos,
@@ -898,11 +918,7 @@ pub fn ZSTD_ldm_skipRawSeqStoreBytes(rawSeqStore: &mut RawSeqStore_t, nbBytes: u
 /// When a partial match is consumed and the residual is shorter than
 /// `minMatch`, it's folded into the next sequence's literals and the
 /// current sequence is dropped.
-pub fn ZSTD_ldm_skipSequences(
-    rawSeqStore: &mut RawSeqStore_t,
-    mut srcSize: usize,
-    minMatch: u32,
-) {
+pub fn ZSTD_ldm_skipSequences(rawSeqStore: &mut RawSeqStore_t, mut srcSize: usize, minMatch: u32) {
     while srcSize > 0 && rawSeqStore.pos < rawSeqStore.size {
         let pos = rawSeqStore.pos;
         let seq_litLength = rawSeqStore.seq[pos].litLength as usize;
@@ -1002,7 +1018,13 @@ pub fn ZSTD_ldm_generateSequences(
             lowestIndex
         };
         let newLeftoverSize = ZSTD_ldm_generateSequences_internal(
-            ldmState, sequences, params, window_buf, chunkStart, chunkEnd, chunkLowest,
+            ldmState,
+            sequences,
+            params,
+            window_buf,
+            chunkStart,
+            chunkEnd,
+            chunkLowest,
         );
 
         if prevSize < sequences.size {
@@ -1024,7 +1046,7 @@ pub fn ZSTD_ldm_blockCompress(
     src: &[u8],
 ) -> usize {
     use crate::compress::match_state::ZSTD_matchState_dictMode;
-    use crate::compress::seq_store::{OFFSET_TO_OFFBASE, ZSTD_storeSeq, ZSTD_updateRep};
+    use crate::compress::seq_store::{ZSTD_storeSeq, ZSTD_updateRep, OFFSET_TO_OFFBASE};
     use crate::compress::zstd_compress::ZSTD_selectBlockCompressor;
 
     let cParams = ms.cParams;
@@ -1039,7 +1061,9 @@ pub fn ZSTD_ldm_blockCompress(
     let mut ip = istart;
 
     if cParams.strategy >= ZSTD_btopt {
+        ms.ldmSeqStore = Some(rawSeqStore.clone());
         let lastLLSize = blockCompressor(ms, seqStore, rep, src);
+        ms.ldmSeqStore = None;
         ZSTD_ldm_skipRawSeqStoreBytes(rawSeqStore, src.len());
         return lastLLSize;
     }
@@ -1059,7 +1083,12 @@ pub fn ZSTD_ldm_blockCompress(
         ZSTD_ldm_limitTableUpdate(ms, ip as u32);
         ZSTD_ldm_fillFastTables(ms, &src[..ip + sequence.litLength as usize]);
 
-        let newLitLength = blockCompressor(ms, seqStore, rep, &src[ip..ip + sequence.litLength as usize]);
+        let newLitLength = blockCompressor(
+            ms,
+            seqStore,
+            rep,
+            &src[ip..ip + sequence.litLength as usize],
+        );
         if crate::common::error::ERR_isError(newLitLength) {
             return newLitLength;
         }
@@ -1147,7 +1176,10 @@ mod tests {
 
     #[test]
     fn gear_hash_init_nondefault_stopmask() {
-        let mut s = ldmRollingHashState_t { rolling: 0, stopMask: 0 };
+        let mut s = ldmRollingHashState_t {
+            rolling: 0,
+            stopMask: 0,
+        };
         let params = ldmParams_t {
             enableLdm: ZSTD_ParamSwitch_e::ZSTD_ps_enable,
             minMatchLength: 64,
@@ -1170,9 +1202,14 @@ mod tests {
             hashRateLog: 4,
             ..Default::default()
         };
-        let mut s = ldmRollingHashState_t { rolling: 0, stopMask: 0 };
+        let mut s = ldmRollingHashState_t {
+            rolling: 0,
+            stopMask: 0,
+        };
         ZSTD_ldm_gear_init(&mut s, &params);
-        let data: Vec<u8> = (0..10_000u32).map(|i| ((i.wrapping_mul(31).wrapping_add(7)) & 0xFF) as u8).collect();
+        let data: Vec<u8> = (0..10_000u32)
+            .map(|i| ((i.wrapping_mul(31).wrapping_add(7)) & 0xFF) as u8)
+            .collect();
         let mut splits = [0usize; LDM_BATCH_SIZE];
         let mut numSplits = 0u32;
         let consumed = ZSTD_ldm_gear_feed(&mut s, &data, &mut splits, &mut numSplits);
@@ -1191,12 +1228,18 @@ mod tests {
             hashRateLog: 4,
             ..Default::default()
         };
-        let mut s = ldmRollingHashState_t { rolling: 0, stopMask: 0 };
+        let mut s = ldmRollingHashState_t {
+            rolling: 0,
+            stopMask: 0,
+        };
         ZSTD_ldm_gear_init(&mut s, &params);
         let initial = s.rolling;
         let warmup = [0x42u8; 64];
         ZSTD_ldm_gear_reset(&mut s, &warmup, 64);
-        assert_ne!(s.rolling, initial, "rolling should have mutated during reset");
+        assert_ne!(
+            s.rolling, initial,
+            "rolling should have mutated during reset"
+        );
     }
 
     fn ldm_params_for(strategy: u32) -> ldmParams_t {
@@ -1231,7 +1274,10 @@ mod tests {
             ZSTD_ldm_insertEntry(
                 &mut st,
                 hash,
-                ldmEntry_t { offset: 1000 + i, checksum: i },
+                ldmEntry_t {
+                    offset: 1000 + i,
+                    checksum: i,
+                },
                 lp.bucketSizeLog,
             );
         }
@@ -1254,8 +1300,14 @@ mod tests {
             .map(|i| ((i.wrapping_mul(2654435761u32)) >> 24) as u8)
             .collect();
         ZSTD_ldm_fillHashTable(&mut st, &data, 0, &lp);
-        let any_nonzero = st.hashTable.iter().any(|e| e.offset != 0 || e.checksum != 0);
-        assert!(any_nonzero, "expected fillHashTable to record at least one entry");
+        let any_nonzero = st
+            .hashTable
+            .iter()
+            .any(|e| e.offset != 0 || e.checksum != 0);
+        assert!(
+            any_nonzero,
+            "expected fillHashTable to record at least one entry"
+        );
     }
 
     #[test]
@@ -1324,25 +1376,30 @@ mod tests {
         //   pIn[4..]='a' vs pExt[5..]='a' ✓
         //   pIn[3..]='a' vs pExt[4..]='a' ✓
         //   pIn[2..]='x' vs pExt[3..]='b' ✗ → stop.
-        let n = ZSTD_ldm_countBackwardsMatch_2segments(
-            pIn, 11, 3,
-            pMatch, 11, 5,
-            pExt, 0, 6,
-        );
+        let n = ZSTD_ldm_countBackwardsMatch_2segments(pIn, 11, 3, pMatch, 11, 5, pExt, 0, 6);
         assert_eq!(n, 8);
     }
 
     #[test]
     fn reduce_table_shifts_offsets() {
         let mut t = vec![
-            ldmEntry_t { offset: 100, checksum: 1 },
-            ldmEntry_t { offset: 50,  checksum: 2 },
-            ldmEntry_t { offset: 10,  checksum: 3 },
+            ldmEntry_t {
+                offset: 100,
+                checksum: 1,
+            },
+            ldmEntry_t {
+                offset: 50,
+                checksum: 2,
+            },
+            ldmEntry_t {
+                offset: 10,
+                checksum: 3,
+            },
         ];
         ZSTD_ldm_reduceTable(&mut t, 60);
         assert_eq!(t[0].offset, 40);
-        assert_eq!(t[1].offset, 0);  // underflow clamped
-        assert_eq!(t[2].offset, 0);  // underflow clamped
+        assert_eq!(t[1].offset, 0); // underflow clamped
+        assert_eq!(t[2].offset, 0); // underflow clamped
         assert_eq!(t[0].checksum, 1); // checksums untouched
     }
 
@@ -1396,7 +1453,9 @@ mod tests {
         // Build a buffer that repeats a 200-byte block after a big
         // gap. Minimum LDM match is 64 bytes, so the repeat should be
         // discovered and emitted as a single sequence.
-        let block: Vec<u8> = (0..200u32).map(|i| ((i.wrapping_mul(2654435761)) >> 24) as u8).collect();
+        let block: Vec<u8> = (0..200u32)
+            .map(|i| ((i.wrapping_mul(2654435761)) >> 24) as u8)
+            .collect();
         let mut buf: Vec<u8> = Vec::new();
         buf.extend_from_slice(&block);
         // filler must NOT match the block — use a different PRNG seed
@@ -1411,9 +1470,8 @@ mod tests {
         let mut st = ldmState_t::new(&lp);
         let mut store = RawSeqStore_t::with_capacity(1024);
 
-        let leftover = ZSTD_ldm_generateSequences_internal(
-            &mut st, &mut store, &lp, &buf, 0, buf.len(), 0,
-        );
+        let leftover =
+            ZSTD_ldm_generateSequences_internal(&mut st, &mut store, &lp, &buf, 0, buf.len(), 0);
         assert!(leftover <= buf.len());
         assert!(store.size > 0, "expected at least one LDM sequence");
 
@@ -1448,9 +1506,8 @@ mod tests {
         let mut st = ldmState_t::new(&lp);
         let mut store = RawSeqStore_t::with_capacity(1024);
 
-        let leftover = ZSTD_ldm_generateSequences_internal(
-            &mut st, &mut store, &lp, &buf, 0, buf.len(), 0,
-        );
+        let leftover =
+            ZSTD_ldm_generateSequences_internal(&mut st, &mut store, &lp, &buf, 0, buf.len(), 0);
         // Allowed to be zero sequences; most of the buffer stays
         // as leftover literals.
         assert_eq!(
@@ -1491,8 +1548,14 @@ mod tests {
             lowest,
         );
 
-        assert!(leftover < src.len(), "expected ext-dict path to consume source bytes");
-        assert!(store.size > 0, "expected at least one ext-dict-backed LDM sequence");
+        assert!(
+            leftover < src.len(),
+            "expected ext-dict path to consume source bytes"
+        );
+        assert!(
+            store.size > 0,
+            "expected at least one ext-dict-backed LDM sequence"
+        );
         assert!(
             store.seq[..store.size]
                 .iter()
@@ -1504,7 +1567,11 @@ mod tests {
     #[test]
     fn maybeSplitSequence_returns_whole_seq_when_fits() {
         let mut s = RawSeqStore_t::with_capacity(2);
-        s.seq[0] = rawSeq { offset: 100, litLength: 5, matchLength: 10 };
+        s.seq[0] = rawSeq {
+            offset: 100,
+            litLength: 5,
+            matchLength: 10,
+        };
         s.size = 1;
         let out = maybeSplitSequence(&mut s, 20, 4);
         assert_eq!(out.offset, 100);
@@ -1516,7 +1583,11 @@ mod tests {
     #[test]
     fn maybeSplitSequence_truncates_match_when_partial() {
         let mut s = RawSeqStore_t::with_capacity(2);
-        s.seq[0] = rawSeq { offset: 100, litLength: 5, matchLength: 20 };
+        s.seq[0] = rawSeq {
+            offset: 100,
+            litLength: 5,
+            matchLength: 20,
+        };
         s.size = 1;
         // remaining = 10 → lit=5, match clipped to 5 (still ≥ minMatch).
         let out = maybeSplitSequence(&mut s, 10, 4);
@@ -1527,7 +1598,11 @@ mod tests {
     #[test]
     fn maybeSplitSequence_drops_short_match() {
         let mut s = RawSeqStore_t::with_capacity(2);
-        s.seq[0] = rawSeq { offset: 100, litLength: 5, matchLength: 20 };
+        s.seq[0] = rawSeq {
+            offset: 100,
+            litLength: 5,
+            matchLength: 20,
+        };
         s.size = 1;
         // remaining = 8 → lit=5, match clipped to 3 — below minMatch=4.
         let out = maybeSplitSequence(&mut s, 8, 4);
@@ -1537,7 +1612,11 @@ mod tests {
     #[test]
     fn maybeSplitSequence_rest_is_literals_when_lit_dominates() {
         let mut s = RawSeqStore_t::with_capacity(2);
-        s.seq[0] = rawSeq { offset: 100, litLength: 50, matchLength: 20 };
+        s.seq[0] = rawSeq {
+            offset: 100,
+            litLength: 50,
+            matchLength: 20,
+        };
         s.size = 1;
         // remaining = 40 ≤ litLength=50 → offset cleared.
         let out = maybeSplitSequence(&mut s, 40, 4);
@@ -1548,13 +1627,25 @@ mod tests {
     fn ldm_skipRawSeqStoreBytes_mirrors_optLdm_variant() {
         // Same input, two different cursor impls — results must match.
         let seqs = [
-            rawSeq { offset: 1, litLength: 3, matchLength: 7 },
-            rawSeq { offset: 2, litLength: 5, matchLength: 8 },
+            rawSeq {
+                offset: 1,
+                litLength: 3,
+                matchLength: 7,
+            },
+            rawSeq {
+                offset: 2,
+                litLength: 5,
+                matchLength: 8,
+            },
         ];
         let mut a = RawSeqStore_t::with_capacity(2);
-        a.seq[0] = seqs[0]; a.seq[1] = seqs[1]; a.size = 2;
+        a.seq[0] = seqs[0];
+        a.seq[1] = seqs[1];
+        a.size = 2;
         let mut b = RawSeqStore_t::with_capacity(2);
-        b.seq[0] = seqs[0]; b.seq[1] = seqs[1]; b.size = 2;
+        b.seq[0] = seqs[0];
+        b.seq[1] = seqs[1];
+        b.size = 2;
 
         ZSTD_ldm_skipRawSeqStoreBytes(&mut a, 12);
         crate::compress::zstd_opt::ZSTD_optLdm_skipRawSeqStoreBytes(&mut b, 12);
@@ -1565,7 +1656,11 @@ mod tests {
     #[test]
     fn skip_sequences_consumes_literals_partially() {
         let mut store = RawSeqStore_t::with_capacity(4);
-        store.seq[0] = rawSeq { offset: 100, litLength: 50, matchLength: 30 };
+        store.seq[0] = rawSeq {
+            offset: 100,
+            litLength: 50,
+            matchLength: 30,
+        };
         store.size = 1;
         ZSTD_ldm_skipSequences(&mut store, 20, 4);
         // 20 ≤ 50 → litLength shrinks, no advance.
@@ -1577,8 +1672,16 @@ mod tests {
     #[test]
     fn skip_sequences_drops_short_match_residual() {
         let mut store = RawSeqStore_t::with_capacity(4);
-        store.seq[0] = rawSeq { offset: 100, litLength: 5, matchLength: 10 };
-        store.seq[1] = rawSeq { offset: 200, litLength: 3, matchLength: 20 };
+        store.seq[0] = rawSeq {
+            offset: 100,
+            litLength: 5,
+            matchLength: 10,
+        };
+        store.seq[1] = rawSeq {
+            offset: 200,
+            litLength: 3,
+            matchLength: 20,
+        };
         store.size = 2;
         // Skip 5 (full lit) + 7 (part of match) = 12 bytes. Residual
         // matchLength = 3, below minMatch=4, so it's dropped and the
@@ -1591,8 +1694,16 @@ mod tests {
     #[test]
     fn skip_sequences_advances_past_full_sequences() {
         let mut store = RawSeqStore_t::with_capacity(4);
-        store.seq[0] = rawSeq { offset: 100, litLength: 4, matchLength: 8 };
-        store.seq[1] = rawSeq { offset: 200, litLength: 2, matchLength: 6 };
+        store.seq[0] = rawSeq {
+            offset: 100,
+            litLength: 4,
+            matchLength: 8,
+        };
+        store.seq[1] = rawSeq {
+            offset: 200,
+            litLength: 2,
+            matchLength: 6,
+        };
         store.size = 2;
         ZSTD_ldm_skipSequences(&mut store, 12, 4); // 4+8 = full seq[0]
         assert_eq!(store.pos, 1);
@@ -1619,9 +1730,7 @@ mod tests {
         let mut st = ldmState_t::new(&lp);
         let mut store = RawSeqStore_t::with_capacity(4096);
 
-        ZSTD_ldm_generateSequences(
-            &mut st, &mut store, &lp, &buf, 0, buf.len(), 0,
-        );
+        ZSTD_ldm_generateSequences(&mut st, &mut store, &lp, &buf, 0, buf.len(), 0);
         assert!(store.size > 0);
         // A repeat that starts at >1 MB distance should be caught.
         let hit = store.seq[..store.size].iter().any(|s| {
@@ -1629,7 +1738,10 @@ mod tests {
                 && (s.offset as usize) > repeat_pos - block.len() - 200
                 && (s.offset as usize) < repeat_pos + 200
         });
-        assert!(hit, "outer driver missed long-distance repeat past chunk boundary");
+        assert!(
+            hit,
+            "outer driver missed long-distance repeat past chunk boundary"
+        );
     }
 
     #[test]
@@ -1691,7 +1803,11 @@ mod tests {
 
         let mut store = RawSeqStore_t::with_capacity(4);
         let mut ms = ZSTD_MatchState_t::new(ZSTD_compressionParameters {
-            windowLog: 20, hashLog: 10, chainLog: 10, minMatch: 4, strategy: ZSTD_fast,
+            windowLog: 20,
+            hashLog: 10,
+            chainLog: 10,
+            minMatch: 4,
+            strategy: ZSTD_fast,
             ..Default::default()
         });
         let mut seq = SeqStore_t::with_capacity(16, 256);
@@ -1703,7 +1819,7 @@ mod tests {
     #[test]
     fn blockCompress_materializes_queued_ldm_sequence_into_seqstore() {
         use crate::compress::match_state::{ZSTD_MatchState_t, ZSTD_compressionParameters};
-        use crate::compress::seq_store::{OFFSET_TO_OFFBASE, SeqStore_t, ZSTD_getSequenceLength};
+        use crate::compress::seq_store::{SeqStore_t, ZSTD_getSequenceLength, OFFSET_TO_OFFBASE};
 
         let mut store = RawSeqStore_t::with_capacity(4);
         store.seq[0] = rawSeq {
@@ -1727,7 +1843,10 @@ mod tests {
 
         let trailing = ZSTD_ldm_blockCompress(&mut store, &mut ms, &mut seq, &mut rep, src);
 
-        assert!(store.pos >= store.size, "queued raw sequence should be consumed");
+        assert!(
+            store.pos >= store.size,
+            "queued raw sequence should be consumed"
+        );
         let ldm_idx = seq
             .sequences
             .iter()
@@ -1736,5 +1855,59 @@ mod tests {
         let seq_len = ZSTD_getSequenceLength(&seq, ldm_idx);
         assert_eq!(seq_len.matchLength, 8);
         assert!(trailing <= src.len());
+    }
+
+    #[test]
+    fn blockCompress_btopt_exposes_ldm_sequences_to_opt_parser_and_clears_bridge() {
+        use crate::compress::match_state::{ZSTD_MatchState_t, ZSTD_compressionParameters};
+        use crate::compress::seq_store::{SeqStore_t, OFFSET_TO_OFFBASE};
+
+        let mut store = RawSeqStore_t::with_capacity(2);
+        store.seq[0] = rawSeq {
+            offset: 4,
+            litLength: 4,
+            matchLength: 24,
+        };
+        store.seq[1] = rawSeq {
+            offset: 4,
+            litLength: 128,
+            matchLength: 24,
+        };
+        store.size = 2;
+
+        let cp = ZSTD_compressionParameters {
+            windowLog: 18,
+            chainLog: 15,
+            hashLog: 14,
+            searchLog: 4,
+            minMatch: 4,
+            targetLength: 32,
+            strategy: ZSTD_btopt,
+        };
+        let mut ms = ZSTD_MatchState_t::new(cp);
+        ms.chainTable = vec![0u32; 1 << cp.chainLog];
+        ms.hashLog3 = 12;
+        ms.hashTable3 = vec![0u32; 1 << ms.hashLog3];
+        let mut seq = SeqStore_t::with_capacity(4096, 131072);
+        let mut rep = [1u32, 4, 8];
+        let src = b"abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
+        let trailing = ZSTD_ldm_blockCompress(&mut store, &mut ms, &mut seq, &mut rep, src);
+
+        assert!(trailing < src.len(), "btopt should use the LDM candidate");
+        assert!(
+            seq.sequences
+                .iter()
+                .any(|s| s.offBase == OFFSET_TO_OFFBASE(4) && s.mlBase as usize + 4 >= 24),
+            "LDM candidate should be visible to the opt parser"
+        );
+        assert!(
+            ms.ldmSeqStore.is_none(),
+            "temporary opt-parser LDM bridge must not leak across blocks"
+        );
+        assert!(
+            store.pos > 0 || store.posInSequence > 0,
+            "raw sequence cursor should advance after the btopt block"
+        );
     }
 }

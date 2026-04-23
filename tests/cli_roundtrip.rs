@@ -146,8 +146,11 @@ fn cli_output_decompressed_by_upstream_zstd() {
         .expect("spawn our compressor");
     comp.stdin.as_mut().unwrap().write_all(&payload).unwrap();
     let comp_out = comp.wait_with_output().expect("wait compressor");
-    assert!(comp_out.status.success(), "our compress stderr: {}",
-        String::from_utf8_lossy(&comp_out.stderr));
+    assert!(
+        comp_out.status.success(),
+        "our compress stderr: {}",
+        String::from_utf8_lossy(&comp_out.stderr)
+    );
     let compressed = comp_out.stdout;
 
     // Decompress via upstream zstd.
@@ -309,8 +312,11 @@ fn cli_multiblock_frame_upstream_cross_compat() {
         .unwrap();
     comp.stdin.as_mut().unwrap().write_all(&payload).unwrap();
     let comp_out = comp.wait_with_output().unwrap();
-    assert!(comp_out.status.success(),
-        "our compress stderr: {}", String::from_utf8_lossy(&comp_out.stderr));
+    assert!(
+        comp_out.status.success(),
+        "our compress stderr: {}",
+        String::from_utf8_lossy(&comp_out.stderr)
+    );
 
     let mut dec = Command::new(&upstream)
         .args(["-d", "-c", "-q", "-"])
@@ -319,7 +325,11 @@ fn cli_multiblock_frame_upstream_cross_compat() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    dec.stdin.as_mut().unwrap().write_all(&comp_out.stdout).unwrap();
+    dec.stdin
+        .as_mut()
+        .unwrap()
+        .write_all(&comp_out.stdout)
+        .unwrap();
     let dec_out = dec.wait_with_output().unwrap();
     assert!(
         dec_out.status.success(),
@@ -367,7 +377,11 @@ fn cli_output_decompressed_by_upstream_zstd_all_levels() {
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        dec.stdin.as_mut().unwrap().write_all(&comp_out.stdout).unwrap();
+        dec.stdin
+            .as_mut()
+            .unwrap()
+            .write_all(&comp_out.stdout)
+            .unwrap();
         let dec_out = dec.wait_with_output().unwrap();
         assert!(
             dec_out.status.success(),
@@ -400,7 +414,9 @@ fn cli_output_decompressed_by_upstream_zstd_across_levels() {
         // Sparse with rare symbol bursts.
         {
             let mut v = vec![b'A'; 2000];
-            for i in (0..v.len()).step_by(37) { v[i] = b'Z'; }
+            for i in (0..v.len()).step_by(37) {
+                v[i] = b'Z';
+            }
             v
         },
     ];
@@ -415,9 +431,11 @@ fn cli_output_decompressed_by_upstream_zstd_across_levels() {
                 .unwrap();
             comp.stdin.as_mut().unwrap().write_all(payload).unwrap();
             let comp_out = comp.wait_with_output().unwrap();
-            assert!(comp_out.status.success(),
+            assert!(
+                comp_out.status.success(),
                 "[case {i}, level {level}] our compress stderr: {}",
-                String::from_utf8_lossy(&comp_out.stderr));
+                String::from_utf8_lossy(&comp_out.stderr)
+            );
 
             let mut dec = Command::new(&upstream)
                 .args(["-d", "-c", "-q", "-"])
@@ -426,13 +444,21 @@ fn cli_output_decompressed_by_upstream_zstd_across_levels() {
                 .stderr(Stdio::piped())
                 .spawn()
                 .unwrap();
-            dec.stdin.as_mut().unwrap().write_all(&comp_out.stdout).unwrap();
+            dec.stdin
+                .as_mut()
+                .unwrap()
+                .write_all(&comp_out.stdout)
+                .unwrap();
             let dec_out = dec.wait_with_output().unwrap();
-            assert!(dec_out.status.success(),
+            assert!(
+                dec_out.status.success(),
                 "[case {i}, level {level}] upstream rejected our output: stderr={}",
-                String::from_utf8_lossy(&dec_out.stderr));
-            assert_eq!(&dec_out.stdout, payload,
-                "[case {i}, level {level}] roundtrip mismatch");
+                String::from_utf8_lossy(&dec_out.stderr)
+            );
+            assert_eq!(
+                &dec_out.stdout, payload,
+                "[case {i}, level {level}] roundtrip mismatch"
+            );
         }
     }
 }
@@ -470,8 +496,11 @@ fn cli_dict_output_decompressed_by_upstream() {
         .unwrap();
     comp.stdin.as_mut().unwrap().write_all(&payload).unwrap();
     let comp_out = comp.wait_with_output().unwrap();
-    assert!(comp_out.status.success(),
-        "our dict compress stderr: {}", String::from_utf8_lossy(&comp_out.stderr));
+    assert!(
+        comp_out.status.success(),
+        "our dict compress stderr: {}",
+        String::from_utf8_lossy(&comp_out.stderr)
+    );
 
     let mut dec = Command::new(&upstream)
         .args(["-d", "-c", "-q", "-D"])
@@ -482,7 +511,11 @@ fn cli_dict_output_decompressed_by_upstream() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    dec.stdin.as_mut().unwrap().write_all(&comp_out.stdout).unwrap();
+    dec.stdin
+        .as_mut()
+        .unwrap()
+        .write_all(&comp_out.stdout)
+        .unwrap();
     let dec_out = dec.wait_with_output().unwrap();
     assert!(
         dec_out.status.success(),
@@ -529,9 +562,11 @@ fn cli_fuzz_random_payloads_all_decode_via_upstream() {
             .unwrap();
         comp.stdin.as_mut().unwrap().write_all(&payload).unwrap();
         let comp_out = comp.wait_with_output().unwrap();
-        assert!(comp_out.status.success(),
+        assert!(
+            comp_out.status.success(),
             "[iter {seed_iter} size {size} level {level}] our compress stderr: {}",
-            String::from_utf8_lossy(&comp_out.stderr));
+            String::from_utf8_lossy(&comp_out.stderr)
+        );
 
         let mut dec = Command::new(&upstream)
             .args(["-d", "-c", "-q", "-"])
@@ -540,15 +575,21 @@ fn cli_fuzz_random_payloads_all_decode_via_upstream() {
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        dec.stdin.as_mut().unwrap().write_all(&comp_out.stdout).unwrap();
+        dec.stdin
+            .as_mut()
+            .unwrap()
+            .write_all(&comp_out.stdout)
+            .unwrap();
         let dec_out = dec.wait_with_output().unwrap();
         assert!(
             dec_out.status.success(),
             "[iter {seed_iter} size {size} level {level}] upstream rejected: stderr={}",
             String::from_utf8_lossy(&dec_out.stderr)
         );
-        assert_eq!(&dec_out.stdout, &payload,
-            "[iter {seed_iter} size {size} level {level}] mismatch");
+        assert_eq!(
+            &dec_out.stdout, &payload,
+            "[iter {seed_iter} size {size} level {level}] mismatch"
+        );
     }
 }
 
@@ -562,7 +603,11 @@ fn cli_file_to_file_compress_then_decompress_roundtrip() {
     let decompressed_path = tmp.join(format!("zstd_pure_f2f_out_{pid}.txt"));
 
     let payload: Vec<u8> = b"file-to-file testing. "
-        .iter().cycle().take(1500).copied().collect();
+        .iter()
+        .cycle()
+        .take(1500)
+        .copied()
+        .collect();
     fs::write(&input_path, &payload).expect("write input");
 
     // Compress via `zstd -q -o compressed_path input_path`.
@@ -573,7 +618,11 @@ fn cli_file_to_file_compress_then_decompress_roundtrip() {
         .stderr(Stdio::piped())
         .output()
         .unwrap();
-    assert!(comp.status.success(), "compress stderr: {}", String::from_utf8_lossy(&comp.stderr));
+    assert!(
+        comp.status.success(),
+        "compress stderr: {}",
+        String::from_utf8_lossy(&comp.stderr)
+    );
     assert!(compressed_path.exists());
 
     // Decompress via `zstd -d -q -o decompressed_path compressed_path`.
@@ -584,7 +633,11 @@ fn cli_file_to_file_compress_then_decompress_roundtrip() {
         .stderr(Stdio::piped())
         .output()
         .unwrap();
-    assert!(dec.status.success(), "decompress stderr: {}", String::from_utf8_lossy(&dec.stderr));
+    assert!(
+        dec.status.success(),
+        "decompress stderr: {}",
+        String::from_utf8_lossy(&dec.stderr)
+    );
     let recovered = fs::read(&decompressed_path).expect("read decompressed");
     assert_eq!(recovered, payload);
 
@@ -595,10 +648,7 @@ fn cli_file_to_file_compress_then_decompress_roundtrip() {
 
 #[test]
 fn cli_help_advertises_compression_support() {
-    let out = Command::new(bin_path())
-        .arg("--help")
-        .output()
-        .unwrap();
+    let out = Command::new(bin_path()).arg("--help").output().unwrap();
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
@@ -612,31 +662,36 @@ fn cli_help_mentions_every_supported_flag() {
     // --help must surface every documented flag so users can
     // discover the API without reading source. Regression gate
     // against an accidental clap attribute removal.
-    let out = Command::new(bin_path())
-        .arg("--help")
-        .output()
-        .unwrap();
+    let out = Command::new(bin_path()).arg("--help").output().unwrap();
     assert!(out.status.success());
     let help = String::from_utf8_lossy(&out.stdout);
     for needle in [
-        "--decompress", "--stdout", "--force", "--quiet", "--verbose",
-        "--output-file", "--level", "--dict", "--check", "--no-check",
+        "--decompress",
+        "--stdout",
+        "--force",
+        "--quiet",
+        "--verbose",
+        "--output-file",
+        "--level",
+        "--dict",
+        "--check",
+        "--no-check",
         "--magicless",
     ] {
         assert!(help.contains(needle), "--help missed {needle}: {help}");
     }
     // Short flags too.
     for needle in ["-d", "-c", "-f", "-q", "-v", "-o", "-L", "-D"] {
-        assert!(help.contains(needle), "--help missed short flag {needle}: {help}");
+        assert!(
+            help.contains(needle),
+            "--help missed short flag {needle}: {help}"
+        );
     }
 }
 
 #[test]
 fn cli_version_flag_prints_version() {
-    let out = Command::new(bin_path())
-        .arg("--version")
-        .output()
-        .unwrap();
+    let out = Command::new(bin_path()).arg("--version").output().unwrap();
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(!stdout.is_empty());
@@ -696,7 +751,12 @@ fn cli_accepts_out_of_range_level_and_clamps_silently() {
     // to MIN. Our CLI inherits this — compression must succeed and
     // the output must roundtrip. Prevents a regression that makes
     // a typo / user-error crash the CLI instead of DWIM'ing.
-    let payload: Vec<u8> = b"clamped-level test ".iter().cycle().take(200).copied().collect();
+    let payload: Vec<u8> = b"clamped-level test "
+        .iter()
+        .cycle()
+        .take(200)
+        .copied()
+        .collect();
     // Negative levels are passed as `--level=-N` to avoid clap tokenizing
     // `-5` as a short flag.
     for level_arg in ["-L", "--level=-5"].iter() {
@@ -706,7 +766,9 @@ fn cli_accepts_out_of_range_level_and_clamps_silently() {
             (level_arg, None)
         };
         let mut args = vec!["-c", "-q", arg1];
-        if let Some(v) = arg2 { args.push(v); }
+        if let Some(v) = arg2 {
+            args.push(v);
+        }
         args.push("-");
         let mut comp = Command::new(bin_path())
             .args(&args)
@@ -742,8 +804,10 @@ fn cli_accepts_out_of_range_level_and_clamps_silently() {
 fn cli_rejects_nonexistent_dict_path_with_nonzero_exit() {
     // Safety gate: `-D` pointing at a missing file must produce a
     // clean error message + non-zero exit, not a panic.
-    let missing_dict = std::env::temp_dir()
-        .join(format!("zstd_pure_missing_dict_{}.dict", std::process::id()));
+    let missing_dict = std::env::temp_dir().join(format!(
+        "zstd_pure_missing_dict_{}.dict",
+        std::process::id()
+    ));
     // Ensure the file truly doesn't exist.
     let _ = std::fs::remove_file(&missing_dict);
 
@@ -766,8 +830,7 @@ fn cli_rejects_nonexistent_dict_path_with_nonzero_exit() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains(&missing_dict.display().to_string())
-            || stderr.contains("dict"),
+        stderr.contains(&missing_dict.display().to_string()) || stderr.contains("dict"),
         "error message didn't reference the missing dict: {stderr}",
     );
 }
@@ -834,7 +897,12 @@ fn cli_decompress_verbose_prints_decompressed_diagnostic() {
     // `-d -v` over stdin should print a "decompressed N -> M" line
     // to stderr. Symmetric with the existing compress-side
     // `cli_verbose_flag_prints_ratio_to_stderr` check.
-    let payload: Vec<u8> = b"the quick brown fox ".iter().cycle().take(400).copied().collect();
+    let payload: Vec<u8> = b"the quick brown fox "
+        .iter()
+        .cycle()
+        .take(400)
+        .copied()
+        .collect();
     // First compress via the CLI to produce a valid frame.
     let mut comp = Command::new(bin_path())
         .args(["-c", "-q", "-"])
@@ -874,7 +942,12 @@ fn cli_decompress_verbose_prints_decompressed_diagnostic() {
 
 #[test]
 fn cli_verbose_flag_prints_ratio_to_stderr() {
-    let payload: Vec<u8> = b"hello verbose world. ".iter().cycle().take(400).copied().collect();
+    let payload: Vec<u8> = b"hello verbose world. "
+        .iter()
+        .cycle()
+        .take(400)
+        .copied()
+        .collect();
     let mut comp = Command::new(bin_path())
         .args(["-c", "-v", "-"])
         .stdin(Stdio::piped())
@@ -927,7 +1000,11 @@ fn cli_checksum_compress_and_upstream_validates() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    dec.stdin.as_mut().unwrap().write_all(&comp_out.stdout).unwrap();
+    dec.stdin
+        .as_mut()
+        .unwrap()
+        .write_all(&comp_out.stdout)
+        .unwrap();
     let dec_out = dec.wait_with_output().unwrap();
     assert!(
         dec_out.status.success(),
@@ -935,6 +1012,97 @@ fn cli_checksum_compress_and_upstream_validates() {
         String::from_utf8_lossy(&dec_out.stderr)
     );
     assert_eq!(dec_out.stdout, payload);
+}
+
+#[test]
+fn cli_no_check_suppresses_checksum_flag_and_trailer() {
+    // Explicit `--no-check` should keep the frame layout identical to
+    // the default non-checksummed path and clear the checksumFlag bit
+    // in the frame header.
+    let payload: Vec<u8> = b"explicit-no-check payload "
+        .iter()
+        .cycle()
+        .take(900)
+        .copied()
+        .collect();
+
+    fn compress(args: &[&str], payload: &[u8]) -> Vec<u8> {
+        let mut child = Command::new(bin_path())
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.as_mut().unwrap().write_all(payload).unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "compress {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        out.stdout
+    }
+
+    let plain = compress(&["-c", "-q", "-"], &payload);
+    let no_check = compress(&["-c", "-q", "--no-check", "-"], &payload);
+    assert_eq!(
+        no_check, plain,
+        "--no-check should match the default non-checksummed output"
+    );
+    assert_eq!(plain[4] & 0b0000_0100, 0, "default path leaked checksumFlag");
+    assert_eq!(
+        no_check[4] & 0b0000_0100,
+        0,
+        "--no-check unexpectedly set checksumFlag"
+    );
+}
+
+#[test]
+fn cli_level1_no_check_matches_upstream_bitwise_on_representative_fixtures() {
+    // Exact compressed-byte parity gate for a representative level-1
+    // no-check matrix. These fixtures cover:
+    // - tiny text (`lorem50.txt`)
+    // - medium natural text (`lorem.txt`)
+    // - pure RLE candidate (`rep100.txt`)
+    // - medium binary-ish payload (`binary.bin`)
+    let Some(upstream) = upstream_zstd() else {
+        eprintln!("upstream zstd not on $PATH; skipping");
+        return;
+    };
+
+    for fixture in [
+        "tests/fixtures/lorem50.txt",
+        "tests/fixtures/lorem.txt",
+        "tests/fixtures/rep100.txt",
+        "tests/fixtures/binary.bin",
+    ] {
+        let ours = Command::new(bin_path())
+            .args(["-q", "--no-check", "-c", "-L", "1", fixture])
+            .output()
+            .unwrap();
+        assert!(
+            ours.status.success(),
+            "[{fixture}] our cli stderr: {}",
+            String::from_utf8_lossy(&ours.stderr)
+        );
+
+        let theirs = Command::new(&upstream)
+            .args(["-q", "--no-check", "-c", "-1", fixture])
+            .output()
+            .unwrap();
+        assert!(
+            theirs.status.success(),
+            "[{fixture}] upstream stderr: {}",
+            String::from_utf8_lossy(&theirs.stderr)
+        );
+
+        assert_eq!(
+            ours.stdout, theirs.stdout,
+            "[{fixture}] compressed bytes diverged from upstream"
+        );
+    }
 }
 
 #[test]
@@ -1124,9 +1292,8 @@ fn cli_magicless_works_across_compression_levels() {
             String::from_utf8_lossy(&comp_out.stderr),
         );
         let compressed = comp_out.stdout;
-        let leading = u32::from_le_bytes([
-            compressed[0], compressed[1], compressed[2], compressed[3],
-        ]);
+        let leading =
+            u32::from_le_bytes([compressed[0], compressed[1], compressed[2], compressed[3]]);
         assert_ne!(
             leading, ZSTD_MAGIC,
             "[level {level}] magicless leaked magic",
@@ -1180,9 +1347,13 @@ fn cli_magicless_plus_dict_plus_check_roundtrip_through_self() {
 
     let comp = Command::new(bin_path())
         .args([
-            "-q", "--magicless", "--check", "-D",
+            "-q",
+            "--magicless",
+            "--check",
+            "-D",
             dict_path.to_str().unwrap(),
-            "-o", compressed_path.to_str().unwrap(),
+            "-o",
+            compressed_path.to_str().unwrap(),
             payload_path.to_str().unwrap(),
         ])
         .output()
@@ -1193,13 +1364,19 @@ fn cli_magicless_plus_dict_plus_check_roundtrip_through_self() {
         String::from_utf8_lossy(&comp.stderr),
     );
     let compressed = fs::read(&compressed_path).expect("read compressed");
-    let leading = u32::from_le_bytes([
-        compressed[0], compressed[1], compressed[2], compressed[3],
-    ]);
+    let leading = u32::from_le_bytes([compressed[0], compressed[1], compressed[2], compressed[3]]);
     assert_ne!(leading, ZSTD_MAGIC, "triple-flag leaked magic");
 
     let mut dec = Command::new(bin_path())
-        .args(["-d", "-c", "-q", "--magicless", "-D", dict_path.to_str().unwrap(), "-"])
+        .args([
+            "-d",
+            "-c",
+            "-q",
+            "--magicless",
+            "-D",
+            dict_path.to_str().unwrap(),
+            "-",
+        ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1325,9 +1502,7 @@ fn cli_magicless_plus_check_roundtrip_through_self() {
     );
     let compressed = comp_out.stdout;
     assert!(compressed.len() >= 4);
-    let leading = u32::from_le_bytes([
-        compressed[0], compressed[1], compressed[2], compressed[3],
-    ]);
+    let leading = u32::from_le_bytes([compressed[0], compressed[1], compressed[2], compressed[3]]);
     assert_ne!(leading, ZSTD_MAGIC, "magicless+check leaked magic");
 
     let mut dec = Command::new(bin_path())
@@ -1369,9 +1544,12 @@ fn cli_magicless_plus_dict_roundtrip_through_self() {
     // Compress with --magicless + -D.
     let comp = Command::new(bin_path())
         .args([
-            "-q", "--magicless", "-D",
+            "-q",
+            "--magicless",
+            "-D",
             dict_path.to_str().unwrap(),
-            "-o", compressed_path.to_str().unwrap(),
+            "-o",
+            compressed_path.to_str().unwrap(),
             payload_path.to_str().unwrap(),
         ])
         .output()
@@ -1384,14 +1562,20 @@ fn cli_magicless_plus_dict_roundtrip_through_self() {
     let compressed = fs::read(&compressed_path).expect("read compressed");
     // No zstd1 magic prefix.
     assert!(compressed.len() >= 4);
-    let leading = u32::from_le_bytes([
-        compressed[0], compressed[1], compressed[2], compressed[3],
-    ]);
+    let leading = u32::from_le_bytes([compressed[0], compressed[1], compressed[2], compressed[3]]);
     assert_ne!(leading, ZSTD_MAGIC, "magicless+dict leaked magic");
 
     // Decompress with --magicless + -D via stdin/stdout.
     let mut dec = Command::new(bin_path())
-        .args(["-d", "-c", "-q", "--magicless", "-D", dict_path.to_str().unwrap(), "-"])
+        .args([
+            "-d",
+            "-c",
+            "-q",
+            "--magicless",
+            "-D",
+            dict_path.to_str().unwrap(),
+            "-",
+        ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1454,8 +1638,7 @@ fn cli_magicless_roundtrip_through_self() {
     // CLI in magicless mode, assert the output lacks the 4-byte zstd1
     // magic prefix, then pipe it back through our CLI with the same
     // flag and verify the original payload is recovered.
-    let payload = b"magicless-cli-roundtrip payload content repeated "
-        .repeat(10);
+    let payload = b"magicless-cli-roundtrip payload content repeated ".repeat(10);
 
     // Compress with --magicless.
     let mut comp = Command::new(bin_path())
@@ -1475,9 +1658,7 @@ fn cli_magicless_roundtrip_through_self() {
     let compressed = comp_out.stdout;
     // First 4 bytes must NOT be the zstd1 magic (0xFD2FB528 LE).
     assert!(compressed.len() >= 4, "compressed output too short");
-    let leading = u32::from_le_bytes([
-        compressed[0], compressed[1], compressed[2], compressed[3],
-    ]);
+    let leading = u32::from_le_bytes([compressed[0], compressed[1], compressed[2], compressed[3]]);
     assert_ne!(
         leading, ZSTD_MAGIC,
         "--magicless output leaked a zstd1 magic prefix",
@@ -1503,9 +1684,5 @@ fn cli_magicless_roundtrip_through_self() {
         dec_out.status,
         String::from_utf8_lossy(&dec_out.stderr),
     );
-    assert_eq!(
-        dec_out.stdout, payload,
-        "magicless CLI roundtrip mismatch",
-    );
+    assert_eq!(dec_out.stdout, payload, "magicless CLI roundtrip mismatch",);
 }
-

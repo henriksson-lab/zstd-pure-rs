@@ -159,7 +159,11 @@ impl Default for BIT_DStream_t<'_> {
 }
 
 /// Port of `BIT_initDStream`.
-pub fn BIT_initDStream<'a>(bitD: &mut BIT_DStream_t<'a>, srcBuffer: &'a [u8], srcSize: usize) -> usize {
+pub fn BIT_initDStream<'a>(
+    bitD: &mut BIT_DStream_t<'a>,
+    srcBuffer: &'a [u8],
+    srcSize: usize,
+) -> usize {
     if srcSize < 1 {
         *bitD = BIT_DStream_t::default();
         return ERROR(ErrorCode::SrcSizeWrong);
@@ -268,8 +272,7 @@ pub fn BIT_lookBits(bitD: &BIT_DStream_t, nbBits: u32) -> usize {
 pub fn BIT_lookBitsFast(bitD: &BIT_DStream_t, nbBits: u32) -> usize {
     debug_assert!(nbBits >= 1);
     let reg_mask = CONTAINER_BITS - 1;
-    (bitD.bitContainer << (bitD.bitsConsumed & reg_mask))
-        >> ((reg_mask + 1 - nbBits) & reg_mask)
+    (bitD.bitContainer << (bitD.bitsConsumed & reg_mask)) >> ((reg_mask + 1 - nbBits) & reg_mask)
 }
 
 /// Port of `BIT_skipBits`.

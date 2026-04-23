@@ -53,13 +53,12 @@ pub enum ZSTD_overlap_e {
 /// to encourage branchless codegen; semantically it is just a
 /// conditional address select.
 #[inline]
-pub fn ZSTD_selectAddr<'a, T>(
-    index: u32,
-    lowLimit: u32,
-    candidate: &'a T,
-    backup: &'a T,
-) -> &'a T {
-    if index >= lowLimit { candidate } else { backup }
+pub fn ZSTD_selectAddr<'a, T>(index: u32, lowLimit: u32, candidate: &'a T, backup: &'a T) -> &'a T {
+    if index >= lowLimit {
+        candidate
+    } else {
+        backup
+    }
 }
 
 /// Port of `ZSTD_safecopyLiterals` (`zstd_compress_internal.h:700`).
@@ -132,9 +131,7 @@ pub fn ZSTD_wildcopy(
     let mut ip = src_ip;
     let oend = op + length;
 
-    if ovtype == ZSTD_overlap_e::ZSTD_overlap_src_before_dst
-        && diff < WILDCOPY_VECLEN as isize
-    {
+    if ovtype == ZSTD_overlap_e::ZSTD_overlap_src_before_dst && diff < WILDCOPY_VECLEN as isize {
         // Short-offset self-overlap: advance by 8 bytes per step,
         // respecting the overlap invariant (`op - ip >= 8` is what
         // the caller of `ZSTD_wildcopy` promises in this branch).
@@ -225,7 +222,9 @@ mod tests {
         // Exactly VECLEN: exercises the early-return path after the
         // first 16-byte copy.
         let mut buf = [0u8; 64];
-        for (i, b) in buf.iter_mut().enumerate().take(16) { *b = (i + 1) as u8; }
+        for (i, b) in buf.iter_mut().enumerate().take(16) {
+            *b = (i + 1) as u8;
+        }
         ZSTD_wildcopy(&mut buf, 32, 0, 16, ZSTD_overlap_e::ZSTD_no_overlap);
         for i in 0..16 {
             assert_eq!(buf[32 + i], (i + 1) as u8);

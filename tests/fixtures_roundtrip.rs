@@ -119,7 +119,7 @@ fn huf_literals_blob_from_lorem80_single_stream() {
 #[test]
 fn decode_literals_block_lorem80() {
     use zstd_pure_rs::decompress::zstd_decompress_block::{
-        streaming_operation, ZSTD_buildDefaultSeqTables, ZSTD_DCtx, ZSTD_decodeLiteralsBlock,
+        streaming_operation, ZSTD_DCtx, ZSTD_buildDefaultSeqTables, ZSTD_decodeLiteralsBlock,
     };
 
     let zst = read_fixture("lorem80_l1.zst");

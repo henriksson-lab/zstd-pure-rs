@@ -43,12 +43,12 @@ Features working:
 - Parametric API: `ZSTD_cParameter` / `ZSTD_dParameter` + `ZSTD_CCtx_setParameter` / `ZSTD_DCtx_setParameter`, reset directives, parameter-bounds queries (`ZSTD_cParam_getBounds` / `ZSTD_dParam_getBounds`).
 - Memory estimation: `ZSTD_estimateCCtxSize{,_usingCParams}`, `ZSTD_estimateDCtxSize`, `ZSTD_estimateDStreamSize{,_fromFrame}`, `ZSTD_sizeof_CCtx` / `ZSTD_sizeof_DCtx`.
 - Frame parameters: content-size flag, XXH64 checksum trailer, multi-block frames crossing the 128 KB boundary.
-- Strategies 1–5 (fast, dfast, greedy, lazy, lazy2); btlazy2/btopt/btultra* are capped down to lazy2 until the binary-tree + optimal parser land.
+- Strategies 1–9 (fast, dfast, greedy, lazy, lazy2, btlazy2, btopt, btultra, btultra2), including no-dict, ext-dict, dict-match-state, row-hash, and LDM-assisted optimal-parser paths.
 - CLI (`cargo build --release --features cli`) with `-d/-c/-f/-q/-v/-o/-L/-D/--check/--no-check/--magicless` flags, stdin/stdout support, file-argument handling with `.zst` extension inference.
 
-The full v1.6 public API from `zstd.h` (stable + experimental) is surfaced — every upstream entry point has a Rust counterpart reachable through `zstd_pure_rs::prelude::*`. Still skeletal (stubs return `ErrorCode::Generic` or equivalent) behind the public surface: the long-distance matcher's `generateSequences_internal` ext-dict branch + `blockCompress`, the `zstd_opt.c` optimal parser, superblock compression, multi-threaded compression (`zstdmt_compress.c`), custom-allocator / static-buffer init variants (`*_advanced`, `initStatic*`), the legacy block-level `compressContinue` / `decompressContinue` APIs, and the compressor-side magic-prefix dict entropy seeding (`ZSTD_compress_usingDict` takes the raw-content path). Magic-prefix dict entropy **decode** is live (via `ZSTD_DCtx_loadDictionary` / `ZSTD_decompress_insertDictionary` / `ZSTD_loadDEntropy`). Progress is tracked in `TODO.md`; the full C → Rust function mapping lives in `FUNCTIONS.md`.
+The full v1.6 public API from `zstd.h` (stable + experimental) is surfaced — every upstream entry point has a Rust counterpart reachable through `zstd_pure_rs::prelude::*`. The current C→Rust function-name coverage backlog is closed for both compression and decompression under `code-complexity-comparator`; remaining gaps are mostly verification breadth, performance/shape differences from safe scalar factoring, and CLI flag completeness rather than missing library entry points. Magic-prefix dictionary entropy **decode** is live via `ZSTD_DCtx_loadDictionary` / `ZSTD_decompress_insertDictionary` / `ZSTD_loadDEntropy`, and DDict full-dictionary entropy is copied into DCtx state when attached. Progress is tracked in `TODO.md`; the full C → Rust function mapping lives in `FUNCTIONS.md`.
 
-Test suite: 724 library unit tests + 33 CLI integration tests + 13 fixture-roundtrip tests + 5 doc tests (775 total). Includes cross-compatibility tests that pipe our output through upstream `zstd` 1.5.7 when the binary is on `$PATH`, a public-API sentinel that touches every exposed entry point, a boundary-size sweep (28 sizes × 3 levels around block/tail boundaries), a regression gate for a past multi-block repcode bug (4 phrases × 4 levels × 200 KB roundtrips), end-to-end `--magicless` CLI roundtrips (bare, with `-D` dict, with `--check` checksum, triple-flag composition, and across a 6-level strategy sweep), and `refPrefix` one-shot auto-clear gates proving single-use dict semantics match upstream for both the compressor (`endStream` / `compress2`) and decompressor (`decompressDCtx` / `decompressStream`) sides.
+Test suite: 816 library unit tests without MT and 834 with `--features mt` as of the latest local run, plus CLI/integration/fixture/doc tests in the full suite. Coverage includes cross-compatibility tests that pipe our output through upstream `zstd` when the binary is on `$PATH`, a public-API sentinel that touches every exposed entry point, a boundary-size sweep around block/tail boundaries, a regression gate for a past multi-block repcode bug, end-to-end `--magicless` CLI roundtrips, and `refPrefix` one-shot auto-clear gates proving single-use dict semantics match upstream for both compressor and decompressor sides.
 
 Throughput (release build on the 182 KB C-header fixture, `cargo build --release`):
 
@@ -66,64 +66,12 @@ These are about 5–10× slower than upstream's hand-tuned C (no SIMD, no BMI2, 
 - **Bitwise-identical output** to the upstream C library for the same inputs and parameters. This is the hard constraint — reproduction takes priority over speed.
 - **Pure Rust**, no `unsafe` FFI to the upstream C code. Only a single `unsafe` block remains inside the crate (a `u32`→`u8` slice reinterpret helper in `common/entropy_common.rs` for passing an FSE workspace by raw bytes).
 - Optional CLI (`zstd` binary) behind the `cli` feature.
-- Keep one-to-one C-function → Rust-function mapping where possible, so that [code-complexity-comparator](../code-complexity-comparator) stays useful throughout.
+- Keep one-to-one C-function → Rust-function mapping where possible, so that code-complexity-comparator stays useful throughout.
 
 ## Non-goals (at least initially)
 
-- GUI code (zstd has none).
-- The legacy v0.1–v0.7 decoders (`lib/legacy/`) — out of scope for v0.1.
 - The zlib-compat shim (`zlibWrapper/`) — out of scope.
 - `contrib/` (pzstd, seekable format, linux kernel integration, etc.) — out of scope.
-
-## Plan
-
-The plan is executed end-to-end in this crate. Each phase has concrete, verifiable deliverables.
-
-### Phase 0 — Scaffolding
-- `Cargo.toml`, `src/lib.rs`, `src/bin/zstd.rs`.
-- License files (`LICENSE`, `COPYING`) copied from upstream.
-- `README.md` (this file), `TODO.md`, `FUNCTIONS.md` (C→Rust mapping).
-- `.gitignore`.
-
-### Phase 1 — Skeletons
-- For every C function in `zstd/lib/{common,compress,decompress}/`, emit a Rust function with a matching signature and `panic!("yet to be translated")`.
-- Functions with SIMD paths use const generics so both scalar and SIMD variants compile.
-- Crate must compile cleanly (no dead-code warnings).
-- No GUI code exists in zstd, so no `panic!("GUI")` placeholders are needed.
-
-### Phase 2 — Bottom-up translation
-Order, derived from code-complexity-comparator + call graph:
-
-1. `lib/common/` — `bits.h`, `mem.h`, `error_private.c`, `xxhash.c`, `debug.c`, `entropy_common.c`, `fse_decompress.c`, `zstd_common.c`, `pool.c`, `threading.c`.
-2. `lib/decompress/` — `huf_decompress.c`, `zstd_decompress_block.c`, `zstd_ddict.c`, `zstd_decompress.c`. (Decoder-first, because it is smaller and the reference is the format itself.)
-3. `lib/compress/` — `hist.c`, `fse_compress.c`, `huf_compress.c`, `zstd_compress_literals.c`, `zstd_compress_sequences.c`, `zstd_compress_superblock.c`, `zstd_fast.c`, `zstd_double_fast.c`, `zstd_lazy.c`, `zstd_opt.c`, `zstd_ldm.c`, `zstd_preSplit.c`, `zstd_compress.c`.
-4. Multi-threaded compression — `zstdmt_compress.c` (behind `mt` feature, using `rayon`).
-
-Each function is translated with logic/complexity matching the original (no simplification), tested against deep-comparator traces on real data, and, if in a hot loop, its speed matched then — not later.
-
-### Phase 3 — Verification
-- **Real-world corpora** over synthetic: the [Silesia](http://sun.aei.polsl.pl/~sdeor/index.php?page=silesia) and [enwik8](https://mattmahoney.net/dc/textdata.html) corpora, plus a FASTQ file (random-access compression is a realistic zstd workload). Pull with `ureq`.
-- deep-comparator traces upstream and Rust side-by-side. Any divergence is a bug.
-- tracehash for fine-grained divergence localization inside a single function.
-- gdb-translation-verifier-rs for hard cases that need step-level comparison.
-- Port upstream tests from `zstd/tests/` (fuzzers, roundtrip tests, dictionary tests) to Rust integration tests.
-
-### Phase 4 — CLI
-- `clap` (derive), `zstd` binary, behind `cli` feature.
-- Mirror every flag of `zstd/programs/zstdcli.c`. Output files must be bitwise-identical to upstream's `zstd` binary on the same inputs.
-
-### Phase 5 — Polish & publish prep
-- Zero warnings under `cargo build --all-features` and `cargo clippy --all-targets --features cli -- -D warnings`.
-- Performance parity check with `-C target-cpu=native`, both sides.
-- Final `Cargo.toml` review, `include` list, `.gitignore`.
-- **Never** run `cargo publish`; never `git commit`.
-
-## Verification tools used
-
-- [code-complexity-comparator](../code-complexity-comparator) — one C fn → one Rust fn; complexity should not drop.
-- [deep-comparator](../deep-comparator) — trace-level equivalence on real data.
-- [tracehash](https://crates.io/crates/tracehash-rs) — divergence localization.
-- [gdb-translation-verifier-rs](../gdb-translation-verifier-rs) — stepwise state comparison.
 
 ## Building
 

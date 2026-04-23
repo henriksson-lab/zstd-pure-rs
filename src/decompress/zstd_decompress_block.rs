@@ -17,7 +17,6 @@
 //! `ZSTD_buildSeqTable`, `ZSTD_decompressBlock_internal`,
 //! `ZSTD_decompressBlock`.
 
-
 use crate::common::error::{ErrorCode, ERROR};
 use crate::common::mem::{MEM_readLE16, MEM_readLE24, MEM_readLE32};
 use crate::decompress::huf_decompress::{
@@ -147,6 +146,30 @@ pub fn ZSTD_safecopyDstBeforeSrc(buf: &mut [u8], dst_idx: usize, src_idx: usize,
     debug_assert!(dst_idx <= src_idx || src_idx + length <= dst_idx);
     for i in 0..length {
         buf[dst_idx + i] = buf[src_idx + i];
+    }
+}
+
+/// Port of `ZSTD_safecopy`. Copies `length` bytes inside one buffer,
+/// selecting the overlap-safe byte-copy path for short tails.
+pub fn ZSTD_safecopy(
+    buf: &mut [u8],
+    dst_idx: usize,
+    src_idx: usize,
+    length: usize,
+    ovtype: crate::common::zstd_internal::ZSTD_overlap_e,
+) {
+    if length == 0 {
+        return;
+    }
+    if ovtype == crate::common::zstd_internal::ZSTD_overlap_e::ZSTD_overlap_src_before_dst
+        && src_idx < dst_idx
+        && src_idx + length > dst_idx
+    {
+        for i in 0..length {
+            buf[dst_idx + i] = buf[src_idx + i];
+        }
+    } else {
+        buf.copy_within(src_idx..src_idx + length, dst_idx);
     }
 }
 
@@ -354,7 +377,9 @@ pub fn ZSTD_decodeSequence(
         seq.matchLength += BIT_readBitsFast(&mut seqState.DStream, mlBits as u32);
     }
 
-    if totalBits >= crate::common::bitstream::BIT_DStream_unfinished + 57 - (LLFSELog + MLFSELog + OffFSELog) {
+    if totalBits
+        >= crate::common::bitstream::BIT_DStream_unfinished + 57 - (LLFSELog + MLFSELog + OffFSELog)
+    {
         // Upstream reloads when the remaining bit budget gets tight.
         // Condition is a static macro; the portable-path check below
         // tracks that effect.
@@ -476,6 +501,66 @@ pub fn ZSTD_execSequence(
         }
     }
     sequenceLength
+}
+
+/// Slow-tail wrapper for `ZSTD_execSequenceEnd`. The safe Rust
+/// `ZSTD_execSequence` already performs bounds checks before copying,
+/// so the end-path entry forwards to the same implementation.
+pub fn ZSTD_execSequenceEnd(
+    dst: &mut [u8],
+    op: usize,
+    sequence: seq_t,
+    litBuf: &[u8],
+    litPtr_offset: usize,
+    out_litPtr: &mut usize,
+) -> usize {
+    ZSTD_execSequence(dst, op, sequence, litBuf, litPtr_offset, out_litPtr)
+}
+
+/// Slow-tail wrapper for `ZSTD_execSequenceEndSplitLitBuffer`.
+pub fn ZSTD_execSequenceEndSplitLitBuffer(
+    dst: &mut [u8],
+    op: usize,
+    sequence: seq_t,
+    litBuf: &[u8],
+    litPtr_offset: usize,
+    out_litPtr: &mut usize,
+) -> usize {
+    ZSTD_execSequence(dst, op, sequence, litBuf, litPtr_offset, out_litPtr)
+}
+
+/// Split-literal wrapper for `ZSTD_execSequenceSplitLitBuffer`.
+pub fn ZSTD_execSequenceSplitLitBuffer(
+    dst: &mut [u8],
+    op: usize,
+    sequence: seq_t,
+    litBuf: &[u8],
+    litPtr_offset: usize,
+    out_litPtr: &mut usize,
+) -> usize {
+    ZSTD_execSequence(dst, op, sequence, litBuf, litPtr_offset, out_litPtr)
+}
+
+/// Fuzz-assert helper name. The production Rust port doesn't keep the
+/// fuzz-only dictionary sentinels, so this reports whether an ext-dict
+/// span is currently recorded on the DCtx.
+#[inline]
+pub fn ZSTD_dictionaryIsActive(dctx: &ZSTD_DCtx, _prefixStart: usize, _oLitEnd: usize) -> i32 {
+    dctx.dictEnd.is_some() as i32
+}
+
+/// Fuzz-only validation hook in upstream. Kept as a no-op entry point
+/// because normal decoding paths already return zstd errors instead
+/// of relying on debug assertions.
+#[inline]
+pub fn ZSTD_assertValidSequence(
+    _dctx: &ZSTD_DCtx,
+    _op: usize,
+    _oend: usize,
+    _seq: seq_t,
+    _prefixStart: usize,
+    _virtualStart: usize,
+) {
 }
 
 // ---- Literals-block types -------------------------------------------
@@ -600,6 +685,10 @@ pub struct ZSTD_DCtx {
     pub stream_out_buffer: Vec<u8>,
     /// Bytes already drained from `stream_out_buffer` into the caller.
     pub stream_out_drained: usize,
+    /// Upstream `oversizedDuration`: number of consecutive streaming
+    /// calls whose retained buffers are much larger than the needed
+    /// input/output workspace.
+    pub oversizedDuration: usize,
     /// Raw-content dict set by `ZSTD_initDStream_usingDict` — applied
     /// to every frame decoded until reset / re-init.
     pub stream_dict: Vec<u8>,
@@ -729,6 +818,7 @@ impl Default for ZSTD_DCtx {
             stream_in_buffer: Vec::new(),
             stream_out_buffer: Vec::new(),
             stream_out_drained: 0,
+            oversizedDuration: 0,
             stream_dict: Vec::new(),
             d_windowLogMax: crate::decompress::zstd_decompress::ZSTD_WINDOWLOG_LIMIT_DEFAULT,
             format: crate::decompress::zstd_decompress::ZSTD_format_e::ZSTD_f_zstd1,
@@ -788,6 +878,10 @@ fn ZSTD_allocateLiteralsBuffer(
     // keeps the simpler extra-buffer layout since `ZSTD_execSequence`
     // reads literals through `dctx.litPtr` regardless of which buffer
     // holds them — the spill is a perf win, not a correctness gate.
+    let needed = litSize.saturating_add(WILDCOPY_OVERLENGTH);
+    if dctx.litExtraBuffer.len() < needed {
+        dctx.litExtraBuffer.resize(needed, 0);
+    }
     dctx.litBuffer_offset = 0;
     dctx.litBufferEnd_offset = litSize;
     dctx.litBufferLocation = ZSTD_litLocation_e::ZSTD_not_in_dst;
@@ -898,6 +992,306 @@ pub fn ZSTD_decompressSequences_body(
     op - op_start
 }
 
+/// Default wrapper for `ZSTD_decompressSequences_default`.
+pub fn ZSTD_decompressSequences_default(
+    dst: &mut [u8],
+    op_start: usize,
+    seqSrc: &[u8],
+    nbSeq: i32,
+    litBuf: &[u8],
+    litSize: usize,
+    LLTable: &[ZSTD_seqSymbol],
+    OFTable: &[ZSTD_seqSymbol],
+    MLTable: &[ZSTD_seqSymbol],
+    entropy_rep: &mut ZSTD_decoder_entropy_rep,
+) -> usize {
+    ZSTD_decompressSequences_body(
+        dst,
+        op_start,
+        seqSrc,
+        nbSeq,
+        litBuf,
+        litSize,
+        LLTable,
+        OFTable,
+        MLTable,
+        entropy_rep,
+    )
+}
+
+/// Split-literal-buffer body wrapper. The current Rust literal buffer
+/// layout doesn't split literals, so it forwards to the common body.
+pub fn ZSTD_decompressSequencesSplitLitBuffer_default(
+    dst: &mut [u8],
+    op_start: usize,
+    seqSrc: &[u8],
+    nbSeq: i32,
+    litBuf: &[u8],
+    litSize: usize,
+    LLTable: &[ZSTD_seqSymbol],
+    OFTable: &[ZSTD_seqSymbol],
+    MLTable: &[ZSTD_seqSymbol],
+    entropy_rep: &mut ZSTD_decoder_entropy_rep,
+) -> usize {
+    ZSTD_decompressSequences_default(
+        dst,
+        op_start,
+        seqSrc,
+        nbSeq,
+        litBuf,
+        litSize,
+        LLTable,
+        OFTable,
+        MLTable,
+        entropy_rep,
+    )
+}
+
+/// Port of `ZSTD_prefetchMatch`. Rust has no explicit prefetch
+/// intrinsic here; preserve the position arithmetic.
+pub fn ZSTD_prefetchMatch(
+    mut prefetchPos: usize,
+    sequence: seq_t,
+    _prefixStart: usize,
+    _dictEnd: usize,
+) -> usize {
+    prefetchPos += sequence.litLength;
+    prefetchPos + sequence.matchLength
+}
+
+/// Long-offset body wrapper. On 64-bit Rust targets the normal decoder
+/// can read all legal zstd offsets without a mid-offset refill.
+pub fn ZSTD_decompressSequencesLong_body(
+    dst: &mut [u8],
+    op_start: usize,
+    seqSrc: &[u8],
+    nbSeq: i32,
+    litBuf: &[u8],
+    litSize: usize,
+    LLTable: &[ZSTD_seqSymbol],
+    OFTable: &[ZSTD_seqSymbol],
+    MLTable: &[ZSTD_seqSymbol],
+    entropy_rep: &mut ZSTD_decoder_entropy_rep,
+) -> usize {
+    ZSTD_decompressSequences_body(
+        dst,
+        op_start,
+        seqSrc,
+        nbSeq,
+        litBuf,
+        litSize,
+        LLTable,
+        OFTable,
+        MLTable,
+        entropy_rep,
+    )
+}
+
+pub fn ZSTD_decompressSequencesLong_default(
+    dst: &mut [u8],
+    op_start: usize,
+    seqSrc: &[u8],
+    nbSeq: i32,
+    litBuf: &[u8],
+    litSize: usize,
+    LLTable: &[ZSTD_seqSymbol],
+    OFTable: &[ZSTD_seqSymbol],
+    MLTable: &[ZSTD_seqSymbol],
+    entropy_rep: &mut ZSTD_decoder_entropy_rep,
+) -> usize {
+    ZSTD_decompressSequencesLong_body(
+        dst,
+        op_start,
+        seqSrc,
+        nbSeq,
+        litBuf,
+        litSize,
+        LLTable,
+        OFTable,
+        MLTable,
+        entropy_rep,
+    )
+}
+
+pub fn ZSTD_decompressSequences_bmi2(
+    dst: &mut [u8],
+    op_start: usize,
+    seqSrc: &[u8],
+    nbSeq: i32,
+    litBuf: &[u8],
+    litSize: usize,
+    LLTable: &[ZSTD_seqSymbol],
+    OFTable: &[ZSTD_seqSymbol],
+    MLTable: &[ZSTD_seqSymbol],
+    entropy_rep: &mut ZSTD_decoder_entropy_rep,
+) -> usize {
+    ZSTD_decompressSequences_default(
+        dst,
+        op_start,
+        seqSrc,
+        nbSeq,
+        litBuf,
+        litSize,
+        LLTable,
+        OFTable,
+        MLTable,
+        entropy_rep,
+    )
+}
+
+pub fn ZSTD_decompressSequencesSplitLitBuffer_bmi2(
+    dst: &mut [u8],
+    op_start: usize,
+    seqSrc: &[u8],
+    nbSeq: i32,
+    litBuf: &[u8],
+    litSize: usize,
+    LLTable: &[ZSTD_seqSymbol],
+    OFTable: &[ZSTD_seqSymbol],
+    MLTable: &[ZSTD_seqSymbol],
+    entropy_rep: &mut ZSTD_decoder_entropy_rep,
+) -> usize {
+    ZSTD_decompressSequencesSplitLitBuffer_default(
+        dst,
+        op_start,
+        seqSrc,
+        nbSeq,
+        litBuf,
+        litSize,
+        LLTable,
+        OFTable,
+        MLTable,
+        entropy_rep,
+    )
+}
+
+pub fn ZSTD_decompressSequencesLong_bmi2(
+    dst: &mut [u8],
+    op_start: usize,
+    seqSrc: &[u8],
+    nbSeq: i32,
+    litBuf: &[u8],
+    litSize: usize,
+    LLTable: &[ZSTD_seqSymbol],
+    OFTable: &[ZSTD_seqSymbol],
+    MLTable: &[ZSTD_seqSymbol],
+    entropy_rep: &mut ZSTD_decoder_entropy_rep,
+) -> usize {
+    ZSTD_decompressSequencesLong_default(
+        dst,
+        op_start,
+        seqSrc,
+        nbSeq,
+        litBuf,
+        litSize,
+        LLTable,
+        OFTable,
+        MLTable,
+        entropy_rep,
+    )
+}
+
+pub fn ZSTD_decompressSequences(
+    dst: &mut [u8],
+    op_start: usize,
+    seqSrc: &[u8],
+    nbSeq: i32,
+    litBuf: &[u8],
+    litSize: usize,
+    LLTable: &[ZSTD_seqSymbol],
+    OFTable: &[ZSTD_seqSymbol],
+    MLTable: &[ZSTD_seqSymbol],
+    entropy_rep: &mut ZSTD_decoder_entropy_rep,
+) -> usize {
+    ZSTD_decompressSequences_default(
+        dst,
+        op_start,
+        seqSrc,
+        nbSeq,
+        litBuf,
+        litSize,
+        LLTable,
+        OFTable,
+        MLTable,
+        entropy_rep,
+    )
+}
+
+pub fn ZSTD_decompressSequencesSplitLitBuffer(
+    dst: &mut [u8],
+    op_start: usize,
+    seqSrc: &[u8],
+    nbSeq: i32,
+    litBuf: &[u8],
+    litSize: usize,
+    LLTable: &[ZSTD_seqSymbol],
+    OFTable: &[ZSTD_seqSymbol],
+    MLTable: &[ZSTD_seqSymbol],
+    entropy_rep: &mut ZSTD_decoder_entropy_rep,
+) -> usize {
+    ZSTD_decompressSequencesSplitLitBuffer_default(
+        dst,
+        op_start,
+        seqSrc,
+        nbSeq,
+        litBuf,
+        litSize,
+        LLTable,
+        OFTable,
+        MLTable,
+        entropy_rep,
+    )
+}
+
+pub fn ZSTD_decompressSequencesLong(
+    dst: &mut [u8],
+    op_start: usize,
+    seqSrc: &[u8],
+    nbSeq: i32,
+    litBuf: &[u8],
+    litSize: usize,
+    LLTable: &[ZSTD_seqSymbol],
+    OFTable: &[ZSTD_seqSymbol],
+    MLTable: &[ZSTD_seqSymbol],
+    entropy_rep: &mut ZSTD_decoder_entropy_rep,
+) -> usize {
+    ZSTD_decompressSequencesLong_default(
+        dst,
+        op_start,
+        seqSrc,
+        nbSeq,
+        litBuf,
+        litSize,
+        LLTable,
+        OFTable,
+        MLTable,
+        entropy_rep,
+    )
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ZSTD_OffsetInfo {
+    pub longOffsetShare: u32,
+    pub maxNbAdditionalBits: u32,
+}
+
+/// Port of `ZSTD_getOffsetInfo`.
+pub fn ZSTD_getOffsetInfo(offTable: &[ZSTD_seqSymbol], nbSeq: i32) -> ZSTD_OffsetInfo {
+    let mut info = ZSTD_OffsetInfo::default();
+    if nbSeq != 0 {
+        let tableLog = seq_header_read(offTable).tableLog;
+        let max = 1usize << tableLog;
+        for entry in offTable.iter().skip(1).take(max) {
+            info.maxNbAdditionalBits = info.maxNbAdditionalBits.max(entry.nbAdditionalBits as u32);
+            if entry.nbAdditionalBits > 22 {
+                info.longOffsetShare += 1;
+            }
+        }
+        info.longOffsetShare <<= OffFSELog - tableLog;
+    }
+    info
+}
+
 /// Port of `ZSTD_decompressBlock_internal`. Decompresses one
 /// `bt_compressed` zstd block from `src` into `dst`, returning the
 /// number of bytes written.
@@ -977,11 +1371,7 @@ pub fn ZSTD_decompressBlock_internal(
 /// Standalone-block variant: sets `isFrameDecompression = 0` and
 /// forwards to `ZSTD_decodeLiteralsBlock` with `streaming =
 /// not_streaming`.
-pub fn ZSTD_decodeLiteralsBlock_wrapper(
-    dctx: &mut ZSTD_DCtx,
-    src: &[u8],
-    dst: &mut [u8],
-) -> usize {
+pub fn ZSTD_decodeLiteralsBlock_wrapper(dctx: &mut ZSTD_DCtx, src: &[u8], dst: &mut [u8]) -> usize {
     dctx.isFrameDecompression = 0;
     ZSTD_decodeLiteralsBlock(dctx, src, dst, streaming_operation::not_streaming)
 }
@@ -1336,9 +1726,9 @@ pub fn ZSTD_buildSeqTable_rle(dt: &mut [ZSTD_seqSymbol], baseline: u32, nbBits: 
     // simple we add a parallel header_of accessor that reads these
     // fields. For now we encode tableLog in the `nbBits` byte of slot 0.
     let header = ZSTD_seqSymbol {
-        nextState: 0,      // fastMode
+        nextState: 0, // fastMode
         nbAdditionalBits: 0,
-        nbBits: 0,         // tableLog
+        nbBits: 0, // tableLog
         baseValue: 0,
     };
     dt[0] = header;
@@ -1461,6 +1851,66 @@ pub fn ZSTD_buildFSETable(
         dt[1 + u].nbAdditionalBits = nbAdditionalBits[symbol];
         dt[1 + u].baseValue = baseValue[symbol];
     }
+}
+
+/// Port of `ZSTD_buildFSETable_body`. The Rust port doesn't need the
+/// C workspace argument because the scratch arrays are stack-owned in
+/// `ZSTD_buildFSETable`.
+pub fn ZSTD_buildFSETable_body(
+    dt: &mut [ZSTD_seqSymbol],
+    normalizedCounter: &[i16],
+    maxSymbolValue: u32,
+    baseValue: &[u32],
+    nbAdditionalBits: &[u8],
+    tableLog: u32,
+) {
+    ZSTD_buildFSETable(
+        dt,
+        normalizedCounter,
+        maxSymbolValue,
+        baseValue,
+        nbAdditionalBits,
+        tableLog,
+    );
+}
+
+/// Portable wrapper for `ZSTD_buildFSETable_body_default`.
+pub fn ZSTD_buildFSETable_body_default(
+    dt: &mut [ZSTD_seqSymbol],
+    normalizedCounter: &[i16],
+    maxSymbolValue: u32,
+    baseValue: &[u32],
+    nbAdditionalBits: &[u8],
+    tableLog: u32,
+) {
+    ZSTD_buildFSETable_body(
+        dt,
+        normalizedCounter,
+        maxSymbolValue,
+        baseValue,
+        nbAdditionalBits,
+        tableLog,
+    );
+}
+
+/// BMI2 wrapper for `ZSTD_buildFSETable_body_bmi2`. The generic Rust
+/// implementation is already bit-identical for the table contents.
+pub fn ZSTD_buildFSETable_body_bmi2(
+    dt: &mut [ZSTD_seqSymbol],
+    normalizedCounter: &[i16],
+    maxSymbolValue: u32,
+    baseValue: &[u32],
+    nbAdditionalBits: &[u8],
+    tableLog: u32,
+) {
+    ZSTD_buildFSETable_body(
+        dt,
+        normalizedCounter,
+        maxSymbolValue,
+        baseValue,
+        nbAdditionalBits,
+        tableLog,
+    );
 }
 
 /// Port of `ZSTD_buildSeqTable`. Returns bytes consumed from `src`, or
@@ -1662,11 +2112,7 @@ pub fn ZSTD_buildDefaultSeqTables(dctx: &mut ZSTD_DCtx) {
 /// Port of `ZSTD_decodeSeqHeaders`. Full form: header probe + three
 /// `ZSTD_buildSeqTable` invocations for LL / OF / ML. Returns bytes
 /// consumed from `src`.
-pub fn ZSTD_decodeSeqHeaders(
-    dctx: &mut ZSTD_DCtx,
-    nbSeqPtr: &mut i32,
-    src: &[u8],
-) -> usize {
+pub fn ZSTD_decodeSeqHeaders(dctx: &mut ZSTD_DCtx, nbSeqPtr: &mut i32, src: &[u8]) -> usize {
     let mut hdr = SeqBlockHeader {
         nbSeq: 0,
         LLtype: SymbolEncodingType_e::set_basic,
@@ -1881,7 +2327,10 @@ mod tests {
         // to `1 << tableLog` plus the count of -1 "less-probable"
         // entries (upstream expects each -1 to represent 1/(1<<log)).
         fn verify_norm_sum(norm: &[i16], log: u32) {
-            let total: i32 = norm.iter().map(|&v| if v == -1 { 1 } else { v as i32 }).sum();
+            let total: i32 = norm
+                .iter()
+                .map(|&v| if v == -1 { 1 } else { v as i32 })
+                .sum();
             assert_eq!(total as u32, 1 << log);
         }
         verify_norm_sum(&LL_defaultNorm, LL_defaultNormLog);

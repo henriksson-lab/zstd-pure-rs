@@ -1,33 +1,37 @@
 //! Translation of `lib/compress/zstdmt_compress.c`. Multi-threaded
 //! compression. Behind the `mt` feature.
 //!
-//! Current v0.1 provides the API surface as returnable errors /
-//! no-ops so the `mt` feature can compile without triggering panics.
-//! A real port would use `rayon` for parallel block compression, but
-//! the sequential path already handles all correctness requirements —
-//! MT is purely a speed optimization.
+//! The current port executes jobs on a reusable worker pool and keeps
+//! the serial orchestration state that upstream uses to prepare work
+//! for those workers. Job creation, buffer-pool handoff, worker CCtx
+//! reuse, round-buffer sizing, and completion cleanup follow the
+//! upstream lifecycle shape.
 
-use core::marker::PhantomData;
-use crate::compress::zstd_compress::{
-    ZSTD_CCtx, ZSTD_CCtxParams_setParameter, ZSTD_CCtx_params, ZSTD_EndDirective,
-    ZSTD_CCtx_trace, ZSTD_compressBegin_advanced_internal, ZSTD_compressBound,
-    ZSTD_compressContinue_public, ZSTD_compressEnd_public, ZSTD_createCCtx_advanced,
-    ZSTD_customMem, ZSTD_cycleLog, ZSTD_frameProgression, ZSTD_invalidateRepCodes,
-    ZSTD_referenceExternalSequences, ZSTD_sizeof_CCtx, ZSTD_writeLastEmptyBlock,
-    ZSTD_CCtxParams_init, ZSTD_CLEVEL_DEFAULT, ZSTD_CParamMode_e,
-    ZSTD_getCParamsFromCCtxParams,
+#![allow(clippy::field_reassign_with_default)]
+
+use crate::common::pool::{
+    POOL_add, POOL_ctx, POOL_free, POOL_resize, POOL_sizeof, ZSTD_createThreadPool,
 };
+use crate::compress::zstd_compress::{
+    ZSTD_CCtx, ZSTD_CCtxParams_init, ZSTD_CCtxParams_setParameter, ZSTD_CCtx_params,
+    ZSTD_CCtx_trace, ZSTD_CParamMode_e, ZSTD_EndDirective, ZSTD_compressBegin_advanced_internal,
+    ZSTD_compressBound, ZSTD_compressContinue_public, ZSTD_compressEnd_public,
+    ZSTD_createCCtx_advanced, ZSTD_customMem, ZSTD_cycleLog, ZSTD_frameProgression,
+    ZSTD_getCParamsFromCCtxParams, ZSTD_invalidateRepCodes, ZSTD_referenceExternalSequences,
+    ZSTD_sizeof_CCtx, ZSTD_writeLastEmptyBlock, ZSTD_CLEVEL_DEFAULT,
+};
+use crate::compress::zstd_compress::{ZSTD_cParameter, ZSTD_WINDOWLOG_MAX};
 use crate::compress::zstd_hashes::{
-    ZSTD_rollingHash_append, ZSTD_rollingHash_compute, ZSTD_rollingHash_primePower,
-    ZSTD_rollingHash_rotate,
+    ZSTD_rollingHash_append, ZSTD_rollingHash_compute, ZSTD_rollingHash_rotate,
 };
-use crate::compress::zstd_compress::{
-    ZSTD_cParameter, ZSTD_WINDOWLOG_MAX,
+use crate::compress::zstd_ldm::{
+    ldmParams_t, ldmState_t, rawSeq, RawSeqStore_t, ZSTD_ParamSwitch_e, ZSTD_ldm_adjustParameters,
+    ZSTD_ldm_fillHashTable, ZSTD_ldm_generateSequences, ZSTD_ldm_getMaxNbSeq,
 };
-use crate::compress::zstd_ldm::{ZSTD_ParamSwitch_e, ZSTD_ldm_getMaxNbSeq};
-use crate::compress::zstd_ldm::{RawSeqStore_t, rawSeq};
 use crate::decompress::zstd_ddict::ZSTD_dictContentType_e;
 use crate::decompress::zstd_decompress_block::ZSTD_BLOCKSIZE_MAX;
+use core::marker::PhantomData;
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::OnceLock;
 use std::time::Instant;
 
@@ -92,6 +96,7 @@ pub struct ZSTDMT_jobDescription {
     pub frameChecksumNeeded: u32,
     pub params: ZSTD_CCtx_params,
     pub fullFrameSize: u64,
+    pub rawSeqStore: RawSeqStore_t,
 }
 
 impl Buffer {
@@ -121,6 +126,9 @@ fn range_as_slice(range: Range) -> &'static [u8] {
 pub struct ZSTDMT_CCtx {
     _priv: PhantomData<()>,
     pub jobs: Vec<ZSTDMT_jobDescription>,
+    pub threadPool: Option<Box<POOL_ctx>>,
+    pub threadPoolRef: usize,
+    jobReceivers: Vec<Option<Receiver<ZSTDMT_completedJob>>>,
     pub bufPool: Option<Box<ZSTDMT_bufferPool>>,
     pub cctxPool: Option<Box<ZSTDMT_CCtxPool>>,
     pub seqPool: Option<Box<ZSTDMT_seqPool>>,
@@ -148,6 +156,9 @@ impl Default for ZSTDMT_CCtx {
         Self {
             _priv: PhantomData,
             jobs: Vec::new(),
+            threadPool: None,
+            threadPoolRef: 0,
+            jobReceivers: Vec::new(),
             bufPool: None,
             cctxPool: None,
             seqPool: None,
@@ -268,7 +279,9 @@ pub fn ZSTDMT_getBuffer(bufPool: &mut ZSTDMT_bufferPool) -> Buffer {
     {
         return bufPool.buffers.swap_remove(pos);
     }
-    Buffer { data: vec![0; bSize] }
+    Buffer {
+        data: vec![0; bSize],
+    }
 }
 
 /// Port of `ZSTDMT_resizeBuffer`.
@@ -332,10 +345,7 @@ pub fn ZSTDMT_setNbSeq(seqPool: &mut ZSTDMT_seqPool, nbSeq: usize) {
 }
 
 /// Port of `ZSTDMT_createSeqPool`.
-pub fn ZSTDMT_createSeqPool(
-    nbWorkers: u32,
-    cMem: ZSTD_customMem,
-) -> Option<Box<ZSTDMT_seqPool>> {
+pub fn ZSTDMT_createSeqPool(nbWorkers: u32, cMem: ZSTD_customMem) -> Option<Box<ZSTDMT_seqPool>> {
     let mut seqPool = ZSTDMT_createBufferPool(nbWorkers, cMem)?;
     ZSTDMT_setNbSeq(&mut seqPool, 0);
     Some(seqPool)
@@ -362,10 +372,7 @@ pub fn ZSTDMT_freeCCtxPool(pool: Option<Box<ZSTDMT_CCtxPool>>) {
 }
 
 /// Port of `ZSTDMT_createCCtxPool`.
-pub fn ZSTDMT_createCCtxPool(
-    nbWorkers: i32,
-    cMem: ZSTD_customMem,
-) -> Option<Box<ZSTDMT_CCtxPool>> {
+pub fn ZSTDMT_createCCtxPool(nbWorkers: i32, cMem: ZSTD_customMem) -> Option<Box<ZSTDMT_CCtxPool>> {
     if nbWorkers <= 0 {
         return None;
     }
@@ -397,7 +404,11 @@ pub fn ZSTDMT_expandCCtxPool(
 pub fn ZSTDMT_sizeof_CCtxPool(cctxPool: &ZSTDMT_CCtxPool) -> usize {
     core::mem::size_of::<ZSTDMT_CCtxPool>()
         + cctxPool.cctxs.capacity() * core::mem::size_of::<Box<ZSTD_CCtx>>()
-        + cctxPool.cctxs.iter().map(|c| ZSTD_sizeof_CCtx(c)).sum::<usize>()
+        + cctxPool
+            .cctxs
+            .iter()
+            .map(|c| ZSTD_sizeof_CCtx(c))
+            .sum::<usize>()
 }
 
 /// Port of `ZSTDMT_getCCtx`.
@@ -473,23 +484,26 @@ pub fn ZSTDMT_serialState_applySequences(
 }
 
 /// Port of `ZSTDMT_serialState_ensureFinished`.
-pub fn ZSTDMT_serialState_ensureFinished(
-    serialState: &mut SerialState,
-    jobID: u32,
-    cSize: usize,
-) {
+pub fn ZSTDMT_serialState_ensureFinished(serialState: &mut SerialState, jobID: u32, cSize: usize) {
     if crate::common::error::ERR_isError(cSize) && serialState.nextJobID <= jobID {
         serialState.nextJobID = jobID + 1;
     }
 }
 
 /// Port of `ZSTDMT_freeJobsTable`.
-pub fn ZSTDMT_freeJobsTable(jobTable: &mut Vec<ZSTDMT_jobDescription>, _nbJobs: u32, _cMem: ZSTD_customMem) {
+pub fn ZSTDMT_freeJobsTable(
+    jobTable: &mut Vec<ZSTDMT_jobDescription>,
+    _nbJobs: u32,
+    _cMem: ZSTD_customMem,
+) {
     jobTable.clear();
 }
 
 /// Port of `ZSTDMT_createJobsTable`.
-pub fn ZSTDMT_createJobsTable(nbJobsPtr: &mut u32, _cMem: ZSTD_customMem) -> Option<Vec<ZSTDMT_jobDescription>> {
+pub fn ZSTDMT_createJobsTable(
+    nbJobsPtr: &mut u32,
+    _cMem: ZSTD_customMem,
+) -> Option<Vec<ZSTDMT_jobDescription>> {
     let nbJobsLog2 = 32 - nbJobsPtr.saturating_sub(1).leading_zeros();
     let nbJobs = 1u32 << nbJobsLog2;
     *nbJobsPtr = nbJobs.max(1);
@@ -501,6 +515,8 @@ pub fn ZSTDMT_expandJobsTable(mtctx: &mut ZSTDMT_CCtx, nbWorkers: u32) -> usize 
     let mut nbJobs = nbWorkers + 2;
     if nbJobs > mtctx.jobIDMask + 1 {
         mtctx.jobs = ZSTDMT_createJobsTable(&mut nbJobs, mtctx.cMem).unwrap_or_default();
+        mtctx.jobReceivers.clear();
+        mtctx.jobReceivers.resize_with(mtctx.jobs.len(), || None);
         mtctx.jobIDMask = nbJobs.saturating_sub(1);
     }
     0
@@ -523,11 +539,15 @@ pub fn ZSTDMT_getFrameProgression(mtctx: &ZSTDMT_CCtx) -> ZSTD_frameProgression 
         currentJobID: mtctx.nextJobID,
         nbActiveWorkers: 0,
     };
-    let lastJobNb = mtctx.nextJobID + mtctx.jobReady;
+    let lastJobNb = mtctx.nextJobID;
     for jobNb in mtctx.doneJobID..lastJobNb {
         let wJobID = (jobNb & mtctx.jobIDMask) as usize;
         if let Some(jobPtr) = mtctx.jobs.get(wJobID) {
-            let produced = if ERR_isError(jobPtr.cSize) { 0 } else { jobPtr.cSize };
+            let produced = if ERR_isError(jobPtr.cSize) {
+                0
+            } else {
+                jobPtr.cSize
+            };
             let flushed = if ERR_isError(jobPtr.cSize) {
                 0
             } else {
@@ -538,7 +558,12 @@ pub fn ZSTDMT_getFrameProgression(mtctx: &ZSTDMT_CCtx) -> ZSTD_frameProgression 
             fps.consumed += jobPtr.consumed as u64;
             fps.produced += produced as u64;
             fps.flushed += flushed as u64;
-            fps.nbActiveWorkers += (jobPtr.consumed < jobPtr.src.size) as u32;
+            let worker_pending = mtctx
+                .jobReceivers
+                .get(wJobID)
+                .and_then(|slot| slot.as_ref())
+                .is_some();
+            fps.nbActiveWorkers += (worker_pending || jobPtr.consumed < jobPtr.src.size) as u32;
         }
     }
     fps
@@ -547,7 +572,10 @@ pub fn ZSTDMT_getFrameProgression(mtctx: &ZSTDMT_CCtx) -> ZSTD_frameProgression 
 /// Port of `ZSTDMT_computeTargetJobLog`.
 pub fn ZSTDMT_computeTargetJobLog(params: &ZSTD_CCtx_params) -> u32 {
     let jobLog = if params.ldmParams.enableLdm == ZSTD_ParamSwitch_e::ZSTD_ps_enable {
-        core::cmp::max(21, ZSTD_cycleLog(params.cParams.chainLog, params.cParams.strategy) + 3)
+        core::cmp::max(
+            21,
+            ZSTD_cycleLog(params.cParams.chainLog, params.cParams.strategy) + 3,
+        )
     } else {
         core::cmp::max(20, params.cParams.windowLog + 2)
     };
@@ -567,27 +595,48 @@ pub fn ZSTDMT_overlapLog_default(strat: u32) -> i32 {
 /// Port of `ZSTDMT_overlapLog`.
 pub fn ZSTDMT_overlapLog(ovlog: i32, strat: u32) -> i32 {
     debug_assert!((0..=9).contains(&ovlog));
-    if ovlog == 0 { ZSTDMT_overlapLog_default(strat) } else { ovlog }
+    if ovlog == 0 {
+        ZSTDMT_overlapLog_default(strat)
+    } else {
+        ovlog
+    }
 }
 
 /// Port of `ZSTDMT_computeOverlapSize`.
 pub fn ZSTDMT_computeOverlapSize(params: &ZSTD_CCtx_params) -> usize {
     let overlapRLog = 9 - ZSTDMT_overlapLog(params.overlapLog, params.cParams.strategy);
-    let mut ovLog = if overlapRLog >= 8 { 0 } else { params.cParams.windowLog as i32 - overlapRLog };
+    let mut ovLog = if overlapRLog >= 8 {
+        0
+    } else {
+        params.cParams.windowLog as i32 - overlapRLog
+    };
     if params.ldmParams.enableLdm == ZSTD_ParamSwitch_e::ZSTD_ps_enable {
-        ovLog = core::cmp::min(params.cParams.windowLog, ZSTDMT_computeTargetJobLog(params) - 2) as i32 - overlapRLog;
+        ovLog = core::cmp::min(
+            params.cParams.windowLog,
+            ZSTDMT_computeTargetJobLog(params) - 2,
+        ) as i32
+            - overlapRLog;
     }
-    if ovLog <= 0 { 0 } else { 1usize << ovLog.min(ZSTD_WINDOWLOG_MAX() as i32) }
+    if ovLog <= 0 {
+        0
+    } else {
+        1usize << ovLog.min(ZSTD_WINDOWLOG_MAX() as i32)
+    }
 }
 
 /// Port of `ZSTDMT_releaseAllJobResources`.
 pub fn ZSTDMT_releaseAllJobResources(mtctx: &mut ZSTDMT_CCtx) {
+    ZSTDMT_waitForAllJobsCompleted(mtctx);
     for job in &mut mtctx.jobs {
         if let Some(bufPool) = mtctx.bufPool.as_mut() {
             ZSTDMT_releaseBuffer(bufPool, core::mem::take(&mut job.dstBuff));
         }
+        if let Some(seqPool) = mtctx.seqPool.as_mut() {
+            ZSTDMT_releaseSeq(seqPool, core::mem::take(&mut job.rawSeqStore));
+        }
         *job = ZSTDMT_jobDescription::default();
     }
+    mtctx.jobReceivers.clear();
     mtctx.inBuff.buffer = Buffer::default();
     mtctx.inBuff.filled = 0;
     mtctx.allJobsCompleted = 1;
@@ -595,7 +644,209 @@ pub fn ZSTDMT_releaseAllJobResources(mtctx: &mut ZSTDMT_CCtx) {
 
 /// Port of `ZSTDMT_waitForAllJobsCompleted`.
 pub fn ZSTDMT_waitForAllJobsCompleted(mtctx: &mut ZSTDMT_CCtx) {
+    for jobID in mtctx.doneJobID..mtctx.nextJobID {
+        let wJobID = (jobID & mtctx.jobIDMask) as usize;
+        let _ = ZSTDMT_joinPendingJob(mtctx, wJobID);
+    }
     mtctx.doneJobID = mtctx.nextJobID;
+}
+
+fn ZSTDMT_getThreadPool(mtctx: &ZSTDMT_CCtx) -> Option<&POOL_ctx> {
+    if let Some(pool) = mtctx.threadPool.as_ref() {
+        Some(pool)
+    } else if mtctx.threadPoolRef != 0 {
+        Some(unsafe { &*(mtctx.threadPoolRef as *const POOL_ctx) })
+    } else {
+        None
+    }
+}
+
+pub fn ZSTDMT_setThreadPool(mtctx: &mut ZSTDMT_CCtx, pool: Option<&POOL_ctx>) {
+    if let Some(pool) = pool {
+        POOL_free(mtctx.threadPool.take());
+        mtctx.threadPoolRef = pool as *const POOL_ctx as usize;
+    } else {
+        mtctx.threadPoolRef = 0;
+        if mtctx.threadPool.is_none() && mtctx.params.nbWorkers > 0 {
+            mtctx.threadPool = ZSTD_createThreadPool(mtctx.params.nbWorkers as usize);
+        }
+    }
+}
+
+struct ZSTDMT_queuedJob {
+    job: ZSTDMT_jobDescription,
+    cctx: Box<ZSTD_CCtx>,
+    tx: mpsc::Sender<ZSTDMT_completedJob>,
+}
+
+struct ZSTDMT_completedJob {
+    job: ZSTDMT_jobDescription,
+    cctx: Box<ZSTD_CCtx>,
+}
+
+fn ZSTDMT_runQueuedJob(opaque: *mut core::ffi::c_void) {
+    let queued = unsafe { Box::from_raw(opaque as *mut ZSTDMT_queuedJob) };
+    let mut job = queued.job;
+    let mut cctx = queued.cctx;
+    ZSTDMT_compressionJob(&mut job, &mut cctx);
+    let _ = queued.tx.send(ZSTDMT_completedJob { job, cctx });
+}
+
+fn ZSTDMT_prepareJobSequences(mtctx: &mut ZSTDMT_CCtx, wJobID: usize) -> usize {
+    let Some(job) = mtctx.jobs.get(wJobID) else {
+        return crate::common::error::ERROR(crate::common::error::ErrorCode::Generic);
+    };
+    let prefix_range = job.prefix;
+    let src_range = job.src;
+    let job_id = job.jobID;
+
+    let serial_params = mtctx.serial.params;
+    if serial_params.ldmParams.enableLdm != ZSTD_ParamSwitch_e::ZSTD_ps_enable {
+        let mut seq_store = RawSeqStore_t::default();
+        ZSTDMT_serialState_genSequences(&mut mtctx.serial, &mut seq_store, src_range, job_id);
+        if let Some(job) = mtctx.jobs.get_mut(wJobID) {
+            job.rawSeqStore = seq_store;
+        }
+        return 0;
+    }
+
+    let prefix = range_as_slice(prefix_range);
+    let src = range_as_slice(src_range);
+    let mut ldmParams: ldmParams_t = serial_params.ldmParams;
+    ldmParams.enableLdm = serial_params.ldmEnable;
+    ZSTD_ldm_adjustParameters(&mut ldmParams, &serial_params.cParams);
+    let required_capacity = ZSTD_ldm_getMaxNbSeq(ldmParams, src.len()).max(1);
+
+    let mut rawSeqStore = if let Some(seqPool) = mtctx.seqPool.as_mut() {
+        let mut seq = ZSTDMT_getSeq(seqPool);
+        if seq.capacity < required_capacity {
+            seq = RawSeqStore_t::with_capacity(required_capacity);
+        } else {
+            if seq.seq.len() < required_capacity {
+                seq.seq.resize(required_capacity, rawSeq::default());
+            }
+            seq.capacity = required_capacity;
+        }
+        seq
+    } else {
+        RawSeqStore_t::with_capacity(required_capacity)
+    };
+    rawSeqStore.size = 0;
+    rawSeqStore.pos = 0;
+    rawSeqStore.posInSequence = 0;
+
+    let mut ldmState = ldmState_t::new(&ldmParams);
+    if !prefix.is_empty() {
+        ZSTD_ldm_fillHashTable(&mut ldmState, prefix, 0, &ldmParams);
+    }
+    let mut window_buf = Vec::with_capacity(prefix.len() + src.len());
+    window_buf.extend_from_slice(prefix);
+    window_buf.extend_from_slice(src);
+    let rc = ZSTD_ldm_generateSequences(
+        &mut ldmState,
+        &mut rawSeqStore,
+        &ldmParams,
+        &window_buf,
+        prefix.len(),
+        window_buf.len(),
+        0,
+    );
+    if crate::common::error::ERR_isError(rc) {
+        return rc;
+    }
+    ZSTDMT_serialState_genSequences(&mut mtctx.serial, &mut rawSeqStore, src_range, job_id);
+    if let Some(job) = mtctx.jobs.get_mut(wJobID) {
+        job.rawSeqStore = rawSeqStore;
+    }
+    0
+}
+
+fn ZSTDMT_spawnCompressionJob(mtctx: &mut ZSTDMT_CCtx, wJobID: usize) -> usize {
+    let Some(job) = mtctx.jobs.get(wJobID).cloned() else {
+        return crate::common::error::ERROR(crate::common::error::ErrorCode::Generic);
+    };
+    if mtctx.jobReceivers.len() <= wJobID {
+        mtctx.jobReceivers.resize_with(wJobID + 1, || None);
+    }
+    let pool_ptr = mtctx
+        .threadPool
+        .as_ref()
+        .map(|p| p.as_ref() as *const POOL_ctx as usize)
+        .unwrap_or(mtctx.threadPoolRef);
+    if pool_ptr == 0 {
+        return crate::common::error::ERROR(crate::common::error::ErrorCode::Generic);
+    }
+    let cctx = if let Some(pool) = mtctx.cctxPool.as_mut() {
+        ZSTDMT_getCCtx(pool)
+    } else {
+        ZSTD_createCCtx_advanced(mtctx.cMem)
+    };
+    let Some(cctx) = cctx else {
+        return crate::common::error::ERROR(crate::common::error::ErrorCode::MemoryAllocation);
+    };
+    let (tx, rx) = mpsc::channel();
+    let queued = Box::new(ZSTDMT_queuedJob { job, cctx, tx });
+    mtctx.jobReceivers[wJobID] = Some(rx);
+    let pool = unsafe { &*(pool_ptr as *const POOL_ctx) };
+    POOL_add(
+        pool,
+        ZSTDMT_runQueuedJob,
+        Box::into_raw(queued) as *mut core::ffi::c_void,
+    );
+    0
+}
+
+fn ZSTDMT_joinPendingJob(mtctx: &mut ZSTDMT_CCtx, wJobID: usize) -> usize {
+    let Some(slot) = mtctx.jobReceivers.get_mut(wJobID) else {
+        return 0;
+    };
+    let Some(rx) = slot.take() else {
+        return 0;
+    };
+    match rx.recv() {
+        Ok(completed) => {
+            if mtctx.jobs.len() <= wJobID {
+                mtctx
+                    .jobs
+                    .resize(wJobID + 1, ZSTDMT_jobDescription::default());
+            }
+            mtctx.jobs[wJobID] = completed.job;
+            if let Some(pool) = mtctx.cctxPool.as_mut() {
+                ZSTDMT_releaseCCtx(pool, Some(completed.cctx));
+            }
+            0
+        }
+        Err(_) => crate::common::error::ERROR(crate::common::error::ErrorCode::Generic),
+    }
+}
+
+fn ZSTDMT_tryJoinFinishedJob(mtctx: &mut ZSTDMT_CCtx, wJobID: usize) -> usize {
+    let Some(slot) = mtctx.jobReceivers.get_mut(wJobID) else {
+        return 0;
+    };
+    let Some(rx) = slot.as_ref() else {
+        return 0;
+    };
+    match rx.try_recv() {
+        Ok(completed) => {
+            slot.take();
+            if mtctx.jobs.len() <= wJobID {
+                mtctx
+                    .jobs
+                    .resize(wJobID + 1, ZSTDMT_jobDescription::default());
+            }
+            mtctx.jobs[wJobID] = completed.job;
+            if let Some(pool) = mtctx.cctxPool.as_mut() {
+                ZSTDMT_releaseCCtx(pool, Some(completed.cctx));
+            }
+            0
+        }
+        Err(TryRecvError::Empty) => 0,
+        Err(TryRecvError::Disconnected) => {
+            slot.take();
+            crate::common::error::ERROR(crate::common::error::ErrorCode::Generic)
+        }
+    }
 }
 
 /// Port of `ZSTDMT_resize`.
@@ -610,11 +861,19 @@ pub fn ZSTDMT_resize(mtctx: &mut ZSTDMT_CCtx, nbWorkers: u32) -> usize {
     if let Some(pool) = mtctx.seqPool.take() {
         mtctx.seqPool = ZSTDMT_expandSeqPool(pool, nbWorkers);
     }
+    if let Some(pool) = mtctx.threadPool.as_mut() {
+        let _ = POOL_resize(pool, nbWorkers as usize);
+    } else if mtctx.threadPoolRef == 0 {
+        mtctx.threadPool = ZSTD_createThreadPool(nbWorkers as usize);
+    }
     ZSTDMT_CCtxParam_setNbWorkers(&mut mtctx.params, nbWorkers)
 }
 
 /// Port of `ZSTDMT_updateCParams_whileCompressing`.
-pub fn ZSTDMT_updateCParams_whileCompressing(mtctx: &mut ZSTDMT_CCtx, cctxParams: &ZSTD_CCtx_params) {
+pub fn ZSTDMT_updateCParams_whileCompressing(
+    mtctx: &mut ZSTDMT_CCtx,
+    cctxParams: &ZSTD_CCtx_params,
+) {
     use crate::decompress::zstd_decompress::ZSTD_CONTENTSIZE_UNKNOWN;
 
     let saved_wlog = mtctx.params.cParams.windowLog;
@@ -653,7 +912,11 @@ pub fn ZSTDMT_getInputDataInUse(mtctx: &ZSTDMT_CCtx) -> Range {
         let wJobID = (jobID & mtctx.jobIDMask) as usize;
         if let Some(job) = mtctx.jobs.get(wJobID) {
             if job.consumed < job.src.size {
-                return if job.prefix.size == 0 { job.src } else { job.prefix };
+                return if job.prefix.size == 0 {
+                    job.src
+                } else {
+                    job.prefix
+                };
             }
         }
     }
@@ -705,7 +968,9 @@ pub fn ZSTDMT_tryGetInputRange(mtctx: &mut ZSTDMT_CCtx) -> i32 {
     }
     let start = mtctx.roundBuff.pos;
     let end = (start + spaceNeeded).min(mtctx.roundBuff.buffer.capacity());
-    let buffer = Buffer { data: mtctx.roundBuff.buffer.data[start..end].to_vec() };
+    let buffer = Buffer {
+        data: mtctx.roundBuff.buffer.data[start..end].to_vec(),
+    };
     if ZSTDMT_isOverlapped(&buffer, inUse) != 0 {
         return 0;
     }
@@ -737,29 +1002,30 @@ pub fn findSynchronizationPoint(mtctx: &ZSTDMT_CCtx, input: &[u8], input_pos: us
     }
 
     let buffered = &mtctx.inBuff.buffer.data;
-    let (mut pos, mut hash, prev): (usize, u64, &[u8]) = if mtctx.inBuff.filled < RSYNC_MIN_BLOCK_SIZE {
-        let pos = RSYNC_MIN_BLOCK_SIZE - mtctx.inBuff.filled;
-        if pos >= RSYNC_LENGTH {
-            let prev = &istart[pos - RSYNC_LENGTH..pos];
-            (pos, ZSTD_rollingHash_compute(prev), prev)
+    let (mut pos, mut hash, prev): (usize, u64, &[u8]) =
+        if mtctx.inBuff.filled < RSYNC_MIN_BLOCK_SIZE {
+            let pos = RSYNC_MIN_BLOCK_SIZE - mtctx.inBuff.filled;
+            if pos >= RSYNC_LENGTH {
+                let prev = &istart[pos - RSYNC_LENGTH..pos];
+                (pos, ZSTD_rollingHash_compute(prev), prev)
+            } else {
+                debug_assert!(mtctx.inBuff.filled >= RSYNC_LENGTH);
+                let prev = &buffered[mtctx.inBuff.filled - RSYNC_LENGTH..mtctx.inBuff.filled];
+                let mut hash = ZSTD_rollingHash_compute(&prev[pos..]);
+                hash = ZSTD_rollingHash_append(hash, &istart[..pos]);
+                (pos, hash, prev)
+            }
         } else {
             debug_assert!(mtctx.inBuff.filled >= RSYNC_LENGTH);
             let prev = &buffered[mtctx.inBuff.filled - RSYNC_LENGTH..mtctx.inBuff.filled];
-            let mut hash = ZSTD_rollingHash_compute(&prev[pos..]);
-            hash = ZSTD_rollingHash_append(hash, &istart[..pos]);
-            (pos, hash, prev)
-        }
-    } else {
-        debug_assert!(mtctx.inBuff.filled >= RSYNC_LENGTH);
-        let prev = &buffered[mtctx.inBuff.filled - RSYNC_LENGTH..mtctx.inBuff.filled];
-        let hash = ZSTD_rollingHash_compute(prev);
-        if (hash & hitMask) == hitMask {
-            syncPoint.toLoad = 0;
-            syncPoint.flush = 1;
-            return syncPoint;
-        }
-        (0, hash, prev)
-    };
+            let hash = ZSTD_rollingHash_compute(prev);
+            if (hash & hitMask) == hitMask {
+                syncPoint.toLoad = 0;
+                syncPoint.flush = 1;
+                return syncPoint;
+            }
+            (0, hash, prev)
+        };
 
     while pos < syncPoint.toLoad {
         let toRemove = if pos < RSYNC_LENGTH {
@@ -780,46 +1046,69 @@ pub fn findSynchronizationPoint(mtctx: &ZSTDMT_CCtx, input: &[u8], input_pos: us
 
 /// Port of `ZSTDMT_writeLastEmptyBlock`.
 pub fn ZSTDMT_writeLastEmptyBlock(job: &mut ZSTDMT_jobDescription) {
-    job.dstBuff = Buffer { data: vec![0; 3] };
+    if job.dstBuff.capacity() < crate::decompress::zstd_decompress_block::ZSTD_blockHeaderSize {
+        job.dstBuff = Buffer { data: vec![0; 3] };
+    }
     job.cSize = ZSTD_writeLastEmptyBlock(&mut job.dstBuff.data);
 }
 
 /// Port of `ZSTDMT_createCompressionJob`.
-pub fn ZSTDMT_createCompressionJob(mtctx: &mut ZSTDMT_CCtx, srcSize: usize, endOp: ZSTD_EndDirective) -> usize {
+pub fn ZSTDMT_createCompressionJob(
+    mtctx: &mut ZSTDMT_CCtx,
+    srcSize: usize,
+    endOp: ZSTD_EndDirective,
+) -> usize {
     if mtctx.nextJobID > mtctx.doneJobID + mtctx.jobIDMask {
         return 0;
     }
     let endFrame = endOp == ZSTD_EndDirective::ZSTD_e_end;
     let jobID = (mtctx.nextJobID & mtctx.jobIDMask) as usize;
     if mtctx.jobs.len() <= jobID {
-        mtctx.jobs.resize(jobID + 1, ZSTDMT_jobDescription::default());
+        mtctx
+            .jobs
+            .resize(jobID + 1, ZSTDMT_jobDescription::default());
     }
-    let job = &mut mtctx.jobs[jobID];
-    let srcBuff = core::mem::take(&mut mtctx.inBuff.buffer);
-    let srcStart = srcBuff.start();
-    job.src = Range { start: mtctx.inBuff.buffer.start(), size: srcSize };
-    job.src = Range { start: srcStart, size: srcSize };
-    job.srcBuff = srcBuff;
-    job.prefix = mtctx.inBuff.prefix;
-    job.consumed = 0;
-    job.cSize = 0;
-    job.jobID = mtctx.nextJobID;
-    job.firstJob = (mtctx.nextJobID == 0) as u32;
-    job.lastJob = endFrame as u32;
-    job.dstFlushed = 0;
-    job.params = mtctx.params;
-    job.fullFrameSize = mtctx.frameContentSize;
-    job.frameChecksumNeeded =
-        (mtctx.params.fParams.checksumFlag != 0 && endFrame && mtctx.nextJobID > 0) as u32;
-    job.dstBuff = Buffer::default();
-    if srcSize == 0 && mtctx.nextJobID > 0 && endFrame {
-        ZSTDMT_writeLastEmptyBlock(job);
+    {
+        let job = &mut mtctx.jobs[jobID];
+        let srcBuff = core::mem::take(&mut mtctx.inBuff.buffer);
+        let srcStart = srcBuff.start();
+        job.src = Range {
+            start: srcStart,
+            size: srcSize,
+        };
+        job.srcBuff = srcBuff;
+        job.prefix = mtctx.inBuff.prefix;
+        job.consumed = 0;
+        job.cSize = 0;
+        job.jobID = mtctx.nextJobID;
+        job.firstJob = (mtctx.nextJobID == 0) as u32;
+        job.lastJob = endFrame as u32;
+        job.dstFlushed = 0;
+        job.params = mtctx.params;
+        job.fullFrameSize = mtctx.frameContentSize;
+        job.frameChecksumNeeded =
+            (mtctx.params.fParams.checksumFlag != 0 && endFrame && mtctx.nextJobID > 0) as u32;
+        let neededDstSize = ZSTD_compressBound(srcSize.max(1));
+        job.dstBuff = if let Some(bufPool) = mtctx.bufPool.as_mut() {
+            let mut dst = ZSTDMT_getBuffer(bufPool);
+            if dst.capacity() < neededDstSize {
+                dst.data.resize(neededDstSize, 0);
+            }
+            dst
+        } else {
+            Buffer {
+                data: vec![0; neededDstSize],
+            }
+        };
+        if srcSize == 0 && mtctx.nextJobID > 0 && endFrame {
+            ZSTDMT_writeLastEmptyBlock(job);
         }
+    }
     mtctx.roundBuff.pos += srcSize;
     mtctx.inBuff.filled = 0;
     if !endFrame {
         let newPrefixSize = srcSize.min(mtctx.targetPrefixSize);
-        let start = job.src.start + srcSize.saturating_sub(newPrefixSize);
+        let start = mtctx.jobs[jobID].src.start + srcSize.saturating_sub(newPrefixSize);
         mtctx.inBuff.prefix = Range {
             start,
             size: newPrefixSize,
@@ -832,7 +1121,7 @@ pub fn ZSTDMT_createCompressionJob(mtctx: &mut ZSTDMT_CCtx, srcSize: usize, endO
         }
     }
     mtctx.nextJobID += 1;
-    0
+    ZSTDMT_prepareJobSequences(mtctx, jobID)
 }
 
 /// Port of `ZSTDMT_flushProduced`.
@@ -847,10 +1136,28 @@ pub fn ZSTDMT_flushProduced(
 
     if mtctx.doneJobID < mtctx.nextJobID {
         let wJobID = (mtctx.doneJobID & mtctx.jobIDMask) as usize;
+        let join = if end == ZSTD_EndDirective::ZSTD_e_continue {
+            ZSTDMT_tryJoinFinishedJob(mtctx, wJobID)
+        } else {
+            ZSTDMT_joinPendingJob(mtctx, wJobID)
+        };
+        if ERR_isError(join) {
+            ZSTDMT_waitForAllJobsCompleted(mtctx);
+            ZSTDMT_releaseAllJobResources(mtctx);
+            return join;
+        }
         let mut job_completed = false;
         let (src_size, c_size);
 
         if let Some(job) = mtctx.jobs.get_mut(wJobID) {
+            if mtctx
+                .jobReceivers
+                .get(wJobID)
+                .and_then(|slot| slot.as_ref())
+                .is_some()
+            {
+                return 1;
+            }
             let c_result = job.cSize;
             if ERR_isError(c_result) {
                 ZSTDMT_waitForAllJobsCompleted(mtctx);
@@ -889,6 +1196,10 @@ pub fn ZSTDMT_flushProduced(
                 if let Some(bufPool) = mtctx.bufPool.as_mut() {
                     ZSTDMT_releaseBuffer(bufPool, dst);
                 }
+                if let Some(seqPool) = mtctx.seqPool.as_mut() {
+                    let rawSeqStore = core::mem::take(&mut job.rawSeqStore);
+                    ZSTDMT_releaseSeq(seqPool, rawSeqStore);
+                }
                 job.cSize = 0;
             }
             mtctx.consumed += src_size as u64;
@@ -914,7 +1225,10 @@ pub fn ZSTDMT_flushProduced(
 }
 
 /// Port of `ZSTDMT_createCCtx_advanced_internal`.
-pub fn ZSTDMT_createCCtx_advanced_internal(nbWorkers: u32, cMem: ZSTD_customMem) -> Option<Box<ZSTDMT_CCtx>> {
+pub fn ZSTDMT_createCCtx_advanced_internal(
+    nbWorkers: u32,
+    cMem: ZSTD_customMem,
+) -> Option<Box<ZSTDMT_CCtx>> {
     if nbWorkers < 1 {
         return None;
     }
@@ -923,6 +1237,8 @@ pub fn ZSTDMT_createCCtx_advanced_internal(nbWorkers: u32, cMem: ZSTD_customMem)
     let mut mtctx = Box::new(ZSTDMT_CCtx::default());
     mtctx.params.nbWorkers = nbWorkers as i32;
     mtctx.cMem = cMem;
+    mtctx.threadPool = ZSTD_createThreadPool(nbWorkers as usize);
+    mtctx.jobReceivers.resize_with(jobs.len(), || None);
     mtctx.jobs = jobs;
     mtctx.jobIDMask = nbJobs - 1;
     mtctx.bufPool = ZSTDMT_createBufferPool(2 * nbWorkers + 3, cMem);
@@ -951,6 +1267,7 @@ pub fn ZSTDMT_initCStream_internal(
     if params.nbWorkers != mtctx.params.nbWorkers {
         ZSTDMT_resize(mtctx, params.nbWorkers as u32);
     }
+    ZSTDMT_releaseAllJobResources(mtctx);
     mtctx.params = params;
     mtctx.frameContentSize = pledgedSrcSize;
     mtctx.targetPrefixSize = ZSTDMT_computeOverlapSize(&mtctx.params);
@@ -963,19 +1280,56 @@ pub fn ZSTDMT_initCStream_internal(
         mtctx.targetSectionSize = mtctx.targetPrefixSize;
     }
     if let Some(bufPool) = mtctx.bufPool.as_mut() {
-        ZSTDMT_setBufferSize(bufPool, crate::compress::zstd_compress::ZSTD_compressBound(mtctx.targetSectionSize));
+        ZSTDMT_setBufferSize(
+            bufPool,
+            crate::compress::zstd_compress::ZSTD_compressBound(mtctx.targetSectionSize),
+        );
+    }
+    let windowSize = if mtctx.params.ldmParams.enableLdm == ZSTD_ParamSwitch_e::ZSTD_ps_enable {
+        1usize << mtctx.params.cParams.windowLog
+    } else {
+        0
+    };
+    let nbSlackBuffers = 2 + usize::from(mtctx.targetPrefixSize > 0);
+    let slackSize = mtctx.targetSectionSize.saturating_mul(nbSlackBuffers);
+    let nbWorkers = mtctx.params.nbWorkers.max(1) as usize;
+    let sectionsSize = mtctx.targetSectionSize.saturating_mul(nbWorkers);
+    let roundBuffCapacity = windowSize.max(sectionsSize).saturating_add(slackSize);
+    if mtctx.roundBuff.capacity < roundBuffCapacity {
+        mtctx.roundBuff.buffer = Buffer {
+            data: vec![0; roundBuffCapacity],
+        };
+        mtctx.roundBuff.capacity = roundBuffCapacity;
+    }
+    mtctx.jobReady = 0;
+    mtctx.doneJobID = 0;
+    mtctx.nextJobID = 0;
+    mtctx.frameEnded = 0;
+    mtctx.allJobsCompleted = 0;
+    mtctx.consumed = 0;
+    mtctx.produced = 0;
+    mtctx.inBuff.prefix = Range::default();
+    mtctx.roundBuff.pos = 0;
+    if let Some(seqPool) = mtctx.seqPool.as_mut() {
+        let _ = ZSTDMT_serialState_reset(
+            &mut mtctx.serial,
+            seqPool,
+            mtctx.params,
+            mtctx.targetSectionSize,
+            None,
+        );
+    } else {
+        mtctx.serial = SerialState {
+            nextJobID: 0,
+            params: mtctx.params,
+        };
     }
     0
 }
 
 /// Port of `ZSTDMT_compressionJob`.
-pub fn ZSTDMT_compressionJob(job: &mut ZSTDMT_jobDescription) {
+pub fn ZSTDMT_compressionJob(job: &mut ZSTDMT_jobDescription, cctx: &mut Box<ZSTD_CCtx>) {
     let mut jobParams = job.params;
-    let mut rawSeqStore = if jobParams.ldmParams.enableLdm == ZSTD_ParamSwitch_e::ZSTD_ps_enable {
-        RawSeqStore_t::with_capacity(ZSTD_ldm_getMaxNbSeq(jobParams.ldmParams, job.src.size))
-    } else {
-        RawSeqStore_t::default()
-    };
     let mut lastCBlockSize = 0usize;
 
     if job.jobID != 0 {
@@ -996,22 +1350,13 @@ pub fn ZSTDMT_compressionJob(job: &mut ZSTDMT_jobDescription) {
         return;
     }
 
-    if job.dstBuff.capacity() == 0 {
-        let bound = ZSTD_compressBound(job.src.size.max(1));
-        job.dstBuff = Buffer { data: vec![0; bound] };
+    let bound = ZSTD_compressBound(job.src.size.max(1));
+    if job.dstBuff.capacity() < bound {
+        job.dstBuff.data.resize(bound, 0);
     }
-
-    let mut cctx = match ZSTD_createCCtx_advanced(jobParams.customMem) {
-        Some(cctx) => cctx,
-        None => {
-            job.cSize = crate::common::error::ERROR(crate::common::error::ErrorCode::MemoryAllocation);
-            return;
-        }
-    };
 
     let src = range_as_slice(job.src);
     let prefix = range_as_slice(job.prefix);
-    ZSTDMT_serialState_genSequences(&mut SerialState { nextJobID: job.jobID, params: job.params }, &mut rawSeqStore, job.src, job.jobID);
 
     let pledgedSrcSize = if job.firstJob != 0 {
         job.fullFrameSize
@@ -1019,7 +1364,7 @@ pub fn ZSTDMT_compressionJob(job: &mut ZSTDMT_jobDescription) {
         job.src.size as u64
     };
     let initError = ZSTD_compressBegin_advanced_internal(
-        &mut cctx,
+        cctx,
         prefix,
         ZSTD_dictContentType_e::ZSTD_dct_rawContent,
         None,
@@ -1045,20 +1390,23 @@ pub fn ZSTDMT_compressionJob(job: &mut ZSTDMT_jobDescription) {
     cctx.appliedParams.extSeqProdFunc = None;
 
     ZSTDMT_serialState_applySequences(
-        &SerialState { nextJobID: job.jobID + 1, params: job.params },
-        &mut cctx,
-        &rawSeqStore,
+        &SerialState {
+            nextJobID: job.jobID + 1,
+            params: job.params,
+        },
+        cctx,
+        &job.rawSeqStore,
     );
 
     let mut op = 0usize;
     if job.firstJob == 0 {
-        let hSize = ZSTD_compressContinue_public(&mut cctx, &mut job.dstBuff.data[op..], &[]);
+        let hSize = ZSTD_compressContinue_public(cctx, &mut job.dstBuff.data[op..], &[]);
         if crate::common::error::ERR_isError(hSize) {
             job.cSize = hSize;
             return;
         }
         op += hSize;
-        ZSTD_invalidateRepCodes(&mut cctx);
+        ZSTD_invalidateRepCodes(cctx);
     }
 
     let chunkSize = 4 * ZSTD_BLOCKSIZE_MAX;
@@ -1066,7 +1414,8 @@ pub fn ZSTDMT_compressionJob(job: &mut ZSTDMT_jobDescription) {
     for chunkNb in 1..nbChunks {
         let start = (chunkNb - 1) * chunkSize;
         let end = start + chunkSize;
-        let cSize = ZSTD_compressContinue_public(&mut cctx, &mut job.dstBuff.data[op..], &src[start..end]);
+        let cSize =
+            ZSTD_compressContinue_public(cctx, &mut job.dstBuff.data[op..], &src[start..end]);
         if crate::common::error::ERR_isError(cSize) {
             job.cSize = cSize;
             return;
@@ -1080,9 +1429,9 @@ pub fn ZSTDMT_compressionJob(job: &mut ZSTDMT_jobDescription) {
         let start = chunkSize.saturating_mul(nbChunks.saturating_sub(1));
         let lastSrc = &src[start..];
         lastCBlockSize = if job.lastJob != 0 {
-            ZSTD_compressEnd_public(&mut cctx, &mut job.dstBuff.data[op..], lastSrc)
+            ZSTD_compressEnd_public(cctx, &mut job.dstBuff.data[op..], lastSrc)
         } else {
-            ZSTD_compressContinue_public(&mut cctx, &mut job.dstBuff.data[op..], lastSrc)
+            ZSTD_compressContinue_public(cctx, &mut job.dstBuff.data[op..], lastSrc)
         };
         if crate::common::error::ERR_isError(lastCBlockSize) {
             job.cSize = lastCBlockSize;
@@ -1090,22 +1439,21 @@ pub fn ZSTDMT_compressionJob(job: &mut ZSTDMT_jobDescription) {
         }
     }
 
-    ZSTD_CCtx_trace(&mut cctx, 0);
+    ZSTD_CCtx_trace(cctx, 0);
     job.cSize += lastCBlockSize;
     job.consumed = job.src.size;
 }
 
 /// Port of `ZSTDMT_createCCtx`. Allocates the MT context header and
-/// its owned job/pool scaffolding; the actual parallel compression
-/// pipeline remains stubbed separately.
+/// its owned job/pool scaffolding.
 pub fn ZSTDMT_createCCtx(nbWorkers: u32) -> Option<Box<ZSTDMT_CCtx>> {
     ZSTDMT_createCCtx_advanced_internal(nbWorkers, ZSTD_customMem)
 }
 
 /// Port of `ZSTDMT_createCCtx_advanced`. The upstream internal helper
 /// also accepts an optional external thread-pool pointer; the current
-/// Rust MT shim owns its synchronous execution model and therefore
-/// only exposes the public `(nbWorkers, customMem)` surface.
+/// Rust port owns its worker threads internally and therefore only
+/// exposes the public `(nbWorkers, customMem)` surface.
 pub fn ZSTDMT_createCCtx_advanced(
     nbWorkers: u32,
     cMem: ZSTD_customMem,
@@ -1124,6 +1472,8 @@ pub fn ZSTDMT_freeCCtx(mtctx: Option<Box<ZSTDMT_CCtx>>) -> usize {
     ZSTDMT_freeBufferPool(mtctx.bufPool.take());
     ZSTDMT_freeCCtxPool(mtctx.cctxPool.take());
     ZSTDMT_freeSeqPool(mtctx.seqPool.take());
+    POOL_free(mtctx.threadPool.take());
+    mtctx.threadPoolRef = 0;
     ZSTDMT_serialState_free(&mut mtctx.serial);
     mtctx.roundBuff.buffer = Buffer::default();
     mtctx.roundBuff.capacity = 0;
@@ -1131,9 +1481,9 @@ pub fn ZSTDMT_freeCCtx(mtctx: Option<Box<ZSTDMT_CCtx>>) -> usize {
     0
 }
 
-/// Port of `ZSTDMT_compressStream_generic`. The Rust port currently
-/// executes queued jobs immediately on the caller thread while still
-/// using the MT context/job buffering state machine.
+/// Port of `ZSTDMT_compressStream_generic`. Jobs are dispatched onto
+/// background worker threads and flushed in-order through the
+/// existing MT context/job buffering state machine.
 pub fn ZSTDMT_compressStream_generic(
     mtctx: &mut ZSTDMT_CCtx,
     output: &mut [u8],
@@ -1142,7 +1492,7 @@ pub fn ZSTDMT_compressStream_generic(
     input_pos: &mut usize,
     end_op: crate::compress::zstd_compress::ZSTD_EndDirective,
 ) -> usize {
-    use crate::common::error::{ErrorCode, ERR_isError, ERROR};
+    use crate::common::error::{ERR_isError, ErrorCode, ERROR};
     use crate::decompress::zstd_decompress::ZSTD_CONTENTSIZE_UNKNOWN;
 
     if *output_pos > output.len() || *input_pos > input.len() {
@@ -1188,13 +1538,12 @@ pub fn ZSTDMT_compressStream_generic(
         }
         if queuedJobID < mtctx.nextJobID {
             let wJobID = (queuedJobID & mtctx.jobIDMask) as usize;
-            if let Some(job) = mtctx.jobs.get_mut(wJobID) {
-                ZSTDMT_compressionJob(job);
-                if ERR_isError(job.cSize) {
-                    return job.cSize;
-                }
-            } else {
+            if mtctx.jobs.get(wJobID).is_none() {
                 return ERROR(ErrorCode::Generic);
+            }
+            let spawn = ZSTDMT_spawnCompressionJob(mtctx, wJobID);
+            if ERR_isError(spawn) {
+                return spawn;
             }
         }
     }
@@ -1215,6 +1564,8 @@ pub fn ZSTDMT_compressStream_generic(
 pub fn ZSTDMT_sizeof_CCtx(mtctx: &ZSTDMT_CCtx) -> usize {
     core::mem::size_of::<ZSTDMT_CCtx>()
         + mtctx.jobs.capacity() * core::mem::size_of::<ZSTDMT_jobDescription>()
+        + mtctx.jobReceivers.capacity()
+            * core::mem::size_of::<Option<Receiver<ZSTDMT_completedJob>>>()
         + mtctx
             .bufPool
             .as_ref()
@@ -1230,6 +1581,7 @@ pub fn ZSTDMT_sizeof_CCtx(mtctx: &ZSTDMT_CCtx) -> usize {
             .as_ref()
             .map(|p| ZSTDMT_sizeof_seqPool(p))
             .unwrap_or(0)
+        + ZSTDMT_getThreadPool(mtctx).map(POOL_sizeof).unwrap_or(0)
         + mtctx.roundBuff.capacity
 }
 
@@ -1278,8 +1630,8 @@ mod tests {
 
     #[test]
     fn zstdmt_api_surface_stubs_behave_safely() {
-        // The MT context still executes jobs synchronously, but the
-        // API surface should be live and safe to call.
+        // The MT context now owns live worker-pool scaffolding; this
+        // test keeps the surface-level API contracts pinned.
         use crate::compress::zstd_compress::ZSTD_EndDirective;
 
         // Creator now constructs the owned MT context scaffolding for
@@ -1298,11 +1650,14 @@ mod tests {
         // Free accepts None without panicking.
         assert_eq!(ZSTDMT_freeCCtx(None), 0);
 
-        // Size / flush-now queries work on a default stub ctx.
-        let stub = ZSTDMT_CCtx::default();
-        assert_eq!(ZSTDMT_sizeof_CCtx(&stub), core::mem::size_of::<ZSTDMT_CCtx>());
-        assert_eq!(ZSTDMT_toFlushNow(&stub), 0);
-        assert_eq!(ZSTDMT_nextInputSizeHint(&stub), ZSTD_BLOCKSIZE_MAX);
+        // Size / flush-now queries work on a default empty ctx.
+        let empty = ZSTDMT_CCtx::default();
+        assert_eq!(
+            ZSTDMT_sizeof_CCtx(&empty),
+            core::mem::size_of::<ZSTDMT_CCtx>()
+        );
+        assert_eq!(ZSTDMT_toFlushNow(&empty), 0);
+        assert_eq!(ZSTDMT_nextInputSizeHint(&empty), ZSTD_BLOCKSIZE_MAX);
 
         let live_size = ZSTDMT_sizeof_CCtx(&ctx);
         assert!(live_size > core::mem::size_of::<ZSTDMT_CCtx>());
@@ -1316,7 +1671,11 @@ mod tests {
         let mut dp = 0usize;
         let mut sp = 0usize;
         let rc = ZSTDMT_compressStream_generic(
-            &mut mt, &mut dst, &mut dp, b"x", &mut sp,
+            &mut mt,
+            &mut dst,
+            &mut dp,
+            b"x",
+            &mut sp,
             ZSTD_EndDirective::ZSTD_e_end,
         );
         assert_eq!(rc, 0);
@@ -1366,6 +1725,119 @@ mod tests {
     }
 
     #[test]
+    fn zstdmt_create_job_prepares_ldm_sequences_serially() {
+        let mut params = ZSTD_CCtx_params::default();
+        ZSTD_CCtxParams_init(&mut params, 3);
+        params.nbWorkers = 1;
+        params.ldmEnable = ZSTD_ParamSwitch_e::ZSTD_ps_enable;
+        params.ldmParams.enableLdm = ZSTD_ParamSwitch_e::ZSTD_ps_enable;
+        params.ldmParams.minMatchLength = 64;
+        params.ldmParams.hashLog = 8;
+        params.ldmParams.bucketSizeLog = 4;
+        params.ldmParams.hashRateLog = 4;
+
+        let mut mt = ZSTDMT_createCCtx(1).expect("mt");
+        assert_eq!(ZSTDMT_initCStream_internal(&mut mt, params, 0), 0);
+
+        let repeated = b"abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ+-";
+        let src = repeated.repeat(3);
+        mt.inBuff.buffer = Buffer { data: src.clone() };
+        mt.inBuff.filled = src.len();
+
+        assert_eq!(
+            ZSTDMT_createCompressionJob(&mut mt, src.len(), ZSTD_EndDirective::ZSTD_e_end),
+            0
+        );
+        let job = &mt.jobs[0];
+        assert!(job.rawSeqStore.capacity > 0);
+        assert!(
+            job.rawSeqStore.size > 0,
+            "expected LDM to discover at least one raw sequence"
+        );
+    }
+
+    #[test]
+    fn zstdmt_create_job_takes_dst_buffer_from_pool() {
+        let mut params = ZSTD_CCtx_params::default();
+        ZSTD_CCtxParams_init(&mut params, 3);
+        params.nbWorkers = 1;
+
+        let mut mt = ZSTDMT_createCCtx(1).expect("mt");
+        assert_eq!(ZSTDMT_initCStream_internal(&mut mt, params, 0), 0);
+        {
+            let pool = mt.bufPool.as_mut().expect("buf pool");
+            ZSTDMT_setBufferSize(pool, 1024);
+            ZSTDMT_releaseBuffer(
+                pool,
+                Buffer {
+                    data: vec![0xA5; 1024],
+                },
+            );
+            assert_eq!(pool.buffers.len(), 1);
+        }
+
+        let src = b"pooled destination buffer job payload".to_vec();
+        mt.inBuff.buffer = Buffer { data: src.clone() };
+        mt.inBuff.filled = src.len();
+
+        assert_eq!(
+            ZSTDMT_createCompressionJob(&mut mt, src.len(), ZSTD_EndDirective::ZSTD_e_end),
+            0
+        );
+        assert_eq!(mt.bufPool.as_ref().unwrap().buffers.len(), 0);
+        assert_eq!(mt.jobs[0].dstBuff.capacity(), 1024);
+
+        ZSTDMT_releaseAllJobResources(&mut mt);
+    }
+
+    #[test]
+    fn zstdmt_init_sizes_round_buffer_like_upstream_slack_window() {
+        let mut params = ZSTD_CCtx_params::default();
+        ZSTD_CCtxParams_init(&mut params, 3);
+        params.nbWorkers = 2;
+        params.jobSize = ZSTD_BLOCKSIZE_MAX;
+        params.overlapLog = 1;
+
+        let mut mt = ZSTDMT_createCCtx(2).expect("mt");
+        assert_eq!(ZSTDMT_initCStream_internal(&mut mt, params, 0), 0);
+
+        let nb_slack_buffers = 2 + usize::from(mt.targetPrefixSize > 0);
+        let expected = mt
+            .targetSectionSize
+            .saturating_mul(mt.params.nbWorkers as usize)
+            .saturating_add(mt.targetSectionSize.saturating_mul(nb_slack_buffers));
+        assert_eq!(mt.roundBuff.capacity, expected);
+        assert_eq!(mt.roundBuff.pos, 0);
+    }
+
+    #[test]
+    fn zstdmt_worker_cctx_returns_to_pool_after_join() {
+        let mut params = ZSTD_CCtx_params::default();
+        ZSTD_CCtxParams_init(&mut params, 3);
+        params.nbWorkers = 1;
+
+        let mut mt = ZSTDMT_createCCtx(1).expect("mt");
+        assert_eq!(ZSTDMT_initCStream_internal(&mut mt, params, 0), 0);
+        assert_eq!(mt.cctxPool.as_ref().unwrap().cctxs.len(), 1);
+
+        mt.inBuff.buffer = Buffer {
+            data: b"x".to_vec(),
+        };
+        mt.inBuff.filled = mt.inBuff.buffer.data.len();
+        let job_size = mt.inBuff.filled;
+
+        assert_eq!(
+            ZSTDMT_createCompressionJob(&mut mt, job_size, ZSTD_EndDirective::ZSTD_e_end),
+            0
+        );
+        let wJobID = (mt.doneJobID & mt.jobIDMask) as usize;
+        assert_eq!(ZSTDMT_spawnCompressionJob(&mut mt, wJobID), 0);
+        assert_eq!(mt.cctxPool.as_ref().unwrap().cctxs.len(), 0);
+        assert_eq!(ZSTDMT_joinPendingJob(&mut mt, wJobID), 0);
+        assert_eq!(mt.cctxPool.as_ref().unwrap().cctxs.len(), 1);
+    }
+
+    #[test]
     fn zstdmt_compress_stream_generic_roundtrips_single_job_frame() {
         use crate::decompress::zstd_decompress::ZSTD_decompress;
 
@@ -1374,7 +1846,10 @@ mod tests {
         ZSTD_CCtxParams_init(&mut params, 3);
         params.nbWorkers = 1;
         let mut mt = ZSTDMT_createCCtx(1).expect("mt");
-        assert_eq!(ZSTDMT_initCStream_internal(&mut mt, params, src.len() as u64), 0);
+        assert_eq!(
+            ZSTDMT_initCStream_internal(&mut mt, params, src.len() as u64),
+            0
+        );
 
         let mut compressed = vec![0u8; ZSTD_compressBound(src.len())];
         let mut cpos = 0usize;
@@ -1441,7 +1916,7 @@ mod tests {
 
     #[test]
     fn zstdmt_get_frame_progression_ignores_errored_job_output() {
-        use crate::common::error::{ERROR, ErrorCode};
+        use crate::common::error::{ErrorCode, ERROR};
 
         let mut mt = ZSTDMT_CCtx::default();
         mt.jobIDMask = 0;
@@ -1478,7 +1953,9 @@ mod tests {
             consumed: 4,
             cSize: 3,
             dstFlushed: 0,
-            dstBuff: Buffer { data: vec![1, 2, 3] },
+            dstBuff: Buffer {
+                data: vec![1, 2, 3],
+            },
             ..ZSTDMT_jobDescription::default()
         };
 
@@ -1505,20 +1982,24 @@ mod tests {
 
     #[test]
     fn zstdmt_flush_produced_returns_error_and_clears_jobs() {
-        use crate::common::error::{ERROR, ERR_isError, ErrorCode};
+        use crate::common::error::{ERR_isError, ErrorCode, ERROR};
 
         let mut mt = ZSTDMT_createCCtx(1).expect("mt");
         mt.nextJobID = 1;
         mt.doneJobID = 0;
         mt.jobIDMask = 3;
-        mt.inBuff.buffer = Buffer { data: vec![9, 8, 7] };
+        mt.inBuff.buffer = Buffer {
+            data: vec![9, 8, 7],
+        };
         mt.inBuff.filled = 3;
         mt.allJobsCompleted = 0;
         mt.jobs[0] = ZSTDMT_jobDescription {
             src: Range { start: 0, size: 4 },
             consumed: 1,
             cSize: ERROR(ErrorCode::MemoryAllocation),
-            dstBuff: Buffer { data: vec![1, 2, 3] },
+            dstBuff: Buffer {
+                data: vec![1, 2, 3],
+            },
             ..ZSTDMT_jobDescription::default()
         };
 
@@ -1537,7 +2018,10 @@ mod tests {
         assert_eq!(mt.inBuff.filled, 0);
         assert!(mt.inBuff.buffer.data.is_empty());
         assert_eq!(mt.allJobsCompleted, 1);
-        assert!(mt.jobs.iter().all(|job| job.cSize == 0 && job.dstBuff.data.is_empty()));
+        assert!(mt
+            .jobs
+            .iter()
+            .all(|job| job.cSize == 0 && job.dstBuff.data.is_empty()));
     }
 
     #[test]
@@ -1552,7 +2036,8 @@ mod tests {
         let tail_hash = ZSTD_rollingHash_compute(
             &mt.inBuff.buffer.data[mt.inBuff.filled - RSYNC_LENGTH..mt.inBuff.filled],
         );
-        mt.rsync.primePower = ZSTD_rollingHash_primePower(RSYNC_LENGTH as u32);
+        mt.rsync.primePower =
+            crate::compress::zstd_hashes::ZSTD_rollingHash_primePower(RSYNC_LENGTH as u32);
         mt.rsync.hitMask = tail_hash;
 
         let sync = findSynchronizationPoint(&mt, b"trailing input", 0);
@@ -1569,7 +2054,8 @@ mod tests {
             data: vec![b'b'; RSYNC_MIN_BLOCK_SIZE],
         };
         mt.inBuff.filled = RSYNC_MIN_BLOCK_SIZE;
-        mt.rsync.primePower = ZSTD_rollingHash_primePower(RSYNC_LENGTH as u32);
+        mt.rsync.primePower =
+            crate::compress::zstd_hashes::ZSTD_rollingHash_primePower(RSYNC_LENGTH as u32);
 
         let prev = &mt.inBuff.buffer.data[mt.inBuff.filled - RSYNC_LENGTH..mt.inBuff.filled];
         let prev_hash = ZSTD_rollingHash_compute(prev);

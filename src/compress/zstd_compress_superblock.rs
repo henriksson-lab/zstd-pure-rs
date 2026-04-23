@@ -6,11 +6,13 @@
 //! is set. Not yet ported — current v0.1 always emits single blocks
 //! per `ZSTD_BLOCKSIZE_MAX` stride.
 
-use crate::compress::seq_store::{MINMATCH, SeqDef, SeqStore_t, ZSTD_getSequenceLength};
+#![allow(clippy::field_reassign_with_default)]
+
+use crate::compress::seq_store::{SeqDef, SeqStore_t, ZSTD_getSequenceLength, MINMATCH};
 use crate::compress::zstd_compress::{
     ZSTD_CCtx_params, ZSTD_entropyCTablesMetadata_t, ZSTD_entropyCTables_t,
-    ZSTD_estimateBlockSize_symbolType, ZSTD_fseCTablesMetadata_t,
-    ZSTD_hufCTablesMetadata_t, ZSTD_hufCTables_t,
+    ZSTD_estimateBlockSize_symbolType, ZSTD_fseCTablesMetadata_t, ZSTD_hufCTablesMetadata_t,
+    ZSTD_hufCTables_t,
 };
 use crate::decompress::zstd_decompress_block::SymbolEncodingType_e;
 
@@ -41,7 +43,8 @@ pub fn ZSTD_compressSubBlock_literal(
 
     let litSize = literals.len();
     let header = if writeEntropy { 200 } else { 0 };
-    let lhSize = 3 + (litSize >= (1024usize.saturating_sub(header))) as usize
+    let lhSize = 3
+        + (litSize >= (1024usize.saturating_sub(header))) as usize
         + (litSize >= (16 * 1024usize).saturating_sub(header)) as usize;
     let singleStream = lhSize == 3;
     let hType = if writeEntropy {
@@ -60,15 +63,26 @@ pub fn ZSTD_compressSubBlock_literal(
     }
 
     if writeEntropy && hufMetadata.hType == SymbolEncodingType_e::set_compressed {
-        dst[op..op + hufMetadata.hufDesSize].copy_from_slice(&hufMetadata.hufDesBuffer[..hufMetadata.hufDesSize]);
+        dst[op..op + hufMetadata.hufDesSize]
+            .copy_from_slice(&hufMetadata.hufDesBuffer[..hufMetadata.hufDesSize]);
         op += hufMetadata.hufDesSize;
         cLitSize += hufMetadata.hufDesSize;
     }
 
     let cSize = if singleStream {
-        HUF_compress1X_usingCTable(&mut dst[op..], literals, hufTable, if bmi2 != 0 { 1 } else { 0 })
+        HUF_compress1X_usingCTable(
+            &mut dst[op..],
+            literals,
+            hufTable,
+            if bmi2 != 0 { 1 } else { 0 },
+        )
     } else {
-        HUF_compress4X_usingCTable(&mut dst[op..], literals, hufTable, if bmi2 != 0 { 1 } else { 0 })
+        HUF_compress4X_usingCTable(
+            &mut dst[op..],
+            literals,
+            hufTable,
+            if bmi2 != 0 { 1 } else { 0 },
+        )
     };
     if cSize == 0 || crate::common::error::ERR_isError(cSize) {
         return 0;
@@ -85,7 +99,9 @@ pub fn ZSTD_compressSubBlock_literal(
 
     match lhSize {
         3 => {
-            let lhc = hType as u32 + ((singleStream as u32 ^ 1) << 2) + ((litSize as u32) << 4)
+            let lhc = hType as u32
+                + ((singleStream as u32 ^ 1) << 2)
+                + ((litSize as u32) << 4)
                 + ((cLitSize as u32) << 14);
             MEM_writeLE24(&mut dst[..3], lhc);
         }
@@ -121,7 +137,7 @@ pub fn ZSTD_compressSubBlock_sequences(
     entropyWritten: &mut i32,
 ) -> usize {
     use crate::common::error::{ErrorCode, ERROR};
-    use crate::common::mem::{MEM_writeLE16};
+    use crate::common::mem::MEM_writeLE16;
     use crate::compress::zstd_compress_sequences::ZSTD_encodeSequences;
     use crate::decompress::zstd_decompress_block::LONGNBSEQ;
 
@@ -180,7 +196,10 @@ pub fn ZSTD_compressSubBlock_sequences(
     }
     op += bitstreamSize;
 
-    if writeEntropy && fseMetadata.lastCountSize != 0 && fseMetadata.lastCountSize + bitstreamSize < 4 {
+    if writeEntropy
+        && fseMetadata.lastCountSize != 0
+        && fseMetadata.lastCountSize + bitstreamSize < 4
+    {
         return 0;
     }
     if op - seqHead < 4 {
@@ -212,7 +231,7 @@ pub fn ZSTD_compressSubBlock(
     lastBlock: u32,
 ) -> usize {
     use crate::common::mem::MEM_writeLE24;
-    use crate::decompress::zstd_decompress_block::{ZSTD_blockHeaderSize, blockType_e};
+    use crate::decompress::zstd_decompress_block::{blockType_e, ZSTD_blockHeaderSize};
 
     let mut op = ZSTD_blockHeaderSize;
     let cLitSize = ZSTD_compressSubBlock_literal(
@@ -249,7 +268,8 @@ pub fn ZSTD_compressSubBlock(
     op += cSeqSize;
 
     let cSize = op - ZSTD_blockHeaderSize;
-    let cBlockHeader24 = lastBlock + ((blockType_e::bt_compressed as u32) << 1) + ((cSize as u32) << 3);
+    let cBlockHeader24 =
+        lastBlock + ((blockType_e::bt_compressed as u32) << 1) + ((cSize as u32) << 3);
     MEM_writeLE24(&mut dst[..3], cBlockHeader24);
     op
 }
@@ -316,7 +336,8 @@ pub fn ZSTD_compressSubBlock_multi(
     let mut of_code_ptr = 0usize;
     let minTarget = crate::compress::zstd_compress::ZSTD_TARGETCBLOCKSIZE_MIN as usize;
     let targetCBlockSize = minTarget.max(cctxParams.targetCBlockSize);
-    let mut writeLitEntropy = (entropyMetadata.hufMetadata.hType == SymbolEncodingType_e::set_compressed) as i32;
+    let mut writeLitEntropy =
+        (entropyMetadata.hufMetadata.hType == SymbolEncodingType_e::set_compressed) as i32;
     let mut writeSeqEntropy = 1i32;
 
     if nbSeqs > 0 {
@@ -492,7 +513,7 @@ pub fn ZSTD_estimateSubBlockSize_literal(
     writeEntropy: bool,
 ) -> usize {
     use crate::compress::hist::HIST_count_wksp;
-    use crate::compress::huf_compress::{HUF_SYMBOLVALUE_MAX, HUF_estimateCompressedSize};
+    use crate::compress::huf_compress::{HUF_estimateCompressedSize, HUF_SYMBOLVALUE_MAX};
 
     let litSize = literals.len();
     let literalSectionHeaderSize = 3usize;
@@ -529,8 +550,8 @@ pub fn ZSTD_estimateSubBlockSize_sequences(
     writeEntropy: bool,
 ) -> usize {
     use crate::decompress::zstd_decompress_block::{
-        DefaultMaxOff, LL_bits, LL_defaultNorm, LL_defaultNormLog, MaxLL, MaxML, MaxOff,
-        ML_bits, ML_defaultNorm, ML_defaultNormLog, OF_defaultNorm, OF_defaultNormLog,
+        DefaultMaxOff, LL_bits, LL_defaultNorm, LL_defaultNormLog, ML_bits, ML_defaultNorm,
+        ML_defaultNormLog, MaxLL, MaxML, MaxOff, OF_defaultNorm, OF_defaultNormLog,
     };
 
     const SEQUENCES_SECTION_HEADER_SIZE: usize = 3;
@@ -607,7 +628,10 @@ pub fn ZSTD_estimateSubBlockSize(
         writeSeqEntropy,
     );
     estBlockSize += estLitSize + crate::decompress::zstd_decompress_block::ZSTD_blockHeaderSize;
-    EstimatedBlockSize { estLitSize, estBlockSize }
+    EstimatedBlockSize {
+        estLitSize,
+        estBlockSize,
+    }
 }
 
 /// Port of `ZSTD_needSequenceEntropyTables`.
@@ -756,8 +780,7 @@ mod tests {
         let bss = crate::compress::zstd_compress::ZSTD_buildSeqStore(&mut cctx, src);
         assert!(!crate::common::error::ERR_isError(bss));
         let rc = ZSTD_compressSuperBlock(&mut cctx, &mut dst, src, 1);
-        let expected =
-            crate::compress::zstd_compress::ZSTD_noCompressBlock(&mut [0u8; 64], src, 1);
+        let expected = crate::compress::zstd_compress::ZSTD_noCompressBlock(&mut [0u8; 64], src, 1);
         assert_eq!(rc, expected);
     }
 
@@ -778,9 +801,21 @@ mod tests {
     fn count_literals_uses_decoded_sequence_lengths() {
         let seq_store = SeqStore_t {
             sequences: vec![
-                SeqDef { offBase: 4, litLength: 2, mlBase: 3 },
-                SeqDef { offBase: 5, litLength: 9, mlBase: 4 },
-                SeqDef { offBase: 6, litLength: 1, mlBase: 5 },
+                SeqDef {
+                    offBase: 4,
+                    litLength: 2,
+                    mlBase: 3,
+                },
+                SeqDef {
+                    offBase: 5,
+                    litLength: 9,
+                    mlBase: 4,
+                },
+                SeqDef {
+                    offBase: 6,
+                    litLength: 1,
+                    mlBase: 5,
+                },
             ],
             literals: Vec::new(),
             llCode: Vec::new(),
@@ -801,9 +836,21 @@ mod tests {
     #[test]
     fn size_block_sequences_stops_when_budget_crosses_compressible_limit() {
         let seqs = vec![
-            SeqDef { offBase: 4, litLength: 10, mlBase: 7 },
-            SeqDef { offBase: 5, litLength: 30, mlBase: 9 },
-            SeqDef { offBase: 6, litLength: 60, mlBase: 11 },
+            SeqDef {
+                offBase: 4,
+                litLength: 10,
+                mlBase: 7,
+            },
+            SeqDef {
+                offBase: 5,
+                litLength: 30,
+                mlBase: 9,
+            },
+            SeqDef {
+                offBase: 6,
+                litLength: 60,
+                mlBase: 11,
+            },
         ];
 
         let got = sizeBlockSequences(&seqs, seqs.len(), 1000, 10, 50, 0);
@@ -813,8 +860,16 @@ mod tests {
     #[test]
     fn size_block_sequences_first_subblock_header_can_force_minimum_one_seq() {
         let seqs = vec![
-            SeqDef { offBase: 4, litLength: 1, mlBase: 1 },
-            SeqDef { offBase: 5, litLength: 1, mlBase: 1 },
+            SeqDef {
+                offBase: 4,
+                litLength: 1,
+                mlBase: 1,
+            },
+            SeqDef {
+                offBase: 5,
+                litLength: 1,
+                mlBase: 1,
+            },
         ];
 
         let got = sizeBlockSequences(&seqs, seqs.len(), 100, 1, 1, 1);
@@ -897,7 +952,10 @@ mod tests {
             false,
             &mut entropy_written,
         );
-        let m = crate::compress::zstd_compress_literals::ZSTD_noCompressLiterals(&mut expected, literals);
+        let m = crate::compress::zstd_compress_literals::ZSTD_noCompressLiterals(
+            &mut expected,
+            literals,
+        );
 
         assert_eq!(entropy_written, 0);
         assert_eq!(n, m);
@@ -970,8 +1028,16 @@ mod tests {
     fn seq_decompressed_size_adds_match_lengths_and_passed_literal_budget() {
         let seq_store = SeqStore_t {
             sequences: vec![
-                SeqDef { offBase: 4, litLength: 2, mlBase: 3 },
-                SeqDef { offBase: 5, litLength: 4, mlBase: 7 },
+                SeqDef {
+                    offBase: 4,
+                    litLength: 2,
+                    mlBase: 3,
+                },
+                SeqDef {
+                    offBase: 5,
+                    litLength: 4,
+                    mlBase: 7,
+                },
             ],
             literals: Vec::new(),
             llCode: Vec::new(),
@@ -1024,7 +1090,8 @@ mod tests {
             1,
             &mut wksp,
         );
-        let expected = crate::compress::zstd_compress::ZSTD_noCompressBlock(&mut [0u8; 128], src, 1);
+        let expected =
+            crate::compress::zstd_compress::ZSTD_noCompressBlock(&mut [0u8; 128], src, 1);
 
         assert_eq!(got, expected);
         assert_eq!(next_rep, prev_rep);

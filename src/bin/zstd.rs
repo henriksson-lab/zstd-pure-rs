@@ -11,15 +11,13 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use zstd_pure_rs::common::error::{ERR_getErrorName, ERR_isError};
-use zstd_pure_rs::compress::match_state::ZSTD_compressionParameters;
 use zstd_pure_rs::compress::zstd_compress::{
-    ZSTD_CCtx_setFormat, ZSTD_compressBound, ZSTD_compressFrame_fast_advanced,
-    ZSTD_compress_advanced, ZSTD_createCCtx, ZSTD_getCParams, ZSTD_FrameParameters,
-    ZSTD_parameters,
+    ZSTD_CCtx_setFormat, ZSTD_FrameParameters, ZSTD_compress_advanced, ZSTD_compressBound,
+    ZSTD_createCCtx, ZSTD_getCParams, ZSTD_parameters,
 };
 use zstd_pure_rs::compress::zstd_compress_sequences::{ZSTD_btlazy2, ZSTD_fast};
 use zstd_pure_rs::decompress::zstd_decompress::{
-    ZSTD_DCtx_setFormat, ZSTD_decompress, ZSTD_decompress_usingDict, ZSTD_decompressStream,
+    ZSTD_DCtx_setFormat, ZSTD_decompress, ZSTD_decompressStream, ZSTD_decompress_usingDict,
     ZSTD_findDecompressedSize, ZSTD_findFrameSizeInfo, ZSTD_format_e, ZSTD_CONTENTSIZE_ERROR,
     ZSTD_CONTENTSIZE_UNKNOWN,
 };
@@ -194,15 +192,16 @@ fn decompress_bytes(src: &[u8], dict: Option<&[u8]>, magicless: bool) -> Result<
             // Single-frame streaming decode threads dctx.format.
             let mut in_pos = 0usize;
             let mut out_pos = 0usize;
-            let mut hint = ZSTD_decompressStream(
-                &mut dctx, &mut dst, &mut out_pos, src, &mut in_pos,
-            );
+            let mut hint =
+                ZSTD_decompressStream(&mut dctx, &mut dst, &mut out_pos, src, &mut in_pos);
             while hint != 0 && !ERR_isError(hint) {
-                hint = ZSTD_decompressStream(
-                    &mut dctx, &mut dst, &mut out_pos, &[], &mut 0usize,
-                );
+                hint = ZSTD_decompressStream(&mut dctx, &mut dst, &mut out_pos, &[], &mut 0usize);
             }
-            if ERR_isError(hint) { hint } else { out_pos }
+            if ERR_isError(hint) {
+                hint
+            } else {
+                out_pos
+            }
         }
     } else if let Some(d) = dict {
         let mut dctx = ZSTD_DCtx::new();
@@ -255,16 +254,24 @@ fn compress_bytes(
         };
         ZSTD_compress_advanced(&mut cctx, &mut dst, src, d, params)
     } else {
-        // Use compressFrame_fast_advanced so --magicless can skip the
-        // 4-byte magic prefix.
-        let mut cp: ZSTD_compressionParameters = ZSTD_getCParams(level, src.len() as u64, 0);
+        // Route through the same CCtx-based public API path as the
+        // dict case so CLI behavior stays aligned with the translated
+        // `ZSTD_compress_advanced()` orchestration.
+        let mut cctx = ZSTD_createCCtx().ok_or("cctx alloc failed")?;
+        if magicless {
+            let _ = ZSTD_CCtx_setFormat(&mut cctx, format);
+        }
+        let mut cp = ZSTD_getCParams(level, src.len() as u64, 0);
         cp.strategy = cp.strategy.clamp(ZSTD_fast, ZSTD_btlazy2);
-        let fp = ZSTD_FrameParameters {
-            contentSizeFlag: 1,
-            checksumFlag: if checksum { 1 } else { 0 },
-            noDictIDFlag: 1,
+        let params = ZSTD_parameters {
+            cParams: cp,
+            fParams: ZSTD_FrameParameters {
+                contentSizeFlag: 1,
+                checksumFlag: if checksum { 1 } else { 0 },
+                noDictIDFlag: 1,
+            },
         };
-        ZSTD_compressFrame_fast_advanced(&mut dst, src, cp, fp, format)
+        ZSTD_compress_advanced(&mut cctx, &mut dst, src, &[], params)
     };
     if ERR_isError(n) {
         return Err(ERR_getErrorName(n).to_string());
@@ -311,7 +318,11 @@ fn run() -> Result<(), String> {
         write_output(out_path.as_deref(), cli.force, &dst)
             .map_err(|e| format!("{out_label}: {e}"))?;
         if !cli.quiet && (out_path.is_some() || cli.verbose) {
-            let verb = if cli.decompress { "decompressed" } else { "compressed" };
+            let verb = if cli.decompress {
+                "decompressed"
+            } else {
+                "compressed"
+            };
             let ratio = if !cli.decompress && !src.is_empty() {
                 format!(" ({:.2}%)", (dst.len() as f64 * 100.0) / (src.len() as f64))
             } else {

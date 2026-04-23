@@ -185,9 +185,7 @@ pub fn ZSTD_deriveSeqStoreChunk(
     };
 
     let (longLengthType, longLengthPos) = match originalSeqStore.longLengthType {
-        ZSTD_longLengthType_e::ZSTD_llt_none => {
-            (ZSTD_longLengthType_e::ZSTD_llt_none, 0)
-        }
+        ZSTD_longLengthType_e::ZSTD_llt_none => (ZSTD_longLengthType_e::ZSTD_llt_none, 0),
         _ => {
             let p = originalSeqStore.longLengthPos as usize;
             if p < startIdx || p > endIdx {
@@ -316,13 +314,19 @@ pub fn ZSTD_storeSeqOnly(
 
     // litLength may exceed U16; flag as long.
     if litLength > 0xFFFF {
-        debug_assert_eq!(seqStore.longLengthType, ZSTD_longLengthType_e::ZSTD_llt_none);
+        debug_assert_eq!(
+            seqStore.longLengthType,
+            ZSTD_longLengthType_e::ZSTD_llt_none
+        );
         seqStore.longLengthType = ZSTD_longLengthType_e::ZSTD_llt_literalLength;
         seqStore.longLengthPos = seqStore.sequences.len() as u32;
     }
     let mlBase = matchLength - MINMATCH as usize;
     if mlBase > 0xFFFF {
-        debug_assert_eq!(seqStore.longLengthType, ZSTD_longLengthType_e::ZSTD_llt_none);
+        debug_assert_eq!(
+            seqStore.longLengthType,
+            ZSTD_longLengthType_e::ZSTD_llt_none
+        );
         seqStore.longLengthType = ZSTD_longLengthType_e::ZSTD_llt_matchLength;
         seqStore.longLengthPos = seqStore.sequences.len() as u32;
     }
@@ -447,7 +451,8 @@ pub fn ZSTD_seqStore_resolveOffCodes(
     seqStore: &mut SeqStore_t,
     nbSeq: u32,
 ) {
-    let longLitLenIdx = if seqStore.longLengthType == ZSTD_longLengthType_e::ZSTD_llt_literalLength {
+    let longLitLenIdx = if seqStore.longLengthType == ZSTD_longLengthType_e::ZSTD_llt_literalLength
+    {
         seqStore.longLengthPos
     } else {
         nbSeq
@@ -557,7 +562,7 @@ mod tests {
         ss.longLengthPos = 1; // second seq
         let s0 = ZSTD_getSequenceLength(&ss, 0);
         let s1 = ZSTD_getSequenceLength(&ss, 1);
-        assert_eq!(s0.litLength, 3);           // untouched
+        assert_eq!(s0.litLength, 3); // untouched
         assert_eq!(s1.litLength, 2 + 0x10000); // long
     }
 
@@ -605,7 +610,10 @@ mod tests {
         let mut ss = SeqStore_t::with_capacity(16, 200_000);
         let lit = vec![b'x'; 0x10001];
         ZSTD_storeSeq(&mut ss, 0x10001, &lit, OFFSET_TO_OFFBASE(100), 5);
-        assert_eq!(ss.longLengthType, ZSTD_longLengthType_e::ZSTD_llt_literalLength);
+        assert_eq!(
+            ss.longLengthType,
+            ZSTD_longLengthType_e::ZSTD_llt_literalLength
+        );
         assert_eq!(ss.longLengthPos, 0);
     }
 

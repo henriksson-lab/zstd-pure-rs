@@ -162,7 +162,11 @@ pub const LitHufLog: u32 = 11;
 #[inline]
 pub fn ZSTD_minGain(srcSize: usize, strategy: ZSTD_strategy) -> usize {
     use crate::compress::zstd_compress_sequences::ZSTD_btultra;
-    let minlog: u32 = if strategy >= ZSTD_btultra { strategy - 1 } else { 6 };
+    let minlog: u32 = if strategy >= ZSTD_btultra {
+        strategy - 1
+    } else {
+        6
+    };
     (srcSize >> minlog) + 2
 }
 
@@ -393,13 +397,13 @@ mod tests {
         // constant-2 term — both of which an earlier Rust port had
         // wrong (used `5 + strat` shift and no +2).
         let cases: &[(u32, usize)] = &[
-            (1, 1024),    // fast: minlog=6 → (1024>>6)+2 = 16+2 = 18
-            (3, 1024),    // greedy: still minlog=6 → 18
-            (7, 1024),    // btopt: still minlog=6 → 18
-            (8, 1024),    // btultra: minlog=7 → 8+2 = 10
-            (9, 1024),    // btultra2: minlog=8 → 4+2 = 6
-            (1, 65536),   // larger src: minlog=6 → 1024+2 = 1026
-            (9, 65536),   // minlog=8 → 256+2 = 258
+            (1, 1024),  // fast: minlog=6 → (1024>>6)+2 = 16+2 = 18
+            (3, 1024),  // greedy: still minlog=6 → 18
+            (7, 1024),  // btopt: still minlog=6 → 18
+            (8, 1024),  // btultra: minlog=7 → 8+2 = 10
+            (9, 1024),  // btultra2: minlog=8 → 4+2 = 6
+            (1, 65536), // larger src: minlog=6 → 1024+2 = 1026
+            (9, 65536), // minlog=8 → 256+2 = 258
         ];
         for &(strat, sz) in cases {
             let minlog: u32 = if strat >= 8 { strat - 1 } else { 6 };
@@ -416,7 +420,7 @@ mod tests {
     // already-ported `ZSTD_decodeLiteralsBlock` so emit-then-decode
     // round-trips the same bytes.
     use crate::decompress::zstd_decompress_block::{
-        streaming_operation, ZSTD_buildDefaultSeqTables, ZSTD_DCtx, ZSTD_decodeLiteralsBlock,
+        streaming_operation, ZSTD_DCtx, ZSTD_buildDefaultSeqTables, ZSTD_decodeLiteralsBlock,
     };
 
     fn roundtrip(src: &[u8]) -> Vec<u8> {
@@ -441,19 +445,39 @@ mod tests {
     #[test]
     fn literalsCompressionIsDisabled_respects_explicit_mode() {
         use crate::compress::zstd_ldm::ZSTD_ParamSwitch_e;
-        assert!(!ZSTD_literalsCompressionIsDisabled(ZSTD_ParamSwitch_e::ZSTD_ps_enable, 1, 32));
-        assert!(ZSTD_literalsCompressionIsDisabled(ZSTD_ParamSwitch_e::ZSTD_ps_disable, 5, 0));
+        assert!(!ZSTD_literalsCompressionIsDisabled(
+            ZSTD_ParamSwitch_e::ZSTD_ps_enable,
+            1,
+            32
+        ));
+        assert!(ZSTD_literalsCompressionIsDisabled(
+            ZSTD_ParamSwitch_e::ZSTD_ps_disable,
+            5,
+            0
+        ));
     }
 
     #[test]
     fn literalsCompressionIsDisabled_auto_fast_plus_targetLength_turns_off() {
         use crate::compress::zstd_ldm::ZSTD_ParamSwitch_e;
         // auto + fast + targetLength > 0 → disabled.
-        assert!(ZSTD_literalsCompressionIsDisabled(ZSTD_ParamSwitch_e::ZSTD_ps_auto, 1, 32));
+        assert!(ZSTD_literalsCompressionIsDisabled(
+            ZSTD_ParamSwitch_e::ZSTD_ps_auto,
+            1,
+            32
+        ));
         // auto + fast + targetLength == 0 → enabled.
-        assert!(!ZSTD_literalsCompressionIsDisabled(ZSTD_ParamSwitch_e::ZSTD_ps_auto, 1, 0));
+        assert!(!ZSTD_literalsCompressionIsDisabled(
+            ZSTD_ParamSwitch_e::ZSTD_ps_auto,
+            1,
+            0
+        ));
         // auto + non-fast → always enabled.
-        assert!(!ZSTD_literalsCompressionIsDisabled(ZSTD_ParamSwitch_e::ZSTD_ps_auto, 3, 32));
+        assert!(!ZSTD_literalsCompressionIsDisabled(
+            ZSTD_ParamSwitch_e::ZSTD_ps_auto,
+            3,
+            32
+        ));
     }
 
     #[test]
@@ -538,7 +562,11 @@ mod tests {
             "compress err: {}",
             crate::common::error::ERR_getErrorName(written)
         );
-        assert!(written > 0 && written < src.len(), "no savings: wrote {written} bytes for {}-byte src", src.len());
+        assert!(
+            written > 0 && written < src.len(),
+            "no savings: wrote {written} bytes for {}-byte src",
+            src.len()
+        );
 
         // Decode.
         let mut dctx = ZSTD_DCtx::new();

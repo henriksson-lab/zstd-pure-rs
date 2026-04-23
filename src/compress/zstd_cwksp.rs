@@ -1,10 +1,12 @@
 //! Translation of `lib/compress/zstd_cwksp.h`.
 
 #![allow(non_snake_case)]
+#![allow(clippy::derivable_impls)]
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use core::ptr::null_mut;
 
-use crate::common::error::{ErrorCode, ERR_isError, ERROR};
+use crate::common::error::{ERR_isError, ErrorCode, ERROR};
 
 pub const ZSTD_CWKSP_ALIGNMENT_BYTES: usize = 64;
 pub const ZSTD_CWKSP_ASAN_REDZONE_SIZE: usize = 128;
@@ -104,10 +106,7 @@ pub fn ZSTD_cwksp_initialAllocStart(ws: &ZSTD_cwksp) -> *mut u8 {
 }
 
 /// Port of `ZSTD_cwksp_reserve_internal_buffer_space`.
-pub fn ZSTD_cwksp_reserve_internal_buffer_space(
-    ws: &mut ZSTD_cwksp,
-    bytes: usize,
-) -> *mut u8 {
+pub fn ZSTD_cwksp_reserve_internal_buffer_space(ws: &mut ZSTD_cwksp, bytes: usize) -> *mut u8 {
     ZSTD_cwksp_assert_internal_consistency(ws);
     if bytes > ZSTD_cwksp_available_space(ws) {
         ws.allocFailed = 1;
@@ -139,8 +138,7 @@ pub fn ZSTD_cwksp_internal_advance_phase(
             ws.initOnceStart = ZSTD_cwksp_initialAllocStart(ws);
 
             let alloc = ws.objectEnd;
-            let bytesToAlign =
-                ZSTD_cwksp_bytes_to_align_ptr(alloc, ZSTD_CWKSP_ALIGNMENT_BYTES);
+            let bytesToAlign = ZSTD_cwksp_bytes_to_align_ptr(alloc, ZSTD_CWKSP_ALIGNMENT_BYTES);
             let objectEnd = unsafe { alloc.add(bytesToAlign) };
             if ptr_lt(ws.workspaceEnd, objectEnd) {
                 return ERROR(ErrorCode::MemoryAllocation);
@@ -342,7 +340,12 @@ pub fn ZSTD_cwksp_create(ws: &mut ZSTD_cwksp, size: usize) -> usize {
     let mut workspace = vec![0u8; size].into_boxed_slice();
     let ptr = workspace.as_mut_ptr();
     ws.owned = Some(workspace);
-    ZSTD_cwksp_init(ws, ptr, size, ZSTD_cwksp_static_alloc_e::ZSTD_cwksp_dynamic_alloc);
+    ZSTD_cwksp_init(
+        ws,
+        ptr,
+        size,
+        ZSTD_cwksp_static_alloc_e::ZSTD_cwksp_dynamic_alloc,
+    );
     0
 }
 
@@ -362,10 +365,7 @@ pub fn ZSTD_cwksp_reserve_failed(ws: &ZSTD_cwksp) -> bool {
 }
 
 /// Port of `ZSTD_cwksp_estimated_space_within_bounds`.
-pub fn ZSTD_cwksp_estimated_space_within_bounds(
-    ws: &ZSTD_cwksp,
-    estimatedSpace: usize,
-) -> bool {
+pub fn ZSTD_cwksp_estimated_space_within_bounds(ws: &ZSTD_cwksp, estimatedSpace: usize) -> bool {
     estimatedSpace.saturating_sub(ZSTD_cwksp_slack_space_required()) <= ZSTD_cwksp_used(ws)
         && ZSTD_cwksp_used(ws) <= estimatedSpace
 }
@@ -384,8 +384,7 @@ pub fn ZSTD_cwksp_check_available(ws: &ZSTD_cwksp, additionalNeededSpace: usize)
 pub fn ZSTD_cwksp_check_too_large(ws: &ZSTD_cwksp, additionalNeededSpace: usize) -> bool {
     ZSTD_cwksp_check_available(
         ws,
-        additionalNeededSpace
-            * crate::common::zstd_internal::ZSTD_WORKSPACETOOLARGE_FACTOR,
+        additionalNeededSpace * crate::common::zstd_internal::ZSTD_WORKSPACETOOLARGE_FACTOR,
     )
 }
 

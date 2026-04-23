@@ -122,6 +122,21 @@
 // Upstream zstd functions often take many arguments; we preserve 1:1
 // signatures so code-complexity-comparator stays meaningful.
 #![allow(clippy::too_many_arguments)]
+// This crate intentionally preserves upstream C control flow and test
+// structure closely, so we suppress style-oriented lints that would
+// otherwise demand less faithful Rust rewrites.
+#![allow(clippy::collapsible_if)]
+#![allow(clippy::default_constructed_unit_structs)]
+#![allow(clippy::derivable_impls)]
+#![allow(clippy::field_reassign_with_default)]
+#![allow(clippy::implicit_saturating_sub)]
+#![allow(clippy::needless_late_init)]
+#![allow(clippy::needless_option_as_deref)]
+#![allow(clippy::needless_return)]
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
+#![allow(clippy::type_complexity)]
+#![allow(clippy::unnecessary_cast)]
+#![allow(clippy::unnecessary_mut_passed)]
 
 // v0.1 is std-only — the port uses `Vec`, `format!`, and `std::thread`
 // throughout. A proper `no_std` variant is a future effort.
@@ -138,7 +153,7 @@ pub mod decompress;
 pub use common::error::{ErrorCode, ZstdError};
 pub use common::mem::is_little_endian;
 pub use common::zstd_common::{
-    ZSTD_isError, ZSTD_versionNumber, ZSTD_versionString, ZSTD_getErrorName,
+    ZSTD_getErrorName, ZSTD_isError, ZSTD_versionNumber, ZSTD_versionString,
 };
 
 /// Re-exports of the most commonly-used public API, so callers can
@@ -148,55 +163,48 @@ pub mod prelude {
     // One-shot compression.
     pub use crate::compress::zstd_compress::{
         ZSTD_CCtx, ZSTD_CCtx_loadDictionary, ZSTD_CCtx_loadDictionary_advanced,
-        ZSTD_CCtx_loadDictionary_byReference, ZSTD_CCtx_refCDict,
-        ZSTD_CCtx_refPrefix, ZSTD_CCtx_refPrefix_advanced, ZSTD_CCtx_refThreadPool,
-        ZSTD_CDict, ZSTD_Sequence, ZSTD_compress, ZSTD_compress2, ZSTD_compressBegin,
-        ZSTD_compressBegin_usingCDict, ZSTD_compressBegin_usingDict, ZSTD_compressBound,
-        ZSTD_compressCCtx, ZSTD_compressSequences, ZSTD_compress_usingCDict,
-        ZSTD_compress_usingCDict_advanced, ZSTD_compress_usingDict,
-        ZSTD_createCCtx, ZSTD_createCCtx_advanced,
-        ZSTD_SequenceFormat_e, ZSTD_SequencePosition,
-        ZSTD_createCDict, ZSTD_createCDict_advanced, ZSTD_createCDict_advanced2,
-        ZSTD_createCDict_byReference,
-        ZSTD_customMem, ZSTD_freeCCtx, ZSTD_freeCDict, ZSTD_generateSequences,
-        ZSTD_getDictID_fromCDict, ZSTD_getFrameProgression, ZSTD_frameProgression,
-        ZSTD_mergeBlockDelimiters, ZSTD_sequenceBound, ZSTD_toFlushNow,
-        ZSTD_writeSkippableFrame,
+        ZSTD_CCtx_loadDictionary_byReference, ZSTD_CCtx_refCDict, ZSTD_CCtx_refPrefix,
+        ZSTD_CCtx_refPrefix_advanced, ZSTD_CCtx_refThreadPool, ZSTD_CDict, ZSTD_Sequence,
+        ZSTD_SequenceFormat_e, ZSTD_SequencePosition, ZSTD_compress, ZSTD_compress2,
+        ZSTD_compressBegin, ZSTD_compressBegin_usingCDict, ZSTD_compressBegin_usingDict,
+        ZSTD_compressBound, ZSTD_compressCCtx, ZSTD_compressSequences, ZSTD_compress_usingCDict,
+        ZSTD_compress_usingCDict_advanced, ZSTD_compress_usingDict, ZSTD_createCCtx,
+        ZSTD_createCCtx_advanced, ZSTD_createCDict, ZSTD_createCDict_advanced,
+        ZSTD_createCDict_advanced2, ZSTD_createCDict_byReference, ZSTD_customMem,
+        ZSTD_frameProgression, ZSTD_freeCCtx, ZSTD_freeCDict, ZSTD_generateSequences,
+        ZSTD_getDictID_fromCDict, ZSTD_getFrameProgression, ZSTD_mergeBlockDelimiters,
+        ZSTD_sequenceBound, ZSTD_toFlushNow, ZSTD_writeSkippableFrame,
     };
     // Streaming compression.
     pub use crate::compress::zstd_compress::{
-        ZSTD_CCtx_setPledgedSrcSize, ZSTD_CStream, ZSTD_CStreamInSize,
-        ZSTD_CStreamOutSize, ZSTD_EndDirective, ZSTD_compressStream,
-        ZSTD_compressStream2, ZSTD_compressStream2_simpleArgs, ZSTD_createCStream,
-        ZSTD_createCStream_advanced, ZSTD_endStream, ZSTD_estimateCCtxSize_usingCCtxParams,
+        ZSTD_CCtx_setPledgedSrcSize, ZSTD_CStream, ZSTD_CStreamInSize, ZSTD_CStreamOutSize,
+        ZSTD_EndDirective, ZSTD_compressBegin_advanced, ZSTD_compressBegin_usingCDict_advanced,
+        ZSTD_compressStream, ZSTD_compressStream2, ZSTD_compressStream2_simpleArgs,
+        ZSTD_createCStream, ZSTD_createCStream_advanced, ZSTD_endStream,
+        ZSTD_estimateCCtxSize_usingCCtxParams, ZSTD_estimateCCtxSize_usingCParams,
         ZSTD_estimateCStreamSize_usingCCtxParams, ZSTD_estimateCStreamSize_usingCParams,
-        ZSTD_estimateCCtxSize_usingCParams, ZSTD_flushStream, ZSTD_freeCStream,
-        ZSTD_compressBegin_advanced, ZSTD_compressBegin_usingCDict_advanced,
-        ZSTD_initCStream, ZSTD_initCStream_advanced, ZSTD_initCStream_srcSize,
-        ZSTD_initCStream_usingCDict, ZSTD_initCStream_usingCDict_advanced,
-        ZSTD_initCStream_usingDict, ZSTD_resetCStream,
+        ZSTD_flushStream, ZSTD_freeCStream, ZSTD_initCStream, ZSTD_initCStream_advanced,
+        ZSTD_initCStream_srcSize, ZSTD_initCStream_usingCDict,
+        ZSTD_initCStream_usingCDict_advanced, ZSTD_initCStream_usingDict, ZSTD_resetCStream,
     };
     // Parametric + level info.
     pub use crate::compress::match_state::ZSTD_compressionParameters;
     pub use crate::compress::zstd_compress::{
         ZSTD_CCtxParams_getParameter, ZSTD_CCtxParams_init, ZSTD_CCtxParams_init_advanced,
-        ZSTD_CCtxParams_reset, ZSTD_CCtxParams_setParameter,
-        ZSTD_CCtxParams_setZstdParams,
+        ZSTD_CCtxParams_reset, ZSTD_CCtxParams_setParameter, ZSTD_CCtxParams_setZstdParams,
         ZSTD_CCtx_getParameter, ZSTD_CCtx_params, ZSTD_CCtx_reset, ZSTD_CCtx_setCParams,
-        ZSTD_CCtx_setFParams, ZSTD_CCtx_setFormat, ZSTD_CCtx_setParameter, ZSTD_CCtx_setParams,
-        ZSTD_CCtx_setParametersUsingCCtxParams,
+        ZSTD_CCtx_setFParams, ZSTD_CCtx_setFormat, ZSTD_CCtx_setParameter,
+        ZSTD_CCtx_setParametersUsingCCtxParams, ZSTD_CCtx_setParams, ZSTD_FrameParameters,
+        ZSTD_ResetDirective, ZSTD_adjustCParams, ZSTD_bounds, ZSTD_cParam_clampBounds,
+        ZSTD_cParam_getBounds, ZSTD_cParam_withinBounds, ZSTD_cParameter, ZSTD_checkCParams,
         ZSTD_compressFrame_fast_advanced, ZSTD_compressFrame_fast_with_prefix_advanced,
-        ZSTD_writeFrameHeader_advanced,
-        ZSTD_FrameParameters, ZSTD_ResetDirective, ZSTD_adjustCParams, ZSTD_bounds,
-        ZSTD_cParam_clampBounds, ZSTD_cParam_getBounds,
-        ZSTD_cParam_withinBounds, ZSTD_cParameter, ZSTD_checkCParams,
         ZSTD_createCCtxParams, ZSTD_defaultCLevel, ZSTD_freeCCtxParams, ZSTD_getCParams,
         ZSTD_getParams, ZSTD_maxCLevel, ZSTD_minCLevel, ZSTD_parameters,
-        ZSTD_CLEVEL_DEFAULT, ZSTD_FRAMEHEADERSIZE_MAX, ZSTD_MAX_CLEVEL, ZSTD_NO_CLEVEL,
-        ZSTD_CHAINLOG_MAX_32, ZSTD_CHAINLOG_MAX_64, ZSTD_CHAINLOG_MIN,
-        ZSTD_MINMATCH_MAX, ZSTD_MINMATCH_MIN, ZSTD_SEARCHLOG_MIN,
-        ZSTD_STRATEGY_MAX, ZSTD_STRATEGY_MIN, ZSTD_TARGETLENGTH_MAX,
-        ZSTD_TARGETLENGTH_MIN, ZSTD_WINDOWLOG_MIN,
+        ZSTD_writeFrameHeader_advanced, ZSTD_CHAINLOG_MAX_32, ZSTD_CHAINLOG_MAX_64,
+        ZSTD_CHAINLOG_MIN, ZSTD_CLEVEL_DEFAULT, ZSTD_FRAMEHEADERSIZE_MAX, ZSTD_MAX_CLEVEL,
+        ZSTD_MINMATCH_MAX, ZSTD_MINMATCH_MIN, ZSTD_NO_CLEVEL, ZSTD_SEARCHLOG_MIN,
+        ZSTD_STRATEGY_MAX, ZSTD_STRATEGY_MIN, ZSTD_TARGETLENGTH_MAX, ZSTD_TARGETLENGTH_MIN,
+        ZSTD_WINDOWLOG_MIN,
     };
     pub use crate::compress::zstd_ldm::{ZSTD_HASHLOG_MAX, ZSTD_HASHLOG_MIN};
     // Memory estimation.
@@ -208,82 +216,66 @@ pub mod prelude {
     };
     // Legacy block-level API stubs.
     pub use crate::compress::zstd_compress::{
-        ZSTD_compressBegin_usingCDict_deprecated,
-        ZSTD_compressBegin_usingDict_deprecated, ZSTD_compressBlock,
-        ZSTD_compressBlock_deprecated, ZSTD_compressContinue,
-        ZSTD_compressContinue_public, ZSTD_compressEnd,
-        ZSTD_compressEnd_public,
+        ZSTD_compressBegin_usingCDict_deprecated, ZSTD_compressBegin_usingDict_deprecated,
+        ZSTD_compressBlock, ZSTD_compressBlock_deprecated, ZSTD_compressContinue,
+        ZSTD_compressContinue_public, ZSTD_compressEnd, ZSTD_compressEnd_public,
     };
     // Advanced + ctx-copy helpers.
     pub use crate::compress::zstd_compress::{
-        ZSTD_compress_advanced, ZSTD_copyCCtx, ZSTD_cycleLog,
-        ZSTD_dedicatedDictSearch_getCParams,
-        ZSTD_dedicatedDictSearch_isSupported,
-        ZSTD_dedicatedDictSearch_revertCParams, ZSTD_dictAndWindowLog,
+        ZSTD_compress_advanced, ZSTD_copyCCtx, ZSTD_cycleLog, ZSTD_dedicatedDictSearch_getCParams,
+        ZSTD_dedicatedDictSearch_isSupported, ZSTD_dedicatedDictSearch_revertCParams,
+        ZSTD_dictAndWindowLog,
     };
     // One-shot + streaming decompression.
     pub use crate::decompress::zstd_decompress::{
-        ZSTD_findFrameCompressedSize_advanced, ZSTD_getFrameHeader_advanced,
-        ZSTD_DCtx_getParameter, ZSTD_DCtx_loadDictionary,
-        ZSTD_DCtx_loadDictionary_advanced, ZSTD_DCtx_loadDictionary_byReference,
-        ZSTD_DCtx_refDDict, ZSTD_DCtx_refPrefix, ZSTD_DCtx_refPrefix_advanced,
-        ZSTD_DCtx_reset, ZSTD_DCtx_setFormat, ZSTD_DCtx_setMaxWindowSize, ZSTD_DCtx_setParameter,
-        ZSTD_DResetDirective, ZSTD_DStream, ZSTD_DStreamInSize, ZSTD_DStreamOutSize,
-        ZSTD_FrameHeader, ZSTD_FrameType_e, ZSTD_copyDCtx,
-        ZSTD_createDCtx, ZSTD_createDStream,
-        ZSTD_dParameter, ZSTD_dictUses_e,
-        ZSTD_dParam_getBounds, ZSTD_dParam_withinBounds, ZSTD_decompress, ZSTD_decompressDCtx,
-        ZSTD_freeDCtx,
-        ZSTD_decompressStream, ZSTD_decompressStream_simpleArgs,
-        ZSTD_decompress_usingDDict, ZSTD_decompress_usingDict,
-        ZSTD_estimateDCtxSize, ZSTD_estimateDStreamSize,
+        ZSTD_DCtx_getParameter, ZSTD_DCtx_loadDictionary, ZSTD_DCtx_loadDictionary_advanced,
+        ZSTD_DCtx_loadDictionary_byReference, ZSTD_DCtx_refDDict, ZSTD_DCtx_refPrefix,
+        ZSTD_DCtx_refPrefix_advanced, ZSTD_DCtx_reset, ZSTD_DCtx_setFormat,
+        ZSTD_DCtx_setMaxWindowSize, ZSTD_DCtx_setParameter, ZSTD_DResetDirective, ZSTD_DStream,
+        ZSTD_DStreamInSize, ZSTD_DStreamOutSize, ZSTD_FrameHeader, ZSTD_FrameType_e, ZSTD_copyDCtx,
+        ZSTD_createDCtx, ZSTD_createDStream, ZSTD_dParam_getBounds, ZSTD_dParam_withinBounds,
+        ZSTD_dParameter, ZSTD_decodingBufferSize_min, ZSTD_decompress, ZSTD_decompressBound,
+        ZSTD_decompressDCtx, ZSTD_decompressStream, ZSTD_decompressStream_simpleArgs,
+        ZSTD_decompress_usingDDict, ZSTD_decompress_usingDict, ZSTD_decompressionMargin,
+        ZSTD_dictUses_e, ZSTD_estimateDCtxSize, ZSTD_estimateDStreamSize,
         ZSTD_estimateDStreamSize_fromFrame, ZSTD_findDecompressedSize,
-        ZSTD_findFrameCompressedSize, ZSTD_findFrameSizeInfo,
-        ZSTD_format_e, ZSTD_frameHeaderSize, ZSTD_frameSizeInfo, ZSTD_freeDStream,
-        ZSTD_getDictID_fromFrame, ZSTD_getFrameHeader,
-        ZSTD_decodingBufferSize_min, ZSTD_decompressBound, ZSTD_decompressionMargin,
-        ZSTD_getDecompressedSize, ZSTD_getFrameContentSize, ZSTD_initDStream,
-        ZSTD_initDStream_usingDDict, ZSTD_initDStream_usingDict,
-        ZSTD_nextSrcSizeToDecompress,
-        ZSTD_isFrame, ZSTD_isSkippableFrame, ZSTD_readSkippableFrame, ZSTD_resetDStream,
-        ZSTD_sizeof_DCtx, ZSTD_sizeof_DStream,
-        ZSTD_CONTENTSIZE_ERROR, ZSTD_CONTENTSIZE_UNKNOWN, ZSTD_FRAMEIDSIZE,
-        ZSTD_MAGICNUMBER, ZSTD_MAGIC_SKIPPABLE_START, ZSTD_WINDOWLOG_ABSOLUTEMIN,
-        ZSTD_WINDOWLOG_LIMIT_DEFAULT, ZSTD_WINDOWLOG_MAX_32, ZSTD_WINDOWLOG_MAX_64,
+        ZSTD_findFrameCompressedSize, ZSTD_findFrameCompressedSize_advanced,
+        ZSTD_findFrameSizeInfo, ZSTD_format_e, ZSTD_frameHeaderSize, ZSTD_frameSizeInfo,
+        ZSTD_freeDCtx, ZSTD_freeDStream, ZSTD_getDecompressedSize, ZSTD_getDictID_fromFrame,
+        ZSTD_getFrameContentSize, ZSTD_getFrameHeader, ZSTD_getFrameHeader_advanced,
+        ZSTD_initDStream, ZSTD_initDStream_usingDDict, ZSTD_initDStream_usingDict, ZSTD_isFrame,
+        ZSTD_isSkippableFrame, ZSTD_nextSrcSizeToDecompress, ZSTD_readSkippableFrame,
+        ZSTD_resetDStream, ZSTD_sizeof_DCtx, ZSTD_sizeof_DStream, ZSTD_CONTENTSIZE_ERROR,
+        ZSTD_CONTENTSIZE_UNKNOWN, ZSTD_FRAMEIDSIZE, ZSTD_MAGICNUMBER, ZSTD_MAGIC_SKIPPABLE_START,
+        ZSTD_WINDOWLOG_ABSOLUTEMIN, ZSTD_WINDOWLOG_LIMIT_DEFAULT, ZSTD_WINDOWLOG_MAX_32,
+        ZSTD_WINDOWLOG_MAX_64,
     };
     pub use crate::decompress::zstd_decompress_block::{
         ZSTD_BLOCKHEADERSIZE, ZSTD_BLOCKSIZELOG_MAX, ZSTD_BLOCKSIZE_MAX,
     };
     // Decompress-side legacy block-level + static-init API stubs.
-    pub use crate::decompress::zstd_decompress::{
-        ZSTD_createDCtx_advanced, ZSTD_createDStream_advanced,
-        ZSTD_decompressBegin, ZSTD_decompressBegin_usingDDict,
-        ZSTD_decompressBegin_usingDict, ZSTD_decompressBlock,
-        ZSTD_decompressBlock_deprecated, ZSTD_decompressContinue,
-        ZSTD_getBlockSize, ZSTD_initStaticDCtx, ZSTD_initStaticDDict,
-        ZSTD_initStaticDStream, ZSTD_insertBlock, ZSTD_nextInputType,
-        ZSTD_nextInputType_e,
-    };
     pub use crate::decompress::zstd_ddict::{
-        ZSTD_DDict, ZSTD_DDict_dictContent, ZSTD_DDict_dictSize,
-        ZSTD_copyDDictParameters, ZSTD_createDDict,
-        ZSTD_createDDict_advanced, ZSTD_createDDict_byReference,
-        ZSTD_dictContentType_e, ZSTD_dictLoadMethod_e, ZSTD_freeDDict,
-        ZSTD_getDictID_fromDDict, ZSTD_estimateDDictSize, ZSTD_getDictID_fromDict,
-        ZSTD_sizeof_DDict,
+        ZSTD_DDict, ZSTD_DDict_dictContent, ZSTD_DDict_dictSize, ZSTD_copyDDictParameters,
+        ZSTD_createDDict, ZSTD_createDDict_advanced, ZSTD_createDDict_byReference,
+        ZSTD_dictContentType_e, ZSTD_dictLoadMethod_e, ZSTD_estimateDDictSize, ZSTD_freeDDict,
+        ZSTD_getDictID_fromDDict, ZSTD_getDictID_fromDict, ZSTD_sizeof_DDict,
+    };
+    pub use crate::decompress::zstd_decompress::{
+        ZSTD_createDCtx_advanced, ZSTD_createDStream_advanced, ZSTD_decompressBegin,
+        ZSTD_decompressBegin_usingDDict, ZSTD_decompressBegin_usingDict, ZSTD_decompressBlock,
+        ZSTD_decompressBlock_deprecated, ZSTD_decompressContinue, ZSTD_getBlockSize,
+        ZSTD_initStaticDCtx, ZSTD_initStaticDDict, ZSTD_initStaticDStream, ZSTD_insertBlock,
+        ZSTD_nextInputType, ZSTD_nextInputType_e,
     };
     // Error handling.
     pub use crate::common::error::{ERR_getErrorName, ERR_isError, ErrorCode, ZstdError};
-    // Thread pool API stubs.
-    pub use crate::common::pool::{
-        POOL_ctx, ZSTD_createThreadPool, ZSTD_freeThreadPool,
-    };
+    // Thread pool API.
+    pub use crate::common::pool::{POOL_ctx, ZSTD_createThreadPool, ZSTD_freeThreadPool};
     // Version + determinism helpers.
     pub use crate::common::zstd_common::{
-        ZSTD_VERSION_MAJOR, ZSTD_VERSION_MINOR, ZSTD_VERSION_NUMBER,
-        ZSTD_VERSION_RELEASE, ZSTD_VERSION_STRING, ZSTD_getErrorCode,
-        ZSTD_getErrorName, ZSTD_getErrorString, ZSTD_isDeterministicBuild,
-        ZSTD_isError, ZSTD_versionNumber, ZSTD_versionString,
+        ZSTD_getErrorCode, ZSTD_getErrorName, ZSTD_getErrorString, ZSTD_isDeterministicBuild,
+        ZSTD_isError, ZSTD_versionNumber, ZSTD_versionString, ZSTD_VERSION_MAJOR,
+        ZSTD_VERSION_MINOR, ZSTD_VERSION_NUMBER, ZSTD_VERSION_RELEASE, ZSTD_VERSION_STRING,
     };
 }
 

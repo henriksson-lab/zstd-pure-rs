@@ -2,20 +2,20 @@
 
 pub mod fse_compress;
 pub mod hist;
+pub mod huf_compress;
 pub mod match_state;
 pub mod seq_store;
-pub mod zstd_hashes;
-pub mod huf_compress;
 pub mod zstd_compress;
 pub mod zstd_compress_literals;
 pub mod zstd_compress_sequences;
 pub mod zstd_compress_superblock;
+pub mod zstd_cwksp;
 pub mod zstd_double_fast;
 pub mod zstd_fast;
+pub mod zstd_hashes;
 pub mod zstd_lazy;
 pub mod zstd_ldm;
 pub mod zstd_opt;
 pub mod zstd_presplit;
-pub mod zstd_cwksp;
 #[cfg(feature = "mt")]
 pub mod zstdmt_compress;

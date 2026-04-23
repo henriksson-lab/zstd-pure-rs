@@ -75,15 +75,10 @@ pub enum ZSTD_dictMode_e {
 /// Port of `ZSTD_matchState_dictMode`. Inspects the match state and
 /// returns the mode the block compressor should use.
 ///
-/// Upstream walks `ms.dictMatchState` / `ms.dictMatchState->dedicatedDictSearch`;
-/// our Rust port doesn't yet carry a `dictMatchState` linkage on
-/// `ZSTD_MatchState_t`, so this always returns `ZSTD_noDict` /
-/// `ZSTD_extDict` based on `ZSTD_window_hasExtDict`.
-///
-/// Once the linkage field lands, this function will fork to
-/// `ZSTD_dictMatchState` / `ZSTD_dedicatedDictSearch` the way upstream
-/// does.
 pub fn ZSTD_matchState_dictMode(ms: &ZSTD_MatchState_t) -> ZSTD_dictMode_e {
+    if ms.dictMatchState.is_some() && ms.loadedDictEnd != 0 {
+        return ZSTD_dictMode_e::ZSTD_dictMatchState;
+    }
     if ZSTD_window_hasExtDict(&ms.window) {
         ZSTD_dictMode_e::ZSTD_extDict
     } else {
@@ -156,11 +151,7 @@ pub const ZSTD_ROW_HASH_CACHE_SIZE: usize = 8;
 ///
 /// Table length must be a multiple of `ZSTD_ROWSIZE` (upstream
 /// enforces via `assert`).
-pub fn ZSTD_reduceTable_internal(
-    table: &mut [u32],
-    reducerValue: u32,
-    preserveMark: bool,
-) {
+pub fn ZSTD_reduceTable_internal(table: &mut [u32], reducerValue: u32, preserveMark: bool) {
     let size = table.len();
     debug_assert_eq!(size & (ZSTD_ROWSIZE - 1), 0);
     debug_assert!(size < (1usize << 31));
@@ -308,7 +299,10 @@ pub fn ZSTD_CDictIndicesAreTagged(cParams: &ZSTD_compressionParameters) -> bool 
 /// is both supported and explicitly enabled — `mode` must be a
 /// resolved enable/disable, never auto.
 #[inline]
-pub fn ZSTD_rowMatchFinderUsed(strategy: u32, mode: crate::compress::zstd_ldm::ZSTD_ParamSwitch_e) -> bool {
+pub fn ZSTD_rowMatchFinderUsed(
+    strategy: u32,
+    mode: crate::compress::zstd_ldm::ZSTD_ParamSwitch_e,
+) -> bool {
     use crate::compress::zstd_ldm::ZSTD_ParamSwitch_e;
     debug_assert!(mode != ZSTD_ParamSwitch_e::ZSTD_ps_auto);
     ZSTD_rowMatchFinderSupported(strategy) && mode == ZSTD_ParamSwitch_e::ZSTD_ps_enable
@@ -351,15 +345,15 @@ pub fn ZSTD_advanceHashSalt(ms: &mut ZSTD_MatchState_t) {
 
 /// Port of `ZSTD_invalidateMatchState`. Clears window state, rewinds
 /// `nextToUpdate` to the dictLimit, and invalidates any loaded dict
-/// end. Upstream also resets `opt.litLengthSum` and nulls
-/// `dictMatchState`; our Rust port doesn't yet carry those fields,
-/// so we document the gap and cover the rest.
+/// end. Upstream also resets `opt.litLengthSum`; this port clears the
+/// attached `dictMatchState` as well.
 pub fn ZSTD_invalidateMatchState(ms: &mut ZSTD_MatchState_t) {
     ZSTD_window_clear(&mut ms.window);
     ms.nextToUpdate = ms.window.dictLimit;
+    ms.dictMatchState = None;
     ms.loadedDictEnd = 0;
-    // Caller-owned btopt opt.litLengthSum reset + dictMatchState
-    // nulling land with the opt parser + dictMatchState field ports.
+    // Caller-owned btopt opt.litLengthSum reset lands with the
+    // remaining opt-state plumbing.
 }
 
 /// Port of `ZSTD_reduceIndex`. Walks the match-state's owned hash /
@@ -412,10 +406,7 @@ pub const ZSTD_SHORT_CACHE_TAG_MASK: u32 = (1u32 << ZSTD_SHORT_CACHE_TAG_BITS) -
 /// `wrapping_sub` in the same u32 arithmetic space.
 #[inline]
 pub fn ZSTD_index_overlap_check(prefixLowestIndex: u32, repIndex: u32) -> bool {
-    prefixLowestIndex
-        .wrapping_sub(1)
-        .wrapping_sub(repIndex)
-        >= 3
+    prefixLowestIndex.wrapping_sub(1).wrapping_sub(repIndex) >= 3
 }
 
 /// Port of `ZSTD_writeTaggedIndex`. Unpacks `hashAndTag` into
@@ -764,6 +755,10 @@ pub struct ZSTD_MatchState_t {
     /// here before invoking `zstd_opt`.
     pub entropySeed: Option<crate::compress::zstd_compress::ZSTD_entropyCTables_t>,
 
+    /// Upstream `ldmSeqStore`. When set, the optimal parser considers
+    /// long-distance matcher sequences as candidate matches.
+    pub ldmSeqStore: Option<crate::compress::zstd_ldm::RawSeqStore_t>,
+
     /// Upstream `dictMatchState`. When present, points at the loaded
     /// dictionary's match-state tables for DMS / DDSS search modes.
     pub dictMatchState: Option<Box<ZSTD_MatchState_t>>,
@@ -838,6 +833,7 @@ impl ZSTD_MatchState_t {
                 nbOverflowCorrections: 0,
             },
             entropySeed: None,
+            ldmSeqStore: None,
             dictMatchState: None,
             dictContent: Vec::new(),
             loadedDictEnd: 0,
@@ -867,6 +863,7 @@ impl ZSTD_MatchState_t {
             nbOverflowCorrections: 0,
         };
         self.entropySeed = None;
+        self.ldmSeqStore = None;
         self.dictMatchState = None;
         self.dictContent.clear();
         self.loadedDictEnd = 0;
@@ -1048,16 +1045,34 @@ mod tests {
         // With loadedDictEnd = curr - 100, curr > maxDist + loadedDictEnd
         // only if curr - loadedDictEnd > maxDist, i.e. 100 > 1<<20 → false.
         let loaded = curr - 100;
-        assert!(!ZSTD_window_canOverflowCorrect(&w, cycleLog, maxDist, loaded, curr));
+        assert!(!ZSTD_window_canOverflowCorrect(
+            &w, cycleLog, maxDist, loaded, curr
+        ));
         // But with loadedDictEnd = 0 the dict is already invalidated.
-        assert!(ZSTD_window_canOverflowCorrect(&w, cycleLog, maxDist, 0, curr));
+        assert!(ZSTD_window_canOverflowCorrect(
+            &w, cycleLog, maxDist, 0, curr
+        ));
     }
 
     #[test]
     fn needOverflowCorrection_tracks_ZSTD_CURRENT_MAX() {
         let w = ZSTD_window_t::default();
-        assert!(!ZSTD_window_needOverflowCorrection(&w, 10, 1 << 20, 0, 0, 1000));
-        assert!(!ZSTD_window_needOverflowCorrection(&w, 10, 1 << 20, 0, 0, ZSTD_CURRENT_MAX));
+        assert!(!ZSTD_window_needOverflowCorrection(
+            &w,
+            10,
+            1 << 20,
+            0,
+            0,
+            1000
+        ));
+        assert!(!ZSTD_window_needOverflowCorrection(
+            &w,
+            10,
+            1 << 20,
+            0,
+            0,
+            ZSTD_CURRENT_MAX
+        ));
         assert!(ZSTD_window_needOverflowCorrection(
             &w,
             10,
@@ -1153,7 +1168,10 @@ mod tests {
 
     #[test]
     fn checkDictValidity_invalidates_past_window() {
-        let w = ZSTD_window_t { dictLimit: 100, ..Default::default() };
+        let w = ZSTD_window_t {
+            dictLimit: 100,
+            ..Default::default()
+        };
         let mut dictEnd = 100u32;
         // blockEnd = 500, maxDist = 100, loaded = 100 → 500 > 200 → invalidate.
         ZSTD_checkDictValidity(&w, 500, 100, &mut dictEnd);
@@ -1162,7 +1180,10 @@ mod tests {
 
     #[test]
     fn checkDictValidity_invalidates_on_noncontig_jump() {
-        let w = ZSTD_window_t { dictLimit: 100, ..Default::default() };
+        let w = ZSTD_window_t {
+            dictLimit: 100,
+            ..Default::default()
+        };
         let mut dictEnd = 80u32; // != dictLimit
         ZSTD_checkDictValidity(&w, 150, 1000, &mut dictEnd);
         assert_eq!(dictEnd, 0);
@@ -1251,9 +1272,9 @@ mod tests {
     fn rowMatchFinderSupported_only_for_greedy_lazy_lazy2() {
         assert!(!ZSTD_rowMatchFinderSupported(1)); // fast
         assert!(!ZSTD_rowMatchFinderSupported(2)); // dfast
-        assert!(ZSTD_rowMatchFinderSupported(3));  // greedy
-        assert!(ZSTD_rowMatchFinderSupported(4));  // lazy
-        assert!(ZSTD_rowMatchFinderSupported(5));  // lazy2
+        assert!(ZSTD_rowMatchFinderSupported(3)); // greedy
+        assert!(ZSTD_rowMatchFinderSupported(4)); // lazy
+        assert!(ZSTD_rowMatchFinderSupported(5)); // lazy2
         assert!(!ZSTD_rowMatchFinderSupported(6)); // btlazy2
         assert!(!ZSTD_rowMatchFinderSupported(7)); // btopt
     }
@@ -1262,16 +1283,40 @@ mod tests {
     fn allocateChainTable_rules() {
         use crate::compress::zstd_ldm::ZSTD_ParamSwitch_e;
         // fast (1) → never allocate (except DDS).
-        assert!(!ZSTD_allocateChainTable(1, ZSTD_ParamSwitch_e::ZSTD_ps_disable, 0));
-        assert!(ZSTD_allocateChainTable(1, ZSTD_ParamSwitch_e::ZSTD_ps_disable, 1));
+        assert!(!ZSTD_allocateChainTable(
+            1,
+            ZSTD_ParamSwitch_e::ZSTD_ps_disable,
+            0
+        ));
+        assert!(ZSTD_allocateChainTable(
+            1,
+            ZSTD_ParamSwitch_e::ZSTD_ps_disable,
+            1
+        ));
         // dfast (2) → always allocate.
-        assert!(ZSTD_allocateChainTable(2, ZSTD_ParamSwitch_e::ZSTD_ps_disable, 0));
+        assert!(ZSTD_allocateChainTable(
+            2,
+            ZSTD_ParamSwitch_e::ZSTD_ps_disable,
+            0
+        ));
         // greedy (3) with row matchfinder enabled → skip chain.
-        assert!(!ZSTD_allocateChainTable(3, ZSTD_ParamSwitch_e::ZSTD_ps_enable, 0));
+        assert!(!ZSTD_allocateChainTable(
+            3,
+            ZSTD_ParamSwitch_e::ZSTD_ps_enable,
+            0
+        ));
         // greedy (3) with row matchfinder disabled → allocate.
-        assert!(ZSTD_allocateChainTable(3, ZSTD_ParamSwitch_e::ZSTD_ps_disable, 0));
+        assert!(ZSTD_allocateChainTable(
+            3,
+            ZSTD_ParamSwitch_e::ZSTD_ps_disable,
+            0
+        ));
         // btlazy2 (6) → row matchfinder not supported, always allocate.
-        assert!(ZSTD_allocateChainTable(6, ZSTD_ParamSwitch_e::ZSTD_ps_enable, 0));
+        assert!(ZSTD_allocateChainTable(
+            6,
+            ZSTD_ParamSwitch_e::ZSTD_ps_enable,
+            0
+        ));
     }
 
     #[test]
@@ -1287,7 +1332,9 @@ mod tests {
         ms.chainTable = vec![100u32; 16];
         ms.hashTable3 = vec![100u32; 16];
         ms.hashLog3 = 4;
-        for h in ms.hashTable.iter_mut() { *h = 100; }
+        for h in ms.hashTable.iter_mut() {
+            *h = 100;
+        }
 
         ZSTD_reduceIndex(&mut ms, ZSTD_ParamSwitch_e::ZSTD_ps_disable, 0, 40);
 
@@ -1318,7 +1365,9 @@ mod tests {
     fn resolveRowMatchFinderMode_respects_explicit_mode() {
         use crate::compress::zstd_ldm::ZSTD_ParamSwitch_e;
         let cp = ZSTD_compressionParameters {
-            strategy: 3, windowLog: 10, ..Default::default()
+            strategy: 3,
+            windowLog: 10,
+            ..Default::default()
         };
         assert_eq!(
             ZSTD_resolveRowMatchFinderMode(ZSTD_ParamSwitch_e::ZSTD_ps_enable, &cp),
@@ -1330,7 +1379,9 @@ mod tests {
     fn resolveRowMatchFinderMode_auto_requires_windowLog_above_14() {
         use crate::compress::zstd_ldm::ZSTD_ParamSwitch_e;
         let mut cp = ZSTD_compressionParameters {
-            strategy: 3, windowLog: 14, ..Default::default()
+            strategy: 3,
+            windowLog: 14,
+            ..Default::default()
         };
         assert_eq!(
             ZSTD_resolveRowMatchFinderMode(ZSTD_ParamSwitch_e::ZSTD_ps_auto, &cp),
@@ -1353,21 +1404,27 @@ mod tests {
     fn resolveBlockSplitterMode_auto_gates_on_btopt_and_wlog_17() {
         use crate::compress::zstd_ldm::ZSTD_ParamSwitch_e;
         let cp_lazy = ZSTD_compressionParameters {
-            strategy: 3, windowLog: 20, ..Default::default()
+            strategy: 3,
+            windowLog: 20,
+            ..Default::default()
         };
         assert_eq!(
             ZSTD_resolveBlockSplitterMode(ZSTD_ParamSwitch_e::ZSTD_ps_auto, &cp_lazy),
             ZSTD_ParamSwitch_e::ZSTD_ps_disable,
         );
         let cp_btopt_small = ZSTD_compressionParameters {
-            strategy: 7, windowLog: 16, ..Default::default()
+            strategy: 7,
+            windowLog: 16,
+            ..Default::default()
         };
         assert_eq!(
             ZSTD_resolveBlockSplitterMode(ZSTD_ParamSwitch_e::ZSTD_ps_auto, &cp_btopt_small),
             ZSTD_ParamSwitch_e::ZSTD_ps_disable,
         );
         let cp_btopt_big = ZSTD_compressionParameters {
-            strategy: 7, windowLog: 17, ..Default::default()
+            strategy: 7,
+            windowLog: 17,
+            ..Default::default()
         };
         assert_eq!(
             ZSTD_resolveBlockSplitterMode(ZSTD_ParamSwitch_e::ZSTD_ps_auto, &cp_btopt_big),
@@ -1379,14 +1436,18 @@ mod tests {
     fn resolveEnableLdm_auto_gates_on_wlog_27() {
         use crate::compress::zstd_ldm::ZSTD_ParamSwitch_e;
         let cp_btopt_small = ZSTD_compressionParameters {
-            strategy: 7, windowLog: 26, ..Default::default()
+            strategy: 7,
+            windowLog: 26,
+            ..Default::default()
         };
         assert_eq!(
             ZSTD_resolveEnableLdm(ZSTD_ParamSwitch_e::ZSTD_ps_auto, &cp_btopt_small),
             ZSTD_ParamSwitch_e::ZSTD_ps_disable,
         );
         let cp_btopt_huge = ZSTD_compressionParameters {
-            strategy: 9, windowLog: 27, ..Default::default()
+            strategy: 9,
+            windowLog: 27,
+            ..Default::default()
         };
         assert_eq!(
             ZSTD_resolveEnableLdm(ZSTD_ParamSwitch_e::ZSTD_ps_auto, &cp_btopt_huge),
@@ -1418,6 +1479,20 @@ mod tests {
     }
 
     #[test]
+    fn matchState_dictMode_reports_dictMatchState_when_attached_and_live() {
+        let cp = ZSTD_compressionParameters::default();
+        let mut ms = ZSTD_MatchState_t::new(cp);
+        ms.dictMatchState = Some(Box::new(ZSTD_MatchState_t::new(cp)));
+        ms.loadedDictEnd = 32;
+        ms.window.lowLimit = 5;
+        ms.window.dictLimit = 10;
+        assert_eq!(
+            ZSTD_matchState_dictMode(&ms),
+            ZSTD_dictMode_e::ZSTD_dictMatchState
+        );
+    }
+
+    #[test]
     fn resolveExternalRepcodeSearch_auto_flips_at_level_10() {
         use crate::compress::zstd_ldm::ZSTD_ParamSwitch_e;
         assert_eq!(
@@ -1437,18 +1512,22 @@ mod tests {
 
     #[test]
     fn CDictIndicesAreTagged_fast_family() {
-        assert!(ZSTD_CDictIndicesAreTagged(
-            &ZSTD_compressionParameters { strategy: 1, ..Default::default() }
-        ));
-        assert!(ZSTD_CDictIndicesAreTagged(
-            &ZSTD_compressionParameters { strategy: 2, ..Default::default() }
-        ));
-        assert!(!ZSTD_CDictIndicesAreTagged(
-            &ZSTD_compressionParameters { strategy: 3, ..Default::default() }
-        ));
-        assert!(!ZSTD_CDictIndicesAreTagged(
-            &ZSTD_compressionParameters { strategy: 9, ..Default::default() }
-        ));
+        assert!(ZSTD_CDictIndicesAreTagged(&ZSTD_compressionParameters {
+            strategy: 1,
+            ..Default::default()
+        }));
+        assert!(ZSTD_CDictIndicesAreTagged(&ZSTD_compressionParameters {
+            strategy: 2,
+            ..Default::default()
+        }));
+        assert!(!ZSTD_CDictIndicesAreTagged(&ZSTD_compressionParameters {
+            strategy: 3,
+            ..Default::default()
+        }));
+        assert!(!ZSTD_CDictIndicesAreTagged(&ZSTD_compressionParameters {
+            strategy: 9,
+            ..Default::default()
+        }));
     }
 
     #[test]

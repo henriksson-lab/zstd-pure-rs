@@ -169,13 +169,18 @@ fn mergeEvents(acc: &mut Fingerprint, newfp: &Fingerprint) {
 }
 
 /// Port of `flushEvents`.
+#[allow(dead_code)]
 fn flushEvents(fpstats: &mut FPStats) {
-    fpstats.pastEvents.events.copy_from_slice(&fpstats.newEvents.events);
+    fpstats
+        .pastEvents
+        .events
+        .copy_from_slice(&fpstats.newEvents.events);
     fpstats.pastEvents.nbEvents = fpstats.newEvents.nbEvents;
     fpstats.newEvents.reset(HASHLOG_MAX);
 }
 
 /// Port of `removeEvents`.
+#[allow(dead_code)]
 fn removeEvents(acc: &mut Fingerprint, slice: &Fingerprint) {
     for n in 0..HASHTABLESIZE {
         debug_assert!(acc.events[n] >= slice.events[n]);
@@ -293,7 +298,11 @@ mod tests {
         // Uniform content → similar fingerprints → no split.
         for level in 0..=4 {
             let split = ZSTD_splitBlock(&block, level);
-            assert_eq!(split, block.len(), "level {level} suggested split at {split}");
+            assert_eq!(
+                split,
+                block.len(),
+                "level {level} suggested split at {split}"
+            );
         }
     }
 

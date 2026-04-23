@@ -26,7 +26,11 @@ pub enum HIST_checkInput_e {
 /// Port of `min_size` (`hist.c:75`).
 #[inline]
 pub fn min_size(a: usize, b: usize) -> usize {
-    if a < b { a } else { b }
+    if a < b {
+        a
+    } else {
+        b
+    }
 }
 
 /// Port of `HIST_isError`.
@@ -416,7 +420,7 @@ mod tests {
     fn hist_isError_matches_underlying_err_check() {
         // HIST_isError is a thin cast over ERR_isError; confirm it
         // returns 1 for error codes and 0 for successful sizes.
-        use crate::common::error::{ERROR, ErrorCode};
+        use crate::common::error::{ErrorCode, ERROR};
         let err = ERROR(ErrorCode::Generic);
         assert_eq!(HIST_isError(err), 1);
         assert_eq!(HIST_isError(0), 0);

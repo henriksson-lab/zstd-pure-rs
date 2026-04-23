@@ -1,12 +1,10 @@
 //! Translation of `lib/decompress/zstd_ddict.c`. Digested dictionary
 //! for decompression.
 //!
-//! Scope note: raw-content dictionaries (`ZSTD_dct_rawContent`) are
-//! fully supported. Pre-digested HUF+FSE tables from dicts prefixed
-//! with `ZSTD_MAGIC_DICTIONARY` need the `ZSTD_entropyDTables_t`
-//! wire-up plus ext-dict sequence execution, both still out of scope
-//! for v0.1. Magic-tagged dicts in `ZSTD_dct_fullDict` mode currently
-//! return `DictionaryCreationFailed` to flag the gap.
+//! Scope note: raw-content dictionaries (`ZSTD_dct_rawContent`) and
+//! zstd-format dictionaries prefixed with `ZSTD_MAGIC_DICTIONARY` are
+//! accepted. The Rust port keeps the original dictionary bytes in the
+//! DDict and reparses entropy tables when attaching it to a DCtx.
 
 use crate::common::error::{ErrorCode, ERROR};
 
@@ -82,10 +80,7 @@ pub fn ZSTD_getDictID_fromDict(dict: &[u8]) -> u32 {
 /// saves the dict-copy bytes since the DDict would only reference
 /// the caller's buffer — v0.1 always copies, but the estimate
 /// honors the choice.
-pub fn ZSTD_estimateDDictSize(
-    dictSize: usize,
-    dictLoadMethod: ZSTD_dictLoadMethod_e,
-) -> usize {
+pub fn ZSTD_estimateDDictSize(dictSize: usize, dictLoadMethod: ZSTD_dictLoadMethod_e) -> usize {
     let copied = if dictLoadMethod == ZSTD_dictLoadMethod_e::ZSTD_dlm_byRef {
         0
     } else {
@@ -102,16 +97,21 @@ pub fn ZSTD_sizeof_DDict(ddict: Option<&ZSTD_DDict>) -> usize {
     }
 }
 
-/// Port of `ZSTD_loadEntropy_intoDDict` — raw-content branch only.
-/// Returns 0 on success or an error code. For magic-tagged dicts with
-/// `ZSTD_dct_fullDict`, we currently return
-/// `DictionaryCreationFailed` to flag the unimplemented path.
+/// Port of `ZSTD_loadEntropy_intoDDict`.
+/// Returns 0 on success or an error code. Magic-tagged zstd-format
+/// dictionaries are parsed with the shared decoder entropy loader so
+/// the DDict exposes only the raw content bytes after the entropy
+/// tables, matching upstream's `dictContent` pointer adjustment.
 pub(crate) fn ZSTD_loadEntropy_intoDDict(
     ddict: &mut ZSTD_DDict,
     dictContentType: ZSTD_dictContentType_e,
 ) -> usize {
+    use crate::common::error::ERR_isError;
     use crate::common::mem::MEM_readLE32;
-    use crate::decompress::zstd_decompress::{ZSTD_FRAMEIDSIZE, ZSTD_MAGIC_DICTIONARY};
+    use crate::decompress::zstd_decompress::{
+        ZSTD_loadDEntropy, ZSTD_FRAMEIDSIZE, ZSTD_MAGIC_DICTIONARY,
+    };
+    use crate::decompress::zstd_decompress_block::ZSTD_DCtx;
 
     ddict.dictID = 0;
     ddict.entropyPresent = 0;
@@ -133,39 +133,63 @@ pub(crate) fn ZSTD_loadEntropy_intoDDict(
         return 0;
     }
 
-    // Magic-tagged: load dictID, but defer entropy-table parsing —
-    // upstream would build HUF + FSE DTables here; that path is
-    // gated on the pre-digested dict port (flagged below for
-    // `ZSTD_dct_fullDict` callers with an explicit error).
     ddict.dictID = MEM_readLE32(&ddict.dictBuffer[ZSTD_FRAMEIDSIZE..ZSTD_FRAMEIDSIZE + 4]);
-
-    if dictContentType == ZSTD_dictContentType_e::ZSTD_dct_fullDict {
-        // Pre-digested HUF/FSE not yet wired. Report a precise error
-        // so callers know this path is a stub.
-        return ERROR(ErrorCode::DictionaryCreationFailed);
+    let mut tmp_dctx = ZSTD_DCtx::new();
+    let mut rep = [0u32; 3];
+    let entropy_size = ZSTD_loadDEntropy(&mut tmp_dctx, &mut rep, &ddict.dictBuffer);
+    if ERR_isError(entropy_size) {
+        if dictContentType == ZSTD_dictContentType_e::ZSTD_dct_fullDict {
+            return ERROR(ErrorCode::DictionaryCorrupted);
+        }
+        // `ZSTD_dct_auto` is permissive: recognize dictID but keep
+        // treating the bytes as raw content when the magic-prefixed
+        // buffer doesn't contain a complete serialized entropy prefix.
+        ddict.entropyPresent = 0;
+        return 0;
     }
-    // For `ZSTD_dct_auto`, fall back to raw-content semantics: dictID
-    // is recognized but entropy tables aren't pre-built.
-    ddict.entropyPresent = 0;
+
+    ddict.entropyPresent = 1;
+    ddict.dictContent = unsafe { ddict.dictBuffer.as_ptr().add(entropy_size) };
+    ddict.dictSize = ddict.dictBuffer.len() - entropy_size;
     0
+}
+
+/// Port of `ZSTD_initDDict_internal`. Initializes an already-allocated
+/// DDict from caller bytes. The Rust port still owns a `Vec<u8>` for
+/// both load methods, but preserves the same parse / error behavior.
+pub(crate) fn ZSTD_initDDict_internal(
+    ddict: &mut ZSTD_DDict,
+    dict: &[u8],
+    _dictLoadMethod: ZSTD_dictLoadMethod_e,
+    dictContentType: ZSTD_dictContentType_e,
+) -> usize {
+    ddict.dictBuffer = dict.to_vec();
+    ddict.dictContent = if ddict.dictBuffer.is_empty() {
+        core::ptr::null()
+    } else {
+        ddict.dictBuffer.as_ptr()
+    };
+    ddict.dictSize = dict.len();
+    ddict.dictID = 0;
+    ddict.entropyPresent = 0;
+    ZSTD_loadEntropy_intoDDict(ddict, dictContentType)
 }
 
 /// Port of `ZSTD_createDDict_advanced`. Always copies the dict bytes
 /// for now.
 pub fn ZSTD_createDDict_advanced(
     dict: &[u8],
-    _dictLoadMethod: ZSTD_dictLoadMethod_e,
+    dictLoadMethod: ZSTD_dictLoadMethod_e,
     dictContentType: ZSTD_dictContentType_e,
 ) -> Option<Box<ZSTD_DDict>> {
     let mut ddict = Box::new(ZSTD_DDict {
-        dictBuffer: dict.to_vec(),
+        dictBuffer: Vec::new(),
         dictContent: core::ptr::null(),
-        dictSize: dict.len(),
+        dictSize: 0,
         dictID: 0,
         entropyPresent: 0,
     });
-    ddict.dictContent = ddict.dictBuffer.as_ptr();
-    let rc = ZSTD_loadEntropy_intoDDict(&mut ddict, dictContentType);
+    let rc = ZSTD_initDDict_internal(&mut ddict, dict, dictLoadMethod, dictContentType);
     if crate::common::error::ERR_isError(rc) {
         return None;
     }
@@ -202,12 +226,16 @@ pub fn ZSTD_freeDDict(_ddict: Option<Box<ZSTD_DDict>>) -> usize {
 /// with a DDict's parameters. Upstream sets the prefix/virtualStart/
 /// dictEnd/previousDstEnd pointers that it uses to resolve back-refs
 /// into the dict; v0.1's decoder works by materializing the dict into
-/// `stream_dict` and re-scanning, so we just copy the content there
-/// and flag `litEntropy` per the DDict's pre-digest status.
+/// `stream_dict` and re-scanning, so we copy the content there and
+/// reparse the DDict's original bytes when serialized entropy is
+/// present.
 pub fn ZSTD_copyDDictParameters(
     dctx: &mut crate::decompress::zstd_decompress_block::ZSTD_DCtx,
     ddict: &ZSTD_DDict,
 ) {
+    use crate::common::error::ERR_isError;
+    use crate::decompress::zstd_decompress::ZSTD_loadDEntropy;
+
     dctx.stream_dict = ZSTD_DDict_dictContent(ddict).to_vec();
     // Upstream (zstd_ddict.c:63-84) also copies dictID and flips
     // `fseEntropy` alongside `litEntropy` when the DDict has
@@ -216,6 +244,11 @@ pub fn ZSTD_copyDDictParameters(
     // after this helper would see stale zeros.
     dctx.dictID = ddict.dictID;
     if ddict.entropyPresent != 0 {
+        let mut rep = [0u32; 3];
+        let rc = ZSTD_loadDEntropy(dctx, &mut rep, &ddict.dictBuffer);
+        if !ERR_isError(rc) {
+            dctx.ddict_rep = rep;
+        }
         dctx.litEntropy = 1;
         dctx.fseEntropy = 1;
     } else {
@@ -267,7 +300,10 @@ mod byref_tests {
         let dict = b"byref-equivalence-test-dict ".repeat(4);
         let by_copy = ZSTD_createDDict(&dict).expect("by-copy");
         let by_ref = ZSTD_createDDict_byReference(&dict).expect("by-ref");
-        assert_eq!(ZSTD_DDict_dictContent(&by_copy), ZSTD_DDict_dictContent(&by_ref));
+        assert_eq!(
+            ZSTD_DDict_dictContent(&by_copy),
+            ZSTD_DDict_dictContent(&by_ref)
+        );
         assert_eq!(ZSTD_DDict_dictSize(&by_copy), ZSTD_DDict_dictSize(&by_ref));
     }
 
@@ -283,6 +319,73 @@ mod byref_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn build_minimal_zstd_dict(dictID: u32, content: &[u8]) -> Vec<u8> {
+        use crate::common::mem::MEM_writeLE32;
+        use crate::compress::fse_compress::FSE_writeNCount;
+        use crate::compress::huf_compress::{
+            HUF_buildCTable_wksp, HUF_readCTableHeader, HUF_writeCTable,
+            HUF_CTABLE_WORKSPACE_SIZE_U32,
+        };
+        use crate::decompress::zstd_decompress::ZSTD_MAGIC_DICTIONARY;
+        use crate::decompress::zstd_decompress_block::{
+            LL_defaultNorm, LL_defaultNormLog, ML_defaultNorm, ML_defaultNormLog, MaxLL, MaxML,
+            MaxOff, OF_defaultNorm, OF_defaultNormLog,
+        };
+
+        let mut out = Vec::new();
+        let mut word = [0u8; 4];
+        MEM_writeLE32(&mut word, ZSTD_MAGIC_DICTIONARY);
+        out.extend_from_slice(&word);
+        MEM_writeLE32(&mut word, dictID);
+        out.extend_from_slice(&word);
+
+        let mut count = [0u32; 256];
+        for &b in content {
+            count[b as usize] += 1;
+        }
+        for c in count.iter_mut().take(16) {
+            if *c == 0 {
+                *c = 1;
+            }
+        }
+        let maxSymbolValue = count
+            .iter()
+            .enumerate()
+            .rposition(|(_, &c)| c > 0)
+            .unwrap_or(0) as u32;
+        let totalCount = count.iter().sum::<u32>() as usize;
+        let tableLog =
+            crate::compress::huf_compress::HUF_optimalTableLog(11, totalCount, maxSymbolValue);
+        let mut ct = vec![0u64; 257];
+        let mut wksp = vec![0u32; HUF_CTABLE_WORKSPACE_SIZE_U32];
+        let rc = HUF_buildCTable_wksp(&mut ct, &count, maxSymbolValue, tableLog, &mut wksp);
+        assert!(!crate::common::error::ERR_isError(rc));
+        let tableLog = HUF_readCTableHeader(&ct).tableLog as u32;
+        let mut huf_hdr = vec![0u8; 512];
+        let written = HUF_writeCTable(&mut huf_hdr, &ct, maxSymbolValue, tableLog);
+        assert!(!crate::common::error::ERR_isError(written));
+        out.extend_from_slice(&huf_hdr[..written]);
+
+        let mut fse_buf = vec![0u8; 256];
+        let written = FSE_writeNCount(&mut fse_buf, &OF_defaultNorm, MaxOff, OF_defaultNormLog);
+        assert!(!crate::common::error::ERR_isError(written));
+        out.extend_from_slice(&fse_buf[..written]);
+        let written = FSE_writeNCount(&mut fse_buf, &ML_defaultNorm, MaxML, ML_defaultNormLog);
+        assert!(!crate::common::error::ERR_isError(written));
+        out.extend_from_slice(&fse_buf[..written]);
+        let written = FSE_writeNCount(&mut fse_buf, &LL_defaultNorm, MaxLL, LL_defaultNormLog);
+        assert!(!crate::common::error::ERR_isError(written));
+        out.extend_from_slice(&fse_buf[..written]);
+
+        let safe = (content.len() as u32).clamp(1, 8);
+        for rep in [safe, safe.saturating_sub(1).max(1), 1u32] {
+            MEM_writeLE32(&mut word, rep);
+            out.extend_from_slice(&word);
+        }
+        out.extend_from_slice(content);
+        out
+    }
 
     #[test]
     fn dict_method_and_contentType_discriminants_match_upstream() {
@@ -335,6 +438,42 @@ mod tests {
     }
 
     #[test]
+    fn initDDict_internal_reinitializes_existing_ddict() {
+        let first = b"first-ddict-content";
+        let second = b"second-ddict-content";
+        let mut ddict = ZSTD_DDict {
+            dictBuffer: Vec::new(),
+            dictContent: core::ptr::null(),
+            dictSize: 0,
+            dictID: 0,
+            entropyPresent: 0,
+        };
+
+        assert_eq!(
+            ZSTD_initDDict_internal(
+                &mut ddict,
+                first,
+                ZSTD_dictLoadMethod_e::ZSTD_dlm_byCopy,
+                ZSTD_dictContentType_e::ZSTD_dct_auto,
+            ),
+            0
+        );
+        assert_eq!(ZSTD_DDict_dictContent(&ddict), first);
+
+        assert_eq!(
+            ZSTD_initDDict_internal(
+                &mut ddict,
+                second,
+                ZSTD_dictLoadMethod_e::ZSTD_dlm_byRef,
+                ZSTD_dictContentType_e::ZSTD_dct_rawContent,
+            ),
+            0
+        );
+        assert_eq!(ZSTD_DDict_dictContent(&ddict), second);
+        assert_eq!(ZSTD_DDict_dictSize(&ddict), second.len());
+    }
+
+    #[test]
     fn create_too_short_dict_in_raw_mode_is_accepted() {
         // In `auto` mode a <8 byte buffer is accepted as pure content.
         let ddict = ZSTD_createDDict(&[1u8, 2, 3]).expect("short dict ok in auto");
@@ -358,12 +497,41 @@ mod tests {
 
         let mut dict = vec![0u8; 16];
         MEM_writeLE32(&mut dict[..4], ZSTD_MAGIC_DICTIONARY);
-        MEM_writeLE32(&mut dict[ZSTD_FRAMEIDSIZE..ZSTD_FRAMEIDSIZE + 4], 0xCAFEBABE);
+        MEM_writeLE32(
+            &mut dict[ZSTD_FRAMEIDSIZE..ZSTD_FRAMEIDSIZE + 4],
+            0xCAFEBABE,
+        );
         // In auto mode, full-entropy loading is not yet wired so
         // `ZSTD_dct_auto` falls back to raw while still recognizing
         // the dictID.
         let ddict = ZSTD_createDDict(&dict).expect("auto-mode magic dict");
         assert_eq!(ZSTD_getDictID_fromDDict(&ddict), 0xCAFEBABE);
+    }
+
+    #[test]
+    fn create_full_dict_mode_loads_entropy_and_exposes_raw_content() {
+        use crate::decompress::zstd_decompress_block::ZSTD_DCtx;
+
+        let content = b"ddict-full-mode-content-for-entropy-loading ".repeat(3);
+        let dict = build_minimal_zstd_dict(0xA5A5_1234, &content);
+        let ddict = ZSTD_createDDict_advanced(
+            &dict,
+            ZSTD_dictLoadMethod_e::ZSTD_dlm_byCopy,
+            ZSTD_dictContentType_e::ZSTD_dct_fullDict,
+        )
+        .expect("full dict");
+
+        assert_eq!(ZSTD_getDictID_fromDDict(&ddict), 0xA5A5_1234);
+        assert_eq!(ddict.entropyPresent, 1);
+        assert_eq!(ZSTD_DDict_dictContent(&ddict), content.as_slice());
+
+        let mut dctx = ZSTD_DCtx::new();
+        ZSTD_copyDDictParameters(&mut dctx, &ddict);
+        assert_eq!(dctx.dictID, 0xA5A5_1234);
+        assert_eq!(dctx.stream_dict, content);
+        assert_eq!(dctx.litEntropy, 1);
+        assert_eq!(dctx.fseEntropy, 1);
+        assert_eq!(dctx.ddict_rep, [8, 7, 1]);
     }
 
     #[test]

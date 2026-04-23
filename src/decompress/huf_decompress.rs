@@ -22,6 +22,18 @@ pub const HUF_flags_suspectUncompressible: i32 = 1 << 3;
 pub const HUF_flags_disableAsm: i32 = 1 << 4;
 pub const HUF_flags_disableFast: i32 = 1 << 5;
 
+/// Port-name wrapper for `HUF_initRemainingDStream`. Upstream uses it
+/// to reconstruct a `BIT_DStream_t` after a hardware-oriented fast
+/// loop. The Rust decoder doesn't split out that fast-loop state, so
+/// callers provide the remaining compressed slice directly.
+#[inline]
+pub fn HUF_initRemainingDStream<'a>(
+    bit: &mut crate::common::bitstream::BIT_DStream_t<'a>,
+    src: &'a [u8],
+) -> usize {
+    crate::common::bitstream::BIT_initDStream(bit, src, src.len())
+}
+
 /// `HUF_DTable` is type-erased in upstream (`typedef U32 HUF_DTable`). The
 /// first slot stores the `DTableDesc`; the remaining slots store decode
 /// entries whose layout depends on table type (X1 or X2).
@@ -225,6 +237,14 @@ pub fn HUF_buildDEltX2(symbol: u32, nbBits: u32, baseSeq: u32, level: i32) -> u3
     HUF_buildDEltX2U32(symbol, nbBits, baseSeq, level)
 }
 
+/// Port of `HUF_buildDEltX2U64`: two identical packed X2 entries in
+/// one little-endian 64-bit lane.
+#[inline]
+pub fn HUF_buildDEltX2U64(symbol: u32, nbBits: u32, baseSeq: u16, level: i32) -> u64 {
+    let delt = HUF_buildDEltX2U32(symbol, nbBits, baseSeq as u32, level) as u64;
+    delt + (delt << 32)
+}
+
 /// Fill positions `DTable[0..length*count]` with entries of width
 /// `nbBits`, one per sorted symbol in `[begin..end]`. Port of
 /// `HUF_fillDTableX2ForWeight`.
@@ -357,15 +377,7 @@ pub fn HUF_fillDTableX2(
             // Single-symbol slot per sortedList entry in this rank.
             let offset = rankVal[w as usize] as usize;
             HUF_fillDTableX2ForWeight(
-                dtable,
-                offset,
-                sortedList,
-                begin,
-                end,
-                nbBits,
-                targetLog,
-                0,
-                1,
+                dtable, offset, sortedList, begin, end, nbBits, targetLog, 0, 1,
             );
         }
     }
@@ -481,8 +493,8 @@ pub fn HUF_selectDecoder(dstSize: usize, cSrcSize: usize) -> u32 {
     // algoTime[Q][single/double] = (tableTime, decode256Time).
     // From upstream huf_decompress.c:1803.
     const ALGO_TIME: [[(u32, u32); 2]; 16] = [
-        [(0, 0),     (1, 1)],
-        [(0, 0),     (1, 1)],
+        [(0, 0), (1, 1)],
+        [(0, 0), (1, 1)],
         [(150, 216), (381, 119)],
         [(170, 205), (514, 112)],
         [(177, 199), (539, 110)],
@@ -505,10 +517,8 @@ pub fn HUF_selectDecoder(dstSize: usize, cSrcSize: usize) -> u32 {
         ((cSrcSize * 16) / dstSize) as u32
     };
     let d256 = (dstSize >> 8) as u32;
-    let d_time0 = ALGO_TIME[q as usize][0].0
-        + ALGO_TIME[q as usize][0].1.wrapping_mul(d256);
-    let mut d_time1 = ALGO_TIME[q as usize][1].0
-        + ALGO_TIME[q as usize][1].1.wrapping_mul(d256);
+    let d_time0 = ALGO_TIME[q as usize][0].0 + ALGO_TIME[q as usize][0].1.wrapping_mul(d256);
+    let mut d_time1 = ALGO_TIME[q as usize][1].0 + ALGO_TIME[q as usize][1].1.wrapping_mul(d256);
     // Small advantage to the smaller-memory algorithm (matches
     // upstream's cache-eviction bias).
     d_time1 = d_time1.wrapping_add(d_time1 >> 5);
@@ -676,7 +686,11 @@ fn write_entry(dtable: &mut [HUF_DTable], idx: usize, ent: u16) {
 #[inline]
 pub fn read_entry(dtable: &[HUF_DTable], idx: usize) -> HUF_DEltX1 {
     let slot = dtable[1 + idx / 2];
-    let half = if idx & 1 == 0 { slot as u16 } else { (slot >> 16) as u16 };
+    let half = if idx & 1 == 0 {
+        slot as u16
+    } else {
+        (slot >> 16) as u16
+    };
     HUF_DEltX1_unpack(half)
 }
 
@@ -782,7 +796,12 @@ pub fn HUF_readDTableX2(
         while consumed < limit {
             let src_col = rankVal[0];
             let dst_col = &mut rankVal[consumed];
-            for (w, dst_slot) in dst_col.iter_mut().enumerate().take(maxW as usize + 1).skip(1) {
+            for (w, dst_slot) in dst_col
+                .iter_mut()
+                .enumerate()
+                .take(maxW as usize + 1)
+                .skip(1)
+            {
                 *dst_slot = src_col[w] >> consumed;
             }
             consumed += 1;
@@ -1061,12 +1080,65 @@ pub fn HUF_decompress4X1_usingDTable_internal(
     HUF_decodeStreamX1(dst, op3, opStart4, &mut bd3, dtable, dtLog);
     HUF_decodeStreamX1(dst, op4, dstSize, &mut bd4, dtable, dtLog);
 
-    let endCheck =
-        BIT_endOfDStream(&bd1) & BIT_endOfDStream(&bd2) & BIT_endOfDStream(&bd3) & BIT_endOfDStream(&bd4);
+    let endCheck = BIT_endOfDStream(&bd1)
+        & BIT_endOfDStream(&bd2)
+        & BIT_endOfDStream(&bd3)
+        & BIT_endOfDStream(&bd4);
     if endCheck == 0 {
         return ERROR(ErrorCode::CorruptionDetected);
     }
     dstSize
+}
+
+/// Port-name wrapper for `HUF_decompress4X1_usingDTable_internal_body`.
+#[inline]
+pub fn HUF_decompress4X1_usingDTable_internal_body(
+    dst: &mut [u8],
+    cSrc: &[u8],
+    dtable: &[HUF_DTable],
+) -> usize {
+    HUF_decompress4X1_usingDTable_internal(dst, cSrc, dtable)
+}
+
+/// Portable wrapper for `HUF_decompress4X1_usingDTable_internal_default`.
+#[inline]
+pub fn HUF_decompress4X1_usingDTable_internal_default(
+    dst: &mut [u8],
+    cSrc: &[u8],
+    dtable: &[HUF_DTable],
+) -> usize {
+    HUF_decompress4X1_usingDTable_internal(dst, cSrc, dtable)
+}
+
+/// BMI2 wrapper for `HUF_decompress4X1_usingDTable_internal_bmi2`.
+#[inline]
+pub fn HUF_decompress4X1_usingDTable_internal_bmi2(
+    dst: &mut [u8],
+    cSrc: &[u8],
+    dtable: &[HUF_DTable],
+) -> usize {
+    HUF_decompress4X1_usingDTable_internal(dst, cSrc, dtable)
+}
+
+/// Fast-loop wrapper for `HUF_decompress4X1_usingDTable_internal_fast`.
+#[inline]
+pub fn HUF_decompress4X1_usingDTable_internal_fast(
+    dst: &mut [u8],
+    cSrc: &[u8],
+    dtable: &[HUF_DTable],
+) -> usize {
+    HUF_decompress4X1_usingDTable_internal(dst, cSrc, dtable)
+}
+
+/// C fast-loop entry name. Rust keeps one scalar implementation, so
+/// this forwards to the complete 4X1 decoder.
+#[inline]
+pub fn HUF_decompress4X1_usingDTable_internal_fast_c_loop(
+    dst: &mut [u8],
+    cSrc: &[u8],
+    dtable: &[HUF_DTable],
+) -> usize {
+    HUF_decompress4X1_usingDTable_internal(dst, cSrc, dtable)
 }
 
 pub fn HUF_decompress4X_usingDTable<const BMI2: bool>(
@@ -1322,12 +1394,65 @@ pub fn HUF_decompress4X2_usingDTable_internal(
     HUF_decodeStreamX2(dst, op3, opStart4, &mut bd3, dtable, dtLog);
     HUF_decodeStreamX2(dst, op4, dstSize, &mut bd4, dtable, dtLog);
 
-    let endCheck =
-        BIT_endOfDStream(&bd1) & BIT_endOfDStream(&bd2) & BIT_endOfDStream(&bd3) & BIT_endOfDStream(&bd4);
+    let endCheck = BIT_endOfDStream(&bd1)
+        & BIT_endOfDStream(&bd2)
+        & BIT_endOfDStream(&bd3)
+        & BIT_endOfDStream(&bd4);
     if endCheck == 0 {
         return ERROR(ErrorCode::CorruptionDetected);
     }
     dstSize
+}
+
+/// Port-name wrapper for `HUF_decompress4X2_usingDTable_internal_body`.
+#[inline]
+pub fn HUF_decompress4X2_usingDTable_internal_body(
+    dst: &mut [u8],
+    cSrc: &[u8],
+    dtable: &[HUF_DTable],
+) -> usize {
+    HUF_decompress4X2_usingDTable_internal(dst, cSrc, dtable)
+}
+
+/// Portable wrapper for `HUF_decompress4X2_usingDTable_internal_default`.
+#[inline]
+pub fn HUF_decompress4X2_usingDTable_internal_default(
+    dst: &mut [u8],
+    cSrc: &[u8],
+    dtable: &[HUF_DTable],
+) -> usize {
+    HUF_decompress4X2_usingDTable_internal(dst, cSrc, dtable)
+}
+
+/// BMI2 wrapper for `HUF_decompress4X2_usingDTable_internal_bmi2`.
+#[inline]
+pub fn HUF_decompress4X2_usingDTable_internal_bmi2(
+    dst: &mut [u8],
+    cSrc: &[u8],
+    dtable: &[HUF_DTable],
+) -> usize {
+    HUF_decompress4X2_usingDTable_internal(dst, cSrc, dtable)
+}
+
+/// Fast-loop wrapper for `HUF_decompress4X2_usingDTable_internal_fast`.
+#[inline]
+pub fn HUF_decompress4X2_usingDTable_internal_fast(
+    dst: &mut [u8],
+    cSrc: &[u8],
+    dtable: &[HUF_DTable],
+) -> usize {
+    HUF_decompress4X2_usingDTable_internal(dst, cSrc, dtable)
+}
+
+/// C fast-loop entry name. Rust keeps one scalar implementation, so
+/// this forwards to the complete 4X2 decoder.
+#[inline]
+pub fn HUF_decompress4X2_usingDTable_internal_fast_c_loop(
+    dst: &mut [u8],
+    cSrc: &[u8],
+    dtable: &[HUF_DTable],
+) -> usize {
+    HUF_decompress4X2_usingDTable_internal(dst, cSrc, dtable)
 }
 
 /// Port of `HUF_decompress4X2_DCtx_wksp`.
@@ -1405,6 +1530,14 @@ mod tests {
     }
 
     #[test]
+    fn deltx2_u64_stamps_two_identical_entries() {
+        let packed = HUF_buildDEltX2U32(0x34, 6, 0x12, 2);
+        let wide = HUF_buildDEltX2U64(0x34, 6, 0x12, 2);
+        assert_eq!(wide as u32, packed);
+        assert_eq!((wide >> 32) as u32, packed);
+    }
+
+    #[test]
     fn deltx2_read_write_round_trip_via_dtable() {
         let mut dt = [0u32; 16];
         write_entry_x2(
@@ -1423,8 +1556,68 @@ mod tests {
     }
 
     #[test]
+    fn huf_port_name_wrappers_forward_to_scalar_paths() {
+        let mut bit = crate::common::bitstream::BIT_DStream_t::default();
+        let bit_src = [0x80u8];
+        assert!(!crate::common::error::ERR_isError(
+            HUF_initRemainingDStream(&mut bit, &bit_src)
+        ));
+
+        let mut dtable = vec![0u32; HUF_DTABLE_SIZE_U32(1)];
+        HUF_setDTableDesc(
+            &mut dtable,
+            DTableDesc {
+                maxTableLog: 1,
+                tableType: 0,
+                tableLog: 1,
+                reserved: 0,
+            },
+        );
+        let mut dst = [0u8; 4];
+        let short = [0u8; 1];
+        let expected = HUF_decompress4X1_usingDTable_internal(&mut dst, &short, &dtable);
+        assert_eq!(
+            HUF_decompress4X1_usingDTable_internal_default(&mut dst, &short, &dtable),
+            expected
+        );
+        assert_eq!(
+            HUF_decompress4X1_usingDTable_internal_bmi2(&mut dst, &short, &dtable),
+            expected
+        );
+        assert_eq!(
+            HUF_decompress4X1_usingDTable_internal_fast(&mut dst, &short, &dtable),
+            expected
+        );
+        assert_eq!(
+            HUF_decompress4X1_usingDTable_internal_fast_c_loop(&mut dst, &short, &dtable),
+            expected
+        );
+
+        let expected = HUF_decompress4X2_usingDTable_internal(&mut dst, &short, &dtable);
+        assert_eq!(
+            HUF_decompress4X2_usingDTable_internal_default(&mut dst, &short, &dtable),
+            expected
+        );
+        assert_eq!(
+            HUF_decompress4X2_usingDTable_internal_bmi2(&mut dst, &short, &dtable),
+            expected
+        );
+        assert_eq!(
+            HUF_decompress4X2_usingDTable_internal_fast(&mut dst, &short, &dtable),
+            expected
+        );
+        assert_eq!(
+            HUF_decompress4X2_usingDTable_internal_fast_c_loop(&mut dst, &short, &dtable),
+            expected
+        );
+    }
+
+    #[test]
     fn deltx1_pack_roundtrip() {
-        let e = HUF_DEltX1 { nbBits: 7, byte: 0xA5 };
+        let e = HUF_DEltX1 {
+            nbBits: 7,
+            byte: 0xA5,
+        };
         let s = HUF_DEltX1_pack(e);
         let r = HUF_DEltX1_unpack(s);
         assert_eq!(r.nbBits, e.nbBits);

@@ -243,7 +243,10 @@ mod tests {
     #[test]
     fn error_name_via_size_t() {
         let enc = ERROR(ErrorCode::ChecksumWrong);
-        assert_eq!(ERR_getErrorName(enc), "Restored data doesn't match checksum");
+        assert_eq!(
+            ERR_getErrorName(enc),
+            "Restored data doesn't match checksum"
+        );
     }
 
     #[test]
@@ -320,7 +323,8 @@ mod tests {
         ] {
             let raw = code as i32;
             assert_eq!(
-                ErrorCode::from_raw(raw), code,
+                ErrorCode::from_raw(raw),
+                code,
                 "from_raw({raw}) did not round-trip for {code:?}"
             );
         }

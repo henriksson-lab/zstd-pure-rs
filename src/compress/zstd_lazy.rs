@@ -8,6 +8,9 @@
 //! old no-dict fallback.
 
 #![allow(non_snake_case)]
+#![allow(clippy::collapsible_if)]
+#![allow(clippy::type_complexity)]
+#![allow(clippy::unnecessary_cast)]
 
 use crate::common::bits::{
     ZSTD_countTrailingZeros64, ZSTD_highbit32, ZSTD_rotateRight_U16, ZSTD_rotateRight_U32,
@@ -15,15 +18,19 @@ use crate::common::bits::{
 };
 use crate::common::mem::MEM_read32;
 use crate::compress::match_state::{
-    ZSTD_MatchState_t, ZSTD_ROW_HASH_CACHE_SIZE, ZSTD_dictMode_e, ZSTD_index_overlap_check,
+    ZSTD_MatchState_t, ZSTD_dictMode_e, ZSTD_index_overlap_check, ZSTD_ROW_HASH_CACHE_SIZE,
 };
 use crate::compress::seq_store::{
     SeqStore_t, ZSTD_storeSeq, OFFBASE_IS_OFFSET, OFFBASE_TO_OFFSET, OFFSET_TO_OFFBASE,
     REPCODE_TO_OFFBASE, ZSTD_REP_NUM,
 };
 use crate::compress::zstd_compress::ZSTD_LAZY_DDSS_BUCKET_LOG;
-use crate::compress::zstd_hashes::{ZSTD_count, ZSTD_count_2segments, ZSTD_hashPtr, ZSTD_hashPtrSalted};
-use crate::compress::zstd_fast::{kSearchStrength, ZSTD_getLowestMatchIndex, ZSTD_getLowestPrefixIndex};
+use crate::compress::zstd_fast::{
+    kSearchStrength, ZSTD_getLowestMatchIndex, ZSTD_getLowestPrefixIndex,
+};
+use crate::compress::zstd_hashes::{
+    ZSTD_count, ZSTD_count_2segments, ZSTD_hashPtr, ZSTD_hashPtrSalted,
+};
 
 pub const ZSTD_ROW_HASH_TAG_BITS: u32 = 8;
 pub const ZSTD_ROW_HASH_TAG_MASK: u32 = (1u32 << ZSTD_ROW_HASH_TAG_BITS) - 1;
@@ -64,20 +71,17 @@ pub fn ZSTD_isAligned<T>(ptr: *const T, align: usize) -> bool {
 
 /// Port of `ZSTD_row_prefetch`.
 #[inline]
-pub fn ZSTD_row_prefetch(
-    hashTable: &[u32],
-    tagTable: &[u8],
-    relRow: u32,
-    rowLog: u32,
-) {
+pub fn ZSTD_row_prefetch(hashTable: &[u32], tagTable: &[u8], relRow: u32, rowLog: u32) {
     let relRow = relRow as usize;
     let _ = &hashTable[relRow..hashTable.len().min(relRow + 16)];
     if rowLog >= 5 {
-        let _ = &hashTable[relRow.saturating_add(16)..hashTable.len().min(relRow.saturating_add(32))];
+        let _ =
+            &hashTable[relRow.saturating_add(16)..hashTable.len().min(relRow.saturating_add(32))];
     }
     let _ = &tagTable[relRow..tagTable.len().min(relRow + 32)];
     if rowLog == 6 {
-        let _ = &tagTable[tagTable.len().min(relRow.saturating_add(32))..tagTable.len().min(relRow.saturating_add(64))];
+        let _ = &tagTable[tagTable.len().min(relRow.saturating_add(32))
+            ..tagTable.len().min(relRow.saturating_add(64))];
     }
 }
 
@@ -96,7 +100,8 @@ pub fn ZSTD_row_fillHashCache(
     } else {
         (iLimit - idx as usize + 1) as u32
     };
-    let lim = idx + (crate::compress::match_state::ZSTD_ROW_HASH_CACHE_SIZE as u32).min(maxElemsToPrefetch);
+    let lim = idx
+        + (crate::compress::match_state::ZSTD_ROW_HASH_CACHE_SIZE as u32).min(maxElemsToPrefetch);
     while idx < lim {
         let hash = ZSTD_hashPtrSalted(
             &base[idx as usize..],
@@ -229,7 +234,12 @@ pub fn ZSTD_row_getSSEMask(nbChunks: i32, src: &[u8], tag: u8, head: u32) -> ZST
 }
 
 /// Port of `ZSTD_row_getNEONMask`.
-pub fn ZSTD_row_getNEONMask(rowEntries: u32, src: &[u8], tag: u8, headGrouped: u32) -> ZSTD_VecMask {
+pub fn ZSTD_row_getNEONMask(
+    rowEntries: u32,
+    src: &[u8],
+    tag: u8,
+    headGrouped: u32,
+) -> ZSTD_VecMask {
     debug_assert!(matches!(rowEntries, 16 | 32 | 64));
     let rowEntries = rowEntries as usize;
     let slice = &src[..rowEntries];
@@ -310,7 +320,11 @@ pub fn ZSTD_dedicatedDictSearch_lazy_loadDictionary(
     let hashLog = ms.cParams.hashLog - ZSTD_LAZY_DDSS_BUCKET_LOG;
     let tmpHashSize = 1usize << hashLog;
     let tmpChainSize = (((1u32 << ZSTD_LAZY_DDSS_BUCKET_LOG) - 1) << hashLog) as u32;
-    let tmpMinChain = if tmpChainSize < target { target - tmpChainSize } else { idx };
+    let tmpMinChain = if tmpChainSize < target {
+        target - tmpChainSize
+    } else {
+        idx
+    };
 
     debug_assert!(ms.cParams.chainLog <= 24);
     debug_assert!(ms.cParams.hashLog > ms.cParams.chainLog);
@@ -430,7 +444,9 @@ pub fn ZSTD_dedicatedDictSearch_lazy_search(
         debug_assert!(matchIndex >= ddsLowestIndex);
         let matchPos = matchIndex as usize;
         let mut currentMl = 0usize;
-        if matchPos + 4 <= dict_buf.len() && MEM_read32(&dict_buf[matchPos..]) == MEM_read32(&input_buf[ip..]) {
+        if matchPos + 4 <= dict_buf.len()
+            && MEM_read32(&dict_buf[matchPos..]) == MEM_read32(&input_buf[ip..])
+        {
             currentMl = ZSTD_count_2segments(
                 input_buf,
                 ip + 4,
@@ -460,7 +476,9 @@ pub fn ZSTD_dedicatedDictSearch_lazy_search(
         let matchPos = matchIndex as usize;
         let mut currentMl = 0usize;
         debug_assert!(matchIndex >= ddsLowestIndex);
-        if matchPos + 4 <= dict_buf.len() && MEM_read32(&dict_buf[matchPos..]) == MEM_read32(&input_buf[ip..]) {
+        if matchPos + 4 <= dict_buf.len()
+            && MEM_read32(&dict_buf[matchPos..]) == MEM_read32(&input_buf[ip..])
+        {
             currentMl = ZSTD_count_2segments(
                 input_buf,
                 ip + 4,
@@ -509,7 +527,11 @@ pub fn ZSTD_RowFindBestMatch(
         lowestValid
     };
     let isDictionary = ms.loadedDictEnd != 0;
-    let lowLimit = if isDictionary { lowestValid } else { withinMaxDistance };
+    let lowLimit = if isDictionary {
+        lowestValid
+    } else {
+        withinMaxDistance
+    };
     let rowEntries = 1u32 << rowLog;
     let rowMask = rowEntries - 1;
     let cappedSearchLog = cParams.searchLog.min(rowLog);
@@ -538,9 +560,11 @@ pub fn ZSTD_RowFindBestMatch(
 
     if dictMode == ZSTD_dictMode_e::ZSTD_dictMatchState {
         if let Some(dms) = ms.dictMatchState.as_deref() {
-            let dmsHash =
-                ZSTD_hashPtr(&input_buf[ip..], dms.rowHashLog + ZSTD_ROW_HASH_TAG_BITS, mls)
-                    as u32;
+            let dmsHash = ZSTD_hashPtr(
+                &input_buf[ip..],
+                dms.rowHashLog + ZSTD_ROW_HASH_TAG_BITS,
+                mls,
+            ) as u32;
             dmsRelRow = ((dmsHash >> ZSTD_ROW_HASH_TAG_BITS) << rowLog) as usize;
             dmsTag = dmsHash & ZSTD_ROW_HASH_TAG_MASK;
             ZSTD_row_prefetch(&dms.hashTable, &dms.tagTable, dmsRelRow as u32, rowLog);
@@ -741,9 +765,17 @@ pub fn ZSTD_searchMax(
             ZSTD_dictMode_e::ZSTD_dedicatedDictSearch => 0,
             _ => ZSTD_BtFindBestMatch(ms, input_buf, ip, iend, offsetPtr, mls, dictMode),
         },
-        searchMethod_e::search_rowHash => {
-            ZSTD_RowFindBestMatch(ms, input_buf, ext_dict_buf, ip, iend, offsetPtr, mls, dictMode, rowLog)
-        }
+        searchMethod_e::search_rowHash => ZSTD_RowFindBestMatch(
+            ms,
+            input_buf,
+            ext_dict_buf,
+            ip,
+            iend,
+            offsetPtr,
+            mls,
+            dictMode,
+            rowLog,
+        ),
     }
 }
 
@@ -869,7 +901,11 @@ pub fn ZSTD_HcFindBestMatch_noDict(
         }
         matchIndex = next;
     }
-    if ml >= 4 { ml } else { 0 }
+    if ml >= 4 {
+        ml
+    } else {
+        0
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -922,8 +958,7 @@ pub fn ZSTD_HcFindBestMatch(
         0usize
     };
 
-    let mut matchIndex =
-        ZSTD_insertAndFindFirstIndex_internal(ms, src, ip, mls);
+    let mut matchIndex = ZSTD_insertAndFindFirstIndex_internal(ms, src, ip, mls);
 
     while matchIndex >= lowLimit && nbAttempts > 0 {
         nbAttempts -= 1;
@@ -939,7 +974,9 @@ pub fn ZSTD_HcFindBestMatch(
             }
         } else {
             let match_pos = matchIndex as usize;
-            if match_pos + 4 <= dictEnd && MEM_read32(&ms.dictContent[match_pos..]) == MEM_read32(&src[ip..]) {
+            if match_pos + 4 <= dictEnd
+                && MEM_read32(&ms.dictContent[match_pos..]) == MEM_read32(&src[ip..])
+            {
                 ZSTD_count_2segments(
                     src,
                     ip + 4,
@@ -1102,8 +1139,7 @@ pub fn ZSTD_compressBlock_lazy_noDict_generic_search(
     let mut offsetSaved2: u32 = 0;
     {
         let curr = base_off + ip as u32;
-        let windowLow =
-            crate::compress::zstd_fast::ZSTD_getLowestPrefixIndex(ms, curr, windowLog);
+        let windowLow = crate::compress::zstd_fast::ZSTD_getLowestPrefixIndex(ms, curr, windowLog);
         let maxRep = curr - windowLow;
         if rep_offset2 > maxRep {
             offsetSaved2 = rep_offset2;
@@ -1123,11 +1159,9 @@ pub fn ZSTD_compressBlock_lazy_noDict_generic_search(
         if rep_offset1 > 0
             && ip + 1 + 4 <= iend
             && ip + 1 >= rep_offset1 as usize
-            && MEM_read32(&src[ip + 1..])
-                == MEM_read32(&src[ip + 1 - rep_offset1 as usize..])
+            && MEM_read32(&src[ip + 1..]) == MEM_read32(&src[ip + 1 - rep_offset1 as usize..])
         {
-            matchLength =
-                ZSTD_count(src, ip + 1 + 4, ip + 1 + 4 - rep_offset1 as usize, iend) + 4;
+            matchLength = ZSTD_count(src, ip + 1 + 4, ip + 1 + 4 - rep_offset1 as usize, iend) + 4;
             // Depth 0 could `goto storeSequence` here (upstream perf
             // shortcut). We fall through — the chain search at ip only
             // replaces if it strictly beats `matchLength`, so behavior
@@ -1141,9 +1175,15 @@ pub fn ZSTD_compressBlock_lazy_noDict_generic_search(
                 searchMethod_e::search_hashChain => {
                     ZSTD_HcFindBestMatch_noDict(ms, src, ip, iend, &mut cand_off, mls)
                 }
-                searchMethod_e::search_binaryTree => {
-                    ZSTD_BtFindBestMatch(ms, src, ip, iend, &mut cand_off, mls, ZSTD_dictMode_e::ZSTD_noDict)
-                }
+                searchMethod_e::search_binaryTree => ZSTD_BtFindBestMatch(
+                    ms,
+                    src,
+                    ip,
+                    iend,
+                    &mut cand_off,
+                    mls,
+                    ZSTD_dictMode_e::ZSTD_noDict,
+                ),
                 searchMethod_e::search_rowHash => unreachable!(),
             };
             if ml2 > matchLength {
@@ -1171,15 +1211,10 @@ pub fn ZSTD_compressBlock_lazy_noDict_generic_search(
                 if rep_offset1 > 0
                     && probe + 4 <= iend
                     && probe >= rep_offset1 as usize
-                    && MEM_read32(&src[probe..])
-                        == MEM_read32(&src[probe - rep_offset1 as usize..])
+                    && MEM_read32(&src[probe..]) == MEM_read32(&src[probe - rep_offset1 as usize..])
                 {
-                    let mlRep = ZSTD_count(
-                        src,
-                        probe + 4,
-                        probe + 4 - rep_offset1 as usize,
-                        iend,
-                    ) + 4;
+                    let mlRep =
+                        ZSTD_count(src, probe + 4, probe + 4 - rep_offset1 as usize, iend) + 4;
                     let gain2 = (mlRep as i32) * 3;
                     let gain1 = (matchLength as i32) * 3
                         - crate::common::bits::ZSTD_highbit32(offBase) as i32
@@ -1196,14 +1231,20 @@ pub fn ZSTD_compressBlock_lazy_noDict_generic_search(
                     searchMethod_e::search_hashChain => {
                         ZSTD_HcFindBestMatch_noDict(ms, src, probe, iend, &mut cand_off, mls)
                     }
-                    searchMethod_e::search_binaryTree => {
-                        ZSTD_BtFindBestMatch(ms, src, probe, iend, &mut cand_off, mls, ZSTD_dictMode_e::ZSTD_noDict)
-                    }
+                    searchMethod_e::search_binaryTree => ZSTD_BtFindBestMatch(
+                        ms,
+                        src,
+                        probe,
+                        iend,
+                        &mut cand_off,
+                        mls,
+                        ZSTD_dictMode_e::ZSTD_noDict,
+                    ),
                     searchMethod_e::search_rowHash => unreachable!(),
                 };
                 if ml2 >= 4 && cand_off != 0 {
-                    let gain2 = (ml2 as i32) * 4
-                        - crate::common::bits::ZSTD_highbit32(cand_off) as i32;
+                    let gain2 =
+                        (ml2 as i32) * 4 - crate::common::bits::ZSTD_highbit32(cand_off) as i32;
                     let gain1 = (matchLength as i32) * 4
                         - crate::common::bits::ZSTD_highbit32(offBase) as i32
                         + 4;
@@ -1223,15 +1264,10 @@ pub fn ZSTD_compressBlock_lazy_noDict_generic_search(
                     if rep_offset1 > 0
                         && p2 + 4 <= iend
                         && p2 >= rep_offset1 as usize
-                        && MEM_read32(&src[p2..])
-                            == MEM_read32(&src[p2 - rep_offset1 as usize..])
+                        && MEM_read32(&src[p2..]) == MEM_read32(&src[p2 - rep_offset1 as usize..])
                     {
-                        let mlRep = ZSTD_count(
-                            src,
-                            p2 + 4,
-                            p2 + 4 - rep_offset1 as usize,
-                            iend,
-                        ) + 4;
+                        let mlRep =
+                            ZSTD_count(src, p2 + 4, p2 + 4 - rep_offset1 as usize, iend) + 4;
                         let gain2 = (mlRep as i32) * 4;
                         let gain1 = (matchLength as i32) * 4
                             - crate::common::bits::ZSTD_highbit32(offBase) as i32
@@ -1247,9 +1283,15 @@ pub fn ZSTD_compressBlock_lazy_noDict_generic_search(
                         searchMethod_e::search_hashChain => {
                             ZSTD_HcFindBestMatch_noDict(ms, src, p2, iend, &mut cand2_off, mls)
                         }
-                        searchMethod_e::search_binaryTree => {
-                            ZSTD_BtFindBestMatch(ms, src, p2, iend, &mut cand2_off, mls, ZSTD_dictMode_e::ZSTD_noDict)
-                        }
+                        searchMethod_e::search_binaryTree => ZSTD_BtFindBestMatch(
+                            ms,
+                            src,
+                            p2,
+                            iend,
+                            &mut cand2_off,
+                            mls,
+                            ZSTD_dictMode_e::ZSTD_noDict,
+                        ),
                         searchMethod_e::search_rowHash => unreachable!(),
                     };
                     if ml3 >= 4 && cand2_off != 0 {
@@ -1319,8 +1361,16 @@ pub fn ZSTD_compressBlock_lazy_noDict_generic_search(
     } else {
         offsetSaved2
     };
-    rep[0] = if rep_offset1 != 0 { rep_offset1 } else { offsetSaved1 };
-    rep[1] = if rep_offset2 != 0 { rep_offset2 } else { offsetSaved2_final };
+    rep[0] = if rep_offset1 != 0 {
+        rep_offset1
+    } else {
+        offsetSaved1
+    };
+    rep[1] = if rep_offset2 != 0 {
+        rep_offset2
+    } else {
+        offsetSaved2_final
+    };
 
     iend - anchor
 }
@@ -1349,7 +1399,8 @@ pub fn ZSTD_compressBlock_lazy_generic(
     let isDMS = dictMode == ZSTD_dictMode_e::ZSTD_dictMatchState;
     let isDDS = dictMode == ZSTD_dictMode_e::ZSTD_dedicatedDictSearch;
     let isDxS = isDMS || isDDS;
-    let (dictLowestIndex, dms_base_offset, dictIndexDelta, dictAndPrefixLength, dictBase) = if isDxS {
+    let (dictLowestIndex, dms_base_offset, dictIndexDelta, dictAndPrefixLength, dictBase) = if isDxS
+    {
         let dms = match ms.dictMatchState.as_deref() {
             Some(dms) => dms,
             None => return src.len(),
@@ -1409,7 +1460,14 @@ pub fn ZSTD_compressBlock_lazy_generic(
 
     ms.lazySkipping = 0;
     if searchMethod == searchMethod_e::search_rowHash {
-        ZSTD_row_fillHashCache(ms, src, rowLog, mls, ms.nextToUpdate.saturating_sub(base_off), ilimit);
+        ZSTD_row_fillHashCache(
+            ms,
+            src,
+            rowLog,
+            mls,
+            ms.nextToUpdate.saturating_sub(base_off),
+            ilimit,
+        );
     }
 
     while ip < ilimit {
@@ -1421,7 +1479,9 @@ pub fn ZSTD_compressBlock_lazy_generic(
             let repIndex = base_off + ip as u32 + 1 - offset_1;
             let repInDict = repIndex < prefixLowestIndex;
             let repMatch = if repInDict {
-                repIndex.saturating_sub(dictIndexDelta).saturating_sub(dms_base_offset) as usize
+                repIndex
+                    .saturating_sub(dictIndexDelta)
+                    .saturating_sub(dms_base_offset) as usize
             } else {
                 repIndex.saturating_sub(base_off) as usize
             };
@@ -1446,7 +1506,13 @@ pub fn ZSTD_compressBlock_lazy_generic(
                 ) + 4;
                 if depth == 0 {
                     let litLength = start - anchor;
-                    ZSTD_storeSeq(seqStore, litLength, &src[anchor..start], offBase, matchLength);
+                    ZSTD_storeSeq(
+                        seqStore,
+                        litLength,
+                        &src[anchor..start],
+                        offBase,
+                        matchLength,
+                    );
                     anchor = start + matchLength;
                     ip = anchor;
                     continue;
@@ -1459,7 +1525,13 @@ pub fn ZSTD_compressBlock_lazy_generic(
             matchLength = ZSTD_count(src, ip + 1 + 4, ip + 1 + 4 - offset_1 as usize, iend) + 4;
             if depth == 0 {
                 let litLength = start - anchor;
-                ZSTD_storeSeq(seqStore, litLength, &src[anchor..start], offBase, matchLength);
+                ZSTD_storeSeq(
+                    seqStore,
+                    litLength,
+                    &src[anchor..start],
+                    offBase,
+                    matchLength,
+                );
                 anchor = start + matchLength;
                 ip = anchor;
                 continue;
@@ -1508,11 +1580,9 @@ pub fn ZSTD_compressBlock_lazy_generic(
                         && offset_1 > 0
                         && MEM_read32(&src[ip - offset_1 as usize..]) == MEM_read32(&src[ip..])
                     {
-                        let mlRep =
-                            ZSTD_count(src, ip + 4, ip + 4 - offset_1 as usize, iend) + 4;
+                        let mlRep = ZSTD_count(src, ip + 4, ip + 4 - offset_1 as usize, iend) + 4;
                         let gain2 = (mlRep * 3) as i32;
-                        let gain1 =
-                            (matchLength * 3) as i32 - ZSTD_highbit32(offBase) as i32 + 1;
+                        let gain1 = (matchLength * 3) as i32 - ZSTD_highbit32(offBase) as i32 + 1;
                         if mlRep >= 4 && gain2 > gain1 {
                             matchLength = mlRep;
                             offBase = REPCODE_TO_OFFBASE(1);
@@ -1524,7 +1594,9 @@ pub fn ZSTD_compressBlock_lazy_generic(
                     let repIndex = base_off + ip as u32 - offset_1;
                     let repInDict = repIndex < prefixLowestIndex;
                     let repMatch = if repInDict {
-                        repIndex.saturating_sub(dictIndexDelta).saturating_sub(dms_base_offset) as usize
+                        repIndex
+                            .saturating_sub(dictIndexDelta)
+                            .saturating_sub(dms_base_offset) as usize
                     } else {
                         repIndex.saturating_sub(base_off) as usize
                     };
@@ -1548,8 +1620,7 @@ pub fn ZSTD_compressBlock_lazy_generic(
                             repMatchEnd,
                         ) + 4;
                         let gain2 = (mlRep * 3) as i32;
-                        let gain1 =
-                            (matchLength * 3) as i32 - ZSTD_highbit32(offBase) as i32 + 1;
+                        let gain1 = (matchLength * 3) as i32 - ZSTD_highbit32(offBase) as i32 + 1;
                         if mlRep >= 4 && gain2 > gain1 {
                             matchLength = mlRep;
                             offBase = REPCODE_TO_OFFBASE(1);
@@ -1609,7 +1680,10 @@ pub fn ZSTD_compressBlock_lazy_generic(
                         let repIndex = base_off + ip as u32 - offset_1;
                         let repInDict = repIndex < prefixLowestIndex;
                         let repMatch = if repInDict {
-                                repIndex.saturating_sub(dictIndexDelta).saturating_sub(dms_base_offset) as usize
+                            repIndex
+                                .saturating_sub(dictIndexDelta)
+                                .saturating_sub(dms_base_offset)
+                                as usize
                         } else {
                             repIndex.saturating_sub(base_off) as usize
                         };
@@ -1689,7 +1763,9 @@ pub fn ZSTD_compressBlock_lazy_generic(
                 let matchIndex = base_off + start as u32 - OFFBASE_TO_OFFSET(offBase);
                 let repInDict = matchIndex < prefixLowestIndex;
                 let mut match_pos = if repInDict {
-                    matchIndex.saturating_sub(dictIndexDelta).saturating_sub(dms_base_offset) as usize
+                    matchIndex
+                        .saturating_sub(dictIndexDelta)
+                        .saturating_sub(dms_base_offset) as usize
                 } else {
                     matchIndex.saturating_sub(base_off) as usize
                 };
@@ -1713,13 +1789,26 @@ pub fn ZSTD_compressBlock_lazy_generic(
         }
 
         let litLength = start - anchor;
-        ZSTD_storeSeq(seqStore, litLength, &src[anchor..start], offBase, matchLength);
+        ZSTD_storeSeq(
+            seqStore,
+            litLength,
+            &src[anchor..start],
+            offBase,
+            matchLength,
+        );
         anchor = start + matchLength;
         ip = anchor;
 
         if ms.lazySkipping != 0 {
             if searchMethod == searchMethod_e::search_rowHash {
-                ZSTD_row_fillHashCache(ms, src, rowLog, mls, ms.nextToUpdate.saturating_sub(base_off), ilimit);
+                ZSTD_row_fillHashCache(
+                    ms,
+                    src,
+                    rowLog,
+                    mls,
+                    ms.nextToUpdate.saturating_sub(base_off),
+                    ilimit,
+                );
             }
             ms.lazySkipping = 0;
         }
@@ -1730,7 +1819,9 @@ pub fn ZSTD_compressBlock_lazy_generic(
                 let repIndex = current2 - offset_2;
                 let repInDict = repIndex < prefixLowestIndex;
                 let repMatch = if repInDict {
-                    repIndex.saturating_sub(dictIndexDelta).saturating_sub(dms_base_offset) as usize
+                    repIndex
+                        .saturating_sub(dictIndexDelta)
+                        .saturating_sub(dms_base_offset) as usize
                 } else {
                     repIndex.saturating_sub(base_off) as usize
                 };
@@ -1755,7 +1846,13 @@ pub fn ZSTD_compressBlock_lazy_generic(
                     offBase = offset_2;
                     offset_2 = offset_1;
                     offset_1 = offBase;
-                    ZSTD_storeSeq(seqStore, 0, &src[anchor..anchor], REPCODE_TO_OFFBASE(1), matchLength);
+                    ZSTD_storeSeq(
+                        seqStore,
+                        0,
+                        &src[anchor..anchor],
+                        REPCODE_TO_OFFBASE(1),
+                        matchLength,
+                    );
                     ip += matchLength;
                     anchor = ip;
                     continue;
@@ -1773,7 +1870,13 @@ pub fn ZSTD_compressBlock_lazy_generic(
                 offBase = offset_2;
                 offset_2 = offset_1;
                 offset_1 = offBase;
-                ZSTD_storeSeq(seqStore, 0, &src[anchor..anchor], REPCODE_TO_OFFBASE(1), matchLength);
+                ZSTD_storeSeq(
+                    seqStore,
+                    0,
+                    &src[anchor..anchor],
+                    REPCODE_TO_OFFBASE(1),
+                    matchLength,
+                );
                 ip += matchLength;
                 anchor = ip;
             }
@@ -1785,8 +1888,16 @@ pub fn ZSTD_compressBlock_lazy_generic(
     } else {
         offsetSaved2
     };
-    rep[0] = if offset_1 != 0 { offset_1 } else { offsetSaved1 };
-    rep[1] = if offset_2 != 0 { offset_2 } else { offsetSaved2 };
+    rep[0] = if offset_1 != 0 {
+        offset_1
+    } else {
+        offsetSaved1
+    };
+    rep[1] = if offset_2 != 0 {
+        offset_2
+    } else {
+        offsetSaved2
+    };
     iend - anchor
 }
 
@@ -1826,7 +1937,15 @@ pub fn ZSTD_compressBlock_greedy_row(
     rep: &mut [u32; ZSTD_REP_NUM],
     src: &[u8],
 ) -> usize {
-    ZSTD_compressBlock_lazy_generic(ms, seqStore, rep, src, searchMethod_e::search_rowHash, 0, ZSTD_dictMode_e::ZSTD_noDict)
+    ZSTD_compressBlock_lazy_generic(
+        ms,
+        seqStore,
+        rep,
+        src,
+        searchMethod_e::search_rowHash,
+        0,
+        ZSTD_dictMode_e::ZSTD_noDict,
+    )
 }
 
 pub fn ZSTD_compressBlock_lazy_row(
@@ -1835,7 +1954,15 @@ pub fn ZSTD_compressBlock_lazy_row(
     rep: &mut [u32; ZSTD_REP_NUM],
     src: &[u8],
 ) -> usize {
-    ZSTD_compressBlock_lazy_generic(ms, seqStore, rep, src, searchMethod_e::search_rowHash, 1, ZSTD_dictMode_e::ZSTD_noDict)
+    ZSTD_compressBlock_lazy_generic(
+        ms,
+        seqStore,
+        rep,
+        src,
+        searchMethod_e::search_rowHash,
+        1,
+        ZSTD_dictMode_e::ZSTD_noDict,
+    )
 }
 
 pub fn ZSTD_compressBlock_lazy2_row(
@@ -1844,7 +1971,15 @@ pub fn ZSTD_compressBlock_lazy2_row(
     rep: &mut [u32; ZSTD_REP_NUM],
     src: &[u8],
 ) -> usize {
-    ZSTD_compressBlock_lazy_generic(ms, seqStore, rep, src, searchMethod_e::search_rowHash, 2, ZSTD_dictMode_e::ZSTD_noDict)
+    ZSTD_compressBlock_lazy_generic(
+        ms,
+        seqStore,
+        rep,
+        src,
+        searchMethod_e::search_rowHash,
+        2,
+        ZSTD_dictMode_e::ZSTD_noDict,
+    )
 }
 
 pub fn ZSTD_compressBlock_greedy_dictMatchState_row(
@@ -1853,7 +1988,15 @@ pub fn ZSTD_compressBlock_greedy_dictMatchState_row(
     rep: &mut [u32; ZSTD_REP_NUM],
     src: &[u8],
 ) -> usize {
-    ZSTD_compressBlock_lazy_generic(ms, seqStore, rep, src, searchMethod_e::search_rowHash, 0, ZSTD_dictMode_e::ZSTD_dictMatchState)
+    ZSTD_compressBlock_lazy_generic(
+        ms,
+        seqStore,
+        rep,
+        src,
+        searchMethod_e::search_rowHash,
+        0,
+        ZSTD_dictMode_e::ZSTD_dictMatchState,
+    )
 }
 
 pub fn ZSTD_compressBlock_lazy_dictMatchState_row(
@@ -1862,7 +2005,15 @@ pub fn ZSTD_compressBlock_lazy_dictMatchState_row(
     rep: &mut [u32; ZSTD_REP_NUM],
     src: &[u8],
 ) -> usize {
-    ZSTD_compressBlock_lazy_generic(ms, seqStore, rep, src, searchMethod_e::search_rowHash, 1, ZSTD_dictMode_e::ZSTD_dictMatchState)
+    ZSTD_compressBlock_lazy_generic(
+        ms,
+        seqStore,
+        rep,
+        src,
+        searchMethod_e::search_rowHash,
+        1,
+        ZSTD_dictMode_e::ZSTD_dictMatchState,
+    )
 }
 
 pub fn ZSTD_compressBlock_lazy2_dictMatchState_row(
@@ -1871,7 +2022,15 @@ pub fn ZSTD_compressBlock_lazy2_dictMatchState_row(
     rep: &mut [u32; ZSTD_REP_NUM],
     src: &[u8],
 ) -> usize {
-    ZSTD_compressBlock_lazy_generic(ms, seqStore, rep, src, searchMethod_e::search_rowHash, 2, ZSTD_dictMode_e::ZSTD_dictMatchState)
+    ZSTD_compressBlock_lazy_generic(
+        ms,
+        seqStore,
+        rep,
+        src,
+        searchMethod_e::search_rowHash,
+        2,
+        ZSTD_dictMode_e::ZSTD_dictMatchState,
+    )
 }
 
 pub fn ZSTD_compressBlock_greedy_extDict_row(
@@ -1880,7 +2039,15 @@ pub fn ZSTD_compressBlock_greedy_extDict_row(
     rep: &mut [u32; ZSTD_REP_NUM],
     src: &[u8],
 ) -> usize {
-    ZSTD_compressBlock_lazy_generic(ms, seqStore, rep, src, searchMethod_e::search_rowHash, 0, ZSTD_dictMode_e::ZSTD_extDict)
+    ZSTD_compressBlock_lazy_generic(
+        ms,
+        seqStore,
+        rep,
+        src,
+        searchMethod_e::search_rowHash,
+        0,
+        ZSTD_dictMode_e::ZSTD_extDict,
+    )
 }
 
 pub fn ZSTD_compressBlock_lazy_extDict_row(
@@ -1889,7 +2056,15 @@ pub fn ZSTD_compressBlock_lazy_extDict_row(
     rep: &mut [u32; ZSTD_REP_NUM],
     src: &[u8],
 ) -> usize {
-    ZSTD_compressBlock_lazy_generic(ms, seqStore, rep, src, searchMethod_e::search_rowHash, 1, ZSTD_dictMode_e::ZSTD_extDict)
+    ZSTD_compressBlock_lazy_generic(
+        ms,
+        seqStore,
+        rep,
+        src,
+        searchMethod_e::search_rowHash,
+        1,
+        ZSTD_dictMode_e::ZSTD_extDict,
+    )
 }
 
 pub fn ZSTD_compressBlock_lazy2_extDict_row(
@@ -1898,7 +2073,15 @@ pub fn ZSTD_compressBlock_lazy2_extDict_row(
     rep: &mut [u32; ZSTD_REP_NUM],
     src: &[u8],
 ) -> usize {
-    ZSTD_compressBlock_lazy_generic(ms, seqStore, rep, src, searchMethod_e::search_rowHash, 2, ZSTD_dictMode_e::ZSTD_extDict)
+    ZSTD_compressBlock_lazy_generic(
+        ms,
+        seqStore,
+        rep,
+        src,
+        searchMethod_e::search_rowHash,
+        2,
+        ZSTD_dictMode_e::ZSTD_extDict,
+    )
 }
 
 pub fn ZSTD_compressBlock_greedy_dedicatedDictSearch(
@@ -1907,7 +2090,15 @@ pub fn ZSTD_compressBlock_greedy_dedicatedDictSearch(
     rep: &mut [u32; ZSTD_REP_NUM],
     src: &[u8],
 ) -> usize {
-    ZSTD_compressBlock_lazy_generic(ms, seqStore, rep, src, searchMethod_e::search_hashChain, 0, ZSTD_dictMode_e::ZSTD_dedicatedDictSearch)
+    ZSTD_compressBlock_lazy_generic(
+        ms,
+        seqStore,
+        rep,
+        src,
+        searchMethod_e::search_hashChain,
+        0,
+        ZSTD_dictMode_e::ZSTD_dedicatedDictSearch,
+    )
 }
 
 pub fn ZSTD_compressBlock_lazy_dedicatedDictSearch(
@@ -1916,7 +2107,15 @@ pub fn ZSTD_compressBlock_lazy_dedicatedDictSearch(
     rep: &mut [u32; ZSTD_REP_NUM],
     src: &[u8],
 ) -> usize {
-    ZSTD_compressBlock_lazy_generic(ms, seqStore, rep, src, searchMethod_e::search_hashChain, 1, ZSTD_dictMode_e::ZSTD_dedicatedDictSearch)
+    ZSTD_compressBlock_lazy_generic(
+        ms,
+        seqStore,
+        rep,
+        src,
+        searchMethod_e::search_hashChain,
+        1,
+        ZSTD_dictMode_e::ZSTD_dedicatedDictSearch,
+    )
 }
 
 pub fn ZSTD_compressBlock_lazy2_dedicatedDictSearch(
@@ -1925,7 +2124,15 @@ pub fn ZSTD_compressBlock_lazy2_dedicatedDictSearch(
     rep: &mut [u32; ZSTD_REP_NUM],
     src: &[u8],
 ) -> usize {
-    ZSTD_compressBlock_lazy_generic(ms, seqStore, rep, src, searchMethod_e::search_hashChain, 2, ZSTD_dictMode_e::ZSTD_dedicatedDictSearch)
+    ZSTD_compressBlock_lazy_generic(
+        ms,
+        seqStore,
+        rep,
+        src,
+        searchMethod_e::search_hashChain,
+        2,
+        ZSTD_dictMode_e::ZSTD_dedicatedDictSearch,
+    )
 }
 
 pub fn ZSTD_compressBlock_greedy_dedicatedDictSearch_row(
@@ -1934,7 +2141,15 @@ pub fn ZSTD_compressBlock_greedy_dedicatedDictSearch_row(
     rep: &mut [u32; ZSTD_REP_NUM],
     src: &[u8],
 ) -> usize {
-    ZSTD_compressBlock_lazy_generic(ms, seqStore, rep, src, searchMethod_e::search_rowHash, 0, ZSTD_dictMode_e::ZSTD_dedicatedDictSearch)
+    ZSTD_compressBlock_lazy_generic(
+        ms,
+        seqStore,
+        rep,
+        src,
+        searchMethod_e::search_rowHash,
+        0,
+        ZSTD_dictMode_e::ZSTD_dedicatedDictSearch,
+    )
 }
 
 pub fn ZSTD_compressBlock_lazy_dedicatedDictSearch_row(
@@ -1943,7 +2158,15 @@ pub fn ZSTD_compressBlock_lazy_dedicatedDictSearch_row(
     rep: &mut [u32; ZSTD_REP_NUM],
     src: &[u8],
 ) -> usize {
-    ZSTD_compressBlock_lazy_generic(ms, seqStore, rep, src, searchMethod_e::search_rowHash, 1, ZSTD_dictMode_e::ZSTD_dedicatedDictSearch)
+    ZSTD_compressBlock_lazy_generic(
+        ms,
+        seqStore,
+        rep,
+        src,
+        searchMethod_e::search_rowHash,
+        1,
+        ZSTD_dictMode_e::ZSTD_dedicatedDictSearch,
+    )
 }
 
 pub fn ZSTD_compressBlock_lazy2_dedicatedDictSearch_row(
@@ -1952,7 +2175,15 @@ pub fn ZSTD_compressBlock_lazy2_dedicatedDictSearch_row(
     rep: &mut [u32; ZSTD_REP_NUM],
     src: &[u8],
 ) -> usize {
-    ZSTD_compressBlock_lazy_generic(ms, seqStore, rep, src, searchMethod_e::search_rowHash, 2, ZSTD_dictMode_e::ZSTD_dedicatedDictSearch)
+    ZSTD_compressBlock_lazy_generic(
+        ms,
+        seqStore,
+        rep,
+        src,
+        searchMethod_e::search_rowHash,
+        2,
+        ZSTD_dictMode_e::ZSTD_dedicatedDictSearch,
+    )
 }
 
 pub fn ZSTD_compressBlock_greedy_dictMatchState(
@@ -1961,7 +2192,15 @@ pub fn ZSTD_compressBlock_greedy_dictMatchState(
     rep: &mut [u32; ZSTD_REP_NUM],
     src: &[u8],
 ) -> usize {
-    ZSTD_compressBlock_lazy_generic(ms, seqStore, rep, src, searchMethod_e::search_hashChain, 0, ZSTD_dictMode_e::ZSTD_dictMatchState)
+    ZSTD_compressBlock_lazy_generic(
+        ms,
+        seqStore,
+        rep,
+        src,
+        searchMethod_e::search_hashChain,
+        0,
+        ZSTD_dictMode_e::ZSTD_dictMatchState,
+    )
 }
 
 pub fn ZSTD_compressBlock_lazy_dictMatchState(
@@ -1970,7 +2209,15 @@ pub fn ZSTD_compressBlock_lazy_dictMatchState(
     rep: &mut [u32; ZSTD_REP_NUM],
     src: &[u8],
 ) -> usize {
-    ZSTD_compressBlock_lazy_generic(ms, seqStore, rep, src, searchMethod_e::search_hashChain, 1, ZSTD_dictMode_e::ZSTD_dictMatchState)
+    ZSTD_compressBlock_lazy_generic(
+        ms,
+        seqStore,
+        rep,
+        src,
+        searchMethod_e::search_hashChain,
+        1,
+        ZSTD_dictMode_e::ZSTD_dictMatchState,
+    )
 }
 
 pub fn ZSTD_compressBlock_lazy2_dictMatchState(
@@ -1979,7 +2226,15 @@ pub fn ZSTD_compressBlock_lazy2_dictMatchState(
     rep: &mut [u32; ZSTD_REP_NUM],
     src: &[u8],
 ) -> usize {
-    ZSTD_compressBlock_lazy_generic(ms, seqStore, rep, src, searchMethod_e::search_hashChain, 2, ZSTD_dictMode_e::ZSTD_dictMatchState)
+    ZSTD_compressBlock_lazy_generic(
+        ms,
+        seqStore,
+        rep,
+        src,
+        searchMethod_e::search_hashChain,
+        2,
+        ZSTD_dictMode_e::ZSTD_dictMatchState,
+    )
 }
 
 pub fn ZSTD_compressBlock_btlazy2_dictMatchState(
@@ -1988,7 +2243,15 @@ pub fn ZSTD_compressBlock_btlazy2_dictMatchState(
     rep: &mut [u32; ZSTD_REP_NUM],
     src: &[u8],
 ) -> usize {
-    ZSTD_compressBlock_lazy_generic(ms, seqStore, rep, src, searchMethod_e::search_binaryTree, 2, ZSTD_dictMode_e::ZSTD_dictMatchState)
+    ZSTD_compressBlock_lazy_generic(
+        ms,
+        seqStore,
+        rep,
+        src,
+        searchMethod_e::search_binaryTree,
+        2,
+        ZSTD_dictMode_e::ZSTD_dictMatchState,
+    )
 }
 
 pub fn ZSTD_compressBlock_greedy_extDict(
@@ -1997,7 +2260,15 @@ pub fn ZSTD_compressBlock_greedy_extDict(
     rep: &mut [u32; ZSTD_REP_NUM],
     src: &[u8],
 ) -> usize {
-    ZSTD_compressBlock_lazy_generic(ms, seqStore, rep, src, searchMethod_e::search_hashChain, 0, ZSTD_dictMode_e::ZSTD_extDict)
+    ZSTD_compressBlock_lazy_generic(
+        ms,
+        seqStore,
+        rep,
+        src,
+        searchMethod_e::search_hashChain,
+        0,
+        ZSTD_dictMode_e::ZSTD_extDict,
+    )
 }
 
 pub fn ZSTD_compressBlock_lazy_extDict(
@@ -2006,7 +2277,15 @@ pub fn ZSTD_compressBlock_lazy_extDict(
     rep: &mut [u32; ZSTD_REP_NUM],
     src: &[u8],
 ) -> usize {
-    ZSTD_compressBlock_lazy_generic(ms, seqStore, rep, src, searchMethod_e::search_hashChain, 1, ZSTD_dictMode_e::ZSTD_extDict)
+    ZSTD_compressBlock_lazy_generic(
+        ms,
+        seqStore,
+        rep,
+        src,
+        searchMethod_e::search_hashChain,
+        1,
+        ZSTD_dictMode_e::ZSTD_extDict,
+    )
 }
 
 pub fn ZSTD_compressBlock_lazy2_extDict(
@@ -2015,7 +2294,15 @@ pub fn ZSTD_compressBlock_lazy2_extDict(
     rep: &mut [u32; ZSTD_REP_NUM],
     src: &[u8],
 ) -> usize {
-    ZSTD_compressBlock_lazy_generic(ms, seqStore, rep, src, searchMethod_e::search_hashChain, 2, ZSTD_dictMode_e::ZSTD_extDict)
+    ZSTD_compressBlock_lazy_generic(
+        ms,
+        seqStore,
+        rep,
+        src,
+        searchMethod_e::search_hashChain,
+        2,
+        ZSTD_dictMode_e::ZSTD_extDict,
+    )
 }
 
 pub fn ZSTD_compressBlock_btlazy2_extDict(
@@ -2024,7 +2311,15 @@ pub fn ZSTD_compressBlock_btlazy2_extDict(
     rep: &mut [u32; ZSTD_REP_NUM],
     src: &[u8],
 ) -> usize {
-    ZSTD_compressBlock_lazy_generic(ms, seqStore, rep, src, searchMethod_e::search_binaryTree, 2, ZSTD_dictMode_e::ZSTD_extDict)
+    ZSTD_compressBlock_lazy_generic(
+        ms,
+        seqStore,
+        rep,
+        src,
+        searchMethod_e::search_binaryTree,
+        2,
+        ZSTD_dictMode_e::ZSTD_extDict,
+    )
 }
 
 pub fn ZSTD_compressBlock_lazy_extDict_generic(
@@ -2090,7 +2385,10 @@ pub fn ZSTD_DUBT_findBetterDictMatch(
     let prefixStart = ms.window.dictLimit.saturating_sub(base_off) as usize;
     let curr = base_off + ip as u32;
     let dictBase = &dictMS.dictContent;
-    let dictHighLimit = dictMS.window.nextSrc.saturating_sub(dictMS.window.base_offset);
+    let dictHighLimit = dictMS
+        .window
+        .nextSrc
+        .saturating_sub(dictMS.window.base_offset);
     let dictLowLimit = dictMS.window.lowLimit;
     let dictIndexDelta = ms.window.lowLimit.saturating_sub(dictHighLimit);
     let dictBt = &dictMS.chainTable;
@@ -2127,14 +2425,13 @@ pub fn ZSTD_DUBT_findBetterDictMatch(
             } else {
                 0
             };
-            let prevCost = if *offsetPtr != 0 {
-                ZSTD_highbit32((*offsetPtr).wrapping_add(1)) as i32
+            let prevOff = (*offsetPtr).wrapping_add(1);
+            let prevCost = if prevOff != 0 {
+                ZSTD_highbit32(prevOff) as i32
             } else {
                 i32::MAX
             };
-            if 4 * (matchLength as i32 - bestLength as i32)
-                > (currCost - prevCost)
-            {
+            if 4 * (matchLength as i32 - bestLength as i32) > (currCost - prevCost) {
                 bestLength = matchLength;
                 *offsetPtr = OFFSET_TO_OFFBASE(curr - matchIndex);
             }
@@ -2220,7 +2517,15 @@ pub fn ZSTD_DUBT_findBestMatch(
     while matchIndex != 0 {
         let nextCandidateIdxPtr = (2 * (matchIndex & btMask)) as usize + 1;
         let nextCandidateIdx = ms.chainTable[nextCandidateIdxPtr];
-        ZSTD_insertDUBT1(ms, src, matchIndex, iLimit, nbCandidates, unsortLimit);
+        ZSTD_insertDUBT1(
+            ms,
+            src,
+            matchIndex,
+            iLimit,
+            nbCandidates,
+            unsortLimit,
+            dictMode,
+        );
         matchIndex = nextCandidateIdx;
         nbCandidates += 1;
     }
@@ -2238,15 +2543,34 @@ pub fn ZSTD_DUBT_findBestMatch(
     while nbCompares > 0 && matchIndex > windowLow {
         let nextPtr = (2 * (matchIndex & btMask)) as usize;
         let mut matchLength = commonLengthSmaller.min(commonLengthLarger);
-        let match_pos = matchIndex.saturating_sub(ms.window.base_offset) as usize;
-
-        matchLength += ZSTD_count(src, ip + matchLength, match_pos + matchLength, iLimit);
+        if dictMode != ZSTD_dictMode_e::ZSTD_extDict
+            || matchIndex + matchLength as u32 >= ms.window.dictLimit
+        {
+            let match_pos = matchIndex.saturating_sub(ms.window.base_offset) as usize;
+            matchLength += ZSTD_count(src, ip + matchLength, match_pos + matchLength, iLimit);
+        } else {
+            let prefixStart = ms.window.dictLimit.saturating_sub(ms.window.base_offset) as usize;
+            let dict_pos = matchIndex.saturating_sub(ms.window.dictBase_offset) as usize;
+            matchLength += ZSTD_count_2segments(
+                src,
+                ip + matchLength,
+                iLimit,
+                prefixStart,
+                &ms.dictContent,
+                dict_pos + matchLength,
+                ms.dictContent.len(),
+            );
+        }
 
         if matchLength > bestLength {
             if matchLength > (matchEndIdx - matchIndex) as usize {
                 matchEndIdx = matchIndex + matchLength as u32;
             }
-            let priorOffBase = if *offBasePtr != 0 { *offBasePtr } else { u32::MAX };
+            let priorOffBase = if *offBasePtr != 0 {
+                *offBasePtr
+            } else {
+                u32::MAX
+            };
             let currCost = if curr > matchIndex {
                 ZSTD_highbit32(curr - matchIndex + 1) as i32
             } else {
@@ -2266,7 +2590,21 @@ pub fn ZSTD_DUBT_findBestMatch(
             }
         }
 
-        if src[match_pos + matchLength] < src[ip + matchLength] {
+        let match_byte = if dictMode == ZSTD_dictMode_e::ZSTD_extDict
+            && (matchIndex + (matchLength as u32)) < ms.window.dictLimit
+        {
+            let dict_pos = matchIndex
+                .saturating_sub(ms.window.dictBase_offset)
+                .saturating_add(matchLength as u32) as usize;
+            ms.dictContent[dict_pos]
+        } else {
+            let match_pos = matchIndex
+                .saturating_add(matchLength as u32)
+                .saturating_sub(ms.window.base_offset) as usize;
+            src[match_pos]
+        };
+
+        if match_byte < src[ip + matchLength] {
             if let Some(slot) = smaller_slot {
                 ms.chainTable[slot] = matchIndex;
             }
@@ -2303,15 +2641,7 @@ pub fn ZSTD_DUBT_findBestMatch(
     if dictMode == ZSTD_dictMode_e::ZSTD_dictMatchState && nbCompares > 0 {
         if let Some(dictMS) = ms.dictMatchState.clone() {
             bestLength = ZSTD_DUBT_findBetterDictMatch(
-                ms,
-                &dictMS,
-                src,
-                ip,
-                iLimit,
-                bestLength,
-                nbCompares,
-                offBasePtr,
-                mls,
+                ms, &dictMS, src, ip, iLimit, bestLength, nbCompares, offBasePtr, mls,
             );
         }
     }
@@ -2376,12 +2706,7 @@ pub fn ZSTD_compressBlock_btlazy2(
 ///
 /// `buf` is the window buffer, `target` is the absolute index to
 /// fill up to.
-pub fn ZSTD_updateDUBT(
-    ms: &mut ZSTD_MatchState_t,
-    buf: &[u8],
-    target: u32,
-    mls: u32,
-) {
+pub fn ZSTD_updateDUBT(ms: &mut ZSTD_MatchState_t, buf: &[u8], target: u32, mls: u32) {
     use crate::compress::match_state::ZSTD_DUBT_UNSORTED_MARK;
     let base_off = ms.window.base_offset;
     let hashLog = ms.cParams.hashLog;
@@ -2414,7 +2739,7 @@ pub fn ZSTD_updateDUBT(
     ms.nextToUpdate = target;
 }
 
-/// Port of `ZSTD_insertDUBT1` — prefix-only variant. Sorts one
+/// Port of `ZSTD_insertDUBT1`. Sorts one
 /// already-queued unsorted DUBT entry at position `curr` into its
 /// proper place in the binary tree (up to `nbCompares` comparisons).
 ///
@@ -2423,9 +2748,6 @@ pub fn ZSTD_updateDUBT(
 ///   - `curr`: absolute position being sorted
 ///   - `iend_pos`: end offset of input (clamp for `ZSTD_count`)
 ///   - `nbCompares`, `btLow`: caller-supplied search limits
-///
-/// Ext-dict branch is deferred (matches upstream's
-/// `dictMode != ZSTD_extDict` path only).
 pub fn ZSTD_insertDUBT1(
     ms: &mut ZSTD_MatchState_t,
     buf: &[u8],
@@ -2433,8 +2755,11 @@ pub fn ZSTD_insertDUBT1(
     iend_pos: usize,
     mut nbCompares: u32,
     btLow: u32,
+    dictMode: ZSTD_dictMode_e,
 ) {
     let base_off = ms.window.base_offset;
+    let dict_base_off = ms.window.dictBase_offset;
+    let dict_limit = ms.window.dictLimit;
     let btLog = ms.cParams.chainLog - 1;
     let btMask: u32 = (1u32 << btLog) - 1;
     let mut commonLengthSmaller: usize = 0;
@@ -2462,14 +2787,58 @@ pub fn ZSTD_insertDUBT1(
         let mut matchLength = commonLengthSmaller.min(commonLengthLarger);
         debug_assert!(matchIndex < curr);
 
-        let match_pos = matchIndex.saturating_sub(base_off) as usize;
-        matchLength += ZSTD_count(buf, ip_pos + matchLength, match_pos + matchLength, iend_pos);
+        if dictMode != ZSTD_dictMode_e::ZSTD_extDict
+            || matchIndex + matchLength as u32 >= dict_limit
+            || curr < dict_limit
+        {
+            let (match_buf, match_pos) =
+                if dictMode == ZSTD_dictMode_e::ZSTD_extDict && curr < dict_limit {
+                    (
+                        &ms.dictContent[..],
+                        matchIndex.saturating_sub(dict_base_off) as usize,
+                    )
+                } else {
+                    (buf, matchIndex.saturating_sub(base_off) as usize)
+                };
+            matchLength += ZSTD_count(
+                match_buf,
+                ip_pos + matchLength,
+                match_pos + matchLength,
+                iend_pos,
+            );
+        } else {
+            let prefixStart = dict_limit.saturating_sub(base_off) as usize;
+            let dict_pos = matchIndex.saturating_sub(dict_base_off) as usize;
+            matchLength += ZSTD_count_2segments(
+                buf,
+                ip_pos + matchLength,
+                iend_pos,
+                prefixStart,
+                &ms.dictContent,
+                dict_pos + matchLength,
+                ms.dictContent.len(),
+            );
+        }
 
         if ip_pos + matchLength == iend_pos {
             break;
         }
 
-        if buf[match_pos + matchLength] < buf[ip_pos + matchLength] {
+        let match_byte = if dictMode == ZSTD_dictMode_e::ZSTD_extDict
+            && (((matchIndex + (matchLength as u32)) < dict_limit) || curr < dict_limit)
+        {
+            let dict_pos = matchIndex
+                .saturating_sub(dict_base_off)
+                .saturating_add(matchLength as u32) as usize;
+            ms.dictContent[dict_pos]
+        } else {
+            let match_pos = matchIndex
+                .saturating_add(matchLength as u32)
+                .saturating_sub(base_off) as usize;
+            buf[match_pos]
+        };
+
+        if match_byte < buf[ip_pos + matchLength] {
             if let Some(s) = smaller_slot {
                 ms.chainTable[s] = matchIndex;
             }
@@ -2505,11 +2874,7 @@ pub fn ZSTD_insertDUBT1(
 }
 
 /// Public wrapper of `ZSTD_insertAndFindFirstIndex`.
-pub fn ZSTD_insertAndFindFirstIndex(
-    ms: &mut ZSTD_MatchState_t,
-    src: &[u8],
-    ip: usize,
-) -> u32 {
+pub fn ZSTD_insertAndFindFirstIndex(ms: &mut ZSTD_MatchState_t, src: &[u8], ip: usize) -> u32 {
     let mls = ms.cParams.minMatch;
     ZSTD_insertAndFindFirstIndex_internal(ms, src, ip, mls)
 }
@@ -2547,8 +2912,7 @@ mod tests {
     #[test]
     fn lazy_and_lazy2_roundtrip_through_decoder() {
         use crate::decompress::zstd_decompress_block::{
-            streaming_operation, ZSTD_DCtx, ZSTD_decoder_entropy_rep,
-            ZSTD_decompressBlock_internal,
+            streaming_operation, ZSTD_DCtx, ZSTD_decoder_entropy_rep, ZSTD_decompressBlock_internal,
         };
 
         let src: Vec<u8> = b"To be, or not to be, that is the question. "
@@ -2570,9 +2934,8 @@ mod tests {
             });
             let mut seq = SeqStore_t::with_capacity(1024, 131072);
             let mut rep: [u32; ZSTD_REP_NUM] = [1, 4, 8];
-            let last = ZSTD_compressBlock_lazy_noDict_generic(
-                &mut ms, &mut seq, &mut rep, &src, 0, depth,
-            );
+            let last =
+                ZSTD_compressBlock_lazy_noDict_generic(&mut ms, &mut seq, &mut rep, &src, 0, depth);
             // Push tail literals into the store so the decoder sees them.
             seq.literals.extend_from_slice(&src[src.len() - last..]);
 
@@ -2594,7 +2957,10 @@ mod tests {
             if body_n == 0 {
                 continue; // this depth picked raw fallback — skip decode
             }
-            assert!(!crate::common::error::ERR_isError(body_n), "depth {depth} compress err");
+            assert!(
+                !crate::common::error::ERR_isError(body_n),
+                "depth {depth} compress err"
+            );
             body.truncate(body_n);
 
             let mut dctx = ZSTD_DCtx::new();
@@ -2608,8 +2974,10 @@ mod tests {
                 &body,
                 streaming_operation::not_streaming,
             );
-            assert!(!crate::common::error::ERR_isError(decoded),
-                "depth {depth} decode err: {decoded:#x}");
+            assert!(
+                !crate::common::error::ERR_isError(decoded),
+                "depth {depth} decode err: {decoded:#x}"
+            );
             assert_eq!(decoded, src.len());
             assert_eq!(&out[..decoded], &src[..], "depth {depth} mismatch");
         }
@@ -2618,8 +2986,7 @@ mod tests {
     #[test]
     fn btlazy2_roundtrip_through_decoder() {
         use crate::decompress::zstd_decompress_block::{
-            streaming_operation, ZSTD_DCtx, ZSTD_decoder_entropy_rep,
-            ZSTD_decompressBlock_internal,
+            streaming_operation, ZSTD_DCtx, ZSTD_decoder_entropy_rep, ZSTD_decompressBlock_internal,
         };
 
         let src: Vec<u8> = b"To be, or not to be, that is the question. "
@@ -2660,7 +3027,10 @@ mod tests {
         if body_n == 0 {
             return;
         }
-        assert!(!crate::common::error::ERR_isError(body_n), "btlazy2 compress err");
+        assert!(
+            !crate::common::error::ERR_isError(body_n),
+            "btlazy2 compress err"
+        );
         body.truncate(body_n);
 
         let mut dctx = ZSTD_DCtx::new();
@@ -2674,8 +3044,10 @@ mod tests {
             &body,
             streaming_operation::not_streaming,
         );
-        assert!(!crate::common::error::ERR_isError(decoded),
-            "btlazy2 decode err: {decoded:#x}");
+        assert!(
+            !crate::common::error::ERR_isError(decoded),
+            "btlazy2 decode err: {decoded:#x}"
+        );
         assert_eq!(decoded, src.len());
         assert_eq!(&out[..decoded], &src[..]);
     }
@@ -2698,7 +3070,15 @@ mod tests {
         ms.window.lowLimit = 4;
         ms.window.dictLimit = 4;
         let src: Vec<u8> = (0..1024u32).map(|i| (i & 0xFF) as u8).collect();
-        ZSTD_insertDUBT1(&mut ms, &src, 500, src.len(), 16, 4);
+        ZSTD_insertDUBT1(
+            &mut ms,
+            &src,
+            500,
+            src.len(),
+            16,
+            4,
+            ZSTD_dictMode_e::ZSTD_noDict,
+        );
         // Slots at curr=500 should end at 0 (nullified).
         let slot = (2 * (500u32 & ((1u32 << 9) - 1))) as usize;
         assert_eq!(ms.chainTable[slot], 0);
@@ -2734,7 +3114,10 @@ mod tests {
                 marked += 1;
             }
         }
-        assert_eq!(marked, 100, "all 100 queued positions should have UNSORTED_MARK");
+        assert_eq!(
+            marked, 100,
+            "all 100 queued positions should have UNSORTED_MARK"
+        );
     }
 
     #[test]
@@ -2778,26 +3161,39 @@ mod tests {
             ZSTD_MatchState_t::new(cp)
         }
 
-        let dict: Vec<u8> = b"abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-            .to_vec();
+        let dict: Vec<u8> =
+            b"abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ".to_vec();
         let src = b"mnopqrstuvwxyz012345mnopqrstuvwxyz012345".to_vec();
 
-        let dict_variants: [fn(&mut ZSTD_MatchState_t, &mut SeqStore_t, &mut [u32; ZSTD_REP_NUM], &[u8]) -> usize; 3] = [
+        let dict_variants: [fn(
+            &mut ZSTD_MatchState_t,
+            &mut SeqStore_t,
+            &mut [u32; ZSTD_REP_NUM],
+            &[u8],
+        ) -> usize; 4] = [
             ZSTD_compressBlock_greedy_dictMatchState,
             ZSTD_compressBlock_lazy_dictMatchState,
             ZSTD_compressBlock_lazy2_dictMatchState,
+            ZSTD_compressBlock_btlazy2_dictMatchState,
         ];
-        let ext_variants: [fn(&mut ZSTD_MatchState_t, &mut SeqStore_t, &mut [u32; ZSTD_REP_NUM], &[u8]) -> usize; 3] = [
+        let ext_variants: [fn(
+            &mut ZSTD_MatchState_t,
+            &mut SeqStore_t,
+            &mut [u32; ZSTD_REP_NUM],
+            &[u8],
+        ) -> usize; 4] = [
             ZSTD_compressBlock_greedy_extDict,
             ZSTD_compressBlock_lazy_extDict,
             ZSTD_compressBlock_lazy2_extDict,
+            ZSTD_compressBlock_btlazy2_extDict,
         ];
 
         for (idx, f) in dict_variants.into_iter().enumerate() {
             let strategy = match idx {
                 0 => 3,
                 1 => 4,
-                _ => 5,
+                2 => 5,
+                _ => 6,
             };
             let mut ms = build_ms(strategy);
             let mut dms = build_ms(strategy);
@@ -2809,7 +3205,8 @@ mod tests {
                 let _ = ZSTD_insertAndFindFirstIndex_internal(&mut dms, &dict, pos, dms_mls);
             }
             ms.dictMatchState = Some(Box::new(dms));
-            ms.window.base_offset = crate::compress::match_state::ZSTD_WINDOW_START_INDEX + dict.len() as u32;
+            ms.window.base_offset =
+                crate::compress::match_state::ZSTD_WINDOW_START_INDEX + dict.len() as u32;
             ms.window.dictLimit = ms.window.base_offset;
             ms.window.lowLimit = ms.window.base_offset;
             ms.nextToUpdate = ms.window.base_offset;
@@ -2831,7 +3228,8 @@ mod tests {
             let strategy = match idx {
                 0 => 3,
                 1 => 4,
-                _ => 5,
+                2 => 5,
+                _ => 6,
             };
             let mut ms = build_ms(strategy);
             let ms_mls = ms.cParams.minMatch;
@@ -2844,7 +3242,8 @@ mod tests {
             }
             ms.window.dictBase_offset = crate::compress::match_state::ZSTD_WINDOW_START_INDEX;
             ms.window.lowLimit = crate::compress::match_state::ZSTD_WINDOW_START_INDEX;
-            ms.window.dictLimit = crate::compress::match_state::ZSTD_WINDOW_START_INDEX + dict.len() as u32;
+            ms.window.dictLimit =
+                crate::compress::match_state::ZSTD_WINDOW_START_INDEX + dict.len() as u32;
             ms.window.base_offset = ms.window.dictLimit;
             ms.window.nextSrc = ms.window.base_offset + src.len() as u32;
             ms.nextToUpdate = ms.window.base_offset;
@@ -2864,7 +3263,6 @@ mod tests {
         }
     }
 
-
     #[test]
     fn insert_and_find_first_index_updates_chain() {
         let mut ms = ZSTD_MatchState_t::new(ZSTD_compressionParameters {
@@ -2881,5 +3279,52 @@ mod tests {
         assert_eq!(ms.nextToUpdate, ms.window.base_offset + 30);
         // head must be either 0 (no collision) or a valid prior position.
         assert!(head < ms.window.base_offset + 30);
+    }
+
+    #[test]
+    fn dubt_find_better_dict_match_preserves_upstream_zero_offset_cost_model() {
+        let cp = ZSTD_compressionParameters {
+            windowLog: 17,
+            hashLog: 10,
+            chainLog: 10,
+            minMatch: 4,
+            strategy: 6,
+            ..Default::default()
+        };
+
+        let mut ms = ZSTD_MatchState_t::new(cp);
+        ms.window.base_offset = 128;
+        ms.window.dictLimit = 128;
+        ms.window.lowLimit = 128;
+
+        let mut dict_ms = ZSTD_MatchState_t::new(cp);
+        dict_ms.window.base_offset = 0;
+        dict_ms.window.lowLimit = 0;
+        dict_ms.window.dictLimit = 0;
+        dict_ms.window.nextSrc = 1024;
+        let mut dict = vec![b'Y'; 1024];
+        dict[4..9].copy_from_slice(b"abcde");
+        dict_ms.dictContent = dict;
+        dict_ms.chainTable.resize(1 << cp.chainLog, 0);
+
+        let src = b"abcdeZ";
+        let h = ZSTD_hashPtr(src, cp.hashLog, cp.minMatch);
+        dict_ms.hashTable[h] = 4;
+
+        let mut offbase = 0u32;
+        let best = ZSTD_DUBT_findBetterDictMatch(
+            &mut ms,
+            &dict_ms,
+            src,
+            0,
+            5,
+            4,
+            1,
+            &mut offbase,
+            cp.minMatch,
+        );
+
+        assert_eq!(best, 4);
+        assert_eq!(offbase, 0);
     }
 }

@@ -69,7 +69,6 @@ pub const fn HUF_DTABLE_SIZE(maxTableLog: u32) -> usize {
     1 + (1usize << maxTableLog)
 }
 
-
 /// Upstream uses `U64` for `HUF_CElt` in the compressor (it packs both
 /// code value and nbBits into one 64-bit word so the hot emit loop can
 /// `BIT_addBitsFast` without a separate lookup).
@@ -272,7 +271,9 @@ pub fn HUF_readCTable(
         return crate::common::error::ERROR(crate::common::error::ErrorCode::TableLogTooLarge);
     }
     if nbSymbols > *maxSymbolValuePtr + 1 {
-        return crate::common::error::ERROR(crate::common::error::ErrorCode::MaxSymbolValueTooSmall);
+        return crate::common::error::ERROR(
+            crate::common::error::ErrorCode::MaxSymbolValueTooSmall,
+        );
     }
 
     *maxSymbolValuePtr = nbSymbols - 1;
@@ -537,11 +538,7 @@ pub const STARTNODE: usize = (HUF_SYMBOLVALUE_MAX + 1) as usize;
 /// carefully chosen shorter codes — always picking the cheapest repay
 /// option (extending one `nBitsToDecrease`-rank node vs moving two
 /// rank-below nodes).
-pub fn HUF_setMaxHeight(
-    huffNode: &mut [nodeElt],
-    lastNonNull: u32,
-    targetNbBits: u32,
-) -> u32 {
+pub fn HUF_setMaxHeight(huffNode: &mut [nodeElt], lastNonNull: u32, targetNbBits: u32) -> u32 {
     use crate::decompress::huf_decompress::HUF_TABLELOG_MAX;
     let largestBits = huffNode[lastNonNull as usize].nbBits as u32;
     if largestBits <= targetNbBits {
@@ -617,8 +614,7 @@ pub fn HUF_setMaxHeight(
             nBitsToDecrease -= 1;
         }
         // Walk up until we land on an occupied rank.
-        while nBitsToDecrease <= HUF_TABLELOG_MAX
-            && rankLast[nBitsToDecrease as usize] == NO_SYMBOL
+        while nBitsToDecrease <= HUF_TABLELOG_MAX && rankLast[nBitsToDecrease as usize] == NO_SYMBOL
         {
             nBitsToDecrease += 1;
         }
@@ -730,7 +726,11 @@ pub fn HUF_buildTree(huffNode: &mut [nodeElt], maxSymbolValue: u32) -> i32 {
             v
         };
 
-        let n1_count_stored = if n1 < 0 { sentinel } else { huffNode[n1 as usize].count };
+        let n1_count_stored = if n1 < 0 {
+            sentinel
+        } else {
+            huffNode[n1 as usize].count
+        };
         let second_lowS_count = if lowS < 0 {
             sentinel
         } else {
@@ -747,7 +747,11 @@ pub fn HUF_buildTree(huffNode: &mut [nodeElt], maxSymbolValue: u32) -> i32 {
             v
         };
 
-        let n2_count_stored = if n2 < 0 { sentinel } else { huffNode[n2 as usize].count };
+        let n2_count_stored = if n2 < 0 {
+            sentinel
+        } else {
+            huffNode[n2 as usize].count
+        };
         let combined = n1_count_stored + n2_count_stored;
         huffNode[nodeNb as usize].count = combined;
         if n1 >= 0 {
@@ -882,13 +886,7 @@ pub fn HUF_buildCTable_wksp(
     if finalMaxBits > HUF_TABLELOG_MAX {
         return ERROR(ErrorCode::Generic);
     }
-    HUF_buildCTableFromTree(
-        ct,
-        &huffNode,
-        nonNullRank,
-        maxSymbolValue,
-        finalMaxBits,
-    );
+    HUF_buildCTableFromTree(ct, &huffNode, nonNullRank, maxSymbolValue, finalMaxBits);
     finalMaxBits as usize
 }
 
@@ -923,11 +921,7 @@ pub fn HUF_estimateCompressedSize(
 /// Port of `HUF_validateCTable`. Returns `true` when every
 /// positive-count symbol in `count` has a non-zero nbBits entry in
 /// the CTable — the precondition the emit loop needs.
-pub fn HUF_validateCTable(
-    ctable: &[HUF_CElt],
-    count: &[u32],
-    maxSymbolValue: u32,
-) -> bool {
+pub fn HUF_validateCTable(ctable: &[HUF_CElt], count: &[u32], maxSymbolValue: u32) -> bool {
     let header = HUF_readCTableHeader(ctable);
     debug_assert!(header.tableLog as u64 <= HUF_TABLELOG_ABSOLUTEMAX);
     if (header.maxSymbolValue as u32) < maxSymbolValue {
@@ -953,8 +947,8 @@ pub const MAX_FSE_TABLELOG_FOR_HUFF_HEADER: u32 = 6;
 ///   - otherwise the byte length of the FSE-compressed payload.
 pub fn HUF_compressWeights(dst: &mut [u8], weightTable: &[u8]) -> usize {
     use crate::compress::fse_compress::{
-        FSE_CTABLE_SIZE_U32, FSE_buildCTable_wksp, FSE_compress_usingCTable, FSE_normalizeCount,
-        FSE_optimalTableLog, FSE_writeNCount,
+        FSE_buildCTable_wksp, FSE_compress_usingCTable, FSE_normalizeCount, FSE_optimalTableLog,
+        FSE_writeNCount, FSE_CTABLE_SIZE_U32,
     };
     use crate::compress::hist::HIST_count_simple;
 
@@ -1039,7 +1033,8 @@ pub fn HUF_writeCTable(
         return ERROR(ErrorCode::MaxSymbolValueTooLarge);
     }
     // bitsToWeight: convert nbBits → weight. weight[n] = tableLog+1-n.
-    let mut bitsToWeight = [0u8; (crate::decompress::huf_decompress::HUF_TABLELOG_MAX + 1) as usize];
+    let mut bitsToWeight =
+        [0u8; (crate::decompress::huf_decompress::HUF_TABLELOG_MAX + 1) as usize];
     bitsToWeight[0] = 0;
     for (n, w) in bitsToWeight
         .iter_mut()
@@ -1107,10 +1102,7 @@ pub struct HUF_CStream_t<'a> {
 /// Port of `HUF_initCStream`. `dstCapacity` must exceed
 /// `sizeof(bitContainer)` so the writer has room for a whole word
 /// flush; returns a nonzero error code otherwise.
-pub fn HUF_initCStream<'a>(
-    dst: &'a mut [u8],
-    dstCapacity: usize,
-) -> (HUF_CStream_t<'a>, usize) {
+pub fn HUF_initCStream<'a>(dst: &'a mut [u8], dstCapacity: usize) -> (HUF_CStream_t<'a>, usize) {
     use crate::common::error::{ErrorCode, ERROR};
     let word = core::mem::size_of::<usize>();
     let (endPtr, rc) = if dstCapacity <= word {
@@ -1137,7 +1129,11 @@ pub fn HUF_addBits(bitC: &mut HUF_CStream_t, elt: HUF_CElt, idx: usize, kFast: b
     debug_assert!(idx <= 1);
     debug_assert!(HUF_getNbBits(elt) <= HUF_TABLELOG_ABSOLUTEMAX);
     bitC.bitContainer[idx] >>= HUF_getNbBits(elt) as usize;
-    let value = if kFast { HUF_getValueFast(elt) } else { HUF_getValue(elt) };
+    let value = if kFast {
+        HUF_getValueFast(elt)
+    } else {
+        HUF_getValue(elt)
+    };
     bitC.bitContainer[idx] |= value as usize;
     bitC.bitPos[idx] += HUF_getNbBitsFast(elt) as usize;
 }
@@ -1406,9 +1402,7 @@ pub fn HUF_compressCTable_internal(
     let srcSize = src.len();
     let (_, tail) = dst.split_at_mut(op_start);
     let cSize = match nbStreams {
-        HUF_nbStreams_e::HUF_singleStream => {
-            HUF_compress1X_usingCTable(tail, src, ctable, flags)
-        }
+        HUF_nbStreams_e::HUF_singleStream => HUF_compress1X_usingCTable(tail, src, ctable, flags),
         HUF_nbStreams_e::HUF_fourStreams => HUF_compress4X_usingCTable(tail, src, ctable, flags),
     };
     if crate::common::error::ERR_isError(cSize) {
@@ -1634,7 +1628,10 @@ mod tests {
         assert_eq!(consumed, written);
 
         // tableLog must roundtrip exactly.
-        assert_eq!(HUF_readCTableHeader(&ct).tableLog, HUF_readCTableHeader(&ct2).tableLog);
+        assert_eq!(
+            HUF_readCTableHeader(&ct).tableLog,
+            HUF_readCTableHeader(&ct2).tableLog
+        );
 
         // nbBits per symbol must match for symbols the reader saw.
         for s in 0..=(maxSymbolValuePtr as usize) {
@@ -1726,10 +1723,30 @@ mod tests {
         //   sym 3 → nbBits=3
         // Sum 2^-nbBits: 0.5 + 0.25 + 0.125 + 0.125 = 1.0 (valid tree).
         let huffNode = vec![
-            nodeElt { count: 0, parent: 0, byte: 0, nbBits: 1 },
-            nodeElt { count: 0, parent: 0, byte: 1, nbBits: 2 },
-            nodeElt { count: 0, parent: 0, byte: 2, nbBits: 3 },
-            nodeElt { count: 0, parent: 0, byte: 3, nbBits: 3 },
+            nodeElt {
+                count: 0,
+                parent: 0,
+                byte: 0,
+                nbBits: 1,
+            },
+            nodeElt {
+                count: 0,
+                parent: 0,
+                byte: 1,
+                nbBits: 2,
+            },
+            nodeElt {
+                count: 0,
+                parent: 0,
+                byte: 2,
+                nbBits: 3,
+            },
+            nodeElt {
+                count: 0,
+                parent: 0,
+                byte: 3,
+                nbBits: 3,
+            },
         ];
         let maxSV = 3u32;
         let maxNbBits = 3u32;
@@ -1823,11 +1840,7 @@ mod tests {
 
         // Kraft sum: Σ 2^-nbBits over the leaves [0..=nonNullRank] should == 1.0.
         let mut kraft: f64 = 0.0;
-        for (n, node) in huffNode
-            .iter()
-            .enumerate()
-            .take(nonNullRank as usize + 1)
-        {
+        for (n, node) in huffNode.iter().enumerate().take(nonNullRank as usize + 1) {
             assert!(
                 node.nbBits > 0,
                 "leaf {n} has zero bit length — invalid tree"
@@ -2119,8 +2132,7 @@ mod tests {
         );
         let mut wksp = vec![0u32; HUF_DECOMPRESS_WORKSPACE_SIZE_U32];
         let mut out = vec![0u8; src.len()];
-        let rc =
-            HUF_decompress1X1_DCtx_wksp(&mut dtable, &mut out, &dst[..written], &mut wksp, 0);
+        let rc = HUF_decompress1X1_DCtx_wksp(&mut dtable, &mut out, &dst[..written], &mut wksp, 0);
         assert!(
             !crate::common::error::ERR_isError(rc),
             "decode err: {}",

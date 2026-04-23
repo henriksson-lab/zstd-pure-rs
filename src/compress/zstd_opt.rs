@@ -26,21 +26,22 @@
 //! entries now cover `noDict`, `extDict`, and `dictMatchState`.
 
 #![allow(non_snake_case)]
+#![allow(clippy::type_complexity)]
 
 use crate::common::bits::ZSTD_highbit32;
 use crate::common::mem::{MEM_isLittleEndian, MEM_read32};
-use crate::compress::fse_compress::{symbolTT_read, FSE_initCState, FSE_CState_t};
+use crate::compress::fse_compress::{symbolTT_read, FSE_CState_t, FSE_initCState};
 use crate::compress::huf_compress::HUF_getNbBitsFromCTable;
 use crate::compress::match_state::{ZSTD_MatchState_t, ZSTD_dictMode_e};
 use crate::compress::seq_store::{
-    MINMATCH, OFFSET_TO_OFFBASE, ZSTD_newRep, ZSTD_resetSeqStore, ZSTD_storeSeq,
+    ZSTD_newRep, ZSTD_resetSeqStore, ZSTD_storeSeq, MINMATCH, OFFSET_TO_OFFBASE,
 };
 use crate::compress::zstd_compress::ZSTD_entropyCTables_t;
-use crate::compress::zstd_compress_literals::HUF_repeat;
-use crate::compress::zstd_ldm::RawSeqStore_t;
 use crate::compress::zstd_compress::{ZSTD_LLcode, ZSTD_MLcode};
+use crate::compress::zstd_compress_literals::HUF_repeat;
 use crate::compress::zstd_fast::ZSTD_getLowestMatchIndex;
 use crate::compress::zstd_hashes::{ZSTD_count, ZSTD_count_2segments, ZSTD_hash3Ptr, ZSTD_hashPtr};
+use crate::compress::zstd_ldm::RawSeqStore_t;
 use crate::compress::zstd_ldm::ZSTD_ParamSwitch_e;
 use crate::decompress::zstd_decompress_block::{
     LL_bits, ML_bits, MaxLL, MaxML, MaxOff, ZSTD_BLOCKSIZE_MAX, ZSTD_REP_NUM,
@@ -774,7 +775,10 @@ pub fn ZSTD_fWeight(rawStat: u32) -> f64 {
 
 #[inline]
 fn fse_max_nb_bits_from_ctable(ctable: &[u32], symbol: u32) -> u32 {
-    let mut state = FSE_CState_t { value: 0, stateLog: 0 };
+    let mut state = FSE_CState_t {
+        value: 0,
+        stateLog: 0,
+    };
     FSE_initCState(&mut state, ctable);
     let tt = symbolTT_read(ctable, state.stateLog, symbol as usize);
     ((tt.deltaNbBits + ((1 << 16) - 1)) as u32) >> 16
@@ -810,8 +814,8 @@ pub fn ZSTD_rescaleFreqs(
             optPtr.priceType = ZSTD_OptPrice_e::zop_predef;
         }
 
-        if let Some(symbolCosts) = symbolCosts
-            .filter(|s| s.huf.repeatMode == HUF_repeat::HUF_repeat_valid)
+        if let Some(symbolCosts) =
+            symbolCosts.filter(|s| s.huf.repeatMode == HUF_repeat::HUF_repeat_valid)
         {
             if compressedLiterals {
                 optPtr.litSum = 0;
@@ -831,7 +835,8 @@ pub fn ZSTD_rescaleFreqs(
             optPtr.litLengthSum = 0;
             for ll in 0..=MaxLL as usize {
                 let scaleLog = 10u32;
-                let bitCost = fse_max_nb_bits_from_ctable(&symbolCosts.fse.litlengthCTable, ll as u32);
+                let bitCost =
+                    fse_max_nb_bits_from_ctable(&symbolCosts.fse.litlengthCTable, ll as u32);
                 debug_assert!(bitCost < scaleLog);
                 optPtr.litLengthFreq[ll] = if bitCost != 0 {
                     1u32 << (scaleLog - bitCost)
@@ -844,7 +849,8 @@ pub fn ZSTD_rescaleFreqs(
             optPtr.matchLengthSum = 0;
             for ml in 0..=MaxML as usize {
                 let scaleLog = 10u32;
-                let bitCost = fse_max_nb_bits_from_ctable(&symbolCosts.fse.matchlengthCTable, ml as u32);
+                let bitCost =
+                    fse_max_nb_bits_from_ctable(&symbolCosts.fse.matchlengthCTable, ml as u32);
                 debug_assert!(bitCost < scaleLog);
                 optPtr.matchLengthFreq[ml] = if bitCost != 0 {
                     1u32 << (scaleLog - bitCost)
@@ -857,7 +863,8 @@ pub fn ZSTD_rescaleFreqs(
             optPtr.offCodeSum = 0;
             for of in 0..=MaxOff as usize {
                 let scaleLog = 10u32;
-                let bitCost = fse_max_nb_bits_from_ctable(&symbolCosts.fse.offcodeCTable, of as u32);
+                let bitCost =
+                    fse_max_nb_bits_from_ctable(&symbolCosts.fse.offcodeCTable, of as u32);
                 debug_assert!(bitCost < scaleLog);
                 optPtr.offCodeFreq[of] = if bitCost != 0 {
                     1u32 << (scaleLog - bitCost)
@@ -1120,7 +1127,12 @@ pub fn ZSTD_insertBtAndGetAllMatches(
             || dictMode == ZSTD_dictMode_e::ZSTD_dictMatchState
             || matchIndex + matchLength as u32 >= dictLimit
         {
-            matchLength += ZSTD_count(buf, ip_pos + matchLength, match_pos + matchLength, ilimit_pos);
+            matchLength += ZSTD_count(
+                buf,
+                ip_pos + matchLength,
+                match_pos + matchLength,
+                ilimit_pos,
+            );
         } else {
             match_pos = matchIndex.saturating_sub(dictBaseOffset) as usize;
             matchLength += ZSTD_count_2segments(
@@ -1205,7 +1217,8 @@ pub fn ZSTD_insertBtAndGetAllMatches(
                 if dictMatchIndex + matchLength as u32 >= dmsHighLimit {
                     match_pos = dictMatchIndex
                         .saturating_add(dmsIndexDelta)
-                        .saturating_sub(ms.window.base_offset) as usize;
+                        .saturating_sub(ms.window.base_offset)
+                        as usize;
                 }
 
                 if matchLength > bestLength {
@@ -1217,7 +1230,9 @@ pub fn ZSTD_insertBtAndGetAllMatches(
                     matches[mnum as usize].off = OFFSET_TO_OFFBASE(curr - translatedIndex);
                     matches[mnum as usize].len = matchLength as u32;
                     mnum += 1;
-                    if matchLength as u32 > ZSTD_OPT_NUM as u32 || ip_pos + matchLength == ilimit_pos {
+                    if matchLength as u32 > ZSTD_OPT_NUM as u32
+                        || ip_pos + matchLength == ilimit_pos
+                    {
                         break;
                     }
                 }
@@ -1266,8 +1281,17 @@ pub fn ZSTD_btGetAllMatches_internal(
     }
     ZSTD_updateTree_internal(ms, buf, ihigh_pos, ip_abs, mls, dictMode);
     ZSTD_insertBtAndGetAllMatches(
-        matches, ms, nextToUpdate3, buf, ip_abs, ihigh_pos,
-        dictMode, rep, ll0, lengthToBeat, mls,
+        matches,
+        ms,
+        nextToUpdate3,
+        buf,
+        ip_abs,
+        ihigh_pos,
+        dictMode,
+        rep,
+        ll0,
+        lengthToBeat,
+        mls,
     )
 }
 
@@ -1411,12 +1435,7 @@ pub fn ZSTD_updateTree_internal(
 
 /// Port of `ZSTD_updateTree`. Thin wrapper over `_internal` using
 /// `ms.cParams.minMatch` and the no-dict code path.
-pub fn ZSTD_updateTree(
-    ms: &mut ZSTD_MatchState_t,
-    buf: &[u8],
-    ip_abs: u32,
-    iend_pos: usize,
-) {
+pub fn ZSTD_updateTree(ms: &mut ZSTD_MatchState_t, buf: &[u8], ip_abs: u32, iend_pos: usize) {
     let mls = ms.cParams.minMatch;
     ZSTD_updateTree_internal(ms, buf, iend_pos, ip_abs, mls, ZSTD_dictMode_e::ZSTD_noDict);
 }
@@ -1447,12 +1466,19 @@ fn ZSTD_compressBlock_opt_generic(
     dictMode: ZSTD_dictMode_e,
 ) -> usize {
     let mut optState = optState_t::default();
-    let mut optLdm = ZSTD_optLdm_t::default();
+    let mut optLdm = ZSTD_optLdm_t {
+        seqStore: ms.ldmSeqStore.clone().unwrap_or_default(),
+        ..Default::default()
+    };
     let cParams = ms.cParams;
     let sufficient_len = cParams.targetLength.min(ZSTD_OPT_NUM as u32 - 1);
     let minMatch = if cParams.minMatch == 3 { 3 } else { 4 };
     let mut nextToUpdate3 = ms.nextToUpdate;
-    let mut ip: usize = if dictMode != ZSTD_dictMode_e::ZSTD_noDict { 1 } else { 0 };
+    let mut ip: usize = if dictMode != ZSTD_dictMode_e::ZSTD_noDict {
+        1
+    } else {
+        0
+    };
     let mut anchor: usize = 0;
     let iend = src.len();
     let ilimit = iend.saturating_sub(8);
@@ -1460,7 +1486,13 @@ fn ZSTD_compressBlock_opt_generic(
     let mut lastStretch = ZSTD_optimal_t::default();
 
     debug_assert!(optLevel <= 2);
-    ZSTD_rescaleFreqs(&mut optState, src, src.len(), optLevel, ms.entropySeed.as_ref());
+    ZSTD_rescaleFreqs(
+        &mut optState,
+        src,
+        src.len(),
+        optLevel,
+        ms.entropySeed.as_ref(),
+    );
     ZSTD_opt_getNextMatchAndUpdateSeqStore(&mut optLdm, ip as u32, (iend - ip) as u32);
 
     while ip < ilimit {
@@ -1536,8 +1568,7 @@ fn ZSTD_compressBlock_opt_generic(
                 let offBase = optState.matchTable[matchNb].off;
                 let end = optState.matchTable[matchNb].len;
                 while pos <= end {
-                    let matchPrice =
-                        ZSTD_getMatchPrice(offBase, pos, &optState, optLevel) as i32;
+                    let matchPrice = ZSTD_getMatchPrice(offBase, pos, &optState, optLevel) as i32;
                     let sequencePrice = optState.priceTable[0].price + matchPrice;
                     optState.priceTable[pos as usize].mlen = pos;
                     optState.priceTable[pos as usize].off = offBase;
@@ -1790,7 +1821,13 @@ fn goto_shortest_path(
         }
 
         debug_assert!(*anchor + llen <= iend);
-        ZSTD_updateStats(optStatePtr, llen as u32, &src[*anchor..], offBase, mlen as u32);
+        ZSTD_updateStats(
+            optStatePtr,
+            llen as u32,
+            &src[*anchor..],
+            offBase,
+            mlen as u32,
+        );
         ZSTD_storeSeq(seqStore, llen, &src[*anchor..], offBase, mlen);
         *anchor += advance;
         *ip = *anchor;
@@ -2004,10 +2041,18 @@ mod tests {
         s.litLengthSum = 256;
         s.matchLengthSum = 256;
         s.offCodeSum = 128;
-        for f in s.litFreq.iter_mut() { *f = 4; }
-        for f in s.litLengthFreq.iter_mut() { *f = 8; }
-        for f in s.matchLengthFreq.iter_mut() { *f = 4; }
-        for f in s.offCodeFreq.iter_mut() { *f = 4; }
+        for f in s.litFreq.iter_mut() {
+            *f = 4;
+        }
+        for f in s.litLengthFreq.iter_mut() {
+            *f = 8;
+        }
+        for f in s.matchLengthFreq.iter_mut() {
+            *f = 4;
+        }
+        for f in s.offCodeFreq.iter_mut() {
+            *f = 4;
+        }
         ZSTD_setBasePrices(&mut s, 2);
         s
     }
@@ -2110,7 +2155,11 @@ mod tests {
         use crate::compress::zstd_ldm::rawSeq;
         let mut s = RawSeqStore_t::with_capacity(seqs.len());
         for (i, &(off, ll, ml)) in seqs.iter().enumerate() {
-            s.seq[i] = rawSeq { offset: off, litLength: ll, matchLength: ml };
+            s.seq[i] = rawSeq {
+                offset: off,
+                litLength: ll,
+                matchLength: ml,
+            };
         }
         s.size = seqs.len();
         s
@@ -2277,7 +2326,9 @@ mod tests {
         ms.chainTable = vec![0u32; 1 << cp.chainLog];
         ms.nextToUpdate = 10;
         ms.window.lowLimit = 4;
-        let data: Vec<u8> = (0..1024u32).map(|i| (i.wrapping_mul(37) & 0xFF) as u8).collect();
+        let data: Vec<u8> = (0..1024u32)
+            .map(|i| (i.wrapping_mul(37) & 0xFF) as u8)
+            .collect();
         ZSTD_updateTree(&mut ms, &data, 500, data.len());
         assert_eq!(ms.nextToUpdate, 500);
     }
@@ -2350,10 +2401,18 @@ mod tests {
         // Seed as if previous block ran — subsequent branch recomputes
         // sums from the freq tables via ZSTD_scaleStats.
         s.litLengthSum = 1; // non-zero → subsequent-block branch
-        for f in s.litFreq.iter_mut() { *f = 40; }
-        for f in s.litLengthFreq.iter_mut() { *f = 30; }
-        for f in s.matchLengthFreq.iter_mut() { *f = 10; }
-        for f in s.offCodeFreq.iter_mut() { *f = 15; }
+        for f in s.litFreq.iter_mut() {
+            *f = 40;
+        }
+        for f in s.litLengthFreq.iter_mut() {
+            *f = 30;
+        }
+        for f in s.matchLengthFreq.iter_mut() {
+            *f = 10;
+        }
+        for f in s.offCodeFreq.iter_mut() {
+            *f = 15;
+        }
         ZSTD_rescaleFreqs(&mut s, b"whatever", 8, 2, None);
         // Sums match the sum of each freq table (scaleStats is no-op
         // at these magnitudes: 30×36 = 1080, 1080>>11 = 0 → keep).
@@ -2386,8 +2445,13 @@ mod tests {
     fn btGetAllMatches_noDict_returns_zero_if_already_updated() {
         use crate::compress::match_state::ZSTD_compressionParameters;
         let cp = ZSTD_compressionParameters {
-            windowLog: 17, chainLog: 14, hashLog: 12, searchLog: 4,
-            minMatch: 4, targetLength: 32, strategy: 7,
+            windowLog: 17,
+            chainLog: 14,
+            hashLog: 12,
+            searchLog: 4,
+            minMatch: 4,
+            targetLength: 32,
+            strategy: 7,
         };
         let mut ms = ZSTD_MatchState_t::new(cp);
         ms.chainTable = vec![0u32; 1 << cp.chainLog];
@@ -2400,9 +2464,16 @@ mod tests {
         let mut matches = vec![ZSTD_match_t::default(); 16];
         let mut n3 = 0u32;
         let n = ZSTD_btGetAllMatches_noDict(
-            &mut matches, &mut ms, &mut n3,
-            &data, 50, data.len(),
-            &rep, 0, 3, 4,
+            &mut matches,
+            &mut ms,
+            &mut n3,
+            &data,
+            50,
+            data.len(),
+            &rep,
+            0,
+            3,
+            4,
         );
         assert_eq!(n, 0);
     }
@@ -2465,9 +2536,9 @@ mod tests {
         let mut ms = ZSTD_MatchState_t::new(cp);
         ms.chainTable = vec![0u32; 1 << cp.chainLog];
         ms.window.lowLimit = 4; // must be > 0
-        // Position 100 should insert its 4-byte hash into the hash
-        // table. Pre-existing matchIndex is zero (no prior), so the
-        // walk exits immediately and insertBt1 returns positions ≥ 1.
+                                // Position 100 should insert its 4-byte hash into the hash
+                                // table. Pre-existing matchIndex is zero (no prior), so the
+                                // walk exits immediately and insertBt1 returns positions ≥ 1.
         let data: Vec<u8> = (0..256u32).map(|i| (i & 0xFF) as u8).collect();
         let positions = ZSTD_insertBt1(&mut ms, &data, 100, data.len(), 100, 4, false);
         assert!(positions >= 1);
@@ -2658,7 +2729,63 @@ mod tests {
 
         assert!(last < src.len(), "expected at least one match");
         assert!(!seqStore.sequences.is_empty(), "expected emitted sequences");
-        assert!(!seqStore.literals.is_empty(), "expected some leading literals");
+        assert!(
+            !seqStore.literals.is_empty(),
+            "expected some leading literals"
+        );
+    }
+
+    #[test]
+    fn compressBlock_btopt_uses_match_state_ldm_sequences_as_candidates() {
+        use crate::compress::match_state::ZSTD_compressionParameters;
+        use crate::compress::seq_store::{SeqStore_t, OFFSET_TO_OFFBASE};
+        use crate::compress::zstd_ldm::{rawSeq, RawSeqStore_t};
+
+        let cp = ZSTD_compressionParameters {
+            windowLog: 18,
+            chainLog: 15,
+            hashLog: 14,
+            searchLog: 4,
+            minMatch: 4,
+            targetLength: 32,
+            strategy: 7,
+        };
+        let mut ms = ZSTD_MatchState_t::new(cp);
+        ms.chainTable = vec![0u32; 1 << cp.chainLog];
+        ms.hashLog3 = 12;
+        ms.hashTable3 = vec![0u32; 1 << ms.hashLog3];
+
+        let mut ldm = RawSeqStore_t::with_capacity(2);
+        ldm.seq[0] = rawSeq {
+            litLength: 4,
+            matchLength: 24,
+            offset: 4,
+        };
+        ldm.seq[1] = rawSeq {
+            litLength: 128,
+            matchLength: 24,
+            offset: 4,
+        };
+        ldm.size = 2;
+        ms.ldmSeqStore = Some(ldm);
+
+        let mut seqStore = SeqStore_t::with_capacity(4096, ZSTD_BLOCKSIZE_MAX);
+        let mut rep = [1u32, 4, 8];
+        let src = b"abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
+        let last = ZSTD_compressBlock_btopt(&mut ms, &mut seqStore, &mut rep, src);
+
+        assert!(
+            last < src.len(),
+            "expected the LDM candidate to be selected"
+        );
+        assert!(
+            seqStore
+                .sequences
+                .iter()
+                .any(|seq| seq.offBase == OFFSET_TO_OFFBASE(4) && seq.mlBase as usize + 4 >= 24),
+            "expected opt parser to emit the injected LDM candidate"
+        );
     }
 
     #[test]
@@ -2684,7 +2811,12 @@ mod tests {
         }
 
         let src = b"abcdefghabcdefghabcdefghabcdefghabcdefghabcdefgh";
-        let variants: [fn(&mut ZSTD_MatchState_t, &mut SeqStore_t, &mut [u32; ZSTD_REP_NUM], &[u8]) -> usize; 4] = [
+        let variants: [fn(
+            &mut ZSTD_MatchState_t,
+            &mut SeqStore_t,
+            &mut [u32; ZSTD_REP_NUM],
+            &[u8],
+        ) -> usize; 4] = [
             ZSTD_compressBlock_btopt_dictMatchState,
             ZSTD_compressBlock_btopt_extDict,
             ZSTD_compressBlock_btultra_dictMatchState,

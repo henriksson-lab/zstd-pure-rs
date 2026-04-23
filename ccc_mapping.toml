@@ -66,12 +66,12 @@ other = "HUF_decompress1X2_usingDTable_internal_body"
 other_path = "zstd/lib/decompress/huf_decompress.c"
 
 [[entries]]
-rust  = "HUF_decompress4X1_usingDTable_internal"
+rust  = "HUF_decompress4X1_usingDTable_internal_body"
 other = "HUF_decompress4X1_usingDTable_internal_body"
 other_path = "zstd/lib/decompress/huf_decompress.c"
 
 [[entries]]
-rust  = "HUF_decompress4X2_usingDTable_internal"
+rust  = "HUF_decompress4X2_usingDTable_internal_body"
 other = "HUF_decompress4X2_usingDTable_internal_body"
 other_path = "zstd/lib/decompress/huf_decompress.c"
 
@@ -108,7 +108,7 @@ other = "ZSTD_btGetAllMatches_internal"
 other_path = "zstd/lib/compress/zstd_opt.c"
 
 [[entries]]
-rust  = "ZSTD_buildFSETable"
+rust  = "ZSTD_buildFSETable_body"
 other = "ZSTD_buildFSETable_body"
 other_path = "zstd/lib/decompress/zstd_decompress_block.c"
 
@@ -2908,4 +2908,3 @@ other_path = "zstd/lib/decompress/zstd_decompress.c"
 rust  = "sum_u32"
 other = "sum_u32"
 other_path = "zstd/lib/compress/zstd_opt.c"
-

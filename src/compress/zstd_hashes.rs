@@ -14,7 +14,9 @@
 //! requirement.
 
 use crate::common::bits::ZSTD_NbCommonBytes;
-use crate::common::mem::{MEM_read16, MEM_read32, MEM_readLE32, MEM_readLE64, MEM_readST, MEM_64bits};
+use crate::common::mem::{
+    MEM_64bits, MEM_read16, MEM_read32, MEM_readLE32, MEM_readLE64, MEM_readST,
+};
 
 // Primes from upstream — must not drift.
 pub const PRIME_3BYTES: u32 = 506_832_829;
@@ -290,7 +292,10 @@ pub fn ZSTD_count(buf: &[u8], in_pos: usize, match_pos: usize, in_limit: usize) 
             return pIn - start;
         }
     }
-    if MEM_64bits() != 0 && pIn + 3 < in_limit && MEM_read32(&buf[pMatch..]) == MEM_read32(&buf[pIn..]) {
+    if MEM_64bits() != 0
+        && pIn + 3 < in_limit
+        && MEM_read32(&buf[pMatch..]) == MEM_read32(&buf[pIn..])
+    {
         pIn += 4;
         pMatch += 4;
     }
@@ -321,13 +326,11 @@ mod tests {
         for i in 0..(buf.len() - window as usize) {
             hash = ZSTD_rollingHash_rotate(
                 hash,
-                buf[i],                // toRemove = leading byte
-                buf[i + window as usize],// toAdd = new trailing byte
+                buf[i],                   // toRemove = leading byte
+                buf[i + window as usize], // toAdd = new trailing byte
                 primePower,
             );
-            let fresh = ZSTD_rollingHash_compute(
-                &buf[i + 1..i + 1 + window as usize],
-            );
+            let fresh = ZSTD_rollingHash_compute(&buf[i + 1..i + 1 + window as usize]);
             assert_eq!(hash, fresh, "slide {i}");
         }
     }
@@ -361,8 +364,13 @@ mod tests {
         // In our test buffer, "!!" lives at input[5]; but iStart is a
         // position inside input_buf. Use input[5..] by setting istart=5.
         let n = ZSTD_count_2segments(
-            input, 0, input.len(), 5, // iStart = 5 → points at "!!abc"
-            dict, 2, 7,                 // match_pos=2, mEnd=7 → 5 bytes
+            input,
+            0,
+            input.len(),
+            5, // iStart = 5 → points at "!!abc"
+            dict,
+            2,
+            7, // match_pos=2, mEnd=7 → 5 bytes
         );
         // Primary = 5 (all of "WORLD" in dict);
         // then iStart continuation matches 0 bytes (input[5..] vs input[5..] always matches).

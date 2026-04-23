@@ -41,13 +41,19 @@ fn finalize(mut h: u64, mut bytes: &[u8]) -> u64 {
     while bytes.len() >= 8 {
         let k1 = u64::from_le_bytes(bytes[..8].try_into().unwrap());
         h ^= round(0, k1);
-        h = h.rotate_left(27).wrapping_mul(PRIME64_1).wrapping_add(PRIME64_4);
+        h = h
+            .rotate_left(27)
+            .wrapping_mul(PRIME64_1)
+            .wrapping_add(PRIME64_4);
         bytes = &bytes[8..];
     }
     if bytes.len() >= 4 {
         let k1 = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as u64;
         h ^= k1.wrapping_mul(PRIME64_1);
-        h = h.rotate_left(23).wrapping_mul(PRIME64_2).wrapping_add(PRIME64_3);
+        h = h
+            .rotate_left(23)
+            .wrapping_mul(PRIME64_2)
+            .wrapping_add(PRIME64_3);
         bytes = &bytes[4..];
     }
     for &b in bytes {
@@ -70,9 +76,18 @@ pub fn XXH64(input: &[u8], seed: u64) -> u64 {
         let limit = input.len() - 32;
         while p <= limit {
             v1 = round(v1, u64::from_le_bytes(input[p..p + 8].try_into().unwrap()));
-            v2 = round(v2, u64::from_le_bytes(input[p + 8..p + 16].try_into().unwrap()));
-            v3 = round(v3, u64::from_le_bytes(input[p + 16..p + 24].try_into().unwrap()));
-            v4 = round(v4, u64::from_le_bytes(input[p + 24..p + 32].try_into().unwrap()));
+            v2 = round(
+                v2,
+                u64::from_le_bytes(input[p + 8..p + 16].try_into().unwrap()),
+            );
+            v3 = round(
+                v3,
+                u64::from_le_bytes(input[p + 16..p + 24].try_into().unwrap()),
+            );
+            v4 = round(
+                v4,
+                u64::from_le_bytes(input[p + 24..p + 32].try_into().unwrap()),
+            );
             p += 32;
         }
 
@@ -160,19 +175,43 @@ pub fn XXH64_update(state: &mut XXH64_state_t, mut input: &[u8]) -> u32 {
         let off = state.memsize as usize;
         let need = 32 - off;
         state.mem64[off..off + need].copy_from_slice(&input[..need]);
-        state.v1 = round(state.v1, u64::from_le_bytes(state.mem64[0..8].try_into().unwrap()));
-        state.v2 = round(state.v2, u64::from_le_bytes(state.mem64[8..16].try_into().unwrap()));
-        state.v3 = round(state.v3, u64::from_le_bytes(state.mem64[16..24].try_into().unwrap()));
-        state.v4 = round(state.v4, u64::from_le_bytes(state.mem64[24..32].try_into().unwrap()));
+        state.v1 = round(
+            state.v1,
+            u64::from_le_bytes(state.mem64[0..8].try_into().unwrap()),
+        );
+        state.v2 = round(
+            state.v2,
+            u64::from_le_bytes(state.mem64[8..16].try_into().unwrap()),
+        );
+        state.v3 = round(
+            state.v3,
+            u64::from_le_bytes(state.mem64[16..24].try_into().unwrap()),
+        );
+        state.v4 = round(
+            state.v4,
+            u64::from_le_bytes(state.mem64[24..32].try_into().unwrap()),
+        );
         input = &input[need..];
         state.memsize = 0;
     }
 
     while input.len() >= 32 {
-        state.v1 = round(state.v1, u64::from_le_bytes(input[0..8].try_into().unwrap()));
-        state.v2 = round(state.v2, u64::from_le_bytes(input[8..16].try_into().unwrap()));
-        state.v3 = round(state.v3, u64::from_le_bytes(input[16..24].try_into().unwrap()));
-        state.v4 = round(state.v4, u64::from_le_bytes(input[24..32].try_into().unwrap()));
+        state.v1 = round(
+            state.v1,
+            u64::from_le_bytes(input[0..8].try_into().unwrap()),
+        );
+        state.v2 = round(
+            state.v2,
+            u64::from_le_bytes(input[8..16].try_into().unwrap()),
+        );
+        state.v3 = round(
+            state.v3,
+            u64::from_le_bytes(input[16..24].try_into().unwrap()),
+        );
+        state.v4 = round(
+            state.v4,
+            u64::from_le_bytes(input[24..32].try_into().unwrap()),
+        );
         input = &input[32..];
     }
 
@@ -290,7 +329,10 @@ mod tests {
         // bytes should leak through the reset.
         let mut st = XXH64_state_t::default();
         XXH64_reset(&mut st, 0);
-        XXH64_update(&mut st, b"discard-this-prior-input-that-should-not-affect-next-digest");
+        XXH64_update(
+            &mut st,
+            b"discard-this-prior-input-that-should-not-affect-next-digest",
+        );
 
         XXH64_reset(&mut st, 42);
         XXH64_update(&mut st, b"fresh");

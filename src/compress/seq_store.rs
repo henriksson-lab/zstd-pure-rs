@@ -188,7 +188,7 @@ pub fn ZSTD_deriveSeqStoreChunk(
         ZSTD_longLengthType_e::ZSTD_llt_none => (ZSTD_longLengthType_e::ZSTD_llt_none, 0),
         _ => {
             let p = originalSeqStore.longLengthPos as usize;
-            if p < startIdx || p > endIdx {
+            if p < startIdx || p >= endIdx {
                 (ZSTD_longLengthType_e::ZSTD_llt_none, 0)
             } else {
                 (originalSeqStore.longLengthType, (p - startIdx) as u32)
@@ -564,6 +564,22 @@ mod tests {
         let s1 = ZSTD_getSequenceLength(&ss, 1);
         assert_eq!(s0.litLength, 3); // untouched
         assert_eq!(s1.litLength, 2 + 0x10000); // long
+    }
+
+    #[test]
+    fn deriveSeqStoreChunk_excludes_long_length_at_end_boundary() {
+        let mut ss = SeqStore_t::with_capacity(8, 128);
+        ZSTD_storeSeqOnly(&mut ss, 3, OFFSET_TO_OFFBASE(10), 7);
+        ZSTD_storeSeqOnly(&mut ss, 4, OFFSET_TO_OFFBASE(11), 8);
+        ZSTD_storeSeqOnly(&mut ss, 5, OFFSET_TO_OFFBASE(12), 9);
+        ss.literals.extend_from_slice(&[b'a'; 12]);
+        ss.longLengthType = ZSTD_longLengthType_e::ZSTD_llt_matchLength;
+        ss.longLengthPos = 2;
+
+        let chunk = ZSTD_deriveSeqStoreChunk(&ss, 0, 2);
+        assert_eq!(chunk.sequences.len(), 2);
+        assert_eq!(chunk.longLengthType, ZSTD_longLengthType_e::ZSTD_llt_none);
+        assert_eq!(chunk.longLengthPos, 0);
     }
 
     #[test]

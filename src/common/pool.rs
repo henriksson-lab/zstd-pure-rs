@@ -109,7 +109,7 @@ pub fn POOL_create(numThreads: usize, queueSize: usize) -> Option<Box<POOL_ctx>>
     POOL_create_advanced(
         numThreads,
         queueSize,
-        crate::compress::zstd_compress::ZSTD_customMem,
+        crate::compress::zstd_compress::ZSTD_customMem::default(),
     )
 }
 

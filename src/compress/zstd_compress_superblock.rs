@@ -99,18 +99,24 @@ pub fn ZSTD_compressSubBlock_literal(
 
     match lhSize {
         3 => {
-            let lhc = hType as u32
-                + ((singleStream as u32 ^ 1) << 2)
-                + ((litSize as u32) << 4)
-                + ((cLitSize as u32) << 14);
+            let lhc = (hType as u32)
+                .wrapping_add((singleStream as u32 ^ 1) << 2)
+                .wrapping_add((litSize as u32) << 4)
+                .wrapping_add((cLitSize as u32) << 14);
             MEM_writeLE24(&mut dst[..3], lhc);
         }
         4 => {
-            let lhc = hType as u32 + (2 << 2) + ((litSize as u32) << 4) + ((cLitSize as u32) << 18);
+            let lhc = (hType as u32)
+                .wrapping_add(2 << 2)
+                .wrapping_add((litSize as u32) << 4)
+                .wrapping_add((cLitSize as u32) << 18);
             MEM_writeLE32(&mut dst[..4], lhc);
         }
         5 => {
-            let lhc = hType as u32 + (3 << 2) + ((litSize as u32) << 4) + ((cLitSize as u32) << 22);
+            let lhc = (hType as u32)
+                .wrapping_add(3 << 2)
+                .wrapping_add((litSize as u32) << 4)
+                .wrapping_add((cLitSize as u32) << 22);
             MEM_writeLE32(&mut dst[..4], lhc);
             dst[4] = (cLitSize >> 10) as u8;
         }
@@ -268,8 +274,9 @@ pub fn ZSTD_compressSubBlock(
     op += cSeqSize;
 
     let cSize = op - ZSTD_blockHeaderSize;
-    let cBlockHeader24 =
-        lastBlock + ((blockType_e::bt_compressed as u32) << 1) + ((cSize as u32) << 3);
+    let cBlockHeader24 = lastBlock
+        .wrapping_add((blockType_e::bt_compressed as u32) << 1)
+        .wrapping_add((cSize as u32) << 3);
     MEM_writeLE24(&mut dst[..3], cBlockHeader24);
     op
 }
@@ -752,7 +759,7 @@ pub fn ZSTD_compressSuperBlock(
         &zc.appliedParams,
         dst,
         src,
-        0,
+        zc.bmi2,
         lastBlock,
         &mut workspace_u32,
     )

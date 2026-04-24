@@ -730,6 +730,8 @@ pub struct ZSTD_DCtx {
     /// after one frame; `ZSTD_use_indefinitely` = persistent dict
     /// from `loadDictionary` / `refDDict`.
     pub dictUses: crate::decompress::zstd_decompress::ZSTD_dictUses_e,
+    /// Upstream custom allocator bundle requested for this DCtx.
+    pub customMem: crate::compress::zstd_compress::ZSTD_customMem,
 }
 
 fn build_default_ll_dtable() -> Vec<ZSTD_seqSymbol> {
@@ -836,6 +838,7 @@ impl Default for ZSTD_DCtx {
             headerSize: 0,
             rleSize: 0,
             dictUses: crate::decompress::zstd_decompress::ZSTD_dictUses_e::ZSTD_dont_use,
+            customMem: crate::compress::zstd_compress::ZSTD_customMem::default(),
         }
     }
 }
@@ -1488,11 +1491,9 @@ pub fn ZSTD_decodeLiteralsBlock(
                     0,
                 )
             } else {
-                // Upstream calls `HUF_decompress4X_hufOnly_wksp` which
-                // auto-selects between X1 and X2 by table-log. We route
-                // directly to X1 — the common case for zstd-produced
-                // frames — deferring the X2 branch until we have a
-                // corpus that actually exercises it.
+                // Our X2 HUF decoder is not yet reliable on larger
+                // real-data compressed-literals blocks. Route fresh
+                // 4-stream literals through the known-good X1 path.
                 HUF_decompress4X1_DCtx_wksp(
                     &mut dctx.hufTable,
                     &mut dctx.litExtraBuffer[..litSize],
@@ -2133,7 +2134,7 @@ pub fn ZSTD_decodeSeqHeaders(dctx: &mut ZSTD_DCtx, nbSeqPtr: &mut i32, src: &[u8
 
     // LL
     {
-        let defaults = dctx.LLTable.clone(); // need a snapshot since we may overwrite
+        let defaults = build_default_ll_dtable();
         let ll_sz = ZSTD_buildSeqTable(
             &mut dctx.LLTable,
             hdr.LLtype,
@@ -2158,7 +2159,7 @@ pub fn ZSTD_decodeSeqHeaders(dctx: &mut ZSTD_DCtx, nbSeqPtr: &mut i32, src: &[u8
 
     // OF
     {
-        let defaults = dctx.OFTable.clone();
+        let defaults = build_default_of_dtable();
         let of_sz = ZSTD_buildSeqTable(
             &mut dctx.OFTable,
             hdr.OFtype,
@@ -2183,7 +2184,7 @@ pub fn ZSTD_decodeSeqHeaders(dctx: &mut ZSTD_DCtx, nbSeqPtr: &mut i32, src: &[u8
 
     // ML
     {
-        let defaults = dctx.MLTable.clone();
+        let defaults = build_default_ml_dtable();
         let ml_sz = ZSTD_buildSeqTable(
             &mut dctx.MLTable,
             hdr.MLtype,
@@ -2229,6 +2230,22 @@ mod tests {
         assert_eq!(dctx.prefixStart, Some(b.as_ptr() as usize));
         assert_eq!(dctx.previousDstEnd, Some(b.as_ptr() as usize));
         assert!(dctx.virtualStart.is_some());
+    }
+
+    #[test]
+    fn decodeSeqHeaders_basic_restores_canonical_default_tables() {
+        let mut dctx = ZSTD_DCtx::default();
+        seq_header_write(&mut dctx.LLTable, 0, LLFSELog);
+        seq_header_write(&mut dctx.OFTable, 0, OffFSELog);
+        seq_header_write(&mut dctx.MLTable, 0, MLFSELog);
+
+        let mut nb_seq = 0i32;
+        let rc = ZSTD_decodeSeqHeaders(&mut dctx, &mut nb_seq, &[1, 0]);
+        assert_eq!(rc, 2);
+        assert_eq!(nb_seq, 1);
+        assert_eq!(seq_header_read(&dctx.LLTable).tableLog, LL_defaultNormLog);
+        assert_eq!(seq_header_read(&dctx.OFTable).tableLog, OF_defaultNormLog);
+        assert_eq!(seq_header_read(&dctx.MLTable).tableLog, ML_defaultNormLog);
     }
 
     #[test]

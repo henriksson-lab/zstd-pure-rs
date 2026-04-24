@@ -185,14 +185,22 @@ pub fn ZSTD_limitCopy(dst: &mut [u8], src: &[u8]) -> usize {
 }
 
 /// Port of `ZSTD_cpuSupportsBmi2` (zstd_internal.h:320). Upstream
-/// probes CPUID for BMI1 + BMI2 support to enable fast-path HUF
-/// decoding. v0.1 doesn't ship a BMI2-specific code path — the scalar
-/// decoder is the only one — so this always returns 0. Kept as part
-/// of the public surface so call-site-compatible C-bridge code
-/// compiles unchanged.
+/// probes CPUID for BMI1 + BMI2 support. The Rust port uses runtime
+/// detection for the same BMI2-gated HUF / sequence encoding paths.
 #[inline]
 pub fn ZSTD_cpuSupportsBmi2() -> i32 {
-    0
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        if std::is_x86_feature_detected!("bmi1") && std::is_x86_feature_detected!("bmi2") {
+            1
+        } else {
+            0
+        }
+    }
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    {
+        0
+    }
 }
 
 /// Port of `ZSTD_copy4`. Kept here so compress + decompress can share.

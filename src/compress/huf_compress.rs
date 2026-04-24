@@ -29,6 +29,8 @@ pub const HUF_WORKSPACE_SIZE_U64: usize = HUF_WORKSPACE_SIZE / 8;
 /// Upstream `HUF_BLOCKSIZE_MAX` (`huf.h:25`). Maximum input size for
 /// a single block compressed with `HUF_compress*`.
 pub const HUF_BLOCKSIZE_MAX: usize = 128 * 1024;
+const SUSPECT_INCOMPRESSIBLE_SAMPLE_SIZE: usize = 4096;
+const SUSPECT_INCOMPRESSIBLE_SAMPLE_RATIO: usize = 10;
 
 /// Upstream `HUF_CTABLE_WORKSPACE_SIZE_U32` (`huf.h:161`). Byte count
 /// of the workspace the CTable-building family (`HUF_buildCTable_wksp`,
@@ -132,11 +134,8 @@ pub fn HUF_minTableLog(symbolCardinality: u32) -> u32 {
     ZSTD_highbit32(symbolCardinality) + 1
 }
 
-/// Port of `HUF_optimalTableLog` — the "cheap" (default) path that
-/// delegates to `FSE_optimalTableLog_internal` with `minus = 1`.
-/// Upstream's full `HUF_flags_optimalDepth` path probes every tableLog
-/// via `HUF_buildCTable_wksp` + `HUF_writeCTable_wksp`; that's gated
-/// behind the flag and lands later alongside the Huffman-tree builder.
+/// Port of `HUF_optimalTableLog` cheap path. Upstream uses this when
+/// `HUF_flags_optimalDepth` is not set.
 pub fn HUF_optimalTableLog(maxTableLog: u32, srcSize: usize, maxSymbolValue: u32) -> u32 {
     crate::compress::fse_compress::FSE_optimalTableLog_internal(
         maxTableLog,
@@ -144,6 +143,69 @@ pub fn HUF_optimalTableLog(maxTableLog: u32, srcSize: usize, maxSymbolValue: u32
         maxSymbolValue,
         1,
     )
+}
+
+/// Port of upstream's full `HUF_optimalTableLog()` entry. The public
+/// Rust helper above keeps the cheap/default path; this internal
+/// variant mirrors the flag-gated depth probe used by
+/// `HUF_compress_internal()`.
+pub fn HUF_optimalTableLog_internal(
+    maxTableLog: u32,
+    srcSize: usize,
+    maxSymbolValue: u32,
+    table: &mut [HUF_CElt],
+    count: &[u32],
+    flags: i32,
+) -> u32 {
+    use crate::decompress::huf_decompress::HUF_flags_optimalDepth;
+
+    debug_assert!(srcSize > 1);
+    if (flags & HUF_flags_optimalDepth) == 0 {
+        return HUF_optimalTableLog(maxTableLog, srcSize, maxSymbolValue);
+    }
+
+    let symbolCardinality = HUF_cardinality(count, maxSymbolValue);
+    let minTableLog = HUF_minTableLog(symbolCardinality);
+    let mut optSize = usize::MAX - 1;
+    let mut optLog = maxTableLog;
+    let mut probe = [0u8; HUF_CTABLEBOUND];
+
+    for optLogGuess in minTableLog..=maxTableLog {
+        let mut build_wksp = [0u32; 1024];
+        let maxBits =
+            HUF_buildCTable_wksp(table, count, maxSymbolValue, optLogGuess, &mut build_wksp);
+        if crate::common::error::ERR_isError(maxBits) {
+            continue;
+        }
+
+        if maxBits < optLogGuess as usize && optLogGuess > minTableLog {
+            break;
+        }
+
+        let mut write_wksp = [0u8; 1];
+        let hSize = HUF_writeCTable_wksp(
+            &mut probe,
+            table,
+            maxSymbolValue,
+            maxBits as u32,
+            &mut write_wksp,
+        );
+        if crate::common::error::ERR_isError(hSize) {
+            continue;
+        }
+
+        let newSize = HUF_estimateCompressedSize(table, count, maxSymbolValue) + hSize;
+        if newSize > optSize + 1 {
+            break;
+        }
+        if newSize < optSize {
+            optSize = newSize;
+            optLog = optLogGuess;
+        }
+    }
+
+    debug_assert!(optLog <= crate::decompress::huf_decompress::HUF_TABLELOG_MAX as u32);
+    optLog
 }
 
 // ---- HUF_CElt accessors --------------------------------------------------
@@ -1135,7 +1197,7 @@ pub fn HUF_addBits(bitC: &mut HUF_CStream_t, elt: HUF_CElt, idx: usize, kFast: b
         HUF_getValue(elt)
     };
     bitC.bitContainer[idx] |= value as usize;
-    bitC.bitPos[idx] += HUF_getNbBitsFast(elt) as usize;
+    bitC.bitPos[idx] = bitC.bitPos[idx].wrapping_add(HUF_getNbBitsFast(elt) as usize);
 }
 
 /// Port of `HUF_zeroIndex1`.
@@ -1151,7 +1213,7 @@ pub fn HUF_mergeIndex1(bitC: &mut HUF_CStream_t) {
     debug_assert!(bitC.bitPos[1] & 0xFF < HUF_BITS_IN_CONTAINER);
     bitC.bitContainer[0] >>= bitC.bitPos[1] & 0xFF;
     bitC.bitContainer[0] |= bitC.bitContainer[1];
-    bitC.bitPos[0] += bitC.bitPos[1];
+    bitC.bitPos[0] = bitC.bitPos[0].wrapping_add(bitC.bitPos[1]);
 }
 
 /// Port of `HUF_flushBits`. Writes the high `bitPos[0]` bits of
@@ -1204,24 +1266,65 @@ pub fn HUF_encodeSymbol(
     HUF_addBits(bitC, ctable[1 + symbol as usize], idx, fast);
 }
 
-/// Port of `HUF_compress1X_usingCTable_internal_body_loop` —
-/// specialized for `kUnroll = 4`, which is upstream's 64-bit default
-/// for the "dst is large enough for unchecked emits" path. Scalar
-/// emit: encode, flush, encode more, flush. No double-container
-/// pipelining (upstream's index-1 merge is a perf-only optimization).
+/// Port of `HUF_compress1X_usingCTable_internal_body_loop`.
 pub fn HUF_compress1X_usingCTable_body_loop(
     bitC: &mut HUF_CStream_t,
     ip: &[u8],
     srcSize: usize,
     ctable: &[HUF_CElt],
+    kUnroll: usize,
+    kFastFlush: bool,
+    kLastFast: bool,
 ) {
     let mut n = srcSize;
+    let mut rem = n % kUnroll;
+    if rem > 0 {
+        while rem > 0 {
+            rem -= 1;
+            n -= 1;
+            HUF_encodeSymbol(bitC, ip[n] as u32, ctable, 0, false);
+        }
+        HUF_flushBits(bitC, kFastFlush);
+    }
+    debug_assert_eq!(n % kUnroll, 0);
+
+    if n % (2 * kUnroll) != 0 {
+        let mut u = 1usize;
+        while u < kUnroll {
+            HUF_encodeSymbol(bitC, ip[n - u] as u32, ctable, 0, true);
+            u += 1;
+        }
+        HUF_encodeSymbol(bitC, ip[n - kUnroll] as u32, ctable, 0, kLastFast);
+        HUF_flushBits(bitC, kFastFlush);
+        n -= kUnroll;
+    }
+    debug_assert_eq!(n % (2 * kUnroll), 0);
+
     while n > 0 {
-        n -= 1;
-        HUF_encodeSymbol(bitC, ip[n] as u32, ctable, 0, false);
-        // Flush after each symbol to keep within the `size_t` register
-        // budget for any tableLog up to HUF_TABLELOG_ABSOLUTEMAX (12).
-        HUF_flushBits(bitC, false);
+        let mut u = 1usize;
+        while u < kUnroll {
+            HUF_encodeSymbol(bitC, ip[n - u] as u32, ctable, 0, true);
+            u += 1;
+        }
+        HUF_encodeSymbol(bitC, ip[n - kUnroll] as u32, ctable, 0, kLastFast);
+        HUF_flushBits(bitC, kFastFlush);
+
+        HUF_zeroIndex1(bitC);
+        let mut u = 1usize;
+        while u < kUnroll {
+            HUF_encodeSymbol(bitC, ip[n - kUnroll - u] as u32, ctable, 1, true);
+            u += 1;
+        }
+        HUF_encodeSymbol(
+            bitC,
+            ip[n - (2 * kUnroll)] as u32,
+            ctable,
+            1,
+            kLastFast,
+        );
+        HUF_mergeIndex1(bitC);
+        HUF_flushBits(bitC, kFastFlush);
+        n -= 2 * kUnroll;
     }
 }
 
@@ -1233,8 +1336,11 @@ pub fn HUF_compress1X_usingCTable_internal_body_loop(
     ip: &[u8],
     srcSize: usize,
     ctable: &[HUF_CElt],
+    kUnroll: usize,
+    kFastFlush: bool,
+    kLastFast: bool,
 ) {
-    HUF_compress1X_usingCTable_body_loop(bitC, ip, srcSize, ctable)
+    HUF_compress1X_usingCTable_body_loop(bitC, ip, srcSize, ctable, kUnroll, kFastFlush, kLastFast)
 }
 
 /// Port of `HUF_compress1X_usingCTable_internal_body`.
@@ -1244,6 +1350,7 @@ pub fn HUF_compress1X_usingCTable_internal_body(
     ctable: &[HUF_CElt],
 ) -> usize {
     let dstSize = dst.len();
+    let tableLog = HUF_readCTableHeader(ctable).tableLog as usize;
     if dstSize < 8 {
         return 0;
     }
@@ -1251,8 +1358,52 @@ pub fn HUF_compress1X_usingCTable_internal_body(
     if crate::common::error::ERR_isError(initErr) {
         return 0;
     }
-    HUF_compress1X_usingCTable_body_loop(&mut bitC, src, src.len(), ctable);
-    HUF_closeCStream(&mut bitC)
+    if dstSize < HUF_tightCompressBound(src.len(), tableLog) || tableLog > 11 {
+        HUF_compress1X_usingCTable_body_loop(
+            &mut bitC,
+            src,
+            src.len(),
+            ctable,
+            if crate::common::mem::MEM_32bits() != 0 { 2 } else { 4 },
+            false,
+            false,
+        );
+    } else if crate::common::mem::MEM_32bits() != 0 {
+        match tableLog {
+            11 => HUF_compress1X_usingCTable_body_loop(
+                &mut bitC, src, src.len(), ctable, 2, true, false,
+            ),
+            10 | 9 | 8 => HUF_compress1X_usingCTable_body_loop(
+                &mut bitC, src, src.len(), ctable, 2, true, true,
+            ),
+            _ => HUF_compress1X_usingCTable_body_loop(
+                &mut bitC, src, src.len(), ctable, 3, true, true,
+            ),
+        }
+    } else {
+        match tableLog {
+            11 => HUF_compress1X_usingCTable_body_loop(
+                &mut bitC, src, src.len(), ctable, 5, true, false,
+            ),
+            10 => HUF_compress1X_usingCTable_body_loop(
+                &mut bitC, src, src.len(), ctable, 5, true, true,
+            ),
+            9 => HUF_compress1X_usingCTable_body_loop(
+                &mut bitC, src, src.len(), ctable, 6, true, false,
+            ),
+            8 => HUF_compress1X_usingCTable_body_loop(
+                &mut bitC, src, src.len(), ctable, 7, true, false,
+            ),
+            7 => HUF_compress1X_usingCTable_body_loop(
+                &mut bitC, src, src.len(), ctable, 8, true, false,
+            ),
+            _ => HUF_compress1X_usingCTable_body_loop(
+                &mut bitC, src, src.len(), ctable, 9, true, true,
+            ),
+        }
+    }
+    let out = HUF_closeCStream(&mut bitC);
+    out
 }
 
 /// Port of `HUF_compress1X_usingCTable`. `_flags` accepts the upstream
@@ -1422,9 +1573,7 @@ pub fn HUF_compressCTable_internal(
 /// Port of `HUF_compress_internal` — the tie-together that builds a
 /// new CTable from `src`, writes it, and emits the payload. `repeat`
 /// is mutated from `HUF_repeat_none` to `HUF_repeat_check` when a
-/// fresh table was used (matching upstream semantics). The "prefer
-/// repeat" and "suspect uncompressible" paths are elided for v0.1 —
-/// they're pure heuristics.
+/// fresh table was used (matching upstream semantics).
 pub fn HUF_compress_internal(
     dst: &mut [u8],
     src: &[u8],
@@ -1432,7 +1581,7 @@ pub fn HUF_compress_internal(
     mut huffLog: u32,
     nbStreams: HUF_nbStreams_e,
     oldHufTable: Option<&mut [HUF_CElt]>,
-    repeat: Option<&mut HUF_repeat>,
+    mut repeat: Option<&mut HUF_repeat>,
     flags: i32,
 ) -> usize {
     use crate::common::error::{ErrorCode, ERROR};
@@ -1460,6 +1609,37 @@ pub fn HUF_compress_internal(
         huffLog = HUF_TABLELOG_DEFAULT;
     }
 
+    if (flags & crate::decompress::huf_decompress::HUF_flags_preferRepeat) != 0 {
+        if let (Some(old), Some(rep)) = (oldHufTable.as_deref(), repeat.as_deref()) {
+            if *rep == HUF_repeat::HUF_repeat_valid {
+                return HUF_compressCTable_internal(dst, 0, src, nbStreams, old, flags);
+            }
+        }
+    }
+
+    if (flags & crate::decompress::huf_decompress::HUF_flags_suspectUncompressible) != 0
+        && srcSize
+            >= (SUSPECT_INCOMPRESSIBLE_SAMPLE_SIZE * SUSPECT_INCOMPRESSIBLE_SAMPLE_RATIO)
+    {
+        let mut count = vec![0u32; (HUF_SYMBOLVALUE_MAX + 1) as usize];
+        let mut maxSymbolValueBegin = maxSymbolValue;
+        let largestBegin = crate::compress::hist::HIST_count_simple(
+            &mut count,
+            &mut maxSymbolValueBegin,
+            &src[..SUSPECT_INCOMPRESSIBLE_SAMPLE_SIZE],
+        ) as usize;
+        let mut maxSymbolValueEnd = maxSymbolValue;
+        let largestEnd = crate::compress::hist::HIST_count_simple(
+            &mut count,
+            &mut maxSymbolValueEnd,
+            &src[srcSize - SUSPECT_INCOMPRESSIBLE_SAMPLE_SIZE..],
+        ) as usize;
+        let largestTotal = largestBegin + largestEnd;
+        if largestTotal <= ((2 * SUSPECT_INCOMPRESSIBLE_SAMPLE_SIZE) >> 7) + 4 {
+            return 0;
+        }
+    }
+
     // Histogram.
     let mut count = vec![0u32; (HUF_SYMBOLVALUE_MAX + 1) as usize];
     let mut hist_wksp = vec![0u32; crate::compress::hist::HIST_WKSP_SIZE_U32];
@@ -1476,9 +1656,24 @@ pub fn HUF_compress_internal(
         return 0; // probably not compressible
     }
 
+    if let (Some(old), Some(rep)) = (oldHufTable.as_deref(), repeat.as_deref_mut()) {
+        if *rep == HUF_repeat::HUF_repeat_check && !HUF_validateCTable(old, &count, maxSymbolValue)
+        {
+            *rep = HUF_repeat::HUF_repeat_none;
+        }
+    }
+
+    if (flags & crate::decompress::huf_decompress::HUF_flags_preferRepeat) != 0 {
+        if let (Some(old), Some(rep)) = (oldHufTable.as_deref(), repeat.as_deref()) {
+            if *rep != HUF_repeat::HUF_repeat_none {
+                return HUF_compressCTable_internal(dst, 0, src, nbStreams, old, flags);
+            }
+        }
+    }
+
     // Build fresh CTable.
     let mut ctable = vec![0u64; (HUF_SYMBOLVALUE_MAX + 2) as usize];
-    huffLog = HUF_optimalTableLog(huffLog, srcSize, maxSymbolValue);
+    huffLog = HUF_optimalTableLog_internal(huffLog, srcSize, maxSymbolValue, &mut ctable, &count, flags);
     let maxBits = HUF_buildCTable(&mut ctable, &count, maxSymbolValue, huffLog);
     if crate::common::error::ERR_isError(maxBits) {
         return maxBits;
@@ -1680,6 +1875,75 @@ mod tests {
         let got = HUF_optimalTableLog(12, 2048, 255);
         let want = FSE_optimalTableLog_internal(12, 2048, 255, 1);
         assert_eq!(got, want);
+    }
+
+    #[test]
+    fn optimal_tablelog_internal_matches_bruteforce_probe_when_optimal_depth_enabled() {
+        let src = b"AAAAAAAAAAAAAAAAAAAAAAAABBBBBBBBBBBBBBBBCCCCCCCCCCCCCCDDDDDDDDEEEE";
+        let mut count = vec![0u32; 256];
+        let mut max_symbol_value = 255u32;
+        crate::compress::hist::HIST_count_simple(&mut count, &mut max_symbol_value, src);
+        let mut table = vec![0u64; (HUF_SYMBOLVALUE_MAX + 2) as usize];
+        let got = HUF_optimalTableLog_internal(
+            12,
+            src.len(),
+            max_symbol_value,
+            &mut table,
+            &count,
+            crate::decompress::huf_decompress::HUF_flags_optimalDepth,
+        );
+
+        let symbol_cardinality = HUF_cardinality(&count, max_symbol_value);
+        let min_table_log = HUF_minTableLog(symbol_cardinality);
+        let mut want = 12;
+        let mut best_size = usize::MAX - 1;
+        for guess in min_table_log..=12 {
+            let mut scratch = vec![0u64; (HUF_SYMBOLVALUE_MAX + 2) as usize];
+            let max_bits = HUF_buildCTable(&mut scratch, &count, max_symbol_value, guess);
+            if crate::common::error::ERR_isError(max_bits) {
+                continue;
+            }
+            if max_bits < guess as usize && guess > min_table_log {
+                break;
+            }
+            let h_size =
+                HUF_writeCTable(&mut [0u8; HUF_CTABLEBOUND], &scratch, max_symbol_value, max_bits as u32);
+            if crate::common::error::ERR_isError(h_size) {
+                continue;
+            }
+            let new_size = HUF_estimateCompressedSize(&scratch, &count, max_symbol_value) + h_size;
+            if new_size > best_size + 1 {
+                break;
+            }
+            if new_size < best_size {
+                best_size = new_size;
+                want = guess;
+            }
+        }
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn compress_internal_rejects_large_suspect_incompressible_input_early() {
+        let mut src = vec![0u8; SUSPECT_INCOMPRESSIBLE_SAMPLE_SIZE * SUSPECT_INCOMPRESSIBLE_SAMPLE_RATIO];
+        let mut x = 0x1234_5678u32;
+        for b in &mut src {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            *b = x as u8;
+        }
+        let mut dst = vec![0u8; HUF_compressBound(src.len())];
+        let got = HUF_compress1X_repeat(
+            &mut dst,
+            &src,
+            255,
+            11,
+            None,
+            None,
+            crate::decompress::huf_decompress::HUF_flags_suspectUncompressible,
+        );
+        assert_eq!(got, 0);
     }
 
     #[test]
@@ -2140,6 +2404,56 @@ mod tests {
         );
         assert_eq!(rc, src.len());
         assert_eq!(out, src);
+    }
+
+    #[test]
+    fn huf_compress1x_prefer_repeat_reuses_valid_old_table() {
+        let src: Vec<u8> = b"prefer-repeat-huf-prefer-repeat-huf"
+            .iter()
+            .cycle()
+            .take(256)
+            .copied()
+            .collect();
+
+        let mut seeded = vec![0u64; (HUF_SYMBOLVALUE_MAX + 2) as usize];
+        let mut repeat = HUF_repeat::HUF_repeat_none;
+        let mut scratch = vec![0u8; HUF_compressBound(src.len())];
+        let first = HUF_compress1X_repeat(
+            &mut scratch,
+            &src,
+            HUF_SYMBOLVALUE_MAX,
+            HUF_TABLELOG_DEFAULT,
+            Some(&mut seeded),
+            Some(&mut repeat),
+            0,
+        );
+        assert!(first > 0);
+
+        let old = seeded.clone();
+        let mut actual = vec![0u8; HUF_compressBound(src.len())];
+        let mut expected = vec![0u8; HUF_compressBound(src.len())];
+        let mut repeat_valid = HUF_repeat::HUF_repeat_valid;
+
+        let actual_size = HUF_compress1X_repeat(
+            &mut actual,
+            &src,
+            HUF_SYMBOLVALUE_MAX,
+            HUF_TABLELOG_DEFAULT,
+            Some(&mut seeded),
+            Some(&mut repeat_valid),
+            crate::decompress::huf_decompress::HUF_flags_preferRepeat,
+        );
+        let expected_size = HUF_compressCTable_internal(
+            &mut expected,
+            0,
+            &src,
+            HUF_nbStreams_e::HUF_singleStream,
+            &old,
+            crate::decompress::huf_decompress::HUF_flags_preferRepeat,
+        );
+
+        assert_eq!(actual_size, expected_size);
+        assert_eq!(&actual[..actual_size], &expected[..expected_size]);
     }
 
     #[test]

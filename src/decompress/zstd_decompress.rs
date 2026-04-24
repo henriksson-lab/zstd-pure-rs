@@ -422,8 +422,13 @@ mod tests {
         let dict = build_minimal_zstd_dict(0xABCD_1234, content);
 
         let mut cctx = ZSTD_createCCtx().unwrap();
-        let rc =
-            ZSTD_compress_insertDictionary(&mut cctx, &dict, ZSTD_dictContentType_e::ZSTD_dct_auto);
+        let params = cctx.requestedParams;
+        let rc = ZSTD_compress_insertDictionary(
+            &mut cctx,
+            &params,
+            &dict,
+            ZSTD_dictContentType_e::ZSTD_dct_auto,
+        );
         assert!(
             !crate::common::error::ERR_isError(rc),
             "compress_insertDictionary failed: {}",
@@ -1040,13 +1045,11 @@ mod tests {
 
     #[test]
     fn createDCtx_advanced_and_createDStream_advanced_return_Some() {
-        // Symmetric with `ZSTD_createCCtx_advanced`. v0.1 ignores
-        // the custom-allocator arg and returns a default DCtx /
-        // DStream. Confirm both creators always return `Some` —
-        // callers must not see `None` from these entries.
+        // Symmetric with `ZSTD_createCCtx_advanced`. The advanced
+        // creators must return functional decoder objects.
         use crate::compress::zstd_compress::ZSTD_customMem;
-        let _dctx = ZSTD_createDCtx_advanced(ZSTD_customMem).unwrap();
-        let _dstream = ZSTD_createDStream_advanced(ZSTD_customMem).unwrap();
+        let _dctx = ZSTD_createDCtx_advanced(ZSTD_customMem::default()).unwrap();
+        let _dstream = ZSTD_createDStream_advanced(ZSTD_customMem::default()).unwrap();
 
         // And prove the returned DCtx actually decodes: compress a
         // payload, feed into _advanced-created DCtx, verify roundtrip.
@@ -1058,6 +1061,233 @@ mod tests {
         let mut out = vec![0u8; src.len() + 64];
         let d = ZSTD_decompress(&mut out, &compressed[..n]);
         assert_eq!(&out[..d], &src[..]);
+    }
+
+    #[test]
+    fn decompresses_upstream_level10_large_real_text_frame() {
+        use std::fs;
+        use std::io::Write;
+        use std::path::PathBuf;
+        use std::process::{Command, Stdio};
+        use crate::decompress::zstd_decompress_block::{
+            blockProperties_t, blockType_e, streaming_operation, ZSTD_DCtx, ZSTD_blockHeaderSize,
+            ZSTD_buildDefaultSeqTables, ZSTD_decodeLiteralsBlock, ZSTD_decodeSeqHeaders,
+            ZSTD_decoder_entropy_rep, ZSTD_decompressSequences_body, ZSTD_getcBlockSize,
+        };
+
+        let which = Command::new("which").arg("zstd").output().expect("which zstd");
+        if !which.status.success() {
+            eprintln!("upstream zstd not on $PATH; skipping");
+            return;
+        }
+        let zstd = PathBuf::from(String::from_utf8(which.stdout).unwrap().trim());
+
+        let seed = fs::read("tests/fixtures/zstd_h.txt").expect("read zstd_h.txt");
+        let src: Vec<u8> = seed.repeat(20);
+
+        let mut child = Command::new(&zstd)
+            .args(["-q", "--no-check", "-10", "-c", "-"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn upstream zstd");
+        child.stdin.as_mut().unwrap().write_all(&src).unwrap();
+        let out = child.wait_with_output().expect("wait upstream zstd");
+        assert!(
+            out.status.success(),
+            "upstream compression failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let mut dctx = ZSTD_DCtx::new();
+        ZSTD_buildDefaultSeqTables(&mut dctx);
+        let mut decoded = vec![0u8; src.len()];
+        let mut rep = ZSTD_decoder_entropy_rep::default();
+        let mut zfh = ZSTD_FrameHeader::default();
+        let hdr = ZSTD_getFrameHeader_advanced(&mut zfh, &out.stdout, dctx.format);
+        assert_eq!(hdr, 0);
+        let mut ip = zfh.headerSize as usize;
+        let mut op = 0usize;
+        let mut block_idx = 0usize;
+        loop {
+            let mut bp = blockProperties_t {
+                blockType: blockType_e::bt_raw,
+                lastBlock: 0,
+                origSize: 0,
+            };
+            let cblock = ZSTD_getcBlockSize(&out.stdout[ip..], &mut bp);
+            assert!(
+                !crate::common::error::ERR_isError(cblock),
+                "block {block_idx}: cblock parse failed: {}",
+                crate::common::error::ERR_getErrorName(cblock)
+            );
+            ip += ZSTD_blockHeaderSize;
+            match bp.blockType {
+                blockType_e::bt_compressed => {
+                    let block = &out.stdout[ip..ip + cblock];
+                    let lit_rc = ZSTD_decodeLiteralsBlock(
+                        &mut dctx,
+                        block,
+                        &mut decoded[op..],
+                        streaming_operation::not_streaming,
+                    );
+                    assert!(
+                        !crate::common::error::ERR_isError(lit_rc),
+                        "block {block_idx}: literals failed: {}",
+                        crate::common::error::ERR_getErrorName(lit_rc)
+                    );
+                    let mut nb_seq = 0i32;
+                    let seq_header = ZSTD_decodeSeqHeaders(&mut dctx, &mut nb_seq, &block[lit_rc..]);
+                    assert!(
+                        !crate::common::error::ERR_isError(seq_header),
+                        "block {block_idx}: seq headers failed: {}",
+                        crate::common::error::ERR_getErrorName(seq_header)
+                    );
+                    let lit_snapshot = dctx.litExtraBuffer[..dctx.litSize].to_vec();
+                    let ll = dctx.LLTable.clone();
+                    let of = dctx.OFTable.clone();
+                    let ml = dctx.MLTable.clone();
+                    let seq_rc = ZSTD_decompressSequences_body(
+                        &mut decoded,
+                        op,
+                        &block[lit_rc + seq_header..],
+                        nb_seq,
+                        &lit_snapshot,
+                        dctx.litSize,
+                        &ll,
+                        &of,
+                        &ml,
+                        &mut rep,
+                    );
+                    assert!(
+                        !crate::common::error::ERR_isError(seq_rc),
+                        "block {block_idx}: sequence body failed: {}",
+                        crate::common::error::ERR_getErrorName(seq_rc)
+                    );
+                    op += seq_rc;
+                }
+                blockType_e::bt_raw => {
+                    let rc = ZSTD_copyRawBlock(&mut decoded[op..], &out.stdout[ip..ip + cblock]);
+                    assert!(
+                        !crate::common::error::ERR_isError(rc),
+                        "block {block_idx}: raw block failed: {}",
+                        crate::common::error::ERR_getErrorName(rc)
+                    );
+                    op += rc;
+                }
+                blockType_e::bt_rle => {
+                    let rc =
+                        ZSTD_setRleBlock(&mut decoded[op..], out.stdout[ip], bp.origSize as usize);
+                    assert!(
+                        !crate::common::error::ERR_isError(rc),
+                        "block {block_idx}: rle block failed: {}",
+                        crate::common::error::ERR_getErrorName(rc)
+                    );
+                    op += rc;
+                }
+                blockType_e::bt_reserved => panic!("block {block_idx}: reserved block"),
+            }
+            ip += cblock;
+            block_idx += 1;
+            if bp.lastBlock != 0 {
+                break;
+            }
+        }
+        let d = ZSTD_decompress(&mut decoded, &out.stdout);
+        assert!(
+            !crate::common::error::ERR_isError(d),
+            "rust decompressor rejected upstream frame: {}",
+            crate::common::error::ERR_getErrorName(d)
+        );
+        assert_eq!(&decoded[..op], &src[..]);
+        assert_eq!(&decoded[..d], &src[..]);
+    }
+
+    #[test]
+    fn createDCtx_advanced_rejects_invalid_custommem_pairs() {
+        use crate::compress::zstd_compress::ZSTD_customMem;
+
+        fn dummy_alloc(_opaque: usize, _size: usize) -> *mut core::ffi::c_void {
+            core::ptr::null_mut()
+        }
+
+        let invalid = ZSTD_customMem {
+            customAlloc: Some(dummy_alloc),
+            customFree: None,
+            opaque: 1,
+        };
+
+        assert!(ZSTD_createDCtx_advanced(invalid).is_none());
+        assert!(ZSTD_createDStream_advanced(invalid).is_none());
+    }
+
+    #[test]
+    fn advanced_dctx_surfaces_invoke_custom_allocator_callbacks() {
+        use crate::compress::zstd_compress::ZSTD_customMem;
+        use core::sync::atomic::{AtomicUsize, Ordering};
+
+        static ALLOCS: AtomicUsize = AtomicUsize::new(0);
+        static FREES: AtomicUsize = AtomicUsize::new(0);
+
+        fn counting_alloc(_opaque: usize, size: usize) -> *mut core::ffi::c_void {
+            use std::alloc::{alloc, Layout};
+
+            const ALIGN: usize = 64;
+            const HEADER_WORDS: usize = 2;
+
+            let total = size.max(1) + ALIGN + HEADER_WORDS * core::mem::size_of::<usize>();
+            let layout = Layout::from_size_align(total, ALIGN).unwrap();
+            unsafe {
+                let base = alloc(layout);
+                if base.is_null() {
+                    return core::ptr::null_mut();
+                }
+                let payload_addr = (base as usize + HEADER_WORDS * core::mem::size_of::<usize>()
+                    + ALIGN
+                    - 1)
+                    & !(ALIGN - 1);
+                let header = (payload_addr as *mut usize).sub(HEADER_WORDS);
+                header.write(base as usize);
+                header.add(1).write(total);
+                ALLOCS.fetch_add(1, Ordering::SeqCst);
+                payload_addr as *mut core::ffi::c_void
+            }
+        }
+
+        fn counting_free(_opaque: usize, address: *mut core::ffi::c_void) {
+            use std::alloc::{dealloc, Layout};
+
+            const ALIGN: usize = 64;
+            const HEADER_WORDS: usize = 2;
+
+            if address.is_null() {
+                return;
+            }
+            unsafe {
+                let header = (address as *mut usize).sub(HEADER_WORDS);
+                let base = header.read() as *mut u8;
+                let total = header.add(1).read();
+                let layout = Layout::from_size_align(total, ALIGN).unwrap();
+                dealloc(base, layout);
+                FREES.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let custom = ZSTD_customMem {
+            customAlloc: Some(counting_alloc),
+            customFree: Some(counting_free),
+            opaque: 11,
+        };
+
+        let dctx = ZSTD_createDCtx_advanced(custom).unwrap();
+        assert_eq!(dctx.customMem, custom);
+        let dstream = ZSTD_createDStream_advanced(custom).unwrap();
+        assert_eq!(dstream.customMem, custom);
+
+        assert_eq!(ALLOCS.load(Ordering::SeqCst), 2);
+        assert_eq!(FREES.load(Ordering::SeqCst), 0);
+        assert_eq!(ZSTD_freeDCtx(dctx), 0);
+        assert_eq!(ZSTD_freeDStream(Some(dstream)), 0);
+        assert_eq!(FREES.load(Ordering::SeqCst), 2);
     }
 
     #[test]
@@ -2125,9 +2355,9 @@ mod tests {
 
         let first = make_ddict(7, b"first");
         let replacement = make_ddict(7, b"replacement");
-        let mut set = ZSTD_createDDictHashSet(ZSTD_customMem);
+        let mut set = ZSTD_createDDictHashSet(ZSTD_customMem::default());
         assert_eq!(
-            ZSTD_DDictHashSet_addDDict(&mut set, &first, ZSTD_customMem),
+            ZSTD_DDictHashSet_addDDict(&mut set, &first, ZSTD_customMem::default()),
             0
         );
         assert_eq!(set.ddictPtrCount, 1);
@@ -2137,7 +2367,7 @@ mod tests {
         ));
 
         assert_eq!(
-            ZSTD_DDictHashSet_addDDict(&mut set, &replacement, ZSTD_customMem),
+            ZSTD_DDictHashSet_addDDict(&mut set, &replacement, ZSTD_customMem::default()),
             0
         );
         assert_eq!(set.ddictPtrCount, 1);
@@ -2151,7 +2381,11 @@ mod tests {
             .collect();
         for ddict in &many {
             assert_eq!(
-                ZSTD_DDictHashSet_addDDict(&mut set, ddict.as_ref(), ZSTD_customMem),
+                ZSTD_DDictHashSet_addDDict(
+                    &mut set,
+                    ddict.as_ref(),
+                    ZSTD_customMem::default()
+                ),
                 0
             );
         }
@@ -3349,14 +3583,11 @@ mod tests {
         use crate::common::error::{ERR_getErrorCode, ERR_isError};
         use crate::common::mem::MEM_writeLE32;
 
-        // Build a magic-prefix dict with dictID A.
-        let mut dict_a = vec![0u8; 64];
-        MEM_writeLE32(&mut dict_a[..4], ZSTD_MAGIC_DICTIONARY);
+        // Start from a real full dictionary, then mutate only the
+        // dictID field to create a mismatch without corrupting the
+        // entropy tables or raw content.
+        let mut dict_a = include_bytes!("../../zstd/tests/dict-files/zero-weight-dict").to_vec();
         MEM_writeLE32(&mut dict_a[4..8], 0x11111111);
-        for (i, b) in dict_a[8..].iter_mut().enumerate() {
-            *b = (i as u8).wrapping_mul(7);
-        }
-        // Same buffer contents, different dictID B.
         let mut dict_b = dict_a.clone();
         MEM_writeLE32(&mut dict_b[4..8], 0x22222222);
 
@@ -3383,12 +3614,8 @@ mod tests {
         use crate::common::mem::MEM_writeLE32;
         use crate::decompress::zstd_ddict::ZSTD_createDDict;
 
-        let mut dict_a = vec![0u8; 64];
-        MEM_writeLE32(&mut dict_a[..4], ZSTD_MAGIC_DICTIONARY);
+        let mut dict_a = include_bytes!("../../zstd/tests/dict-files/zero-weight-dict").to_vec();
         MEM_writeLE32(&mut dict_a[4..8], 0x11111111);
-        for (i, b) in dict_a[8..].iter_mut().enumerate() {
-            *b = (i as u8).wrapping_mul(7);
-        }
         let mut dict_b = dict_a.clone();
         MEM_writeLE32(&mut dict_b[4..8], 0x22222222);
 
@@ -3751,13 +3978,18 @@ pub use crate::decompress::zstd_decompress_block::ZSTD_DCtx;
 /// Port of `ZSTD_createDCtx`. Rust port returns an owned `ZSTD_DCtx`
 /// with default seq-tables pre-built.
 pub fn ZSTD_createDCtx() -> Box<ZSTD_DCtx> {
-    let mut d = Box::new(ZSTD_DCtx::new());
+    let mut d = ZSTD_createDCtx_internal(crate::compress::zstd_compress::ZSTD_customMem::default())
+        .expect("default customMem allocation must succeed");
     crate::decompress::zstd_decompress_block::ZSTD_buildDefaultSeqTables(&mut d);
     d
 }
 
 /// Port of `ZSTD_freeDCtx`. In the Rust port, dropping the Box frees.
-pub fn ZSTD_freeDCtx(_dctx: Box<ZSTD_DCtx>) -> usize {
+pub fn ZSTD_freeDCtx(dctx: Box<ZSTD_DCtx>) -> usize {
+    let customMem = dctx.customMem;
+    unsafe {
+        crate::compress::zstd_compress::ZSTD_customFreeBox(dctx, customMem);
+    }
     0
 }
 
@@ -4423,11 +4655,15 @@ pub fn ZSTD_getDDict(dctx: &mut ZSTD_DCtx) -> Option<Vec<u8>> {
 /// DCtx; this helper adds the explicit init-internal call for
 /// upstream-parity behavior on field resets.
 pub fn ZSTD_createDCtx_internal(
-    _customMem: crate::compress::zstd_compress::ZSTD_customMem,
-) -> Box<ZSTD_DCtx> {
-    let mut dctx = Box::new(ZSTD_DCtx::new());
+    customMem: crate::compress::zstd_compress::ZSTD_customMem,
+) -> Option<Box<ZSTD_DCtx>> {
+    let mut dctx = unsafe {
+        crate::compress::zstd_compress::ZSTD_customAllocBox(ZSTD_DCtx::new(), customMem)
+            ?
+    };
+    dctx.customMem = customMem;
     ZSTD_initDCtx_internal(&mut dctx);
-    dctx
+    Some(dctx)
 }
 
 /// Port of `ZSTD_initDCtx_internal` (`zstd_decompress.c:252`). Resets
@@ -4531,11 +4767,14 @@ pub type ZSTD_DStream = ZSTD_DCtx;
 
 /// Port of `ZSTD_createDStream`. Alias for `ZSTD_createDCtx`.
 pub fn ZSTD_createDStream() -> Option<Box<ZSTD_DStream>> {
-    Some(Box::new(ZSTD_DCtx::new()))
+    Some(ZSTD_createDCtx())
 }
 
 /// Port of `ZSTD_freeDStream`. Alias for `ZSTD_freeDCtx`.
-pub fn ZSTD_freeDStream(_zds: Option<Box<ZSTD_DStream>>) -> usize {
+pub fn ZSTD_freeDStream(zds: Option<Box<ZSTD_DStream>>) -> usize {
+    if let Some(zds) = zds {
+        return ZSTD_freeDCtx(zds);
+    }
     0
 }
 
@@ -5630,19 +5869,21 @@ pub fn ZSTD_decodingBufferSize_min(windowSize: u64, frameContentSize: u64) -> us
     ZSTD_decodingBufferSize_internal(windowSize, frameContentSize, ZSTD_BLOCKSIZE_MAX)
 }
 
-/// Port of `ZSTD_createDCtx_advanced`. v0.1 ignores the custom
-/// allocator and returns a default DCtx.
+/// Port of `ZSTD_createDCtx_advanced`.
 pub fn ZSTD_createDCtx_advanced(
-    _customMem: crate::compress::zstd_compress::ZSTD_customMem,
+    customMem: crate::compress::zstd_compress::ZSTD_customMem,
 ) -> Option<Box<ZSTD_DCtx>> {
-    Some(ZSTD_createDCtx())
+    if !crate::compress::zstd_compress::ZSTD_customMem_validate(customMem) {
+        return None;
+    }
+    ZSTD_createDCtx_internal(customMem)
 }
 
-/// Port of `ZSTD_createDStream_advanced`. Same as above.
+/// Port of `ZSTD_createDStream_advanced`.
 pub fn ZSTD_createDStream_advanced(
-    _customMem: crate::compress::zstd_compress::ZSTD_customMem,
+    customMem: crate::compress::zstd_compress::ZSTD_customMem,
 ) -> Option<Box<ZSTD_DStream>> {
-    Some(ZSTD_createDCtx())
+    ZSTD_createDCtx_advanced(customMem)
 }
 
 /// Port of `ZSTD_initStaticDCtx`. Places a `ZSTD_DCtx` header inside

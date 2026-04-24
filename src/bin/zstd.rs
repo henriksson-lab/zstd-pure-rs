@@ -15,7 +15,6 @@ use zstd_pure_rs::compress::zstd_compress::{
     ZSTD_CCtx_setFormat, ZSTD_FrameParameters, ZSTD_compress_advanced, ZSTD_compressBound,
     ZSTD_createCCtx, ZSTD_getCParams, ZSTD_parameters,
 };
-use zstd_pure_rs::compress::zstd_compress_sequences::{ZSTD_btlazy2, ZSTD_fast};
 use zstd_pure_rs::decompress::zstd_decompress::{
     ZSTD_DCtx_setFormat, ZSTD_decompress, ZSTD_decompressStream, ZSTD_decompress_usingDict,
     ZSTD_findDecompressedSize, ZSTD_findFrameSizeInfo, ZSTD_format_e, ZSTD_CONTENTSIZE_ERROR,
@@ -242,8 +241,7 @@ fn compress_bytes(
         if magicless {
             let _ = ZSTD_CCtx_setFormat(&mut cctx, ZSTD_format_e::ZSTD_f_zstd1_magicless);
         }
-        let mut cp = ZSTD_getCParams(level, src.len() as u64, d.len());
-        cp.strategy = cp.strategy.clamp(ZSTD_fast, ZSTD_btlazy2);
+        let cp = ZSTD_getCParams(level, src.len() as u64, d.len());
         let params = ZSTD_parameters {
             cParams: cp,
             fParams: ZSTD_FrameParameters {
@@ -261,8 +259,7 @@ fn compress_bytes(
         if magicless {
             let _ = ZSTD_CCtx_setFormat(&mut cctx, format);
         }
-        let mut cp = ZSTD_getCParams(level, src.len() as u64, 0);
-        cp.strategy = cp.strategy.clamp(ZSTD_fast, ZSTD_btlazy2);
+        let cp = ZSTD_getCParams(level, src.len() as u64, 0);
         let params = ZSTD_parameters {
             cParams: cp,
             fParams: ZSTD_FrameParameters {

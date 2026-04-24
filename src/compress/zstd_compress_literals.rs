@@ -81,7 +81,9 @@ pub fn ZSTD_noCompressLiterals(dst: &mut [u8], src: &[u8]) -> usize {
         }
         _ => {
             // flSize == 3: 2 | 2 | 20
-            let v = set_basic_bits() as u32 + (3u32 << 2) + ((srcSize as u32) << 4);
+            let v = (set_basic_bits() as u32)
+                .wrapping_add(3u32 << 2)
+                .wrapping_add((srcSize as u32) << 4);
             MEM_writeLE32(&mut dst[..4], v);
         }
     }
@@ -121,7 +123,9 @@ pub fn ZSTD_compressRleLiteralsBlock(dst: &mut [u8], src: &[u8]) -> usize {
             MEM_writeLE16(&mut dst[..2], v);
         }
         _ => {
-            let v = set_rle_bits() as u32 + (3u32 << 2) + ((srcSize as u32) << 4);
+            let v = (set_rle_bits() as u32)
+                .wrapping_add(3u32 << 2)
+                .wrapping_add((srcSize as u32) << 4);
             MEM_writeLE32(&mut dst[..4], v);
         }
     }
@@ -190,9 +194,12 @@ pub fn ZSTD_compressLiterals(
 ) -> usize {
     use crate::common::error::{ErrorCode, ERROR};
     use crate::common::mem::{MEM_writeLE24, MEM_writeLE32};
+    use crate::compress::zstd_compress_sequences::{ZSTD_btultra, ZSTD_lazy};
     use crate::compress::huf_compress::{HUF_compress1X_repeat, HUF_compress4X_repeat};
 
     let srcSize = src.len();
+    let prevHufTable = prevHufTable;
+    let mut prevRepeat = prevRepeat;
     // Literal block header length: 3, 4, or 5 bytes depending on size.
     let lhSize = 3 + (srcSize >= 1024) as usize + (srcSize >= 16384) as usize;
     let mut singleStream = srcSize < 256;
@@ -234,6 +241,14 @@ pub fn ZSTD_compressLiterals(
         crate::common::entropy_common::HUF_flags_bmi2
     } else {
         0
+    }) | (if strategy < ZSTD_lazy && srcSize <= 1024 {
+        crate::decompress::huf_decompress::HUF_flags_preferRepeat
+    } else {
+        0
+    }) | (if strategy >= ZSTD_btultra {
+        crate::decompress::huf_decompress::HUF_flags_optimalDepth
+    } else {
+        0
     }) | (if suspectUncompressible != 0 {
         crate::decompress::huf_decompress::HUF_flags_suspectUncompressible
     } else {
@@ -251,6 +266,7 @@ pub fn ZSTD_compressLiterals(
         .as_deref()
         .copied()
         .unwrap_or(HUF_repeat::HUF_repeat_none);
+    let initial_repeat = repeat_scratch;
     let cLitSize = {
         let (_, payload_dst) = dst.split_at_mut(lhSize);
         if singleStream {
@@ -278,32 +294,38 @@ pub fn ZSTD_compressLiterals(
         }
     };
     // Propagate the final repeat state back to the caller's slot.
-    if let Some(r) = prevRepeat {
+    if let Some(r) = prevRepeat.as_deref_mut() {
         *r = repeat_scratch;
     }
     if crate::common::error::ERR_isError(cLitSize) {
+        if let Some(r) = prevRepeat.as_deref_mut() {
+            *r = initial_repeat;
+        }
         return ZSTD_noCompressLiterals(dst, src);
     }
 
     // If the compressor returned 1, upstream treats it as a single-symbol
     // RLE hint.
     if cLitSize == 1 && (srcSize >= 8 || allBytesIdentical(src)) {
+        if let Some(r) = prevRepeat.as_deref_mut() {
+            *r = initial_repeat;
+        }
         return ZSTD_compressRleLiteralsBlock(dst, src);
     }
 
     // Compressed output must yield at least `minGain` savings over raw.
     let minGain = ZSTD_minGain(srcSize, strategy);
     if cLitSize == 0 || cLitSize + minGain >= srcSize {
+        if let Some(r) = prevRepeat.as_deref_mut() {
+            *r = initial_repeat;
+        }
         return ZSTD_noCompressLiterals(dst, src);
     }
 
     // Differentiate set_repeat (HUF table was reused) vs set_compressed
     // by consulting the repeat flag the compressor left behind in
-    // `repeat_scratch`. Upstream: when `HUF_compress*_repeat` chose to
-    // reuse the prior CTable, it leaves the flag at HUF_repeat_valid and
-    // skips emitting a tree description — the header then advertises
-    // set_repeat so the decoder knows to reuse its prior table.
-    let used_repeat = repeat_scratch == HUF_repeat::HUF_repeat_valid;
+    // `repeat_scratch`. Upstream uses `repeat != HUF_repeat_none` here.
+    let used_repeat = repeat_scratch != HUF_repeat::HUF_repeat_none;
     if used_repeat {
         hType = SymbolEncodingType_e::set_repeat;
     }
@@ -329,6 +351,11 @@ pub fn ZSTD_compressLiterals(
         _ => {
             MEM_writeLE32(&mut dst[..4], lhc);
             dst[4] = (cLitSize >> 10) as u8;
+        }
+    }
+    if hType == SymbolEncodingType_e::set_compressed {
+        if let Some(r) = prevRepeat.as_deref_mut() {
+            *r = HUF_repeat::HUF_repeat_check;
         }
     }
     lhSize + cLitSize

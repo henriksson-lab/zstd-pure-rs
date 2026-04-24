@@ -345,15 +345,14 @@ pub fn ZSTD_advanceHashSalt(ms: &mut ZSTD_MatchState_t) {
 
 /// Port of `ZSTD_invalidateMatchState`. Clears window state, rewinds
 /// `nextToUpdate` to the dictLimit, and invalidates any loaded dict
-/// end. Upstream also resets `opt.litLengthSum`; this port clears the
-/// attached `dictMatchState` as well.
+/// end. Upstream also resets `opt.litLengthSum`; this port now mirrors
+/// that and clears the attached `dictMatchState` as well.
 pub fn ZSTD_invalidateMatchState(ms: &mut ZSTD_MatchState_t) {
     ZSTD_window_clear(&mut ms.window);
     ms.nextToUpdate = ms.window.dictLimit;
     ms.dictMatchState = None;
     ms.loadedDictEnd = 0;
-    // Caller-owned btopt opt.litLengthSum reset lands with the
-    // remaining opt-state plumbing.
+    ms.opt.litLengthSum = 0;
 }
 
 /// Port of `ZSTD_reduceIndex`. Walks the match-state's owned hash /
@@ -612,6 +611,7 @@ pub fn ZSTD_window_correctOverflow(
 /// so index 0/1 aren't used (they collide with DUBT sentinels).
 pub fn ZSTD_window_init(window: &mut ZSTD_window_t) {
     *window = ZSTD_window_t::default();
+    window.base_offset = ZSTD_WINDOW_START_INDEX;
     window.dictLimit = ZSTD_WINDOW_START_INDEX;
     window.lowLimit = ZSTD_WINDOW_START_INDEX;
     window.nextSrc = ZSTD_WINDOW_START_INDEX;
@@ -744,8 +744,8 @@ pub fn ZSTD_overflowCorrectIfNeeded(
 /// Cut-down `ZSTD_MatchState_t`. Covers the primary hash table, the
 /// `hashTable3` short-hash leg, and the `chainTable` used by
 /// `zstd_lazy` / `zstd_opt`. Row-hash scratch fields are live for the
-/// greedy/lazy/lazy2 matchfinders; only optimal-parser row mode
-/// remains out of scope, matching upstream's strategy coverage.
+/// greedy/lazy/lazy2 matchfinders, which matches this upstream
+/// snapshot's strategy coverage.
 #[derive(Debug, Clone)]
 pub struct ZSTD_MatchState_t {
     pub window: ZSTD_window_t,
@@ -771,6 +771,12 @@ pub struct ZSTD_MatchState_t {
     /// Upstream `loadedDictEnd`. Non-zero while a dictionary is in
     /// use.
     pub loadedDictEnd: u32,
+
+    /// Upstream `forceNonContiguous`. When set, the next
+    /// `ZSTD_window_update()` must pivot into the non-contiguous
+    /// branch even if the incoming source would otherwise look
+    /// contiguous in the index space.
+    pub forceNonContiguous: bool,
 
     /// Next index (into the `base`-relative position space) that
     /// `ZSTD_fillHashTable` still needs to insert.
@@ -813,6 +819,9 @@ pub struct ZSTD_MatchState_t {
     /// allocated.
     pub chainTable: Vec<u32>,
 
+    /// Upstream `opt`. Persistent optimal-parser pricing state.
+    pub opt: crate::compress::zstd_opt::optState_t,
+
     /// Active compression parameters.
     pub cParams: ZSTD_compressionParameters,
 }
@@ -837,6 +846,7 @@ impl ZSTD_MatchState_t {
             dictMatchState: None,
             dictContent: Vec::new(),
             loadedDictEnd: 0,
+            forceNonContiguous: false,
             nextToUpdate: ZSTD_WINDOW_START_INDEX,
             hashTable: vec![0u32; hashSize],
             hashTable3: Vec::new(),
@@ -848,6 +858,7 @@ impl ZSTD_MatchState_t {
             hashSaltEntropy: 0,
             lazySkipping: 0,
             chainTable: Vec::new(),
+            opt: crate::compress::zstd_opt::optState_t::default(),
             cParams,
         }
     }
@@ -867,6 +878,7 @@ impl ZSTD_MatchState_t {
         self.dictMatchState = None;
         self.dictContent.clear();
         self.loadedDictEnd = 0;
+        self.forceNonContiguous = false;
         self.nextToUpdate = ZSTD_WINDOW_START_INDEX;
         for c in self.hashTable.iter_mut() {
             *c = 0;
@@ -885,6 +897,7 @@ impl ZSTD_MatchState_t {
         self.hashSalt = 0;
         self.hashSaltEntropy = 0;
         self.lazySkipping = 0;
+        self.opt = crate::compress::zstd_opt::optState_t::default();
     }
 }
 
@@ -1134,6 +1147,7 @@ mod tests {
         };
         ZSTD_window_init(&mut w);
         assert_eq!(w.nextSrc, ZSTD_WINDOW_START_INDEX);
+        assert_eq!(w.base_offset, ZSTD_WINDOW_START_INDEX);
         assert_eq!(w.dictLimit, ZSTD_WINDOW_START_INDEX);
         assert_eq!(w.lowLimit, ZSTD_WINDOW_START_INDEX);
         assert_eq!(w.nbOverflowCorrections, 0);
@@ -1564,12 +1578,14 @@ mod tests {
         ms.window.lowLimit = 25;
         ms.nextToUpdate = 400;
         ms.loadedDictEnd = 99;
+        ms.opt.litLengthSum = 77;
         ZSTD_invalidateMatchState(&mut ms);
         // window_clear collapses dictLimit/lowLimit to nextSrc = 500.
         assert_eq!(ms.window.dictLimit, 500);
         assert_eq!(ms.window.lowLimit, 500);
         assert_eq!(ms.nextToUpdate, 500); // tracks dictLimit
         assert_eq!(ms.loadedDictEnd, 0);
+        assert_eq!(ms.opt.litLengthSum, 0);
     }
 
     #[test]

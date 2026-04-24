@@ -89,7 +89,7 @@ pub struct ldmMatchCandidate_t {
 /// Port of `ldmState_t`. Upstream packs a `ZSTD_window_t`, an
 /// `ldmEntry_t*` flat hash table, a per-bucket cursor array, a
 /// split-index scratch buffer, and a candidate scratch buffer.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ldmState_t {
     pub window: ZSTD_window_t,
     pub hashTable: Vec<ldmEntry_t>,
@@ -137,7 +137,7 @@ pub fn ZSTD_ldm_insertEntry(
     let offset = ldmState.bucketOffsets[hash as usize] as usize;
     ldmState.hashTable[bucket_base + offset] = entry;
     let mask = (1u32 << bucketSizeLog) - 1;
-    ldmState.bucketOffsets[hash as usize] = ((offset as u32 + 1) & mask) as u8;
+    ldmState.bucketOffsets[hash as usize] = ((offset as u32).wrapping_add(1) & mask) as u8;
 }
 
 /// Port of `ZSTD_ldm_fillHashTable`. Walks `data` with the gear-hash,
@@ -186,7 +186,7 @@ pub fn ZSTD_ldm_fillHashTable(
                 let xxhash = XXH64(&data[split_pos..split_pos + minMatchLength as usize], 0);
                 let hash = (xxhash as u32) & mask;
                 let entry = ldmEntry_t {
-                    offset: abs_start + split_pos as u32,
+                    offset: abs_start.wrapping_add(split_pos as u32),
                     checksum: (xxhash >> 32) as u32,
                 };
                 ZSTD_ldm_insertEntry(ldmState, hash, entry, bucketSizeLog);
@@ -618,8 +618,10 @@ pub fn ZSTD_ldm_fillFastTables(ms: &mut ZSTD_MatchState_t, data_end: &[u8]) -> u
 /// re-filling an excessive amount of hash-table state after a long
 /// LDM match.
 pub fn ZSTD_ldm_limitTableUpdate(ms: &mut ZSTD_MatchState_t, curr: u32) {
-    if curr > ms.nextToUpdate + 1024 {
-        ms.nextToUpdate = curr - 512u32.min(curr - ms.nextToUpdate - 1024);
+    if curr > ms.nextToUpdate.wrapping_add(1024) {
+        ms.nextToUpdate = curr.wrapping_sub(
+            512u32.min(curr.wrapping_sub(ms.nextToUpdate).wrapping_sub(1024)),
+        );
     }
 }
 
@@ -824,7 +826,7 @@ pub fn ZSTD_ldm_generateSequences_internal(
             let seq = &mut rawSeqStore.seq[rawSeqStore.size];
             seq.litLength = (split_pos - backward_len - anchor) as u32;
             seq.matchLength = best_total as u32;
-            seq.offset = split_pos as u32 - matched_offset;
+            seq.offset = (split_pos as u32).wrapping_sub(matched_offset);
             rawSeqStore.size += 1;
 
             // Insert only after reading the bucket — safe to do so
@@ -869,15 +871,15 @@ pub fn maybeSplitSequence(
     let mut sequence = rawSeqStore.seq[rawSeqStore.pos];
     debug_assert!(sequence.offset > 0);
 
-    if remaining >= sequence.litLength + sequence.matchLength {
+    if remaining >= sequence.litLength.wrapping_add(sequence.matchLength) {
         rawSeqStore.pos += 1;
         return sequence;
     }
     // Sequence extends past `remaining` — clip it.
     if remaining <= sequence.litLength {
         sequence.offset = 0;
-    } else if remaining < sequence.litLength + sequence.matchLength {
-        sequence.matchLength = remaining - sequence.litLength;
+    } else if remaining < sequence.litLength.wrapping_add(sequence.matchLength) {
+        sequence.matchLength = remaining.wrapping_sub(sequence.litLength);
         if sequence.matchLength < minMatch {
             sequence.offset = 0;
         }
@@ -892,12 +894,12 @@ pub fn maybeSplitSequence(
 /// `zstd_opt.rs` — same logic, separate symbol for 1:1 parity with
 /// upstream.
 pub fn ZSTD_ldm_skipRawSeqStoreBytes(rawSeqStore: &mut RawSeqStore_t, nbBytes: usize) {
-    let mut currPos = rawSeqStore.posInSequence as u32 + nbBytes as u32;
+    let mut currPos = (rawSeqStore.posInSequence as u32).wrapping_add(nbBytes as u32);
     while currPos > 0 && rawSeqStore.pos < rawSeqStore.size {
         let currSeq = rawSeqStore.seq[rawSeqStore.pos];
-        let fullLen = currSeq.litLength + currSeq.matchLength;
+        let fullLen = currSeq.litLength.wrapping_add(currSeq.matchLength);
         if currPos >= fullLen {
-            currPos -= fullLen;
+            currPos = currPos.wrapping_sub(fullLen);
             rawSeqStore.pos += 1;
         } else {
             rawSeqStore.posInSequence = currPos as usize;
@@ -923,20 +925,23 @@ pub fn ZSTD_ldm_skipSequences(rawSeqStore: &mut RawSeqStore_t, mut srcSize: usiz
         let pos = rawSeqStore.pos;
         let seq_litLength = rawSeqStore.seq[pos].litLength as usize;
         if srcSize <= seq_litLength {
-            rawSeqStore.seq[pos].litLength -= srcSize as u32;
+            rawSeqStore.seq[pos].litLength =
+                rawSeqStore.seq[pos].litLength.wrapping_sub(srcSize as u32);
             return;
         }
         srcSize -= seq_litLength;
         rawSeqStore.seq[pos].litLength = 0;
         let seq_matchLength = rawSeqStore.seq[pos].matchLength as usize;
         if srcSize < seq_matchLength {
-            rawSeqStore.seq[pos].matchLength -= srcSize as u32;
+            rawSeqStore.seq[pos].matchLength =
+                rawSeqStore.seq[pos].matchLength.wrapping_sub(srcSize as u32);
             if rawSeqStore.seq[pos].matchLength < minMatch {
                 // Match too short — roll residual into next seq's
                 // literals and drop this one.
                 if rawSeqStore.pos + 1 < rawSeqStore.size {
                     let leftover = rawSeqStore.seq[pos].matchLength;
-                    rawSeqStore.seq[pos + 1].litLength += leftover;
+                    rawSeqStore.seq[pos + 1].litLength =
+                        rawSeqStore.seq[pos + 1].litLength.wrapping_add(leftover);
                 }
                 rawSeqStore.pos += 1;
             }
@@ -1028,7 +1033,9 @@ pub fn ZSTD_ldm_generateSequences(
         );
 
         if prevSize < sequences.size {
-            sequences.seq[prevSize].litLength += leftoverSize as u32;
+            sequences.seq[prevSize].litLength = sequences.seq[prevSize]
+                .litLength
+                .wrapping_add(leftoverSize as u32);
             leftoverSize = newLeftoverSize;
         } else {
             debug_assert_eq!(newLeftoverSize, chunkSize);
@@ -1321,7 +1328,9 @@ mod tests {
             .collect();
         let abs_start = 1_000_000u32;
         ZSTD_ldm_fillHashTable(&mut st, &data, abs_start, &lp);
-        let max_offset = abs_start + data.len() as u32 - lp.minMatchLength;
+        let max_offset = abs_start
+            .wrapping_add(data.len() as u32)
+            .wrapping_sub(lp.minMatchLength);
         for e in st.hashTable.iter() {
             if e.offset != 0 || e.checksum != 0 {
                 assert!(e.offset >= abs_start);

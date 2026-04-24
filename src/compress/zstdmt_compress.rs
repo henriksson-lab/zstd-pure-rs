@@ -178,7 +178,7 @@ impl Default for ZSTDMT_CCtx {
             frameContentSize: 0,
             consumed: 0,
             produced: 0,
-            cMem: ZSTD_customMem,
+            cMem: ZSTD_customMem::default(),
         }
     }
 }
@@ -416,7 +416,7 @@ pub fn ZSTDMT_getCCtx(cctxPool: &mut ZSTDMT_CCtxPool) -> Option<Box<ZSTD_CCtx>> 
     if let Some(cctx) = cctxPool.cctxs.pop() {
         Some(cctx)
     } else {
-        ZSTD_createCCtx_advanced(ZSTD_customMem)
+        ZSTD_createCCtx_advanced(ZSTD_customMem::default())
     }
 }
 
@@ -1447,7 +1447,7 @@ pub fn ZSTDMT_compressionJob(job: &mut ZSTDMT_jobDescription, cctx: &mut Box<ZST
 /// Port of `ZSTDMT_createCCtx`. Allocates the MT context header and
 /// its owned job/pool scaffolding.
 pub fn ZSTDMT_createCCtx(nbWorkers: u32) -> Option<Box<ZSTDMT_CCtx>> {
-    ZSTDMT_createCCtx_advanced_internal(nbWorkers, ZSTD_customMem)
+    ZSTDMT_createCCtx_advanced_internal(nbWorkers, ZSTD_customMem::default())
 }
 
 /// Port of `ZSTDMT_createCCtx_advanced`. The upstream internal helper
@@ -1642,10 +1642,11 @@ mod tests {
         assert!(ctx.bufPool.is_some());
         assert!(ctx.cctxPool.is_some());
         assert!(ctx.seqPool.is_some());
-        let advanced = ZSTDMT_createCCtx_advanced(1, ZSTD_customMem).expect("advanced mt ctx");
+        let advanced =
+            ZSTDMT_createCCtx_advanced(1, ZSTD_customMem::default()).expect("advanced mt ctx");
         assert_eq!(advanced.params.nbWorkers, 1);
         assert!(ZSTDMT_createCCtx(0).is_none());
-        assert!(ZSTDMT_createCCtx_advanced(0, ZSTD_customMem).is_none());
+        assert!(ZSTDMT_createCCtx_advanced(0, ZSTD_customMem::default()).is_none());
 
         // Free accepts None without panicking.
         assert_eq!(ZSTDMT_freeCCtx(None), 0);

@@ -1149,6 +1149,7 @@ mod tests {
                     let seq_rc = ZSTD_decompressSequences_body(
                         &mut decoded,
                         op,
+                        &[],
                         &block[lit_rc + seq_header..],
                         nb_seq,
                         &lit_snapshot,
@@ -2230,6 +2231,75 @@ mod tests {
             ZSTD_nextSrcSizeToDecompress(&dctx),
             ZSTD_startingInputLength(ZSTD_format_e::ZSTD_f_zstd1)
         );
+    }
+
+    #[test]
+    fn decompressContinue_multi_block_with_independent_dst_buffers() {
+        // Build a multi-block compressed frame whose later blocks
+        // back-reference earlier blocks. Drive it through
+        // `ZSTD_decompressContinue` while handing each block a *fresh*
+        // `dst` slice — the prior block's bytes do not live in
+        // `dst[..op_start]`, so the only way back-references can
+        // resolve is via the rolling history buffer in `dctx`.
+        //
+        // This is the regression gate for the dctx.historyBuffer +
+        // ext-dict wiring in `ZSTD_execSequence`.
+        use crate::compress::zstd_compress::ZSTD_compress;
+
+        // Strong cross-block repetition: a 64 KB unique preamble
+        // followed by 8 copies of itself, total ~576 KB. At standard
+        // block size 128 KB, blocks 2..=4 will reference into earlier
+        // blocks' bytes. Every block boundary will see at least one
+        // long back-reference cross it.
+        let chunk: Vec<u8> = (0..65_536u32).map(|i| ((i * 17 + 3) & 0xFF) as u8).collect();
+        let mut payload = chunk.clone();
+        for _ in 0..8 {
+            payload.extend_from_slice(&chunk);
+        }
+
+        let mut compressed = vec![0u8; payload.len() + 1024];
+        let n = ZSTD_compress(&mut compressed, &payload, 1);
+        assert!(
+            !crate::common::error::ERR_isError(n),
+            "compress failed: {}",
+            crate::common::error::ERR_getErrorName(n)
+        );
+        compressed.truncate(n);
+
+        // Drive ZSTD_decompressContinue chunk-by-chunk; for each
+        // decompressBlock stage, allocate a brand-new Vec for the
+        // block output so prior-block bytes are NOT visible to the
+        // sequence executor through `dst`. Concatenate the per-call
+        // outputs to verify the full frame.
+        let mut dctx = ZSTD_DCtx::default();
+        let mut ip = 0usize;
+        let mut decoded: Vec<u8> = Vec::with_capacity(payload.len());
+
+        while ip < compressed.len() {
+            let chunk = ZSTD_nextSrcSizeToDecompress(&dctx);
+            if chunk == 0 {
+                break;
+            }
+            // Allocate a fresh buffer big enough for any block.
+            let block_max = dctx
+                .fParams
+                .blockSizeMax
+                .max(crate::decompress::zstd_decompress_block::ZSTD_BLOCKSIZE_MAX as u32)
+                as usize;
+            let mut block_dst = vec![0u8; block_max + 64];
+            let produced =
+                ZSTD_decompressContinue(&mut dctx, &mut block_dst, &compressed[ip..ip + chunk]);
+            assert!(
+                !crate::common::error::ERR_isError(produced),
+                "decompressContinue at ip={ip}, chunk={chunk}: {}",
+                crate::common::error::ERR_getErrorName(produced)
+            );
+            decoded.extend_from_slice(&block_dst[..produced]);
+            ip += chunk;
+        }
+
+        assert_eq!(decoded.len(), payload.len(), "decoded length mismatch");
+        assert_eq!(decoded, payload, "decoded bytes differ from payload");
     }
 
     #[test]
@@ -6044,6 +6114,7 @@ pub fn ZSTD_decompressBegin(dctx: &mut ZSTD_DCtx) -> usize {
     dctx.validateChecksum = 0;
     dctx.fParams = ZSTD_FrameHeader::default();
     dctx.headerBuffer.fill(0);
+    dctx.historyBuffer.clear();
     XXH64_reset(&mut dctx.xxhState, 0);
     0
 }
@@ -6221,6 +6292,23 @@ pub fn ZSTD_decompressContinue(dctx: &mut ZSTD_DCtx, dst: &mut [u8], src: &[u8])
             if dctx.validateChecksum != 0 && rSize > 0 {
                 XXH64_update(&mut dctx.xxhState, &dst[..rSize]);
             }
+            // Append this block's output to the rolling history buffer
+            // so subsequent blocks' back-references can resolve into it
+            // via the ext-dict path. Cap at the frame's window size
+            // (or the ZSTD_BLOCKSIZE_MAX fallback before a frame
+            // header has been parsed).
+            if rSize > 0 {
+                let cap = if dctx.fParams.windowSize > 0 {
+                    dctx.fParams.windowSize as usize
+                } else {
+                    crate::decompress::zstd_decompress_block::ZSTD_BLOCKSIZE_MAX
+                };
+                dctx.historyBuffer.extend_from_slice(&dst[..rSize]);
+                if dctx.historyBuffer.len() > cap {
+                    let drop = dctx.historyBuffer.len() - cap;
+                    dctx.historyBuffer.drain(..drop);
+                }
+            }
             if dctx.expected > 0 {
                 return rSize;
             }
@@ -6237,6 +6325,9 @@ pub fn ZSTD_decompressContinue(dctx: &mut ZSTD_DCtx, dst: &mut [u8], src: &[u8])
                     dctx.expected = ZSTD_startingInputLength(dctx.format);
                     dctx.stage = ZSTD_dStage::ZSTDds_getFrameHeaderSize;
                 }
+                // Clear the rolling history at frame boundaries — the
+                // next frame starts with a fresh window.
+                dctx.historyBuffer.clear();
             } else {
                 dctx.expected = ZSTD_blockHeaderSize;
                 dctx.stage = ZSTD_dStage::ZSTDds_decodeBlockHeader;

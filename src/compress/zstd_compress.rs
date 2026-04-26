@@ -1398,6 +1398,12 @@ pub fn ZSTD_optimalBlockSize(
     use crate::compress::zstd_presplit::ZSTD_splitBlock;
 
     const FULL_BLOCK: usize = 128 << 10;
+    // Match upstream's `splitLevels` table from `zstd_compress.c:4579`.
+    // (Note: a previous workaround forced `[0; 10]` (fromBorders for all
+    // strategies) thinking byChunks corrupted output. Bisection showed
+    // the actual bug is a separate L5+ greedy/lazy corruption that
+    // triggers on specific content past ~80 MB silesia and fires
+    // regardless of splitter choice — see TODO.md.)
     const SPLIT_LEVELS: [i32; 10] = [0, 0, 1, 2, 2, 3, 3, 4, 4, 4];
 
     if src.len() < FULL_BLOCK || blockSizeMax < FULL_BLOCK {
@@ -1576,7 +1582,23 @@ pub fn ZSTD_compress_frameChunk(
             return ERROR(ErrorCode::Generic);
         }
         let lastBlock = lastFrameChunk & ((blockSize == remaining) as u32);
-        let blockStartAbs = cctx.ms.as_ref().unwrap().window.nextSrc;
+        // blockStartAbs is the absolute index of THIS block's start.
+        // Earlier we read `window.nextSrc`, but `nextSrc` was advanced
+        // to `src_abs + src.len()` (the end of the whole input) by the
+        // `ZSTD_window_update` call at the top of `compressContinue_internal`,
+        // so it points at end-of-input, not block start. Using that
+        // bogus value made `ZSTD_overflowCorrectIfNeeded` and
+        // `ZSTD_window_enforceMaxDist` think the window had already
+        // exceeded `maxDist` on the very first block, shoving
+        // `lowLimit` (and therefore `nextToUpdate`) far past the
+        // current block, producing garbage matches and bloated output.
+        let blockStartAbs = cctx
+            .ms
+            .as_ref()
+            .unwrap()
+            .window
+            .base_offset
+            .wrapping_add(ip as u32);
         let blockEndAbs = blockStartAbs.wrapping_add(blockSize as u32);
 
         if dst.len() - op < ZSTD_blockHeaderSize + MIN_CBLOCK_SIZE + 1 {

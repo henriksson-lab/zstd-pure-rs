@@ -69,19 +69,30 @@ pub fn ZSTD_isAligned<T>(ptr: *const T, align: usize) -> bool {
     ((ptr as usize) & (align - 1)) == 0
 }
 
-/// Port of `ZSTD_row_prefetch`.
+/// Port of `ZSTD_row_prefetch`. Mirrors upstream's `PREFETCH_L1` macro
+/// — issues real `_mm_prefetch` / `prfm pldl1keep` hints rather than
+/// hint-stubbed slice creations.
 #[inline]
 pub fn ZSTD_row_prefetch(hashTable: &[u32], tagTable: &[u8], relRow: u32, rowLog: u32) {
+    use crate::common::zstd_internal::ZSTD_prefetchL1;
     let relRow = relRow as usize;
-    let _ = &hashTable[relRow..hashTable.len().min(relRow + 16)];
-    if rowLog >= 5 {
-        let _ =
-            &hashTable[relRow.saturating_add(16)..hashTable.len().min(relRow.saturating_add(32))];
+    if relRow < hashTable.len() {
+        ZSTD_prefetchL1(unsafe { hashTable.as_ptr().add(relRow) });
     }
-    let _ = &tagTable[relRow..tagTable.len().min(relRow + 32)];
+    if rowLog >= 5 {
+        let p2 = relRow.saturating_add(16);
+        if p2 < hashTable.len() {
+            ZSTD_prefetchL1(unsafe { hashTable.as_ptr().add(p2) });
+        }
+    }
+    if relRow < tagTable.len() {
+        ZSTD_prefetchL1(unsafe { tagTable.as_ptr().add(relRow) });
+    }
     if rowLog == 6 {
-        let _ = &tagTable[tagTable.len().min(relRow.saturating_add(32))
-            ..tagTable.len().min(relRow.saturating_add(64))];
+        let t2 = relRow.saturating_add(32);
+        if t2 < tagTable.len() {
+            ZSTD_prefetchL1(unsafe { tagTable.as_ptr().add(t2) });
+        }
     }
 }
 
@@ -266,18 +277,42 @@ pub fn ZSTD_row_getRVVMask(rowEntries: i32, src: &[u8], tag: u8, head: u32) -> Z
     }
 }
 
+/// SWAR (SIMD-Within-A-Register) port of upstream's scalar
+/// `ZSTD_row_getMatchMask` fallback. Processes `usize`-sized chunks at a
+/// time, detecting matching bytes via `((x | 0x80) - 0x01) | x) & 0x80`
+/// after `x ^= splat(tag)`. Per-byte high bits are then packed via the
+/// `extractMagic` multiply trick. Matches upstream's little-endian path.
+#[inline]
 fn ZSTD_row_getMatchMask_scalar(
     src: &[u8],
     tag: u8,
     headGrouped: u32,
     rowEntries: u32,
 ) -> ZSTD_VecMask {
-    let mut matches = 0u64;
-    for (i, &b) in src.iter().take(rowEntries as usize).enumerate() {
-        if b == tag {
-            matches |= 1u64 << i;
-        }
+    const CHUNK_SIZE: usize = core::mem::size_of::<usize>();
+    let shift_amount: u32 = ((CHUNK_SIZE * 8) - CHUNK_SIZE) as u32;
+    let x_ff: usize = !0usize;
+    let x01: usize = x_ff / 0xFF;
+    let x80: usize = x01 << 7;
+    let splat_char: usize = (tag as usize).wrapping_mul(x01);
+    let extract_magic: usize = (x_ff / 0x7F) >> CHUNK_SIZE;
+
+    let mut matches: u64 = 0;
+    let mut i: i32 = (rowEntries as i32) - (CHUNK_SIZE as i32);
+    debug_assert!(CHUNK_SIZE == 4 || CHUNK_SIZE == 8);
+    while i >= 0 {
+        let off = i as usize;
+        let bytes: [u8; CHUNK_SIZE] = src[off..off + CHUNK_SIZE]
+            .try_into()
+            .expect("SWAR row mask chunk");
+        let mut chunk = usize::from_le_bytes(bytes);
+        chunk ^= splat_char;
+        chunk = (((chunk | x80).wrapping_sub(x01)) | chunk) & x80;
+        matches <<= CHUNK_SIZE;
+        matches |= (chunk.wrapping_mul(extract_magic) >> shift_amount) as u64;
+        i -= CHUNK_SIZE as i32;
     }
+    matches = !matches;
     match rowEntries {
         16 => ZSTD_rotateRight_U16(matches as u16, headGrouped) as u64,
         32 => ZSTD_rotateRight_U32(matches as u32, headGrouped) as u64,
@@ -616,6 +651,20 @@ pub fn ZSTD_RowFindBestMatch(
             if matchPos != 0 {
                 if matchIndex < lowLimit {
                     break;
+                }
+                // Mirror upstream's `PREFETCH_L1(base + matchIndex)` from
+                // zstd_lazy.c:1281 — issue a real cache-line hint for
+                // the candidate before it's consumed below.
+                if dictMode != ZSTD_dictMode_e::ZSTD_extDict || matchIndex >= dictLimit {
+                    let off = matchIndex as usize;
+                    if off < input_buf.len() {
+                        crate::common::zstd_internal::prefetchSliceByte(input_buf, off);
+                    }
+                } else if let Some(dict_buf) = ext_dict_buf {
+                    let off = matchIndex as usize;
+                    if off < dict_buf.len() {
+                        crate::common::zstd_internal::prefetchSliceByte(dict_buf, off);
+                    }
                 }
                 matchBuffer[numMatches] = matchIndex;
                 numMatches += 1;

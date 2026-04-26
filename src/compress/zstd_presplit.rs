@@ -95,7 +95,12 @@ fn addEvents_generic(fp: &mut Fingerprint, src: &[u8], samplingRate: usize, hash
         fp.events[h] += 1;
         n += samplingRate;
     }
-    fp.nbEvents += limit.div_ceil(samplingRate);
+    // Upstream's `limit/samplingRate` is integer floor division — when
+    // `limit % samplingRate != 0`, the loop above records ceil(limit/rate)
+    // events but `nbEvents` is incremented by floor(limit/rate). This
+    // off-by-one is intentional for faithful threshold math; matching
+    // it is required for byte-identical split decisions.
+    fp.nbEvents += limit / samplingRate;
 }
 
 /// Port of `recordFingerprint_generic`.

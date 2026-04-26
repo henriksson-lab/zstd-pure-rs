@@ -50,21 +50,21 @@ The full v1.6 public API from `zstd.h` (stable + experimental) is surfaced — e
 
 Test suite: 816 library unit tests without MT and 834 with `--features mt` as of the latest local run, plus CLI/integration/fixture/doc tests in the full suite. Coverage includes cross-compatibility tests that pipe our output through upstream `zstd` when the binary is on `$PATH`, a public-API sentinel that touches every exposed entry point, a boundary-size sweep around block/tail boundaries, a regression gate for a past multi-block repcode bug, end-to-end `--magicless` CLI roundtrips, and `refPrefix` one-shot auto-clear gates proving single-use dict semantics match upstream for both compressor and decompressor sides.
 
-Throughput (release build on the 182 KB C-header fixture, `cargo build --release`):
+Throughput (`RUSTFLAGS="-C target-cpu=native" cargo build --release`, on the 10 MB silesia `dickens` corpus):
 
 | Level | Ratio | Compress   | Decompress |
 |------:|------:|-----------:|-----------:|
-| 1     | 3.5×  |  60 MB/s   |  222 MB/s  |
-| 3     | 3.6×  |  61 MB/s   |  218 MB/s  |
-| 10    | 4.3×  |   5 MB/s   |  210 MB/s  |
-| 19    | 4.3×  |   3 MB/s   |  235 MB/s  |
+| 1     | 2.4×  |  89 MB/s   |  287 MB/s  |
+| 3     | 2.8×  |  63 MB/s   |  236 MB/s  |
+| 10    | 3.2×  |   6 MB/s   |  175 MB/s  |
+| 19    | 3.6×  |   1.2 MB/s |  157 MB/s  |
 
-These are about 5–10× slower than upstream's hand-tuned C (no SIMD, no BMI2, single-cursor match finders in place of the 4-way pipeline), but correctness + format compliance were the v0.1 priority, not speed.
+Level 1 and decompression are roughly at parity with upstream's hand-tuned C (upstream's CLI on the same input ≈ 80 MB/s effective compress). Higher compression levels (10+) still trail upstream's pipelined matchers / SIMD entropy coding by 3-5×; correctness + format compliance were the v0.1 priority.
 
 ## Goals
 
 - **Bitwise-identical output** to the upstream C library for the same inputs and parameters. This is the hard constraint — reproduction takes priority over speed.
-- **Pure Rust**, no `unsafe` FFI to the upstream C code. Only a single `unsafe` block remains inside the crate (a `u32`→`u8` slice reinterpret helper in `common/entropy_common.rs` for passing an FSE workspace by raw bytes).
+- **Pure Rust**, no `unsafe` FFI to the upstream C code. The crate still contains a small amount of in-tree `unsafe` (~50 occurrences across 9 files: pointer arithmetic in `compress/zstd_cwksp.rs`, allocator-Box plumbing in `compress/zstd_compress.rs`, raw-pointer slice reinterprets in `decompress/zstd_ddict.rs` and `common/entropy_common.rs`, `Box::from_raw`/`Arc::from_raw` round-trips in `common/pool.rs` + `common/threading.rs`, and a few `offset_from`/`add` calls in `compress/zstd_compress_superblock.rs` + `decompress/zstd_decompress.rs`). Driving this number toward zero is a goal but not a hard requirement.
 - Optional CLI (`zstd` binary) behind the `cli` feature.
 - Keep one-to-one C-function → Rust-function mapping where possible, so that code-complexity-comparator stays useful throughout.
 

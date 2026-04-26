@@ -824,6 +824,13 @@ pub struct ZSTD_MatchState_t {
 
     /// Active compression parameters.
     pub cParams: ZSTD_compressionParameters,
+
+    /// Upstream `prefetchCDictTables`. When true, the dictMatchState
+    /// matchers prefetch the attached CDict's hash/chain tables into
+    /// cache before each probe. Propagated from
+    /// `ZSTD_CCtx_params::prefetchCDictTables` in
+    /// `ZSTD_resetCCtx_internal` (mirrors `zstd_compress.c:2217`).
+    pub prefetchCDictTables: bool,
 }
 
 impl ZSTD_MatchState_t {
@@ -860,6 +867,7 @@ impl ZSTD_MatchState_t {
             chainTable: Vec::new(),
             opt: crate::compress::zstd_opt::optState_t::default(),
             cParams,
+            prefetchCDictTables: false,
         }
     }
 

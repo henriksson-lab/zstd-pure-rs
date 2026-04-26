@@ -1219,6 +1219,7 @@ pub fn HUF_mergeIndex1(bitC: &mut HUF_CStream_t) {
 /// Port of `HUF_flushBits`. Writes the high `bitPos[0]` bits of
 /// `bitContainer[0]` out to `ptr` (LE-ordered), advances `ptr`, and
 /// clamps `ptr` to `endPtr` when `kFast == false` to prevent overrun.
+#[inline]
 pub fn HUF_flushBits(bitC: &mut HUF_CStream_t, kFast: bool) {
     let nbBits = bitC.bitPos[0] & 0xFF;
     let nbBytes = nbBits >> 3;
@@ -1253,7 +1254,7 @@ pub fn HUF_closeCStream(bitC: &mut HUF_CStream_t) -> usize {
 }
 
 /// Port of `HUF_encodeSymbol`.
-#[inline]
+#[inline(always)]
 pub fn HUF_encodeSymbol(
     bitC: &mut HUF_CStream_t,
     symbol: u32,
@@ -1288,7 +1289,7 @@ pub fn HUF_compress1X_usingCTable_body_loop(
     }
     debug_assert_eq!(n % kUnroll, 0);
 
-    if n % (2 * kUnroll) != 0 {
+    if !n.is_multiple_of(2 * kUnroll) {
         let mut u = 1usize;
         while u < kUnroll {
             HUF_encodeSymbol(bitC, ip[n - u] as u32, ctable, 0, true);
@@ -1373,7 +1374,7 @@ pub fn HUF_compress1X_usingCTable_internal_body(
             11 => HUF_compress1X_usingCTable_body_loop(
                 &mut bitC, src, src.len(), ctable, 2, true, false,
             ),
-            10 | 9 | 8 => HUF_compress1X_usingCTable_body_loop(
+            8..=10 => HUF_compress1X_usingCTable_body_loop(
                 &mut bitC, src, src.len(), ctable, 2, true, true,
             ),
             _ => HUF_compress1X_usingCTable_body_loop(
@@ -1402,8 +1403,7 @@ pub fn HUF_compress1X_usingCTable_internal_body(
             ),
         }
     }
-    let out = HUF_closeCStream(&mut bitC);
-    out
+    HUF_closeCStream(&mut bitC)
 }
 
 /// Port of `HUF_compress1X_usingCTable`. `_flags` accepts the upstream

@@ -198,8 +198,22 @@ pub fn ZSTD_compressLiterals(
     use crate::compress::huf_compress::{HUF_compress1X_repeat, HUF_compress4X_repeat};
 
     let srcSize = src.len();
-    let prevHufTable = prevHufTable;
     let mut prevRepeat = prevRepeat;
+    // Snapshot the caller's CTable on entry. Upstream's
+    // `ZSTD_compressLiterals` does `ZSTD_memcpy(nextHuf, prevHuf, ...)` at
+    // the top — the caller pre-clones into `prevHufTable`, so on entry
+    // `prevHufTable` already mirrors `prevHuf`. On any noCompress
+    // fallback (HUF error, RLE detection, gain check fails) we MUST
+    // restore the table so the decoder's view of "last set_compressed"
+    // stays in sync with the compressor's `nextEntropy.huf.CTable`.
+    // Forgetting this restore was a bug that fired on long inputs
+    // (silesia past ~165 MB at L5+): HUF's fresh-build path would
+    // overwrite the table even though we eventually emitted the block
+    // as `set_basic`, leaving compressor and decoder with mismatched
+    // tables for the next `set_repeat`.
+    let snapshot_huf_ctable: Option<Vec<crate::compress::huf_compress::HUF_CElt>> =
+        prevHufTable.as_deref().map(|t| t.to_vec());
+    let mut prevHufTable = prevHufTable;
     // Literal block header length: 3, 4, or 5 bytes depending on size.
     let lhSize = 3 + (srcSize >= 1024) as usize + (srcSize >= 16384) as usize;
     let mut singleStream = srcSize < 256;
@@ -269,13 +283,16 @@ pub fn ZSTD_compressLiterals(
     let initial_repeat = repeat_scratch;
     let cLitSize = {
         let (_, payload_dst) = dst.split_at_mut(lhSize);
+        // Reborrow `prevHufTable` so we can still access it after the
+        // call to do the noCompress-path table restore.
+        let huf_table_arg = prevHufTable.as_deref_mut();
         if singleStream {
             HUF_compress1X_repeat(
                 payload_dst,
                 src,
                 crate::decompress::huf_decompress::HUF_SYMBOLVALUE_MAX,
                 LitHufLog,
-                prevHufTable,
+                huf_table_arg,
                 Some(&mut repeat_scratch),
                 flags,
             )
@@ -285,7 +302,7 @@ pub fn ZSTD_compressLiterals(
                 src,
                 crate::decompress::huf_decompress::HUF_SYMBOLVALUE_MAX,
                 LitHufLog,
-                prevHufTable,
+                huf_table_arg,
                 Some(&mut repeat_scratch),
                 flags,
             )
@@ -297,10 +314,24 @@ pub fn ZSTD_compressLiterals(
     if let Some(r) = prevRepeat.as_deref_mut() {
         *r = repeat_scratch;
     }
+    // Helper to restore the caller's CTable from the on-entry snapshot.
+    // Mirrors upstream's `ZSTD_memcpy(nextHuf, prevHuf, ...)` reset on
+    // noCompress fallback paths. Without this, a fresh HUF table built
+    // inside `HUF_compress*_repeat` leaks into `nextEntropy.huf.CTable`
+    // for the next block, even though no `set_compressed` was emitted —
+    // the compressor and decoder then disagree on the "last table" the
+    // following `set_repeat` should reuse.
+    let restore_table = |slot: &mut Option<&mut [crate::compress::huf_compress::HUF_CElt]>| {
+        if let (Some(snap), Some(t)) = (snapshot_huf_ctable.as_ref(), slot.as_deref_mut()) {
+            let n = snap.len().min(t.len());
+            t[..n].copy_from_slice(&snap[..n]);
+        }
+    };
     if crate::common::error::ERR_isError(cLitSize) {
         if let Some(r) = prevRepeat.as_deref_mut() {
             *r = initial_repeat;
         }
+        restore_table(&mut prevHufTable);
         return ZSTD_noCompressLiterals(dst, src);
     }
 
@@ -310,6 +341,7 @@ pub fn ZSTD_compressLiterals(
         if let Some(r) = prevRepeat.as_deref_mut() {
             *r = initial_repeat;
         }
+        restore_table(&mut prevHufTable);
         return ZSTD_compressRleLiteralsBlock(dst, src);
     }
 
@@ -319,6 +351,7 @@ pub fn ZSTD_compressLiterals(
         if let Some(r) = prevRepeat.as_deref_mut() {
             *r = initial_repeat;
         }
+        restore_table(&mut prevHufTable);
         return ZSTD_noCompressLiterals(dst, src);
     }
 

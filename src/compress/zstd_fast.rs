@@ -466,6 +466,8 @@ pub fn ZSTD_compressBlock_fast_noDict_generic(
 
             if ip2 >= nextStep {
                 step += 1;
+                crate::common::zstd_internal::prefetchSliceByte(src, ip1 + 64);
+                crate::common::zstd_internal::prefetchSliceByte(src, ip1 + 128);
                 nextStep += kStepIncr;
             }
             if ip3 >= ilimit {
@@ -569,6 +571,10 @@ pub fn ZSTD_compressBlock_fast_dictMatchState_generic(
     }
     if rep[1] > dictAndPrefixLength {
         rep[1] = dictAndPrefixLength;
+    }
+
+    if ms.prefetchCDictTables {
+        crate::common::zstd_internal::ZSTD_prefetchArea(&dms.hashTable);
     }
 
     let hlog = cParams.hashLog;
@@ -1238,6 +1244,8 @@ pub fn ZSTD_compressBlock_fast_extDict_generic(
             ip3 = ip1 + step;
             if ip2 >= nextStep {
                 step += 1;
+                crate::common::zstd_internal::prefetchSliceByte(src, ip1 + 64);
+                crate::common::zstd_internal::prefetchSliceByte(src, ip1 + 128);
                 nextStep += kStepIncr;
             }
             if ip3 >= ilimit {

@@ -303,6 +303,7 @@ pub fn OFFBASE_TO_REPCODE(o: u32) -> u32 {
 /// Port of `ZSTD_storeSeqOnly`. Appends a `SeqDef` to the store
 /// without copying literal bytes. Long litLength / mlBase are
 /// flagged by setting `longLengthType` + `longLengthPos`.
+#[inline]
 pub fn ZSTD_storeSeqOnly(
     seqStore: &mut SeqStore_t,
     litLength: usize,
@@ -346,6 +347,7 @@ pub fn ZSTD_storeSeqOnly(
 /// &[u8]` whose length is the upper bound — upstream's wildcopy
 /// over-read optimization isn't portable without more ceremony, so
 /// we `copy_from_slice` (one memcpy) and accept the small perf loss.
+#[inline]
 pub fn ZSTD_storeSeq(
     seqStore: &mut SeqStore_t,
     litLength: usize,

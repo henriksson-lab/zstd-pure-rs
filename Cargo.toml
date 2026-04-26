@@ -30,6 +30,10 @@ name = "zstd"
 path = "src/bin/zstd.rs"
 required-features = ["cli"]
 
+[[bin]]
+name = "bench"
+path = "src/bin/bench.rs"
+
 [features]
 default = ["std"]
 std = []

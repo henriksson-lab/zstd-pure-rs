@@ -21,7 +21,7 @@ use crate::common::error::{ErrorCode, ERROR};
 use crate::common::mem::{MEM_readLE16, MEM_readLE24, MEM_readLE32};
 use crate::decompress::huf_decompress::{
     HUF_DTable, HUF_decompress1X1_DCtx_wksp, HUF_decompress1X_usingDTable,
-    HUF_decompress4X1_DCtx_wksp, HUF_decompress4X_usingDTable, HUF_DTABLE_SIZE_U32,
+    HUF_decompress4X_hufOnly_wksp, HUF_decompress4X_usingDTable, HUF_DTABLE_SIZE_U32,
     HUF_TABLELOG_MAX,
 };
 
@@ -307,6 +307,7 @@ pub struct seqState_t<'a> {
 /// reloads, no aarch64-specific local copy). Decodes one sequence
 /// triplet (litLength, matchLength, offset), updates repcodes, and
 /// (when not the last sequence) advances the FSE states.
+#[inline]
 pub fn ZSTD_decodeSequence(
     seqState: &mut seqState_t,
     LLTable: &[ZSTD_seqSymbol],
@@ -421,21 +422,26 @@ pub fn ZSTD_decodeSequence(
 /// Port of `ZSTD_execSequence`. Executes a single (litLength,
 /// matchLength, offset) sequence: copies literals from `litBuf[litPtr..]`
 /// to `dst[op..]`, then back-references `matchLength` bytes starting
-/// `offset` bytes earlier in `dst`. Returns the total bytes written
-/// (`litLength + matchLength`) on success.
+/// `offset` bytes earlier in the virtual stream `[ext_history][dst]`.
+/// Returns the total bytes written (`litLength + matchLength`) on
+/// success.
 ///
 /// Rust signature note: upstream takes raw `BYTE**` pointers so state
 /// can mutate across calls. Here we take &mut slices + indices and
 /// return the updated `litPtr_offset` via the `out_litPtr` parameter.
 ///
-/// Scope note: the external-dictionary path (offset larger than the
-/// current prefix) is not supported yet — it returns
-/// `ErrorCode::CorruptionDetected`. Standalone block decode never
-/// triggers it.
+/// `ext_history` carries any history bytes that conceptually live
+/// *before* `dst[0]` — typically the loaded raw-content dictionary or
+/// the prior streaming-block tail — so cross-segment back-references
+/// (the upstream `extDict` path) can land. Pass `&[]` when no
+/// out-of-buffer history is reachable; one-shot decode paths that
+/// concatenate `dict || scratch` into `dst` already have everything
+/// in-buffer and can leave `ext_history` empty.
 pub fn ZSTD_execSequence(
     dst: &mut [u8],
     op: usize,
     sequence: seq_t,
+    ext_history: &[u8],
     litBuf: &[u8],
     litPtr_offset: usize,
     out_litPtr: &mut usize,
@@ -451,9 +457,10 @@ pub fn ZSTD_execSequence(
     if iLitEnd > litBuf.len() {
         return ERROR(ErrorCode::CorruptionDetected);
     }
-    // Offset larger than the available prefix → would require an
-    // external dictionary. Not yet supported.
-    if sequence.offset > oLitEnd {
+    // Offset reaches before dst[0] — must come from ext_history.
+    // Reject if even the virtual `[ext_history][dst]` view doesn't
+    // have enough history.
+    if sequence.offset > oLitEnd + ext_history.len() {
         return ERROR(ErrorCode::CorruptionDetected);
     }
     if sequence.matchLength == 0 {
@@ -466,7 +473,34 @@ pub fn ZSTD_execSequence(
     dst[op..oLitEnd].copy_from_slice(&litBuf[litPtr_offset..iLitEnd]);
     *out_litPtr = iLitEnd;
 
-    // Copy match from dst[match_src..] to dst[oLitEnd..oMatchEnd].
+    // ext-dict path: offset reaches into ext_history. Mirrors the
+    // upstream `if (sequence.offset > (size_t)(oLitEnd - prefixStart))`
+    // branch — copy the leading segment from ext_history's tail, then
+    // continue from the start of dst if the match spans both regions.
+    if sequence.offset > oLitEnd {
+        let into_ext = sequence.offset - oLitEnd;
+        let ext_start = ext_history.len() - into_ext;
+        let from_ext = sequence.matchLength.min(into_ext);
+        dst[oLitEnd..oLitEnd + from_ext]
+            .copy_from_slice(&ext_history[ext_start..ext_start + from_ext]);
+        if sequence.matchLength > from_ext {
+            // Spill into the prefix portion of dst (starting at index 0).
+            // This is a *forward* wildcopy: each write may be read back
+            // by a later iteration when the spill length exceeds the
+            // initial offset, which is the ZSTD repcode-style pattern
+            // expansion. `copy_within` is memmove-semantics — for
+            // overlapping forward copies it preserves the original src
+            // bytes, breaking the expansion. Do it byte-by-byte.
+            let remaining = sequence.matchLength - from_ext;
+            let dst_off = oLitEnd + from_ext;
+            for i in 0..remaining {
+                dst[dst_off + i] = dst[i];
+            }
+        }
+        return sequenceLength;
+    }
+
+    // In-buffer match: copy from dst[match_src..] to dst[oLitEnd..oMatchEnd].
     // If offset >= WILDCOPY_VECLEN, the regions don't overlap within
     // the 16-byte wildcopy window, so a plain byte-by-byte forward
     // copy is correct (and matches upstream's `ZSTD_wildcopy`
@@ -477,10 +511,20 @@ pub fn ZSTD_execSequence(
     let mut out_idx = oLitEnd;
 
     if sequence.offset >= WILDCOPY_VECLEN {
-        // Plain forward byte copy — safe because regions don't alias
-        // in harmful ways for the per-byte read/write pattern.
-        for i in 0..sequence.matchLength {
-            dst[oLitEnd + i] = dst[match_src + i];
+        // True non-overlap fast path: when offset > matchLength,
+        // the source and destination ranges don't overlap at all —
+        // safe to use `copy_within` (memmove) which lowers to a
+        // SIMD/SSE memcpy on x86. The byte-by-byte loop fallback
+        // covers the wildcopy-style overlapping case where
+        // sequence.offset >= 16 but matchLength > offset, and the
+        // source/dest overlap matters for the repeating-pattern
+        // semantic some sequences rely on.
+        if sequence.offset >= sequence.matchLength {
+            dst.copy_within(match_src..match_src + sequence.matchLength, oLitEnd);
+        } else {
+            for i in 0..sequence.matchLength {
+                dst[oLitEnd + i] = dst[match_src + i];
+            }
         }
     } else {
         // Overlap-spread up to 8 bytes, then wildcopy-style tail.
@@ -510,11 +554,12 @@ pub fn ZSTD_execSequenceEnd(
     dst: &mut [u8],
     op: usize,
     sequence: seq_t,
+    ext_history: &[u8],
     litBuf: &[u8],
     litPtr_offset: usize,
     out_litPtr: &mut usize,
 ) -> usize {
-    ZSTD_execSequence(dst, op, sequence, litBuf, litPtr_offset, out_litPtr)
+    ZSTD_execSequence(dst, op, sequence, ext_history, litBuf, litPtr_offset, out_litPtr)
 }
 
 /// Slow-tail wrapper for `ZSTD_execSequenceEndSplitLitBuffer`.
@@ -522,11 +567,12 @@ pub fn ZSTD_execSequenceEndSplitLitBuffer(
     dst: &mut [u8],
     op: usize,
     sequence: seq_t,
+    ext_history: &[u8],
     litBuf: &[u8],
     litPtr_offset: usize,
     out_litPtr: &mut usize,
 ) -> usize {
-    ZSTD_execSequence(dst, op, sequence, litBuf, litPtr_offset, out_litPtr)
+    ZSTD_execSequence(dst, op, sequence, ext_history, litBuf, litPtr_offset, out_litPtr)
 }
 
 /// Split-literal wrapper for `ZSTD_execSequenceSplitLitBuffer`.
@@ -534,11 +580,12 @@ pub fn ZSTD_execSequenceSplitLitBuffer(
     dst: &mut [u8],
     op: usize,
     sequence: seq_t,
+    ext_history: &[u8],
     litBuf: &[u8],
     litPtr_offset: usize,
     out_litPtr: &mut usize,
 ) -> usize {
-    ZSTD_execSequence(dst, op, sequence, litBuf, litPtr_offset, out_litPtr)
+    ZSTD_execSequence(dst, op, sequence, ext_history, litBuf, litPtr_offset, out_litPtr)
 }
 
 /// Fuzz-assert helper name. The production Rust port doesn't keep the
@@ -692,6 +739,13 @@ pub struct ZSTD_DCtx {
     /// Raw-content dict set by `ZSTD_initDStream_usingDict` — applied
     /// to every frame decoded until reset / re-init.
     pub stream_dict: Vec<u8>,
+    /// Sliding history of prior-block output, retained across
+    /// `ZSTD_decompressContinue` calls so back-references in later
+    /// blocks can resolve into earlier-block bytes that no longer live
+    /// in the caller's `dst`. Capped at `fParams.windowSize` (or
+    /// `ZSTD_BLOCKSIZE_MAX` before a frame header has been parsed).
+    /// Reset on frame boundaries and on `ZSTD_decompressBegin`.
+    pub historyBuffer: Vec<u8>,
     /// `ZSTD_d_windowLogMax`: upper bound on the window size the
     /// decoder will accept. Set via `ZSTD_DCtx_setParameter`.
     pub d_windowLogMax: u32,
@@ -822,6 +876,7 @@ impl Default for ZSTD_DCtx {
             stream_out_drained: 0,
             oversizedDuration: 0,
             stream_dict: Vec::new(),
+            historyBuffer: Vec::new(),
             d_windowLogMax: crate::decompress::zstd_decompress::ZSTD_WINDOWLOG_LIMIT_DEFAULT,
             format: crate::decompress::zstd_decompress::ZSTD_format_e::ZSTD_f_zstd1,
             expected: crate::decompress::zstd_decompress::ZSTD_startingInputLength(
@@ -918,6 +973,7 @@ impl Default for ZSTD_decoder_entropy_rep {
 pub fn ZSTD_decompressSequences_body(
     dst: &mut [u8],
     op_start: usize,
+    ext_history: &[u8],
     seqSrc: &[u8],
     nbSeq: i32,
     litBuf: &[u8],
@@ -933,6 +989,8 @@ pub fn ZSTD_decompressSequences_body(
     // output begins. Prior-block output lives in `dst[..op_start]` and
     // must remain visible for cross-block back-references (offsets
     // larger than the current block's offset relative to op_start).
+    // `ext_history` carries any further history that lives outside
+    // `dst` — see `ZSTD_execSequence` for details.
     let mut op: usize = op_start;
     let mut litPtr: usize = 0;
     let litEnd = litSize;
@@ -963,7 +1021,8 @@ pub fn ZSTD_decompressSequences_body(
         while remaining > 0 {
             let sequence =
                 ZSTD_decodeSequence(&mut seqState, LLTable, OFTable, MLTable, remaining == 1);
-            let oneSeqSize = ZSTD_execSequence(dst, op, sequence, litBuf, litPtr, &mut litPtr);
+            let oneSeqSize =
+                ZSTD_execSequence(dst, op, sequence, ext_history, litBuf, litPtr, &mut litPtr);
             if crate::common::error::ERR_isError(oneSeqSize) {
                 return oneSeqSize;
             }
@@ -999,6 +1058,7 @@ pub fn ZSTD_decompressSequences_body(
 pub fn ZSTD_decompressSequences_default(
     dst: &mut [u8],
     op_start: usize,
+    ext_history: &[u8],
     seqSrc: &[u8],
     nbSeq: i32,
     litBuf: &[u8],
@@ -1011,6 +1071,7 @@ pub fn ZSTD_decompressSequences_default(
     ZSTD_decompressSequences_body(
         dst,
         op_start,
+        ext_history,
         seqSrc,
         nbSeq,
         litBuf,
@@ -1027,6 +1088,7 @@ pub fn ZSTD_decompressSequences_default(
 pub fn ZSTD_decompressSequencesSplitLitBuffer_default(
     dst: &mut [u8],
     op_start: usize,
+    ext_history: &[u8],
     seqSrc: &[u8],
     nbSeq: i32,
     litBuf: &[u8],
@@ -1039,6 +1101,7 @@ pub fn ZSTD_decompressSequencesSplitLitBuffer_default(
     ZSTD_decompressSequences_default(
         dst,
         op_start,
+        ext_history,
         seqSrc,
         nbSeq,
         litBuf,
@@ -1067,6 +1130,7 @@ pub fn ZSTD_prefetchMatch(
 pub fn ZSTD_decompressSequencesLong_body(
     dst: &mut [u8],
     op_start: usize,
+    ext_history: &[u8],
     seqSrc: &[u8],
     nbSeq: i32,
     litBuf: &[u8],
@@ -1079,6 +1143,7 @@ pub fn ZSTD_decompressSequencesLong_body(
     ZSTD_decompressSequences_body(
         dst,
         op_start,
+        ext_history,
         seqSrc,
         nbSeq,
         litBuf,
@@ -1093,6 +1158,7 @@ pub fn ZSTD_decompressSequencesLong_body(
 pub fn ZSTD_decompressSequencesLong_default(
     dst: &mut [u8],
     op_start: usize,
+    ext_history: &[u8],
     seqSrc: &[u8],
     nbSeq: i32,
     litBuf: &[u8],
@@ -1105,6 +1171,7 @@ pub fn ZSTD_decompressSequencesLong_default(
     ZSTD_decompressSequencesLong_body(
         dst,
         op_start,
+        ext_history,
         seqSrc,
         nbSeq,
         litBuf,
@@ -1119,6 +1186,7 @@ pub fn ZSTD_decompressSequencesLong_default(
 pub fn ZSTD_decompressSequences_bmi2(
     dst: &mut [u8],
     op_start: usize,
+    ext_history: &[u8],
     seqSrc: &[u8],
     nbSeq: i32,
     litBuf: &[u8],
@@ -1131,6 +1199,7 @@ pub fn ZSTD_decompressSequences_bmi2(
     ZSTD_decompressSequences_default(
         dst,
         op_start,
+        ext_history,
         seqSrc,
         nbSeq,
         litBuf,
@@ -1145,6 +1214,7 @@ pub fn ZSTD_decompressSequences_bmi2(
 pub fn ZSTD_decompressSequencesSplitLitBuffer_bmi2(
     dst: &mut [u8],
     op_start: usize,
+    ext_history: &[u8],
     seqSrc: &[u8],
     nbSeq: i32,
     litBuf: &[u8],
@@ -1157,6 +1227,7 @@ pub fn ZSTD_decompressSequencesSplitLitBuffer_bmi2(
     ZSTD_decompressSequencesSplitLitBuffer_default(
         dst,
         op_start,
+        ext_history,
         seqSrc,
         nbSeq,
         litBuf,
@@ -1171,6 +1242,7 @@ pub fn ZSTD_decompressSequencesSplitLitBuffer_bmi2(
 pub fn ZSTD_decompressSequencesLong_bmi2(
     dst: &mut [u8],
     op_start: usize,
+    ext_history: &[u8],
     seqSrc: &[u8],
     nbSeq: i32,
     litBuf: &[u8],
@@ -1183,6 +1255,7 @@ pub fn ZSTD_decompressSequencesLong_bmi2(
     ZSTD_decompressSequencesLong_default(
         dst,
         op_start,
+        ext_history,
         seqSrc,
         nbSeq,
         litBuf,
@@ -1197,6 +1270,7 @@ pub fn ZSTD_decompressSequencesLong_bmi2(
 pub fn ZSTD_decompressSequences(
     dst: &mut [u8],
     op_start: usize,
+    ext_history: &[u8],
     seqSrc: &[u8],
     nbSeq: i32,
     litBuf: &[u8],
@@ -1209,6 +1283,7 @@ pub fn ZSTD_decompressSequences(
     ZSTD_decompressSequences_default(
         dst,
         op_start,
+        ext_history,
         seqSrc,
         nbSeq,
         litBuf,
@@ -1223,6 +1298,7 @@ pub fn ZSTD_decompressSequences(
 pub fn ZSTD_decompressSequencesSplitLitBuffer(
     dst: &mut [u8],
     op_start: usize,
+    ext_history: &[u8],
     seqSrc: &[u8],
     nbSeq: i32,
     litBuf: &[u8],
@@ -1235,6 +1311,7 @@ pub fn ZSTD_decompressSequencesSplitLitBuffer(
     ZSTD_decompressSequencesSplitLitBuffer_default(
         dst,
         op_start,
+        ext_history,
         seqSrc,
         nbSeq,
         litBuf,
@@ -1249,6 +1326,7 @@ pub fn ZSTD_decompressSequencesSplitLitBuffer(
 pub fn ZSTD_decompressSequencesLong(
     dst: &mut [u8],
     op_start: usize,
+    ext_history: &[u8],
     seqSrc: &[u8],
     nbSeq: i32,
     litBuf: &[u8],
@@ -1261,6 +1339,7 @@ pub fn ZSTD_decompressSequencesLong(
     ZSTD_decompressSequencesLong_default(
         dst,
         op_start,
+        ext_history,
         seqSrc,
         nbSeq,
         litBuf,
@@ -1355,10 +1434,33 @@ pub fn ZSTD_decompressBlock_internal(
     let LL = dctx.LLTable.clone();
     let OF = dctx.OFTable.clone();
     let ML = dctx.MLTable.clone();
+    // Build the ext-dict history slice. The virtual layout the
+    // sequence decoder reasons about is:
+    //
+    //     [ stream_dict ][ historyBuffer ][ dst[..op_start] ][ this block ]
+    //
+    // - `stream_dict` is the loaded raw-content dictionary (if any).
+    // - `historyBuffer` is the rolling output of prior blocks decoded
+    //   via `ZSTD_decompressContinue`, retained outside `dst`.
+    // - `dst[..op_start]` is what the caller has put in front of us
+    //   (e.g. the dict concatenated by `ZSTD_decompress_usingDict`,
+    //   or earlier blocks of the same frame for `ZSTD_decompressFrame`).
+    //
+    // Cloning for borrow hygiene; the slice is only used while
+    // regenerating this block.
+    let ext_history = if dctx.stream_dict.is_empty() && dctx.historyBuffer.is_empty() {
+        Vec::new()
+    } else {
+        let mut v = Vec::with_capacity(dctx.stream_dict.len() + dctx.historyBuffer.len());
+        v.extend_from_slice(&dctx.stream_dict);
+        v.extend_from_slice(&dctx.historyBuffer);
+        v
+    };
 
     ZSTD_decompressSequences_body(
         dst,
         op_start,
+        &ext_history,
         &src[ip..ip + srcSize],
         nbSeq,
         &lit_snapshot,
@@ -1491,10 +1593,7 @@ pub fn ZSTD_decodeLiteralsBlock(
                     0,
                 )
             } else {
-                // Our X2 HUF decoder is not yet reliable on larger
-                // real-data compressed-literals blocks. Route fresh
-                // 4-stream literals through the known-good X1 path.
-                HUF_decompress4X1_DCtx_wksp(
+                HUF_decompress4X_hufOnly_wksp(
                     &mut dctx.hufTable,
                     &mut dctx.litExtraBuffer[..litSize],
                     &src[lhSize..lhSize + litCSize],
@@ -2771,6 +2870,7 @@ mod tests {
         let out = ZSTD_decompressSequences_body(
             &mut dst,
             0,
+            &[], // empty ext_history
             &[], // no FSE stream
             0,   // no sequences
             lit,
@@ -2800,6 +2900,7 @@ mod tests {
             &mut dst,
             0,
             &[],
+            &[],
             0,
             lit,
             lit.len(),
@@ -2827,7 +2928,7 @@ mod tests {
             offset: 16,
         };
         let mut litPtr = 0usize;
-        let written = ZSTD_execSequence(&mut dst, 16, seq, litBuf, 0, &mut litPtr);
+        let written = ZSTD_execSequence(&mut dst, 16, seq, &[], litBuf, 0, &mut litPtr);
         assert!(!crate::common::error::ERR_isError(written));
         assert_eq!(written, 21);
         assert_eq!(&dst[16..21], b"HELLO");
@@ -2849,7 +2950,7 @@ mod tests {
             offset: 2,
         };
         let mut litPtr = 0usize;
-        let written = ZSTD_execSequence(&mut dst, 2, seq, litBuf, 0, &mut litPtr);
+        let written = ZSTD_execSequence(&mut dst, 2, seq, &[], litBuf, 0, &mut litPtr);
         assert!(!crate::common::error::ERR_isError(written));
         assert_eq!(written, 10);
         assert_eq!(&dst[2..4], b"CD");
@@ -2868,8 +2969,56 @@ mod tests {
             offset: 10, // larger than op(0)+litLength(1) = 1
         };
         let mut litPtr = 0;
-        let rc = ZSTD_execSequence(&mut dst, 0, seq, litBuf, 0, &mut litPtr);
+        let rc = ZSTD_execSequence(&mut dst, 0, seq, &[], litBuf, 0, &mut litPtr);
         assert!(crate::common::error::ERR_isError(rc));
+    }
+
+    #[test]
+    fn exec_sequence_ext_history_resolves_within_history() {
+        // ext_history holds the prior history segment; offset reaches
+        // back into it without spilling into dst.
+        // ext_history = "0123456789", dst is empty for op=0,
+        // litBuf = "L"; offset=8 reaches back 8 bytes from oLitEnd=1
+        // → into_ext=7, ext_start = 10 - 7 = 3.
+        // matchLength=5 fits entirely in ext_history → reads
+        // ext_history[3..8] = "34567" into dst[1..6].
+        let mut dst = vec![0u8; 16];
+        let ext_history = b"0123456789";
+        let litBuf = b"L";
+        let seq = seq_t {
+            litLength: 1,
+            matchLength: 5,
+            offset: 8,
+        };
+        let mut litPtr = 0usize;
+        let written = ZSTD_execSequence(&mut dst, 0, seq, ext_history, litBuf, 0, &mut litPtr);
+        assert!(!crate::common::error::ERR_isError(written));
+        assert_eq!(written, 6);
+        assert_eq!(&dst[..1], b"L");
+        assert_eq!(&dst[1..6], b"34567");
+    }
+
+    #[test]
+    fn exec_sequence_ext_history_spills_into_dst_prefix() {
+        // ext_history = "AB" (2 bytes); dst[0..2] starts as "MN".
+        // op=2, litLength=0, offset=4, matchLength=6.
+        // oLitEnd=2, into_ext = offset - oLitEnd = 2; ext_start = 0.
+        // First 2 bytes of match come from ext_history[0..2] = "AB".
+        // Remaining 4 bytes come from dst[0..4] forward: "MN" then
+        // the freshly-written "AB". Final layout dst[..8] = "MNABMNAB".
+        let mut dst = vec![0u8; 16];
+        dst[..2].copy_from_slice(b"MN");
+        let ext_history = b"AB";
+        let seq = seq_t {
+            litLength: 0,
+            matchLength: 6,
+            offset: 4,
+        };
+        let mut litPtr = 0usize;
+        let written = ZSTD_execSequence(&mut dst, 2, seq, ext_history, b"", 0, &mut litPtr);
+        assert!(!crate::common::error::ERR_isError(written));
+        assert_eq!(written, 6);
+        assert_eq!(&dst[..8], b"MNABMNAB");
     }
 
     #[test]

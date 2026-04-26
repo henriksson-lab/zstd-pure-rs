@@ -268,7 +268,7 @@ pub fn BIT_lookBits(bitD: &BIT_DStream_t, nbBits: u32) -> usize {
 }
 
 /// Port of `BIT_lookBitsFast`. Requires `nbBits >= 1`.
-#[inline]
+#[inline(always)]
 pub fn BIT_lookBitsFast(bitD: &BIT_DStream_t, nbBits: u32) -> usize {
     debug_assert!(nbBits >= 1);
     let reg_mask = CONTAINER_BITS - 1;
@@ -276,7 +276,7 @@ pub fn BIT_lookBitsFast(bitD: &BIT_DStream_t, nbBits: u32) -> usize {
 }
 
 /// Port of `BIT_skipBits`.
-#[inline]
+#[inline(always)]
 pub fn BIT_skipBits(bitD: &mut BIT_DStream_t, nbBits: u32) {
     bitD.bitsConsumed += nbBits;
 }

@@ -6,13 +6,13 @@
 //! `core::ptr::read_unaligned` and `write_unaligned` in Rust generate the
 //! same code.
 
-#[inline]
+#[inline(always)]
 pub const fn is_little_endian() -> bool {
     cfg!(target_endian = "little")
 }
 
 /// Upstream `MEM_isLittleEndian`.
-#[inline]
+#[inline(always)]
 pub const fn MEM_isLittleEndian() -> u32 {
     if is_little_endian() {
         1
@@ -22,42 +22,43 @@ pub const fn MEM_isLittleEndian() -> u32 {
 }
 
 /// `MEM_64bits()` — constant `1` when `size_t` is 64-bit wide.
-#[inline]
+#[inline(always)]
 pub const fn MEM_64bits() -> u32 {
     (core::mem::size_of::<usize>() == 8) as u32
 }
 
 /// `MEM_32bits()` — constant `1` when `size_t` is 32-bit wide.
-#[inline]
+#[inline(always)]
 pub const fn MEM_32bits() -> u32 {
     (core::mem::size_of::<usize>() == 4) as u32
 }
 
-#[inline]
+#[inline(always)]
 pub fn MEM_read16(ptr: &[u8]) -> u16 {
-    u16::from_ne_bytes([ptr[0], ptr[1]])
+    let bytes: [u8; 2] = ptr[..2].try_into().expect("MEM_read16 needs >=2 bytes");
+    u16::from_ne_bytes(bytes)
 }
 
-#[inline]
+#[inline(always)]
 pub fn MEM_read24(ptr: &[u8]) -> u32 {
     // Upstream returns a U32 containing three bytes in natural endianness.
     MEM_read16(ptr) as u32 | ((ptr[2] as u32) << 16)
 }
 
-#[inline]
+#[inline(always)]
 pub fn MEM_read32(ptr: &[u8]) -> u32 {
-    u32::from_ne_bytes([ptr[0], ptr[1], ptr[2], ptr[3]])
+    let bytes: [u8; 4] = ptr[..4].try_into().expect("MEM_read32 needs >=4 bytes");
+    u32::from_ne_bytes(bytes)
 }
 
-#[inline]
+#[inline(always)]
 pub fn MEM_read64(ptr: &[u8]) -> u64 {
-    u64::from_ne_bytes([
-        ptr[0], ptr[1], ptr[2], ptr[3], ptr[4], ptr[5], ptr[6], ptr[7],
-    ])
+    let bytes: [u8; 8] = ptr[..8].try_into().expect("MEM_read64 needs >=8 bytes");
+    u64::from_ne_bytes(bytes)
 }
 
 /// `size_t` load (`MEM_readST`): 4 or 8 bytes depending on target.
-#[inline]
+#[inline(always)]
 pub fn MEM_readST(ptr: &[u8]) -> usize {
     if core::mem::size_of::<usize>() == 8 {
         MEM_read64(ptr) as usize
@@ -66,19 +67,19 @@ pub fn MEM_readST(ptr: &[u8]) -> usize {
     }
 }
 
-#[inline]
+#[inline(always)]
 pub fn MEM_write16(dst: &mut [u8], value: u16) {
     let b = value.to_ne_bytes();
     dst[..2].copy_from_slice(&b);
 }
 
-#[inline]
+#[inline(always)]
 pub fn MEM_write32(dst: &mut [u8], value: u32) {
     let b = value.to_ne_bytes();
     dst[..4].copy_from_slice(&b);
 }
 
-#[inline]
+#[inline(always)]
 pub fn MEM_write64(dst: &mut [u8], value: u64) {
     let b = value.to_ne_bytes();
     dst[..8].copy_from_slice(&b);
@@ -86,29 +87,30 @@ pub fn MEM_write64(dst: &mut [u8], value: u64) {
 
 // ---- Little-endian ------------------------------------------------------
 
-#[inline]
+#[inline(always)]
 pub fn MEM_readLE16(ptr: &[u8]) -> u16 {
-    u16::from_le_bytes([ptr[0], ptr[1]])
+    let bytes: [u8; 2] = ptr[..2].try_into().expect("MEM_readLE16 needs >=2 bytes");
+    u16::from_le_bytes(bytes)
 }
 
-#[inline]
+#[inline(always)]
 pub fn MEM_readLE24(ptr: &[u8]) -> u32 {
     MEM_readLE16(ptr) as u32 | ((ptr[2] as u32) << 16)
 }
 
-#[inline]
+#[inline(always)]
 pub fn MEM_readLE32(ptr: &[u8]) -> u32 {
-    u32::from_le_bytes([ptr[0], ptr[1], ptr[2], ptr[3]])
+    let bytes: [u8; 4] = ptr[..4].try_into().expect("MEM_readLE32 needs >=4 bytes");
+    u32::from_le_bytes(bytes)
 }
 
-#[inline]
+#[inline(always)]
 pub fn MEM_readLE64(ptr: &[u8]) -> u64 {
-    u64::from_le_bytes([
-        ptr[0], ptr[1], ptr[2], ptr[3], ptr[4], ptr[5], ptr[6], ptr[7],
-    ])
+    let bytes: [u8; 8] = ptr[..8].try_into().expect("MEM_readLE64 needs >=8 bytes");
+    u64::from_le_bytes(bytes)
 }
 
-#[inline]
+#[inline(always)]
 pub fn MEM_readLEST(ptr: &[u8]) -> usize {
     if core::mem::size_of::<usize>() == 8 {
         MEM_readLE64(ptr) as usize
@@ -117,28 +119,28 @@ pub fn MEM_readLEST(ptr: &[u8]) -> usize {
     }
 }
 
-#[inline]
+#[inline(always)]
 pub fn MEM_writeLE16(dst: &mut [u8], value: u16) {
     dst[..2].copy_from_slice(&value.to_le_bytes());
 }
 
-#[inline]
+#[inline(always)]
 pub fn MEM_writeLE24(dst: &mut [u8], value: u32) {
     MEM_writeLE16(dst, value as u16);
     dst[2] = (value >> 16) as u8;
 }
 
-#[inline]
+#[inline(always)]
 pub fn MEM_writeLE32(dst: &mut [u8], value: u32) {
     dst[..4].copy_from_slice(&value.to_le_bytes());
 }
 
-#[inline]
+#[inline(always)]
 pub fn MEM_writeLE64(dst: &mut [u8], value: u64) {
     dst[..8].copy_from_slice(&value.to_le_bytes());
 }
 
-#[inline]
+#[inline(always)]
 pub fn MEM_writeLEST(dst: &mut [u8], value: usize) {
     if core::mem::size_of::<usize>() == 8 {
         MEM_writeLE64(dst, value as u64);
@@ -149,19 +151,19 @@ pub fn MEM_writeLEST(dst: &mut [u8], value: usize) {
 
 // ---- Big-endian ---------------------------------------------------------
 
-#[inline]
+#[inline(always)]
 pub fn MEM_readBE32(ptr: &[u8]) -> u32 {
     u32::from_be_bytes([ptr[0], ptr[1], ptr[2], ptr[3]])
 }
 
-#[inline]
+#[inline(always)]
 pub fn MEM_readBE64(ptr: &[u8]) -> u64 {
     u64::from_be_bytes([
         ptr[0], ptr[1], ptr[2], ptr[3], ptr[4], ptr[5], ptr[6], ptr[7],
     ])
 }
 
-#[inline]
+#[inline(always)]
 pub fn MEM_readBEST(ptr: &[u8]) -> usize {
     if core::mem::size_of::<usize>() == 8 {
         MEM_readBE64(ptr) as usize
@@ -170,17 +172,17 @@ pub fn MEM_readBEST(ptr: &[u8]) -> usize {
     }
 }
 
-#[inline]
+#[inline(always)]
 pub fn MEM_writeBE32(dst: &mut [u8], value: u32) {
     dst[..4].copy_from_slice(&value.to_be_bytes());
 }
 
-#[inline]
+#[inline(always)]
 pub fn MEM_writeBE64(dst: &mut [u8], value: u64) {
     dst[..8].copy_from_slice(&value.to_be_bytes());
 }
 
-#[inline]
+#[inline(always)]
 pub fn MEM_writeBEST(dst: &mut [u8], value: usize) {
     if core::mem::size_of::<usize>() == 8 {
         MEM_writeBE64(dst, value as u64);
@@ -191,17 +193,17 @@ pub fn MEM_writeBEST(dst: &mut [u8], value: usize) {
 
 // ---- swap helpers -------------------------------------------------------
 
-#[inline]
+#[inline(always)]
 pub const fn MEM_swap32(x: u32) -> u32 {
     x.swap_bytes()
 }
 
-#[inline]
+#[inline(always)]
 pub const fn MEM_swap64(x: u64) -> u64 {
     x.swap_bytes()
 }
 
-#[inline]
+#[inline(always)]
 pub const fn MEM_swapST(x: usize) -> usize {
     x.swap_bytes()
 }

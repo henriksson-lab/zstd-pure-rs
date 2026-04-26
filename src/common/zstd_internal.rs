@@ -3,10 +3,74 @@
 
 use crate::common::mem::{MEM_read32, MEM_read64, MEM_write32, MEM_write64};
 
+/// Single-cache-line L1 prefetch hint for an address inside a slice.
+/// Mirrors upstream's `PREFETCH_L1(ptr)` macro: real `_mm_prefetch` /
+/// `prfm pldl1keep` where available, no-op fallback elsewhere. This is
+/// strictly a hint — the address is allowed to be out of bounds and is
+/// never dereferenced safely.
+#[inline(always)]
+pub fn ZSTD_prefetchL1<T>(ptr: *const T) {
+    #[cfg(all(target_arch = "x86_64", target_feature = "sse"))]
+    unsafe {
+        core::arch::x86_64::_mm_prefetch(ptr as *const i8, core::arch::x86_64::_MM_HINT_T0);
+    }
+    #[cfg(all(target_arch = "x86", target_feature = "sse"))]
+    unsafe {
+        core::arch::x86::_mm_prefetch(ptr as *const i8, core::arch::x86::_MM_HINT_T0);
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        core::arch::asm!("prfm pldl1keep, [{0}]", in(reg) ptr, options(nostack, readonly, preserves_flags));
+    }
+    #[cfg(not(any(
+        all(target_arch = "x86_64", target_feature = "sse"),
+        all(target_arch = "x86", target_feature = "sse"),
+        target_arch = "aarch64",
+    )))]
+    {
+        let _ = ptr;
+    }
+}
+
+/// Convenience: prefetch byte at `slice[off]` (or beyond — out-of-bound
+/// addresses are fine for a hint, the CPU just ignores them).
+#[inline(always)]
+pub fn prefetchSliceByte(slice: &[u8], off: usize) {
+    let base = slice.as_ptr() as usize;
+    ZSTD_prefetchL1((base + off) as *const u8);
+}
+
 pub const WILDCOPY_OVERLENGTH: usize = 32;
 pub const WILDCOPY_VECLEN: usize = 16;
 pub const ZSTD_WORKSPACETOOLARGE_FACTOR: usize = 3;
 pub const ZSTD_WORKSPACETOOLARGE_MAXDURATION: usize = 128;
+
+/// Port of upstream's `PREFETCH_AREA` macro (`mem.h`). Upstream walks
+/// the region in cache-line strides and emits `__builtin_prefetch` /
+/// `_mm_prefetch` hints so the CPU pulls subsequent lines before the
+/// matcher reads them.
+///
+/// Pure stable Rust doesn't expose a safe prefetch intrinsic, and this
+/// crate caps itself at a single `unsafe` block (see lib.rs), so we
+/// implement a portable software-prefetch: touch one element per
+/// 64-byte stride and feed the value through `core::hint::black_box`
+/// so the optimizer can't elide the load. That forces the CPU's
+/// prefetcher to pull the next cache lines without needing any unsafe
+/// hardware intrinsic. Hint only — never affects compressed output.
+#[inline]
+pub fn ZSTD_prefetchArea<T: Copy>(slice: &[T]) {
+    const CACHELINE_BYTES: usize = 64;
+    let elem_bytes = core::mem::size_of::<T>();
+    if slice.is_empty() || elem_bytes == 0 {
+        return;
+    }
+    let stride = (CACHELINE_BYTES / elem_bytes).max(1);
+    let mut i = 0usize;
+    while i < slice.len() {
+        core::hint::black_box(slice[i]);
+        i += stride;
+    }
+}
 
 /// Upstream `repStartValue[ZSTD_REP_NUM]`. The default repcode
 /// history that every compressed block inherits before its first

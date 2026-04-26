@@ -155,12 +155,17 @@ fn symbolTT_write(
     ct[base + 1] = t.deltaFindState as u32;
 }
 
-#[inline]
+#[inline(always)]
 pub fn symbolTT_read(ct: &[FSE_CTable], tableLog: u32, s: usize) -> FSE_symbolCompressionTransform {
     let base = symbolTT_offset(tableLog) + 2 * s;
+    // Single bounded-slice load lets LLVM hoist the bounds check
+    // out of the encoder's inner loop.
+    let pair: &[FSE_CTable; 2] = ct[base..base + 2]
+        .try_into()
+        .expect("symbolTT_read: 2 slots");
     FSE_symbolCompressionTransform {
-        deltaNbBits: ct[base] as i32,
-        deltaFindState: ct[base + 1] as i32,
+        deltaNbBits: pair[0] as i32,
+        deltaFindState: pair[1] as i32,
     }
 }
 
@@ -517,7 +522,7 @@ pub struct FSE_CState_t {
 }
 
 /// Read the nextState u16 at logical index `i` inside a CTable.
-#[inline]
+#[inline(always)]
 fn ct_u16_read(ct: &[FSE_CTable], i: usize) -> u16 {
     let slot = 1 + (i / 2);
     let w = ct[slot];
@@ -548,6 +553,7 @@ pub fn FSE_initCState2(st: &mut FSE_CState_t, ct: &[FSE_CTable], symbol: u32) {
 
 /// Port of `FSE_encodeSymbol`. Emits up to `tableLog` bits into the
 /// bitstream and advances the state via the lookup table.
+#[inline]
 pub fn FSE_encodeSymbol(
     bitC: &mut crate::common::bitstream::BIT_CStream_t,
     st: &mut FSE_CState_t,

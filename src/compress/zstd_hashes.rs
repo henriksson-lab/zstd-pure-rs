@@ -181,7 +181,7 @@ pub fn ZSTD_hash8PtrS(p: &[u8], h: u32, s: u64) -> usize {
 }
 
 /// Port of `ZSTD_hashPtr`. Dispatch to the MLS-specific hash.
-#[inline]
+#[inline(always)]
 pub fn ZSTD_hashPtr(p: &[u8], hBits: u32, mls: u32) -> usize {
     debug_assert!(hBits <= 32);
     match mls {

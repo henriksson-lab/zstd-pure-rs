@@ -432,6 +432,18 @@ pub fn HUF_decodeLastSymbolX2(
 }
 
 /// Port of `HUF_decodeStreamX2`. Decode X2 symbols into `dst[p..pEnd]`.
+///
+/// Mirrors the upstream structure exactly: a fast loop that decodes
+/// many symbols per iteration while there's container-bytes margin and
+/// the bitstream is unfinished, followed by a two-stage tail — first a
+/// per-symbol loop that still calls reload, then a per-symbol loop that
+/// drains the existing bit container without further reloads, and
+/// finally a single 1-byte last-symbol decode if `p` hasn't quite
+/// reached `pEnd`. The two-stage tail is load-bearing: when the
+/// bitstream has hit `endOfBuffer` but the container still holds
+/// enough bits for one more 2-byte X2 symbol, the second loop emits it
+/// without trying to reload past end-of-stream.
+#[inline]
 pub fn HUF_decodeStreamX2(
     dst: &mut [u8],
     p: usize,
@@ -447,31 +459,44 @@ pub fn HUF_decodeStreamX2(
 
     if pEnd.saturating_sub(p) >= container_bytes {
         if dtLog <= 11 {
-            // 10 symbols at a time while the stream is unfinished and
-            // we have at least 10 bytes of tail margin.
+            // Up to 10 bytes at a time (5 X2 decode steps, each writing
+            // 1 or 2 bytes). Margin guard leaves 10 bytes of tail.
             while pEnd > 9 && p < pEnd - 9 && BIT_reloadDStream(bitD) == BIT_DStream_unfinished {
-                for _ in 0..5 {
-                    p += HUF_decodeSymbolX2(dst, p, bitD, dtable, dtLog) as usize;
-                    p += HUF_decodeSymbolX2(dst, p, bitD, dtable, dtLog) as usize;
-                }
+                p += HUF_decodeSymbolX2(dst, p, bitD, dtable, dtLog) as usize;
+                p += HUF_decodeSymbolX2(dst, p, bitD, dtable, dtLog) as usize;
+                p += HUF_decodeSymbolX2(dst, p, bitD, dtable, dtLog) as usize;
+                p += HUF_decodeSymbolX2(dst, p, bitD, dtable, dtLog) as usize;
+                p += HUF_decodeSymbolX2(dst, p, bitD, dtable, dtLog) as usize;
             }
         } else {
-            // 8 symbols at a time.
+            // Up to 8 bytes at a time (4 X2 decode steps).
             while pEnd > 7 && p < pEnd - 7 && BIT_reloadDStream(bitD) == BIT_DStream_unfinished {
-                for _ in 0..4 {
-                    p += HUF_decodeSymbolX2(dst, p, bitD, dtable, dtLog) as usize;
-                    p += HUF_decodeSymbolX2(dst, p, bitD, dtable, dtLog) as usize;
-                }
+                p += HUF_decodeSymbolX2(dst, p, bitD, dtable, dtLog) as usize;
+                p += HUF_decodeSymbolX2(dst, p, bitD, dtable, dtLog) as usize;
+                p += HUF_decodeSymbolX2(dst, p, bitD, dtable, dtLog) as usize;
+                p += HUF_decodeSymbolX2(dst, p, bitD, dtable, dtLog) as usize;
             }
+        }
+    } else {
+        BIT_reloadDStream(bitD);
+    }
+
+    // Tail: closer to end, up to 2 symbols at a time. First while-with-
+    // reload drains the bitstream while there's still input; second
+    // while-without-reload squeezes any remaining 2-byte symbols out
+    // of the bit container after the bitstream has been consumed.
+    if pEnd.saturating_sub(p) >= 2 {
+        while p + 1 < pEnd && BIT_reloadDStream(bitD) == BIT_DStream_unfinished {
+            p += HUF_decodeSymbolX2(dst, p, bitD, dtable, dtLog) as usize;
+        }
+        while p + 1 < pEnd {
+            p += HUF_decodeSymbolX2(dst, p, bitD, dtable, dtLog) as usize;
         }
     }
 
-    // Tail: step one X2 symbol at a time until we'd spill past pEnd;
-    // then hand off to the last-symbol path which writes exactly 1 byte.
-    while p + 1 < pEnd && BIT_reloadDStream(bitD) == BIT_DStream_unfinished {
-        p += HUF_decodeSymbolX2(dst, p, bitD, dtable, dtLog) as usize;
-    }
-    while p < pEnd {
+    // Last byte (length=1): if we haven't quite reached pEnd, emit one
+    // single-byte symbol via the dedicated last-symbol path.
+    if p < pEnd {
         p += HUF_decodeLastSymbolX2(dst, p, bitD, dtable, dtLog) as usize;
     }
 
@@ -683,7 +708,7 @@ fn write_entry(dtable: &mut [HUF_DTable], idx: usize, ent: u16) {
 
 /// Read a packed `HUF_DEltX1` at entry index `idx` from the decode
 /// region at `dtable[1..]`.
-#[inline]
+#[inline(always)]
 pub fn read_entry(dtable: &[HUF_DTable], idx: usize) -> HUF_DEltX1 {
     let slot = dtable[1 + idx / 2];
     let half = if idx & 1 == 0 {
@@ -755,6 +780,11 @@ pub fn HUF_readDTableX2(
 
     // Cumulative-start index per weight, stored at `rankStart0[w+1]`
     // to mirror upstream's `rankStart = rankStart0 + 1` pointer offset.
+    // Upstream parks weight-0 (unused) symbols *after* all weighted
+    // ones during sorting (`rankStart[0] = nextRankStart`) so they
+    // don't collide with weight-1 slot 0; we replicate that here, then
+    // reset rankStart[0] back to 0 after the sort so fillDTableX2's
+    // first iteration reads the correct weight-1 origin.
     {
         let mut nextRankStart: u32 = 0;
         for w in 1..=maxW {
@@ -762,8 +792,8 @@ pub fn HUF_readDTableX2(
             nextRankStart += rankStats[w as usize];
             rankStart0[(w + 1) as usize] = curr;
         }
-        rankStart0[1] = 0; // rankStart[0] — beginning of weight-1 symbols
-        rankStart0[(maxW + 2) as usize] = nextRankStart; // rankStart[maxW+1]
+        rankStart0[1] = nextRankStart;
+        rankStart0[(maxW + 2) as usize] = nextRankStart;
     }
 
     // Sort symbols by weight. Uses a scratch copy of rankStart0 so we
@@ -777,6 +807,7 @@ pub fn HUF_readDTableX2(
             sortedSymbol[r] = s as u8;
         }
     }
+    rankStart0[1] = 0;
 
     // Build rankVal: rankVal[consumed][w] gives the DTable offset where
     // the first entry of weight `w`, after already consuming
@@ -851,6 +882,7 @@ pub fn HUF_decodeSymbolX1(
 /// one bitstream at a time. The upstream hot loop does up to 4
 /// symbols per iteration (staggered with `BIT_reloadDStream`); we
 /// mirror that structure so the per-iteration work is identical.
+#[inline]
 pub fn HUF_decodeStreamX1(
     dst: &mut [u8],
     p: usize,
@@ -1714,6 +1746,54 @@ mod tests {
                 e.byte
             );
         }
+    }
+
+    #[test]
+    fn decompress1X2_DCtx_roundtrips_compress1X_output() {
+        // Force the single-stream X2 decode path. `HUF_compress1X_repeat`
+        // emits a single-stream HUF block; `HUF_decompress1X2_DCtx_wksp`
+        // builds an X2 DTable and dispatches through
+        // `HUF_decompress1X2_usingDTable_internal`, which shares the
+        // tail-stage `HUF_decodeStreamX2` with the 4X2 path. This is
+        // the regression gate confirming the 1X2 leg sees the same
+        // fixes as 4X2.
+        use crate::compress::huf_compress::HUF_compress1X_repeat;
+
+        // Skewed payload so X2 picks up substantial 2-byte sequences.
+        let mut src = vec![0u8; 4096];
+        for (i, b) in src.iter_mut().enumerate() {
+            // Three symbols dominate (0/1/2), three are rare (3/4/5).
+            *b = match i % 16 {
+                0..=4 => 0,
+                5..=9 => 1,
+                10..=12 => 2,
+                13 => 3,
+                14 => 4,
+                _ => 5,
+            };
+        }
+
+        let mut compressed = vec![0u8; src.len() + 256];
+        let n = HUF_compress1X_repeat(&mut compressed, &src, 5, 11, None, None, 0);
+        assert!(
+            !crate::common::error::ERR_isError(n),
+            "compress1X failed: {n:#x}"
+        );
+        assert!(n > 0 && n < src.len(), "expected actual compression, got n={n}");
+        compressed.truncate(n);
+
+        let mut dtable = vec![0u32; HUF_DTABLE_SIZE_U32(HUF_TABLELOG_MAX)];
+        let mtl_minus_1 = HUF_TABLELOG_MAX - 1;
+        dtable[0] = mtl_minus_1 * 0x01_00_00_01;
+        let mut wksp = vec![0u32; HUF_DECOMPRESS_WORKSPACE_SIZE_U32];
+        let mut decoded = vec![0u8; src.len()];
+        let r = HUF_decompress1X2_DCtx_wksp(&mut dtable, &mut decoded, &compressed, &mut wksp, 0);
+        assert!(
+            !crate::common::error::ERR_isError(r),
+            "1X2 decode failed: {r:#x}"
+        );
+        assert_eq!(r, src.len());
+        assert_eq!(decoded, src, "1X2 decode mismatched input");
     }
 
     #[test]

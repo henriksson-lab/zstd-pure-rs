@@ -94,8 +94,20 @@ fn decompress_with_upstream(bin: &Path, frame: &[u8]) -> Vec<u8> {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn upstream zstd");
-    child.stdin.as_mut().unwrap().write_all(frame).unwrap();
+    // Stream stdin from a dedicated thread so a large compressed
+    // frame doesn't deadlock against a full stdout pipe. Without
+    // this, write_all() blocks on a full stdin pipe while the child
+    // simultaneously blocks writing decompressed output to stdout —
+    // since wait_with_output() (which drains stdout) hasn't been
+    // called yet. Surfaces on >64 KB inputs.
+    let mut stdin = child.stdin.take().expect("zstd stdin");
+    let frame_owned = frame.to_vec();
+    let writer = std::thread::spawn(move || {
+        stdin.write_all(&frame_owned).expect("write_all to zstd stdin");
+        drop(stdin);
+    });
     let out = child.wait_with_output().expect("wait upstream");
+    writer.join().expect("zstd stdin writer thread");
     assert!(
         out.status.success(),
         "upstream rejected our frame: {}",

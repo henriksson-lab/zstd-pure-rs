@@ -437,6 +437,7 @@ pub fn ZSTD_decodeSequence(
 /// out-of-buffer history is reachable; one-shot decode paths that
 /// concatenate `dict || scratch` into `dst` already have everything
 /// in-buffer and can leave `ext_history` empty.
+#[inline]
 pub fn ZSTD_execSequence(
     dst: &mut [u8],
     op: usize,
@@ -468,9 +469,52 @@ pub fn ZSTD_execSequence(
         return ERROR(ErrorCode::CorruptionDetected);
     }
 
-    // Copy literals. We can't borrow dst and litBuf both mutably;
-    // take a straight byte copy.
-    dst[op..oLitEnd].copy_from_slice(&litBuf[litPtr_offset..iLitEnd]);
+    // Copy literals. Hot path: most literal runs are short (avg 5-10
+    // bytes for typical text). `copy_from_slice` lowers to a memmove
+    // call (~30 cycles call overhead) regardless of length. When we
+    // have 16 bytes of slack on both source and destination, do an
+    // inline 16-byte unaligned copy via raw pointers — saves the call
+    // overhead. This mirrors upstream's `ZSTD_copy16` shortcut at the
+    // top of `ZSTD_execSequence`. `litBuf` is always a separate
+    // allocation (a Vec clone of the literal block), so the 16-byte
+    // write to `dst[op..op+16]` cannot corrupt litBuf even if
+    // `lit_len < 16`.
+    let lit_len = sequence.litLength;
+    if lit_len <= 16 && iLitEnd + 16 <= litBuf.len() && oLitEnd + 16 <= oend {
+        // SAFETY: bounds verified above. Read of 16 bytes from
+        // `litBuf[litPtr_offset..]` is in-range; write of 16 bytes to
+        // `dst[op..op+16]` is in-range (op + 16 ≤ oLitEnd + 16 ≤ oend).
+        // Bytes [op + lit_len .. op + 16] contain garbage future-literal
+        // bytes but get overwritten by the immediately-following match
+        // copy (when ml + lit_len ≥ 16) or by the next sequence's
+        // literal/match writes.
+        unsafe {
+            let src_p = litBuf.as_ptr().add(litPtr_offset);
+            let dst_p = dst.as_mut_ptr().add(op);
+            let v = (src_p as *const [u8; 16]).read_unaligned();
+            (dst_p as *mut [u8; 16]).write_unaligned(v);
+        }
+    } else if lit_len > 16 && iLitEnd + 16 <= litBuf.len() && oLitEnd + 16 <= oend {
+        // Wildcopy 16-byte stamps when both sides have slack. The
+        // 16-byte overshoot past oLitEnd is bounded at ≤ 15 bytes
+        // (since end = op + ceil(lit_len/16)*16 ≤ oLitEnd + 15).
+        // SAFETY: each stamp's read/write is bounded by the slack guard.
+        unsafe {
+            let mut copied = 0usize;
+            let src_p = litBuf.as_ptr().add(litPtr_offset);
+            let dst_p = dst.as_mut_ptr().add(op);
+            loop {
+                let v = (src_p.add(copied) as *const [u8; 16]).read_unaligned();
+                (dst_p.add(copied) as *mut [u8; 16]).write_unaligned(v);
+                copied += 16;
+                if copied >= lit_len {
+                    break;
+                }
+            }
+        }
+    } else {
+        dst[op..oLitEnd].copy_from_slice(&litBuf[litPtr_offset..iLitEnd]);
+    }
     *out_litPtr = iLitEnd;
 
     // ext-dict path: offset reaches into ext_history. Mirrors the
@@ -514,16 +558,81 @@ pub fn ZSTD_execSequence(
         // True non-overlap fast path: when offset > matchLength,
         // the source and destination ranges don't overlap at all —
         // safe to use `copy_within` (memmove) which lowers to a
-        // SIMD/SSE memcpy on x86. The byte-by-byte loop fallback
-        // covers the wildcopy-style overlapping case where
-        // sequence.offset >= 16 but matchLength > offset, and the
-        // source/dest overlap matters for the repeating-pattern
-        // semantic some sequences rely on.
+        // SIMD/SSE memcpy on x86.
         if sequence.offset >= sequence.matchLength {
-            dst.copy_within(match_src..match_src + sequence.matchLength, oLitEnd);
+            // Inline 16-byte stamp for short matches (typical: 5-15
+            // bytes). `copy_within` lowers to a memmove call (~30 cycles
+            // call overhead per match) — for ml ≤ 16 we can do one
+            // unaligned 16-byte read+write instead. The over-write
+            // beyond oMatchEnd into [oMatchEnd, oLitEnd+16] is fine: the
+            // next sequence's literal copy at op_next == oMatchEnd will
+            // overwrite the garbage, OR the tail-literals copy or
+            // caller-side fill will. Gated on slack so dst doesn't
+            // overflow at end-of-block.
+            let ml = sequence.matchLength;
+            if ml <= 16 && oLitEnd + 16 <= oend {
+                // SAFETY: offset >= ml AND offset >= 16, so match_src + 16
+                // = oLitEnd - offset + 16 ≤ oLitEnd ≤ oend, and the read
+                // and write ranges are disjoint (source is fully behind
+                // the destination by at least `offset` bytes).
+                unsafe {
+                    let dst_ptr = dst.as_mut_ptr();
+                    let src_p = dst_ptr.add(match_src);
+                    let dst_p = dst_ptr.add(oLitEnd);
+                    let v = (src_p as *const [u8; 16]).read_unaligned();
+                    (dst_p as *mut [u8; 16]).write_unaligned(v);
+                }
+            } else if oLitEnd + ml + 16 <= oend {
+                // Wildcopy fast path for longer matches with full slack.
+                // Stamps end at oLitEnd + ((ml-1) | 15) + 1 ≤ oLitEnd +
+                // ml + 15 < oLitEnd + ml + 16 ≤ oend. Reads similarly
+                // bounded since match_src + ml ≤ oLitEnd by `offset >= ml`.
+                // SAFETY: per-stamp bounds (write at `oLitEnd + copied`,
+                // read at `match_src + copied`, both for 16 bytes); copied
+                // < ml + 16 in the worst case. Source/dest disjoint
+                // because offset ≥ matchLength.
+                unsafe {
+                    let dst_ptr = dst.as_mut_ptr();
+                    let src_p = dst_ptr.add(match_src);
+                    let dst_p = dst_ptr.add(oLitEnd);
+                    let mut copied = 0usize;
+                    loop {
+                        let v = (src_p.add(copied) as *const [u8; 16]).read_unaligned();
+                        (dst_p.add(copied) as *mut [u8; 16]).write_unaligned(v);
+                        copied += 16;
+                        if copied >= ml {
+                            break;
+                        }
+                    }
+                }
+            } else {
+                dst.copy_within(match_src..match_src + ml, oLitEnd);
+            }
         } else {
-            for i in 0..sequence.matchLength {
-                dst[oLitEnd + i] = dst[match_src + i];
+            // Wildcopy-style overlapping case: offset >= 16 but the
+            // match wraps around so the destination overlaps the
+            // source. The repcode-pattern semantics require bytes
+            // written by an earlier iteration to be read by a later
+            // one — that's how a `(offset, matchLength)` pair
+            // expands to a repeating pattern of length `matchLength`
+            // bytes. Since `offset >= 16`, we can safely copy in
+            // 16-byte chunks: each chunk reads bytes that are at
+            // least 16 positions behind the current write head, so
+            // the chunk read never aliases the chunk write. The tail
+            // is finished byte-by-byte to handle any leftover bytes
+            // and the final < 16-byte stride. Mirrors upstream's
+            // `ZSTD_wildcopy(..., ZSTD_overlap_src_before_dst)` for
+            // the medium-offset overlap case.
+            let mut copied = 0usize;
+            while copied + 16 <= sequence.matchLength {
+                let mut buf = [0u8; 16];
+                buf.copy_from_slice(&dst[match_src + copied..match_src + copied + 16]);
+                dst[oLitEnd + copied..oLitEnd + copied + 16].copy_from_slice(&buf);
+                copied += 16;
+            }
+            while copied < sequence.matchLength {
+                dst[oLitEnd + copied] = dst[match_src + copied];
+                copied += 1;
             }
         }
     } else {
@@ -559,7 +668,15 @@ pub fn ZSTD_execSequenceEnd(
     litPtr_offset: usize,
     out_litPtr: &mut usize,
 ) -> usize {
-    ZSTD_execSequence(dst, op, sequence, ext_history, litBuf, litPtr_offset, out_litPtr)
+    ZSTD_execSequence(
+        dst,
+        op,
+        sequence,
+        ext_history,
+        litBuf,
+        litPtr_offset,
+        out_litPtr,
+    )
 }
 
 /// Slow-tail wrapper for `ZSTD_execSequenceEndSplitLitBuffer`.
@@ -572,7 +689,15 @@ pub fn ZSTD_execSequenceEndSplitLitBuffer(
     litPtr_offset: usize,
     out_litPtr: &mut usize,
 ) -> usize {
-    ZSTD_execSequence(dst, op, sequence, ext_history, litBuf, litPtr_offset, out_litPtr)
+    ZSTD_execSequence(
+        dst,
+        op,
+        sequence,
+        ext_history,
+        litBuf,
+        litPtr_offset,
+        out_litPtr,
+    )
 }
 
 /// Split-literal wrapper for `ZSTD_execSequenceSplitLitBuffer`.
@@ -585,7 +710,15 @@ pub fn ZSTD_execSequenceSplitLitBuffer(
     litPtr_offset: usize,
     out_litPtr: &mut usize,
 ) -> usize {
-    ZSTD_execSequence(dst, op, sequence, ext_history, litBuf, litPtr_offset, out_litPtr)
+    ZSTD_execSequence(
+        dst,
+        op,
+        sequence,
+        ext_history,
+        litBuf,
+        litPtr_offset,
+        out_litPtr,
+    )
 }
 
 /// Fuzz-assert helper name. The production Rust port doesn't keep the

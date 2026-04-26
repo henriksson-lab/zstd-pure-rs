@@ -98,7 +98,7 @@ pub struct FSE_symbolCompressionTransform {
 /// symbol has zero frequency, upstream returns a fake cost of
 /// `tableLog + 1` bits; we inherit that behavior via the raw
 /// `deltaNbBits` read.
-#[inline]
+#[inline(always)]
 pub fn FSE_getMaxNbBits(symbolTT: &[FSE_symbolCompressionTransform], symbolValue: u32) -> u32 {
     ((symbolTT[symbolValue as usize].deltaNbBits + ((1 << 16) - 1)) as u32) >> 16
 }
@@ -110,23 +110,23 @@ pub fn FSE_getMaxNbBits(symbolTT: &[FSE_symbolCompressionTransform], symbolValue
 //   ct[1 .. 1+tableSize/2] : U16 nextState table, two entries per u32
 //   ct[1+tableSize/2 ..]: pairs of u32 for symbolCompressionTransform
 
-#[inline]
+#[inline(always)]
 fn ct_header_write(ct: &mut [FSE_CTable], tableLog: u16, maxSymbolValue: u16) {
     ct[0] = (tableLog as u32) | ((maxSymbolValue as u32) << 16);
 }
 
-#[inline]
+#[inline(always)]
 pub fn ct_header_tableLog(ct: &[FSE_CTable]) -> u32 {
     ct[0] & 0xFFFF
 }
 
-#[inline]
+#[inline(always)]
 pub fn ct_header_maxSV(ct: &[FSE_CTable]) -> u32 {
     (ct[0] >> 16) & 0xFFFF
 }
 
 /// Write into the u16 nextState table at logical index `i`.
-#[inline]
+#[inline(always)]
 fn ct_u16_write(ct: &mut [FSE_CTable], i: usize, val: u16) {
     let slot = 1 + (i / 2);
     let prev = ct[slot];
@@ -137,13 +137,13 @@ fn ct_u16_write(ct: &mut [FSE_CTable], i: usize, val: u16) {
     }
 }
 
-#[inline]
+#[inline(always)]
 fn symbolTT_offset(tableLog: u32) -> usize {
     let tableSize = 1usize << tableLog;
     1 + tableSize / 2
 }
 
-#[inline]
+#[inline(always)]
 fn symbolTT_write(
     ct: &mut [FSE_CTable],
     tableLog: u32,
@@ -169,9 +169,32 @@ pub fn symbolTT_read(ct: &[FSE_CTable], tableLog: u32, s: usize) -> FSE_symbolCo
     }
 }
 
+/// Unsafe variant of `symbolTT_read` used by `FSE_encodeSymbol`. CTable
+/// is sized at allocation time to hold `2*(maxSymbolValue+1)` symbol
+/// transform entries past the per-tableLog `symbolTT_offset(tableLog)`
+/// base. The encoder hot loop only ever passes `s ≤ maxSymbolValue` so
+/// `base + 2 ≤ ct.len()` always holds. Eliminates the per-symbol
+/// `cmp/jb` bounds check pair (~3% of L1 cycles in encodeSequences).
+///
+/// SAFETY: `symbolTT_offset(tableLog) + 2*s + 2 ≤ ct.len()`.
+#[inline(always)]
+unsafe fn symbolTT_read_unchecked(
+    ct: &[FSE_CTable],
+    tableLog: u32,
+    s: usize,
+) -> FSE_symbolCompressionTransform {
+    let base = symbolTT_offset(tableLog) + 2 * s;
+    let p0 = unsafe { *ct.get_unchecked(base) };
+    let p1 = unsafe { *ct.get_unchecked(base + 1) };
+    FSE_symbolCompressionTransform {
+        deltaNbBits: p0 as i32,
+        deltaFindState: p1 as i32,
+    }
+}
+
 /// Total u32 slots needed for a CTable of the given tableLog +
 /// maxSymbolValue. Matches upstream's `FSE_CTABLE_SIZE_U32`.
-#[inline]
+#[inline(always)]
 pub fn FSE_CTABLE_SIZE_U32(tableLog: u32, maxSymbolValue: u32) -> usize {
     let tableSize = 1usize << tableLog;
     1 + tableSize / 2 + 2 * (maxSymbolValue as usize + 1)
@@ -523,6 +546,7 @@ pub struct FSE_CState_t {
 
 /// Read the nextState u16 at logical index `i` inside a CTable.
 #[inline(always)]
+#[allow(dead_code)]
 fn ct_u16_read(ct: &[FSE_CTable], i: usize) -> u16 {
     let slot = 1 + (i / 2);
     let w = ct[slot];
@@ -533,7 +557,28 @@ fn ct_u16_read(ct: &[FSE_CTable], i: usize) -> u16 {
     }
 }
 
+/// Unsafe variant of `ct_u16_read` used inside `FSE_encodeSymbol`. The
+/// caller is the FSE encoder hot loop which always passes an `i` derived
+/// from a valid state machine transition — the CTable was sized to hold
+/// `1 + (1 << tableLog)/2 + 2*(maxSymbolValue+1)` u32 slots, so
+/// `1 + i/2 < ct.len()` whenever `i < (1 << tableLog)`. Strips the
+/// per-iter bounds check that LLVM can't elide because it doesn't
+/// track the FSE state-table invariants.
+///
+/// SAFETY: `1 + i/2 < ct.len()`.
+#[inline(always)]
+unsafe fn ct_u16_read_unchecked(ct: &[FSE_CTable], i: usize) -> u16 {
+    let slot = 1 + (i / 2);
+    let w = unsafe { *ct.get_unchecked(slot) };
+    if i.is_multiple_of(2) {
+        w as u16
+    } else {
+        (w >> 16) as u16
+    }
+}
+
 /// Port of `FSE_initCState`.
+#[inline(always)]
 pub fn FSE_initCState(st: &mut FSE_CState_t, ct: &[FSE_CTable]) {
     let tableLog = ct_header_tableLog(ct);
     st.value = 1isize << tableLog;
@@ -541,19 +586,34 @@ pub fn FSE_initCState(st: &mut FSE_CState_t, ct: &[FSE_CTable]) {
 }
 
 /// Port of `FSE_initCState2` (first-symbol init optimization).
+#[inline(always)]
 pub fn FSE_initCState2(st: &mut FSE_CState_t, ct: &[FSE_CTable], symbol: u32) {
     FSE_initCState(st, ct);
     let tableLog = st.stateLog;
-    let tt = symbolTT_read(ct, tableLog, symbol as usize);
+    // SAFETY: see `FSE_encodeSymbol` — same invariants apply (called once
+    // per block at the last sequence, not in a hot loop, but using the
+    // same unchecked path keeps the helper consistent and cheaper).
+    let tt = unsafe { symbolTT_read_unchecked(ct, tableLog, symbol as usize) };
     let nbBitsOut = ((tt.deltaNbBits + (1 << 15)) >> 16) as u32;
     let v = ((nbBitsOut as isize) << 16) - (tt.deltaNbBits as isize);
     let idx = ((v >> nbBitsOut) + tt.deltaFindState as isize) as usize;
-    st.value = ct_u16_read(ct, idx) as isize;
+    st.value = unsafe { ct_u16_read_unchecked(ct, idx) } as isize;
 }
 
 /// Port of `FSE_encodeSymbol`. Emits up to `tableLog` bits into the
 /// bitstream and advances the state via the lookup table.
-#[inline]
+///
+/// Hot-path optimization: the symbol/state-table reads use unsafe
+/// unchecked indexing. The CTable allocation guarantees that all valid
+/// (tableLog, symbol) and (state) indices land in-range, but LLVM
+/// can't prove this from the slice length alone — every symbol read
+/// would otherwise emit a `cmp/jb` pair. Each call sites's invariants:
+///   - `symbol ≤ maxSymbolValue` (FSE precondition; checked by upstream
+///     too)
+///   - `idx = state >> nbBits + deltaFindState` is a valid state index
+///     0 ≤ idx < (1 << tableLog), upheld by FSE state-machine
+///     correctness
+#[inline(always)]
 pub fn FSE_encodeSymbol(
     bitC: &mut crate::common::bitstream::BIT_CStream_t,
     st: &mut FSE_CState_t,
@@ -561,15 +621,18 @@ pub fn FSE_encodeSymbol(
     symbol: u32,
 ) {
     let tableLog = st.stateLog;
-    let tt = symbolTT_read(ct, tableLog, symbol as usize);
+    // SAFETY: see function docstring — symbol ≤ maxSymbolValue, idx is
+    // in-range by FSE state-machine invariants, ct sized accordingly.
+    let tt = unsafe { symbolTT_read_unchecked(ct, tableLog, symbol as usize) };
     let nbBitsOut = ((st.value + tt.deltaNbBits as isize) >> 16) as u32;
     crate::common::bitstream::BIT_addBits(bitC, st.value as usize, nbBitsOut);
     let idx = ((st.value >> nbBitsOut) + tt.deltaFindState as isize) as usize;
-    st.value = ct_u16_read(ct, idx) as isize;
+    st.value = unsafe { ct_u16_read_unchecked(ct, idx) } as isize;
 }
 
 /// Port of `FSE_flushCState`. Writes the final state and flushes the
 /// local bit register.
+#[inline(always)]
 pub fn FSE_flushCState(bitC: &mut crate::common::bitstream::BIT_CStream_t, st: &FSE_CState_t) {
     crate::common::bitstream::BIT_addBits(bitC, st.value as usize, st.stateLog);
     crate::common::bitstream::BIT_flushBits(bitC);
@@ -684,19 +747,19 @@ pub fn FSE_compress_usingCTable(dst: &mut [u8], src: &[u8], ct: &[FSE_CTable]) -
 }
 
 /// Upstream `FSE_BLOCKBOUND` macro.
-#[inline]
+#[inline(always)]
 pub const fn FSE_BLOCKBOUND(size: usize) -> usize {
     size + (size >> 7) + 4 + core::mem::size_of::<usize>()
 }
 
 /// Upstream `FSE_COMPRESSBOUND` macro — NCount header + compressed block.
-#[inline]
+#[inline(always)]
 pub const fn FSE_COMPRESSBOUND(size: usize) -> usize {
     FSE_NCOUNTBOUND + FSE_BLOCKBOUND(size)
 }
 
 /// Port of `FSE_compressBound`.
-#[inline]
+#[inline(always)]
 pub fn FSE_compressBound(srcSize: usize) -> usize {
     FSE_COMPRESSBOUND(srcSize)
 }

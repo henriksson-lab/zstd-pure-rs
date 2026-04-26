@@ -1065,17 +1065,20 @@ mod tests {
 
     #[test]
     fn decompresses_upstream_level10_large_real_text_frame() {
-        use std::fs;
-        use std::io::Write;
-        use std::path::PathBuf;
-        use std::process::{Command, Stdio};
         use crate::decompress::zstd_decompress_block::{
             blockProperties_t, blockType_e, streaming_operation, ZSTD_DCtx, ZSTD_blockHeaderSize,
             ZSTD_buildDefaultSeqTables, ZSTD_decodeLiteralsBlock, ZSTD_decodeSeqHeaders,
             ZSTD_decoder_entropy_rep, ZSTD_decompressSequences_body, ZSTD_getcBlockSize,
         };
+        use std::fs;
+        use std::io::Write;
+        use std::path::PathBuf;
+        use std::process::{Command, Stdio};
 
-        let which = Command::new("which").arg("zstd").output().expect("which zstd");
+        let which = Command::new("which")
+            .arg("zstd")
+            .output()
+            .expect("which zstd");
         if !which.status.success() {
             eprintln!("upstream zstd not on $PATH; skipping");
             return;
@@ -1136,7 +1139,8 @@ mod tests {
                         crate::common::error::ERR_getErrorName(lit_rc)
                     );
                     let mut nb_seq = 0i32;
-                    let seq_header = ZSTD_decodeSeqHeaders(&mut dctx, &mut nb_seq, &block[lit_rc..]);
+                    let seq_header =
+                        ZSTD_decodeSeqHeaders(&mut dctx, &mut nb_seq, &block[lit_rc..]);
                     assert!(
                         !crate::common::error::ERR_isError(seq_header),
                         "block {block_idx}: seq headers failed: {}",
@@ -1242,10 +1246,9 @@ mod tests {
                 if base.is_null() {
                     return core::ptr::null_mut();
                 }
-                let payload_addr = (base as usize + HEADER_WORDS * core::mem::size_of::<usize>()
-                    + ALIGN
-                    - 1)
-                    & !(ALIGN - 1);
+                let payload_addr =
+                    (base as usize + HEADER_WORDS * core::mem::size_of::<usize>() + ALIGN - 1)
+                        & !(ALIGN - 1);
                 let header = (payload_addr as *mut usize).sub(HEADER_WORDS);
                 header.write(base as usize);
                 header.add(1).write(total);
@@ -2251,7 +2254,9 @@ mod tests {
         // block size 128 KB, blocks 2..=4 will reference into earlier
         // blocks' bytes. Every block boundary will see at least one
         // long back-reference cross it.
-        let chunk: Vec<u8> = (0..65_536u32).map(|i| ((i * 17 + 3) & 0xFF) as u8).collect();
+        let chunk: Vec<u8> = (0..65_536u32)
+            .map(|i| ((i * 17 + 3) & 0xFF) as u8)
+            .collect();
         let mut payload = chunk.clone();
         for _ in 0..8 {
             payload.extend_from_slice(&chunk);
@@ -2451,11 +2456,7 @@ mod tests {
             .collect();
         for ddict in &many {
             assert_eq!(
-                ZSTD_DDictHashSet_addDDict(
-                    &mut set,
-                    ddict.as_ref(),
-                    ZSTD_customMem::default()
-                ),
+                ZSTD_DDictHashSet_addDDict(&mut set, ddict.as_ref(), ZSTD_customMem::default()),
                 0
             );
         }
@@ -4728,8 +4729,7 @@ pub fn ZSTD_createDCtx_internal(
     customMem: crate::compress::zstd_compress::ZSTD_customMem,
 ) -> Option<Box<ZSTD_DCtx>> {
     let mut dctx = unsafe {
-        crate::compress::zstd_compress::ZSTD_customAllocBox(ZSTD_DCtx::new(), customMem)
-            ?
+        crate::compress::zstd_compress::ZSTD_customAllocBox(ZSTD_DCtx::new(), customMem)?
     };
     dctx.customMem = customMem;
     ZSTD_initDCtx_internal(&mut dctx);

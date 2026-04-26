@@ -619,9 +619,8 @@ pub fn ZSTD_ldm_fillFastTables(ms: &mut ZSTD_MatchState_t, data_end: &[u8]) -> u
 /// LDM match.
 pub fn ZSTD_ldm_limitTableUpdate(ms: &mut ZSTD_MatchState_t, curr: u32) {
     if curr > ms.nextToUpdate.wrapping_add(1024) {
-        ms.nextToUpdate = curr.wrapping_sub(
-            512u32.min(curr.wrapping_sub(ms.nextToUpdate).wrapping_sub(1024)),
-        );
+        ms.nextToUpdate =
+            curr.wrapping_sub(512u32.min(curr.wrapping_sub(ms.nextToUpdate).wrapping_sub(1024)));
     }
 }
 
@@ -933,8 +932,9 @@ pub fn ZSTD_ldm_skipSequences(rawSeqStore: &mut RawSeqStore_t, mut srcSize: usiz
         rawSeqStore.seq[pos].litLength = 0;
         let seq_matchLength = rawSeqStore.seq[pos].matchLength as usize;
         if srcSize < seq_matchLength {
-            rawSeqStore.seq[pos].matchLength =
-                rawSeqStore.seq[pos].matchLength.wrapping_sub(srcSize as u32);
+            rawSeqStore.seq[pos].matchLength = rawSeqStore.seq[pos]
+                .matchLength
+                .wrapping_sub(srcSize as u32);
             if rawSeqStore.seq[pos].matchLength < minMatch {
                 // Match too short — roll residual into next seq's
                 // literals and drop this one.

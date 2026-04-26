@@ -12,7 +12,7 @@ use std::process::ExitCode;
 
 use zstd_pure_rs::common::error::{ERR_getErrorName, ERR_isError};
 use zstd_pure_rs::compress::zstd_compress::{
-    ZSTD_CCtx_setFormat, ZSTD_FrameParameters, ZSTD_compress_advanced, ZSTD_compressBound,
+    ZSTD_CCtx_setFormat, ZSTD_FrameParameters, ZSTD_compressBound, ZSTD_compress_advanced,
     ZSTD_createCCtx, ZSTD_getCParams, ZSTD_parameters,
 };
 use zstd_pure_rs::decompress::zstd_decompress::{
@@ -72,12 +72,12 @@ struct Cli {
     dict: Option<PathBuf>,
 
     /// Add / require an XXH64 content checksum trailer on compression.
-    /// Decompression validates when present regardless of this flag.
+    /// This is the upstream CLI default; decompression validates when
+    /// present regardless of this flag.
     #[arg(long = "check")]
     check: bool,
 
-    /// Explicit opposite of `--check` (present for upstream CLI
-    /// compatibility; currently the default).
+    /// Disable the default XXH64 content checksum trailer.
     #[arg(long = "no-check", conflicts_with = "check")]
     no_check: bool,
 
@@ -299,7 +299,8 @@ fn run() -> Result<(), String> {
         let dst = if cli.decompress {
             decompress_bytes(&src, dict_ref, cli.magicless)?
         } else {
-            compress_bytes(&src, cli.level, dict_ref, cli.check, cli.magicless)?
+            let checksum = cli.check || !cli.no_check;
+            compress_bytes(&src, cli.level, dict_ref, checksum, cli.magicless)?
         };
         let out_path: Option<PathBuf> = if cli.stdout || input == Path::new("-") {
             cli.output_file.clone()

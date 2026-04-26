@@ -194,8 +194,8 @@ pub fn ZSTD_compressLiterals(
 ) -> usize {
     use crate::common::error::{ErrorCode, ERROR};
     use crate::common::mem::{MEM_writeLE24, MEM_writeLE32};
-    use crate::compress::zstd_compress_sequences::{ZSTD_btultra, ZSTD_lazy};
     use crate::compress::huf_compress::{HUF_compress1X_repeat, HUF_compress4X_repeat};
+    use crate::compress::zstd_compress_sequences::{ZSTD_btultra, ZSTD_lazy};
 
     let srcSize = src.len();
     let mut prevRepeat = prevRepeat;

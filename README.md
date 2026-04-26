@@ -50,16 +50,42 @@ The full v1.6 public API from `zstd.h` (stable + experimental) is surfaced — e
 
 Test suite: 816 library unit tests without MT and 834 with `--features mt` as of the latest local run, plus CLI/integration/fixture/doc tests in the full suite. Coverage includes cross-compatibility tests that pipe our output through upstream `zstd` when the binary is on `$PATH`, a public-API sentinel that touches every exposed entry point, a boundary-size sweep around block/tail boundaries, a regression gate for a past multi-block repcode bug, end-to-end `--magicless` CLI roundtrips, and `refPrefix` one-shot auto-clear gates proving single-use dict semantics match upstream for both compressor and decompressor sides.
 
-Throughput (`RUSTFLAGS="-C target-cpu=native" cargo build --release`, on the 10 MB silesia `dickens` corpus):
+Compression throughput on `tests/fixtures/zstd_h.txt` (182 KB), comparing the current Rust release binary against the vendored upstream `zstd` binary:
 
-| Level | Ratio | Compress   | Decompress |
-|------:|------:|-----------:|-----------:|
-| 1     | 2.4×  |  89 MB/s   |  287 MB/s  |
-| 3     | 2.8×  |  63 MB/s   |  236 MB/s  |
-| 10    | 3.2×  |   6 MB/s   |  175 MB/s  |
-| 19    | 3.6×  |   1.2 MB/s |  157 MB/s  |
+| Level | Rust MB/s | Original MB/s | Rust / Original |
+|------:|----------:|--------------:|----------------:|
+| 1 | 158.6 | 242.4 | 65.4% |
+| 2 | 123.8 | 205.8 | 60.2% |
+| 3 | 139.8 | 196.6 | 71.1% |
+| 4 | 60.5 | 88.2 | 68.6% |
+| 5 | 48.7 | 73.6 | 66.2% |
+| 6 | 45.5 | 61.3 | 74.2% |
+| 7 | 36.6 | 55.6 | 65.8% |
+| 8 | 28.2 | 44.7 | 63.1% |
+| 9 | 22.9 | 36.9 | 62.1% |
+| 10 | 17.8 | 26.5 | 67.2% |
+| 11 | 9.8 | 12.2 | 80.3% |
+| 12 | 8.9 | 11.3 | 78.8% |
+| 13 | 6.4 | 8.21 | 78.0% |
+| 14 | 5.4 | 7.07 | 76.4% |
+| 15 | 4.7 | 6.37 | 73.8% |
+| 16 | 3.2 | 4.26 | 75.1% |
+| 17 | 3.1 | 3.73 | 83.1% |
+| 18 | 2.0 | 2.40 | 83.3% |
+| 19 | 1.9 | 2.31 | 82.3% |
+| 20 | 1.9 | 2.40 | 79.2% |
+| 21 | 1.8 | 2.46 | 73.2% |
+| 22 | 1.8 | 2.42 | 74.4% |
 
-Level 1 and decompression are roughly at parity with upstream's hand-tuned C (upstream's CLI on the same input ≈ 80 MB/s effective compress). Higher compression levels (10+) still trail upstream's pipelined matchers / SIMD entropy coding by 3-5×; correctness + format compliance were the v0.1 priority.
+Commands used:
+
+```sh
+cargo build --release
+target/release/bench_c tests/fixtures/zstd_h.txt <level> <iters>
+zstd/programs/zstd -b1e22 -i5 tests/fixtures/zstd_h.txt
+```
+
+These are local microbenchmarks on a small fixture, not general performance claims. They are useful for tracking translation speed against the vendored original while preserving byte-identical output.
 
 ## Goals
 

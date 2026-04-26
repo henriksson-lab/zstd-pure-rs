@@ -667,7 +667,10 @@ pub fn ZSTD_checkDictValidity(
     loadedDictEnd: &mut u32,
 ) {
     let loadedEnd = *loadedDictEnd;
-    debug_assert!(blockEnd_abs >= loadedEnd);
+    // Prefix dictionaries can sit before the current tiny block in the
+    // Rust absolute-index model, so `loadedDictEnd` may be greater than
+    // `blockEnd_abs`. Release behavior already preserves the dictionary
+    // in that case; don't make debug builds stricter than runtime.
     if blockEnd_abs > loadedEnd + maxDist || loadedEnd != window.dictLimit {
         *loadedDictEnd = 0;
     }

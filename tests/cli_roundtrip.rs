@@ -1016,9 +1016,8 @@ fn cli_checksum_compress_and_upstream_validates() {
 
 #[test]
 fn cli_no_check_suppresses_checksum_flag_and_trailer() {
-    // Explicit `--no-check` should keep the frame layout identical to
-    // the default non-checksummed path and clear the checksumFlag bit
-    // in the frame header.
+    // The CLI mirrors upstream: checksum is on by default, and
+    // explicit `--no-check` clears the checksumFlag bit and trailer.
     let payload: Vec<u8> = b"explicit-no-check payload "
         .iter()
         .cycle()
@@ -1047,11 +1046,16 @@ fn cli_no_check_suppresses_checksum_flag_and_trailer() {
 
     let plain = compress(&["-c", "-q", "-"], &payload);
     let no_check = compress(&["-c", "-q", "--no-check", "-"], &payload);
+    let explicit_check = compress(&["-c", "-q", "--check", "-"], &payload);
     assert_eq!(
-        no_check, plain,
-        "--no-check should match the default non-checksummed output"
+        plain, explicit_check,
+        "default output should match explicit --check"
     );
-    assert_eq!(plain[4] & 0b0000_0100, 0, "default path leaked checksumFlag");
+    assert_eq!(
+        plain[4] & 0b0000_0100,
+        0b0000_0100,
+        "default path did not set checksumFlag"
+    );
     assert_eq!(
         no_check[4] & 0b0000_0100,
         0,
@@ -1404,8 +1408,8 @@ fn cli_dict_plus_check_emits_xxh64_trailer() {
     // routes the dict path through `ZSTD_compress_advanced` so
     // `fParams.checksumFlag` is honored. Proof: output with
     // `-D + --check` should be exactly 4 bytes longer than
-    // `-D` alone (the XXH64 trailer), and contentSize bits of the
-    // FHD byte must encode the checksumFlag.
+    // `-D + --no-check` (the XXH64 trailer), and contentSize bits of
+    // the FHD byte must encode the checksumFlag.
     use std::env;
     use std::fs;
     let tmp = env::temp_dir();
@@ -1423,7 +1427,7 @@ fn cli_dict_plus_check_emits_xxh64_trailer() {
     fs::write(&payload_path, &payload).unwrap();
 
     for (args, out_path) in [
-        (vec!["-q", "-D"], &plain_out),
+        (vec!["-q", "--no-check", "-D"], &plain_out),
         (vec!["-q", "--check", "-D"], &check_out),
     ] {
         let mut cmd_args = args;

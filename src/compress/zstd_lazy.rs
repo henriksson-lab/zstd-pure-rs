@@ -25,11 +25,10 @@ use crate::compress::seq_store::{
     REPCODE_TO_OFFBASE, ZSTD_REP_NUM,
 };
 use crate::compress::zstd_compress::ZSTD_LAZY_DDSS_BUCKET_LOG;
-use crate::compress::zstd_fast::{
-    kSearchStrength, ZSTD_getLowestMatchIndex,
-};
+use crate::compress::zstd_fast::{kSearchStrength, ZSTD_getLowestMatchIndex};
 use crate::compress::zstd_hashes::{
     ZSTD_count, ZSTD_count_2segments, ZSTD_hashPtr, ZSTD_hashPtrSalted,
+    ZSTD_hashPtrSalted_at_unchecked,
 };
 
 pub const ZSTD_ROW_HASH_TAG_BITS: u32 = 8;
@@ -39,6 +38,12 @@ pub const ZSTD_ROW_HASH_CACHE_MASK: usize = ZSTD_ROW_HASH_CACHE_SIZE - 1;
 pub const kLazySkippingStep: usize = 8;
 
 pub type ZSTD_VecMask = u64;
+
+#[inline(always)]
+unsafe fn read32_at(src: &[u8], pos: usize) -> u32 {
+    debug_assert!(pos + 4 <= src.len());
+    (src.as_ptr().add(pos) as *const u32).read_unaligned()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum searchMethod_e {
@@ -75,28 +80,30 @@ pub fn ZSTD_isAligned<T>(ptr: *const T, align: usize) -> bool {
 #[inline]
 pub fn ZSTD_row_prefetch(hashTable: &[u32], tagTable: &[u8], relRow: u32, rowLog: u32) {
     use crate::common::zstd_internal::ZSTD_prefetchL1;
-    let relRow = relRow as usize;
-    if relRow < hashTable.len() {
-        ZSTD_prefetchL1(unsafe { hashTable.as_ptr().add(relRow) });
-    }
+    // `relRow` is always `< hashTable.len()` and `< tagTable.len()` by
+    // construction (caller derived it as `(hash >> TAG_BITS) << rowLog`,
+    // and the tables are sized to accommodate every possible value).
+    // Use `wrapping_offset` to skip the per-call bounds checks — the
+    // hot row-hash path showed `prefetcht0` and its surrounding
+    // `cmp/jb` branches consuming ~9% of L7 cycles. A bad prefetch
+    // address is silently ignored by the CPU; the wrapping_offset
+    // keeps things sound by avoiding `.add`'s out-of-allocation UB.
+    let relRow = relRow as isize;
+    ZSTD_prefetchL1(hashTable.as_ptr().wrapping_offset(relRow));
     if rowLog >= 5 {
-        let p2 = relRow.saturating_add(16);
-        if p2 < hashTable.len() {
-            ZSTD_prefetchL1(unsafe { hashTable.as_ptr().add(p2) });
-        }
+        ZSTD_prefetchL1(hashTable.as_ptr().wrapping_offset(relRow + 16));
     }
-    if relRow < tagTable.len() {
-        ZSTD_prefetchL1(unsafe { tagTable.as_ptr().add(relRow) });
-    }
+    ZSTD_prefetchL1(tagTable.as_ptr().wrapping_offset(relRow));
     if rowLog == 6 {
-        let t2 = relRow.saturating_add(32);
-        if t2 < tagTable.len() {
-            ZSTD_prefetchL1(unsafe { tagTable.as_ptr().add(t2) });
-        }
+        ZSTD_prefetchL1(tagTable.as_ptr().wrapping_offset(relRow + 32));
     }
 }
 
-/// Port of `ZSTD_row_fillHashCache`.
+/// Port of `ZSTD_row_fillHashCache`. `idx` is the absolute window-space
+/// index (= `base_off + ip` in caller terms) that the cache will start
+/// pre-filling from; `iLimit` is the slice-offset upper bound on bytes
+/// the matcher may still inspect.
+///
 pub fn ZSTD_row_fillHashCache(
     ms: &mut ZSTD_MatchState_t,
     base: &[u8],
@@ -106,21 +113,30 @@ pub fn ZSTD_row_fillHashCache(
     iLimit: usize,
 ) {
     let hashLog = ms.rowHashLog;
-    let maxElemsToPrefetch = if idx as usize > iLimit {
+    let base_off = ms.window.base_offset;
+    let idx_slice = idx.saturating_sub(base_off) as usize;
+    let maxElemsToPrefetch = if idx_slice > iLimit {
         0
     } else {
-        (iLimit - idx as usize + 1) as u32
+        (iLimit - idx_slice + 1) as u32
     };
     let lim = idx.wrapping_add(
         (crate::compress::match_state::ZSTD_ROW_HASH_CACHE_SIZE as u32).min(maxElemsToPrefetch),
     );
     while idx < lim {
-        let hash = ZSTD_hashPtrSalted(
-            &base[idx as usize..],
-            hashLog + ZSTD_ROW_HASH_TAG_BITS,
-            mls,
-            ms.hashSalt,
-        ) as u32;
+        let off = idx.wrapping_sub(base_off) as usize;
+        // SAFETY: `lim` is bounded by `iLimit + 1` and `iLimit ≤
+        // base.len() - 8` (matcher invariant), so each iteration's
+        // `off + 8 ≤ base.len()`.
+        let hash = unsafe {
+            ZSTD_hashPtrSalted_at_unchecked(
+                base,
+                off,
+                hashLog + ZSTD_ROW_HASH_TAG_BITS,
+                mls,
+                ms.hashSalt,
+            ) as u32
+        };
         let row = (hash >> ZSTD_ROW_HASH_TAG_BITS) << rowLog;
         ZSTD_row_prefetch(&ms.hashTable, &ms.tagTable, row, rowLog);
         ms.hashCache[idx as usize & ZSTD_ROW_HASH_CACHE_MASK] = hash;
@@ -128,25 +144,33 @@ pub fn ZSTD_row_fillHashCache(
     }
 }
 
-/// Port of `ZSTD_row_nextCachedHash`.
+/// Port of `ZSTD_row_nextCachedHash`. `idx` is the absolute
+/// window-space index. `base_off` lets us recover the slice offset
+/// (= `idx - base_off`) for byte reads.
 #[allow(clippy::too_many_arguments)]
+#[inline]
 pub fn ZSTD_row_nextCachedHash(
     cache: &mut [u32; crate::compress::match_state::ZSTD_ROW_HASH_CACHE_SIZE],
     hashTable: &[u32],
     tagTable: &[u8],
     base: &[u8],
     idx: u32,
+    base_off: u32,
     hashLog: u32,
     rowLog: u32,
     mls: u32,
     hashSalt: u64,
 ) -> u32 {
-    let newHash = ZSTD_hashPtrSalted(
-        &base[(idx as usize) + crate::compress::match_state::ZSTD_ROW_HASH_CACHE_SIZE..],
-        hashLog + ZSTD_ROW_HASH_TAG_BITS,
-        mls,
-        hashSalt,
-    ) as u32;
+    let off = idx.wrapping_sub(base_off) as usize
+        + crate::compress::match_state::ZSTD_ROW_HASH_CACHE_SIZE;
+    // SAFETY: caller's row-hash matcher invariant gives
+    // `idx - base_off + CACHE_SIZE + 8 ≤ base.len()` — i.e.,
+    // `ip + CACHE_SIZE + 8 ≤ iend` is implied by the matcher's
+    // `ip ≤ ilimit = iend - 8 - CACHE_SIZE` bound.
+    let newHash = unsafe {
+        ZSTD_hashPtrSalted_at_unchecked(base, off, hashLog + ZSTD_ROW_HASH_TAG_BITS, mls, hashSalt)
+            as u32
+    };
     let row = (newHash >> ZSTD_ROW_HASH_TAG_BITS) << rowLog;
     ZSTD_row_prefetch(hashTable, tagTable, row, rowLog);
     let slot = idx as usize & ZSTD_ROW_HASH_CACHE_MASK;
@@ -155,7 +179,10 @@ pub fn ZSTD_row_nextCachedHash(
     hash
 }
 
-/// Port of `ZSTD_row_update_internalImpl`.
+/// Port of `ZSTD_row_update_internalImpl`. `updateStartIdx`/`updateEndIdx`
+/// are absolute indices (matching upstream's `(U32)(ip - base)` and the
+/// chain-hash convention). The `base` slice is the matcher's input buffer;
+/// we subtract `base_off` to recover the slice offset for byte reads.
 pub fn ZSTD_row_update_internalImpl(
     ms: &mut ZSTD_MatchState_t,
     mut updateStartIdx: u32,
@@ -167,7 +194,9 @@ pub fn ZSTD_row_update_internalImpl(
     base: &[u8],
 ) {
     let hashLog = ms.rowHashLog;
+    let base_off = ms.window.base_offset;
     while updateStartIdx < updateEndIdx {
+        let slice_off = updateStartIdx.wrapping_sub(base_off) as usize;
         let hash = if useCache {
             ZSTD_row_nextCachedHash(
                 &mut ms.hashCache,
@@ -175,31 +204,59 @@ pub fn ZSTD_row_update_internalImpl(
                 &ms.tagTable,
                 base,
                 updateStartIdx,
+                base_off,
                 hashLog,
                 rowLog,
                 mls,
                 ms.hashSalt,
             )
         } else {
-            ZSTD_hashPtrSalted(
-                &base[updateStartIdx as usize..],
-                hashLog + ZSTD_ROW_HASH_TAG_BITS,
-                mls,
-                ms.hashSalt,
-            ) as u32
+            // SAFETY: caller passes `base = input_buf` (the source) and
+            // `updateStartIdx ≤ target = base_off + ip`. `ip` is bounded
+            // by the row-hash matcher's `ilimit < base.len() - 8`, so
+            // `slice_off + 8 ≤ base.len()`.
+            unsafe {
+                ZSTD_hashPtrSalted_at_unchecked(
+                    base,
+                    slice_off,
+                    hashLog + ZSTD_ROW_HASH_TAG_BITS,
+                    mls,
+                    ms.hashSalt,
+                ) as u32
+            }
         };
         let relRow = ((hash >> ZSTD_ROW_HASH_TAG_BITS) << rowLog) as usize;
-        let pos = {
-            let tagRow = &mut ms.tagTable[relRow..relRow + (1usize << rowLog)];
-            ZSTD_row_nextIndex(tagRow, rowMask)
-        } as usize;
-        ms.tagTable[relRow + pos] = (hash & ZSTD_ROW_HASH_TAG_MASK) as u8;
-        ms.hashTable[relRow + pos] = updateStartIdx;
+        // SAFETY: `relRow + (1 << rowLog) ≤ tagTable.len()` by table
+        // sizing — `relRow = (hash >> TAG_BITS) << rowLog` where the
+        // shifted hash fits in `(rowHashLog + rowLog)` bits, matching
+        // `tagTable.len() = 1 << (rowHashLog + rowLog)`. Same for the
+        // hashTable. `pos < rowEntries = 1 << rowLog`. The bounds-
+        // checked slice indexing emits per-call `cmp/jb` pairs that
+        // dominate this per-byte hot loop (~17% of L7 cycles).
+        let pos = unsafe {
+            let head = ms.tagTable.get_unchecked_mut(relRow);
+            let mut next = (*head as u32).wrapping_sub(1) & rowMask;
+            next += ((next == 0) as u32) * rowMask;
+            *head = next as u8;
+            next as usize
+        };
+        unsafe {
+            *ms.tagTable.get_unchecked_mut(relRow + pos) = (hash & ZSTD_ROW_HASH_TAG_MASK) as u8;
+            *ms.hashTable.get_unchecked_mut(relRow + pos) = updateStartIdx;
+        }
         updateStartIdx = updateStartIdx.wrapping_add(1);
     }
 }
 
-/// Port of `ZSTD_row_update_internal`.
+/// Port of `ZSTD_row_update_internal`. `ip` is the slice offset of the
+/// current cursor; we convert it to the absolute window-space index
+/// (`base_off + ip`) before storing it as `nextToUpdate` / hash-table
+/// values, matching upstream's pointer-based `(U32)(ip - base)`
+/// convention. Storing absolute indices keeps the "0 = uninitialized"
+/// sentinel distinct from real entries (which start at `base_off >= 2`
+/// for any window) and keeps row-hash compatible with the chain-hash
+/// nextToUpdate convention so the same field can be shared and clamped
+/// against `ms.window.lowLimit` between blocks.
 pub fn ZSTD_row_update_internal(
     ms: &mut ZSTD_MatchState_t,
     ip: usize,
@@ -209,8 +266,9 @@ pub fn ZSTD_row_update_internal(
     useCache: bool,
     base: &[u8],
 ) {
+    let base_off = ms.window.base_offset;
     let mut idx = ms.nextToUpdate;
-    let target = ip as u32;
+    let target = base_off.wrapping_add(ip as u32);
     const K_SKIP_THRESHOLD: u32 = 384;
     const K_MAX_MATCH_START_POSITIONS_TO_UPDATE: u32 = 96;
     const K_MAX_MATCH_END_POSITIONS_TO_UPDATE: u32 = 32;
@@ -233,7 +291,11 @@ pub fn ZSTD_row_update(ms: &mut ZSTD_MatchState_t, ip: usize, base: &[u8]) {
     ZSTD_row_update_internal(ms, ip, mls, rowLog, rowMask, false, base);
 }
 
-/// Port of `ZSTD_row_matchMaskGroupWidth`.
+/// Port of `ZSTD_row_matchMaskGroupWidth`. Always 1 in our scalar
+/// SWAR formulation; marked `#[inline(always)]` so the constant
+/// `1` propagates into the per-byte row-hash inner loop and the
+/// `* groupWidth` / `/ groupWidth` patterns fold to no-ops.
+#[inline(always)]
 pub fn ZSTD_row_matchMaskGroupWidth(rowEntries: u32) -> u32 {
     debug_assert!(matches!(rowEntries, 16 | 32 | 64));
     1
@@ -302,9 +364,7 @@ fn ZSTD_row_getMatchMask_scalar(
     debug_assert!(CHUNK_SIZE == 4 || CHUNK_SIZE == 8);
     while i >= 0 {
         let off = i as usize;
-        let bytes: [u8; CHUNK_SIZE] = src[off..off + CHUNK_SIZE]
-            .try_into()
-            .expect("SWAR row mask chunk");
+        let bytes: [u8; CHUNK_SIZE] = src[off..off + CHUNK_SIZE].try_into().expect("chunk size");
         let mut chunk = usize::from_le_bytes(bytes);
         chunk ^= splat_char;
         chunk = (((chunk | x80).wrapping_sub(x01)) | chunk) & x80;
@@ -495,7 +555,8 @@ pub fn ZSTD_dedicatedDictSearch_lazy_search(
         }
         if currentMl > ml {
             ml = currentMl;
-            *offsetPtr = OFFSET_TO_OFFBASE(curr.wrapping_sub(matchIndex.wrapping_add(ddsIndexDelta)));
+            *offsetPtr =
+                OFFSET_TO_OFFBASE(curr.wrapping_sub(matchIndex.wrapping_add(ddsIndexDelta)));
             if ip + currentMl == iLimit {
                 return ml;
             }
@@ -527,7 +588,8 @@ pub fn ZSTD_dedicatedDictSearch_lazy_search(
         }
         if currentMl > ml {
             ml = currentMl;
-            *offsetPtr = OFFSET_TO_OFFBASE(curr.wrapping_sub(matchIndex.wrapping_add(ddsIndexDelta)));
+            *offsetPtr =
+                OFFSET_TO_OFFBASE(curr.wrapping_sub(matchIndex.wrapping_add(ddsIndexDelta)));
             if ip + currentMl == iLimit {
                 break;
             }
@@ -537,8 +599,13 @@ pub fn ZSTD_dedicatedDictSearch_lazy_search(
     ml
 }
 
-/// Port of `ZSTD_RowFindBestMatch`.
+/// Port of `ZSTD_RowFindBestMatch`. Mirrors upstream's
+/// `FORCE_INLINE_TEMPLATE`: callers (the lazy/greedy/lazy2 row-hash
+/// matchers via `ZSTD_searchMax`) pass per-block-constant `mls` /
+/// `dictMode` / `rowLog`, so inlining lets LLVM constant-fold the
+/// per-byte runtime branches inside.
 #[allow(clippy::too_many_arguments)]
+#[inline(always)]
 pub fn ZSTD_RowFindBestMatch(
     ms: &mut ZSTD_MatchState_t,
     input_buf: &[u8],
@@ -552,9 +619,16 @@ pub fn ZSTD_RowFindBestMatch(
 ) -> usize {
     let hashLog = ms.rowHashLog;
     let cParams = ms.cParams;
-    let curr = ip as u32;
+    let base_off = ms.window.base_offset;
+    // Match upstream's `(U32)(ip - base)` — absolute window-space index.
+    // This is the value we'll compare against `lowLimit` and store in the
+    // hash table (`base_off + 0` for the very first byte avoids the "0 =
+    // never inserted" sentinel collision the previous ip-relative
+    // convention had).
+    let curr = base_off.wrapping_add(ip as u32);
     let dictLimit = ms.window.dictLimit;
-    let prefixStart = dictLimit as usize;
+    // Convert dictLimit (absolute) to a slice offset for byte-side bounds.
+    let prefixStart = dictLimit.saturating_sub(base_off) as usize;
     let maxDistance = 1u32 << cParams.windowLog;
     let lowestValid = ms.window.lowLimit;
     let withinMaxDistance = if curr.wrapping_sub(lowestValid) > maxDistance {
@@ -615,6 +689,7 @@ pub fn ZSTD_RowFindBestMatch(
             &ms.tagTable,
             input_buf,
             curr,
+            base_off,
             hashLog,
             rowLog,
             mls,
@@ -641,13 +716,88 @@ pub fn ZSTD_RowFindBestMatch(
             headGrouped,
             rowEntries,
         );
+        // The no-dict row-hash path is the dominant L10 hot loop. It
+        // doesn't need the temporary match buffer that the ext-dict and
+        // dictMatchState paths use to satisfy borrowing around table
+        // mutation, so evaluate candidates inline and only insert the
+        // current position after the row has been scanned.
+        if dictMode == ZSTD_dictMode_e::ZSTD_noDict {
+            static PREFILTER_DUMMY: [u8; 4] = [0x12, 0x34, 0x56, 0x78];
+            let hash_row = &ms.hashTable[relRow..relRow + rowEntries as usize];
+            let mut mask = matches;
+
+            while mask > 0 && nbAttempts > 0 {
+                let matchPos = ((headGrouped + ZSTD_VecMask_next(mask)) / groupWidth) & rowMask;
+                let matchIndex = hash_row[matchPos as usize];
+                if matchPos != 0 {
+                    if matchIndex < lowLimit {
+                        break;
+                    }
+
+                    let matchBytePos = matchIndex.wrapping_sub(base_off) as usize;
+                    if matchBytePos < input_buf.len() {
+                        crate::common::zstd_internal::prefetchSliceByte(input_buf, matchBytePos);
+                    }
+
+                    let prefilter_valid =
+                        matchBytePos + ml + 1 <= input_buf.len() && ip + ml + 1 <= iLimit;
+                    let m_ptr = if prefilter_valid {
+                        input_buf.as_ptr().wrapping_add(matchBytePos + ml - 3)
+                    } else {
+                        PREFILTER_DUMMY.as_ptr()
+                    };
+                    let c_ptr = if prefilter_valid {
+                        input_buf.as_ptr().wrapping_add(ip + ml - 3)
+                    } else {
+                        PREFILTER_DUMMY.as_ptr()
+                    };
+                    let m_val = unsafe { (m_ptr as *const u32).read_unaligned() };
+                    let c_val = unsafe { (c_ptr as *const u32).read_unaligned() };
+                    if prefilter_valid & (m_val == c_val) {
+                        let currentMl = ZSTD_count(input_buf, ip, matchBytePos, iLimit);
+                        if currentMl > ml {
+                            ml = currentMl;
+                            *offsetPtr = OFFSET_TO_OFFBASE(curr.wrapping_sub(matchIndex));
+                            if ip + currentMl == iLimit {
+                                break;
+                            }
+                        }
+                    }
+                    nbAttempts -= 1;
+                }
+                mask &= mask - 1;
+            }
+            let _ = hash_row;
+
+            let pos = unsafe {
+                let head = ms.tagTable.get_unchecked_mut(relRow);
+                let mut next = (*head as u32).wrapping_sub(1) & rowMask;
+                next += ((next == 0) as u32) * rowMask;
+                *head = next as u8;
+                next as usize
+            };
+            unsafe {
+                *ms.tagTable.get_unchecked_mut(relRow + pos) = tag;
+                *ms.hashTable.get_unchecked_mut(relRow + pos) = ms.nextToUpdate;
+            }
+            ms.nextToUpdate = ms.nextToUpdate.wrapping_add(1);
+            return ml;
+        }
+
         let mut matchBuffer = [0u32; ZSTD_ROW_HASH_MAX_ENTRIES as usize];
         let mut numMatches = 0usize;
         let mut mask = matches;
+        // Hoist the row sub-slice and `dictBase_offset` read out of the
+        // candidate loop so each iteration's hashTable access is a
+        // bounded local index (skips the per-iter `ms.hashTable.len()`
+        // bounds check) and we avoid re-reading `ms.window` for every
+        // ext-dict candidate.
+        let dict_base_off = ms.window.dictBase_offset;
+        let hash_row = &ms.hashTable[relRow..relRow + rowEntries as usize];
 
         while mask > 0 && nbAttempts > 0 {
             let matchPos = ((headGrouped + ZSTD_VecMask_next(mask)) / groupWidth) & rowMask;
-            let matchIndex = ms.hashTable[relRow + matchPos as usize];
+            let matchIndex = hash_row[matchPos as usize];
             if matchPos != 0 {
                 if matchIndex < lowLimit {
                     break;
@@ -656,12 +806,13 @@ pub fn ZSTD_RowFindBestMatch(
                 // zstd_lazy.c:1281 — issue a real cache-line hint for
                 // the candidate before it's consumed below.
                 if dictMode != ZSTD_dictMode_e::ZSTD_extDict || matchIndex >= dictLimit {
-                    let off = matchIndex as usize;
+                    // Absolute matchIndex → slice offset.
+                    let off = matchIndex.wrapping_sub(base_off) as usize;
                     if off < input_buf.len() {
                         crate::common::zstd_internal::prefetchSliceByte(input_buf, off);
                     }
                 } else if let Some(dict_buf) = ext_dict_buf {
-                    let off = matchIndex as usize;
+                    let off = matchIndex.wrapping_sub(dict_base_off) as usize;
                     if off < dict_buf.len() {
                         crate::common::zstd_internal::prefetchSliceByte(dict_buf, off);
                     }
@@ -672,29 +823,75 @@ pub fn ZSTD_RowFindBestMatch(
             }
             mask &= mask - 1;
         }
+        // End of immutable borrow on ms.hashTable.
+        let _ = hash_row;
 
-        let pos = {
-            let tagRow = &mut ms.tagTable[relRow..relRow + rowEntries as usize];
-            ZSTD_row_nextIndex(tagRow, rowMask) as usize
+        // SAFETY: `relRow + (1 << rowLog) ≤ tagTable.len()` by table
+        // sizing (same invariant as in `ZSTD_row_update_internalImpl`).
+        // `pos < rowEntries`. Inline `ZSTD_row_nextIndex` accessing
+        // only `tagRow[0]` so we can target a single byte.
+        let pos = unsafe {
+            let head = ms.tagTable.get_unchecked_mut(relRow);
+            let mut next = (*head as u32).wrapping_sub(1) & rowMask;
+            next += ((next == 0) as u32) * rowMask;
+            *head = next as u8;
+            next as usize
         };
-        ms.tagTable[relRow + pos] = tag;
-        ms.hashTable[relRow + pos] = ms.nextToUpdate;
+        unsafe {
+            *ms.tagTable.get_unchecked_mut(relRow + pos) = tag;
+            *ms.hashTable.get_unchecked_mut(relRow + pos) = ms.nextToUpdate;
+        }
         ms.nextToUpdate = ms.nextToUpdate.wrapping_add(1);
+
+        // 4-byte dummy for the CMOV-friendly select-address pattern in
+        // the candidate prefilter below. Reused across every candidate
+        // so the load goes to a hot constant when bounds fail.
+        static PREFILTER_DUMMY: [u8; 4] = [0x12, 0x34, 0x56, 0x78];
 
         for &matchIndex in &matchBuffer[..numMatches] {
             let mut currentMl = 0usize;
             if dictMode != ZSTD_dictMode_e::ZSTD_extDict || matchIndex >= dictLimit {
-                let matchPos = matchIndex as usize;
-                if matchPos + ml + 1 >= 4
-                    && matchPos + ml - 3 + 4 <= input_buf.len()
-                    && ip + ml - 3 + 4 <= iLimit
-                    && MEM_read32(&input_buf[matchPos + ml - 3..])
-                        == MEM_read32(&input_buf[ip + ml - 3..])
-                {
+                // Absolute matchIndex → slice offset.
+                let matchPos = matchIndex.wrapping_sub(base_off) as usize;
+                // `ml` is seeded at 3 and grows monotonically, so
+                // `matchPos + ml >= 3` always — no underflow protection
+                // needed. The bounds checks remain because matchIndex
+                // can be from a prior block (saturating_sub won't catch
+                // wraparound past `iLimit`).
+                let prefilter_valid = matchPos + ml + 1 <= input_buf.len() && ip + ml + 1 <= iLimit;
+                // CMOV-friendly select: read from real `matchPos+ml-3`
+                // when valid, else from a dummy. Mirrors upstream's
+                // `ZSTD_selectAddr`-style pointer pick. Slice-indexed
+                // reads would emit per-call `cmp/jb` bounds checks that
+                // defeat CMOV codegen on this hot inner prefilter.
+                let m_ptr = if prefilter_valid {
+                    input_buf.as_ptr().wrapping_add(matchPos + ml - 3)
+                } else {
+                    PREFILTER_DUMMY.as_ptr()
+                };
+                let c_ptr = if prefilter_valid {
+                    input_buf.as_ptr().wrapping_add(ip + ml - 3)
+                } else {
+                    PREFILTER_DUMMY.as_ptr()
+                };
+                // SAFETY: when `prefilter_valid`, the loop invariants
+                // give `matchPos + ml + 1 ≤ input_buf.len()` and
+                // `ip + ml + 1 ≤ iLimit ≤ input_buf.len()`, so both
+                // 4-byte reads are in-range. Otherwise we read from
+                // `PREFILTER_DUMMY` (4 bytes valid).
+                let m_val = unsafe { (m_ptr as *const u32).read_unaligned() };
+                let c_val = unsafe { (c_ptr as *const u32).read_unaligned() };
+                if prefilter_valid & (m_val == c_val) {
                     currentMl = ZSTD_count(input_buf, ip, matchPos, iLimit);
                 }
             } else if let Some(dict_buf) = ext_dict_buf {
-                let matchPos = matchIndex as usize;
+                // ext-dict path: the matchIndex still lives in the local
+                // matchState's window-index space; the dict_buf however
+                // is laid out so byte at absolute index `i` lives at
+                // `dict_buf[i - dict_base_off]`. Reuse the per-matchstate
+                // `dictBase_offset` for the conversion.
+                let dict_base_off = ms.window.dictBase_offset;
+                let matchPos = matchIndex.wrapping_sub(dict_base_off) as usize;
                 if matchPos + 4 <= dict_buf.len()
                     && MEM_read32(&dict_buf[matchPos..]) == MEM_read32(&input_buf[ip..])
                 {
@@ -782,8 +979,9 @@ pub fn ZSTD_RowFindBestMatch(
                 }
                 if currentMl > ml {
                     ml = currentMl;
-                    *offsetPtr =
-                        OFFSET_TO_OFFBASE(curr.wrapping_sub(matchIndex.wrapping_add(dmsIndexDelta)));
+                    *offsetPtr = OFFSET_TO_OFFBASE(
+                        curr.wrapping_sub(matchIndex.wrapping_add(dmsIndexDelta)),
+                    );
                     if ip + currentMl == iLimit {
                         break;
                     }
@@ -794,8 +992,11 @@ pub fn ZSTD_RowFindBestMatch(
     ml
 }
 
-/// Port of `ZSTD_searchMax`.
+/// Port of `ZSTD_searchMax`. `FORCE_INLINE_TEMPLATE` upstream — the
+/// dispatch on `searchMethod` / `dictMode` is fully constant-folded
+/// when this is inlined into each templated public entry.
 #[allow(clippy::too_many_arguments)]
+#[inline(always)]
 pub fn ZSTD_searchMax(
     ms: &mut ZSTD_MatchState_t,
     input_buf: &[u8],
@@ -875,6 +1076,7 @@ pub fn ZSTD_insertAndFindFirstIndex_internal(
 /// match length (in bytes) and fills `offBase_out` with the chosen
 /// match's offBase. Returns 0 if no match ≥ 4 bytes was found.
 #[allow(clippy::too_many_arguments)]
+#[inline]
 pub fn ZSTD_HcFindBestMatch_noDict(
     ms: &mut ZSTD_MatchState_t,
     src: &[u8],
@@ -921,16 +1123,19 @@ pub fn ZSTD_HcFindBestMatch_noDict(
             matchIndex = next;
             continue;
         }
-        // Cheap pre-check: the 4 bytes ending at (match + ml - 3) must
-        // equal those at (ip + ml - 3). Only compute full match length
-        // if this passes — OR, if ml is at its seed (3), just do a
-        // head-of-match u32 compare.
-        let head_match = MEM_read32(&src[ip..]) == MEM_read32(&src[match_pos..]);
-        let tail_match = ml >= 3
-            && match_pos + ml < src.len()
-            && ip + ml <= iLimit
-            && MEM_read32(&src[match_pos + ml - 3..]) == MEM_read32(&src[ip + ml - 3..]);
-        let currentMl = if head_match || tail_match {
+        // Cheap pre-check, identical to upstream's
+        // `ZSTD_HcFindBestMatch` HC4 inner loop:
+        //     if (MEM_read32(match + ml - 3) == MEM_read32(ip + ml - 3))
+        //         currentMl = ZSTD_count(ip, match, iLimit);
+        // For the seed `ml = 3`, `ml - 3 == 0`, so this collapses to a
+        // head-of-match u32 compare; for longer best-so-far it acts as
+        // a "tail must match" filter that rejects shorter candidates
+        // before the full byte-by-byte count.
+        let tail_off = ml.wrapping_sub(3);
+        let bytes_ok = match_pos + tail_off + 4 <= src.len() && ip + tail_off + 4 <= iLimit;
+        let currentMl = if bytes_ok
+            && MEM_read32(&src[match_pos + tail_off..]) == MEM_read32(&src[ip + tail_off..])
+        {
             ZSTD_count(src, ip, match_pos, iLimit)
         } else {
             0
@@ -1282,8 +1487,7 @@ pub fn ZSTD_compressBlock_lazy_noDict_generic(
                         }
                     }
                     let mut cand2_off: u32 = 0;
-                    let ml3 =
-                        ZSTD_HcFindBestMatch_noDict(ms, src, p2, iend, &mut cand2_off, mls);
+                    let ml3 = ZSTD_HcFindBestMatch_noDict(ms, src, p2, iend, &mut cand2_off, mls);
                     if ml3 >= 4 && cand2_off != 0 {
                         let gain2 = (ml3 as i32) * 4
                             - crate::common::bits::ZSTD_highbit32(cand2_off) as i32;
@@ -1320,13 +1524,7 @@ pub fn ZSTD_compressBlock_lazy_noDict_generic(
 
         // Emit.
         let litLength = start - anchor;
-        ZSTD_storeSeq(
-            seqStore,
-            litLength,
-            &src[anchor..start],
-            offBase,
-            matchLength,
-        );
+        ZSTD_storeSeq(seqStore, litLength, &src[anchor..], offBase, matchLength);
         ip = start + matchLength;
         anchor = ip;
 
@@ -1483,7 +1681,9 @@ fn ZSTD_compressBlock_lazy_noDict_generic_search(
                         mls,
                         ZSTD_dictMode_e::ZSTD_noDict,
                     ),
-                    searchMethod_e::search_hashChain | searchMethod_e::search_rowHash => unreachable!(),
+                    searchMethod_e::search_hashChain | searchMethod_e::search_rowHash => {
+                        unreachable!()
+                    }
                 };
                 if ml2 >= 4 && cand_off != 0 {
                     let gain2 =
@@ -1531,7 +1731,9 @@ fn ZSTD_compressBlock_lazy_noDict_generic_search(
                             mls,
                             ZSTD_dictMode_e::ZSTD_noDict,
                         ),
-                        searchMethod_e::search_hashChain | searchMethod_e::search_rowHash => unreachable!(),
+                        searchMethod_e::search_hashChain | searchMethod_e::search_rowHash => {
+                            unreachable!()
+                        }
                     };
                     if ml3 >= 4 && cand2_off != 0 {
                         let gain2 = (ml3 as i32) * 4
@@ -1567,13 +1769,7 @@ fn ZSTD_compressBlock_lazy_noDict_generic_search(
         }
 
         let litLength = start - anchor;
-        ZSTD_storeSeq(
-            seqStore,
-            litLength,
-            &src[anchor..start],
-            offBase,
-            matchLength,
-        );
+        ZSTD_storeSeq(seqStore, litLength, &src[anchor..], offBase, matchLength);
         ip = start + matchLength;
         anchor = ip;
 
@@ -1610,11 +1806,56 @@ fn ZSTD_compressBlock_lazy_noDict_generic_search(
     iend - anchor
 }
 
+/// Mirrors upstream's `FORCE_INLINE_TEMPLATE` declaration on
+/// `ZSTD_compressBlock_lazy_generic`: each public entry (greedy_row,
+/// lazy_row, lazy2_row, ext_*, dictMatchState_*, etc.) passes literal
+/// constants for `searchMethod` / `depth` / `dictMode`. With
+/// `#[inline(always)]`, LLVM inlines this body into each public entry
+/// and constant-propagates those values, eliminating the per-byte
+/// runtime branches on `if dictMode == …` / `if searchMethod == …`.
+/// Without this attribute the function stays as one runtime-dispatched
+/// blob (~8KB) and every per-byte iteration pays for those branches.
+#[inline(always)]
 pub fn ZSTD_compressBlock_lazy_generic(
     ms: &mut ZSTD_MatchState_t,
     seqStore: &mut SeqStore_t,
     rep: &mut [u32; ZSTD_REP_NUM],
     src: &[u8],
+    searchMethod: searchMethod_e,
+    depth: u32,
+    dictMode: ZSTD_dictMode_e,
+) -> usize {
+    ZSTD_compressBlock_lazy_generic_with_istart(
+        ms,
+        seqStore,
+        rep,
+        src,
+        0,
+        searchMethod,
+        depth,
+        dictMode,
+    )
+}
+
+/// Generic lazy/row-hash matcher with a `istart` (first byte to match
+/// from). Bytes in `src[..istart]` are treated as cross-block history
+/// (matchable but not parsed for new sequences). Mirrors upstream's
+/// `ZSTD_compressBlock_lazy_generic` template, which uses
+/// `ip = ms->window.base + istart` implicitly through the
+/// `(BYTE const*)src` parameter; in our slice-based encoding we make
+/// `istart` an explicit parameter so callers like
+/// `ZSTD_compressBlock_lazy_with_history` can avoid trimming `src` to
+/// the current block (the trim would break the
+/// `base_offset + ip = abs_index` invariant once base_offset is anchored
+/// to the window start, not the block start).
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+pub fn ZSTD_compressBlock_lazy_generic_with_istart(
+    ms: &mut ZSTD_MatchState_t,
+    seqStore: &mut SeqStore_t,
+    rep: &mut [u32; ZSTD_REP_NUM],
+    src: &[u8],
+    istart: usize,
     searchMethod: searchMethod_e,
     depth: u32,
     dictMode: ZSTD_dictMode_e,
@@ -1674,8 +1915,16 @@ pub fn ZSTD_compressBlock_lazy_generic(
         Vec::new()
     };
 
-    let mut ip = usize::from(dictAndPrefixLength == 0);
-    let mut anchor = 0usize;
+    // Start matching at `istart`; bytes before that are cross-block
+    // history. For a fresh window with no dict prefix, upstream skips
+    // byte 0 to avoid colliding with the "uninitialized" sentinel; we
+    // preserve that only at the very start of compression (istart == 0).
+    let mut ip = if istart == 0 {
+        usize::from(dictAndPrefixLength == 0)
+    } else {
+        istart
+    };
+    let mut anchor = istart;
     let mut offset_1 = rep[0];
     let mut offset_2 = rep[1];
     let mut offsetSaved1 = 0u32;
@@ -1702,14 +1951,10 @@ pub fn ZSTD_compressBlock_lazy_generic(
 
     ms.lazySkipping = 0;
     if searchMethod == searchMethod_e::search_rowHash {
-        ZSTD_row_fillHashCache(
-            ms,
-            src,
-            rowLog,
-            mls,
-            ms.nextToUpdate.saturating_sub(base_off),
-            ilimit,
-        );
+        // `fillHashCache` expects an absolute index now (matches
+        // upstream's `ms->nextToUpdate` convention); the conversion to
+        // slice frame happens inside the helper.
+        ZSTD_row_fillHashCache(ms, src, rowLog, mls, ms.nextToUpdate, ilimit);
     }
 
     while ip < ilimit {
@@ -1754,7 +1999,8 @@ pub fn ZSTD_compressBlock_lazy_generic(
             }
         } else if dictMode == ZSTD_dictMode_e::ZSTD_extDict {
             let curr = base_off.wrapping_add(ip as u32);
-            let windowLow = ZSTD_getLowestMatchIndex(ms, curr.wrapping_add(1), ms.cParams.windowLog);
+            let windowLow =
+                ZSTD_getLowestMatchIndex(ms, curr.wrapping_add(1), ms.cParams.windowLog);
             let repIndex = curr.wrapping_add(1).wrapping_sub(offset_1);
             let repInDict = repIndex < prefixLowestIndex;
             let repMatch = if repInDict {
@@ -1786,7 +2032,8 @@ pub fn ZSTD_compressBlock_lazy_generic(
             }
         } else if offset_1 > 0
             && ip + 1 >= offset_1 as usize
-            && MEM_read32(&src[ip + 1 - offset_1 as usize..]) == MEM_read32(&src[ip + 1..])
+            && unsafe { read32_at(src, ip + 1 - offset_1 as usize) }
+                == unsafe { read32_at(src, ip + 1) }
         {
             matchLength = ZSTD_count(src, ip + 1 + 4, ip + 1 + 4 - offset_1 as usize, iend) + 4;
             depth0_rep_match = depth == 0;
@@ -1832,7 +2079,8 @@ pub fn ZSTD_compressBlock_lazy_generic(
                 if dictMode == ZSTD_dictMode_e::ZSTD_noDict {
                     if offBase != 0
                         && offset_1 > 0
-                        && MEM_read32(&src[ip - offset_1 as usize..]) == MEM_read32(&src[ip..])
+                        && unsafe { read32_at(src, ip - offset_1 as usize) }
+                            == unsafe { read32_at(src, ip) }
                     {
                         let mlRep = ZSTD_count(src, ip + 4, ip + 4 - offset_1 as usize, iend) + 4;
                         let gain2 = (mlRep * 3) as i32;
@@ -1955,7 +2203,8 @@ pub fn ZSTD_compressBlock_lazy_generic(
                     if dictMode == ZSTD_dictMode_e::ZSTD_noDict {
                         if offBase != 0
                             && offset_1 > 0
-                            && MEM_read32(&src[ip - offset_1 as usize..]) == MEM_read32(&src[ip..])
+                            && unsafe { read32_at(src, ip - offset_1 as usize) }
+                                == unsafe { read32_at(src, ip) }
                         {
                             let mlRep =
                                 ZSTD_count(src, ip + 4, ip + 4 - offset_1 as usize, iend) + 4;
@@ -2129,7 +2378,11 @@ pub fn ZSTD_compressBlock_lazy_generic(
                 } else {
                     matchIndex.saturating_sub(base_off) as usize
                 };
-                let mStart = if repInDict { extDictLowest } else { prefixLowest };
+                let mStart = if repInDict {
+                    extDictLowest
+                } else {
+                    prefixLowest
+                };
                 while start > anchor
                     && match_pos > mStart
                     && src[start - 1]
@@ -2149,13 +2402,7 @@ pub fn ZSTD_compressBlock_lazy_generic(
         }
 
         let litLength = start - anchor;
-        ZSTD_storeSeq(
-            seqStore,
-            litLength,
-            &src[anchor..start],
-            offBase,
-            matchLength,
-        );
+        ZSTD_storeSeq(seqStore, litLength, &src[anchor..], offBase, matchLength);
         anchor = start + matchLength;
         ip = anchor;
 
@@ -2224,7 +2471,8 @@ pub fn ZSTD_compressBlock_lazy_generic(
         if dictMode == ZSTD_dictMode_e::ZSTD_noDict {
             while ip <= ilimit
                 && offset_2 > 0
-                && MEM_read32(&src[ip..]) == MEM_read32(&src[ip - offset_2 as usize..])
+                && unsafe { read32_at(src, ip) }
+                    == unsafe { read32_at(src, ip - offset_2 as usize) }
             {
                 matchLength = ZSTD_count(src, ip + 4, ip + 4 - offset_2 as usize, iend) + 4;
                 offBase = offset_2;
@@ -2938,9 +3186,7 @@ pub fn ZSTD_DUBT_findBestMatch(
             } else {
                 0
             };
-            if 4 * (matchLength - bestLength) as i32
-                > (currCost - prevCost)
-            {
+            if 4 * (matchLength - bestLength) as i32 > (currCost - prevCost) {
                 bestLength = matchLength;
                 *offBasePtr = OFFSET_TO_OFFBASE(curr.wrapping_sub(matchIndex));
             }
@@ -3031,7 +3277,10 @@ pub fn ZSTD_BtFindBestMatch(
 }
 
 /// Cross-block-history variant — caller passes `src[..istart]` as
-/// prior content. Shared by all three depth variants.
+/// prior content. Shared by all three depth variants. When the
+/// strategy is row-hash-eligible (greedy/lazy/lazy2 with row-hash
+/// enabled — the auto-resolved default), routes through the row-hash
+/// matcher via `lazy_generic_with_istart` for a substantial speed-up.
 pub fn ZSTD_compressBlock_lazy_with_history(
     ms: &mut ZSTD_MatchState_t,
     seqStore: &mut SeqStore_t,
@@ -3040,6 +3289,22 @@ pub fn ZSTD_compressBlock_lazy_with_history(
     istart: usize,
     depth: u32,
 ) -> usize {
+    use crate::compress::match_state::{ZSTD_resolveRowMatchFinderMode, ZSTD_rowMatchFinderUsed};
+    use crate::compress::zstd_ldm::ZSTD_ParamSwitch_e;
+
+    let resolved = ZSTD_resolveRowMatchFinderMode(ZSTD_ParamSwitch_e::ZSTD_ps_auto, &ms.cParams);
+    if ZSTD_rowMatchFinderUsed(ms.cParams.strategy, resolved) {
+        return ZSTD_compressBlock_lazy_generic_with_istart(
+            ms,
+            seqStore,
+            rep,
+            src,
+            istart,
+            searchMethod_e::search_rowHash,
+            depth,
+            ZSTD_dictMode_e::ZSTD_noDict,
+        );
+    }
     ZSTD_compressBlock_lazy_noDict_generic(ms, seqStore, rep, src, istart, depth)
 }
 
@@ -3055,6 +3320,36 @@ pub fn ZSTD_compressBlock_btlazy2(
         rep,
         src,
         0,
+        2,
+        searchMethod_e::search_binaryTree,
+    )
+}
+
+/// Cross-block-window variant of btlazy2 — caller passes
+/// `window_buf[..src_end]` as the matchable buffer (so the BT walk can
+/// reach into prior-block bytes via `ms.window`'s base_offset) and
+/// `src_pos` is the offset where the current block starts. Without
+/// this, multi-block compression at L13/L15 (btlazy2) re-trimmed `src`
+/// to just the current block, the BT walked stale prior-block
+/// matchIndex entries pointing past the trimmed slice end, the
+/// bounds checks rejected those matches and cross-block matching
+/// effectively didn't happen — visible as a 1.78× ratio on 10 MB
+/// silesia at L15 vs upstream's 3.33×.
+pub fn ZSTD_compressBlock_btlazy2_window(
+    ms: &mut ZSTD_MatchState_t,
+    seqStore: &mut SeqStore_t,
+    rep: &mut [u32; ZSTD_REP_NUM],
+    window_buf: &[u8],
+    src_pos: usize,
+    src_end: usize,
+) -> usize {
+    let block_end = &window_buf[..src_end];
+    ZSTD_compressBlock_lazy_noDict_generic_search(
+        ms,
+        seqStore,
+        rep,
+        block_end,
+        src_pos,
         2,
         searchMethod_e::search_binaryTree,
     )
@@ -3689,5 +3984,4 @@ mod tests {
         assert_eq!(best, 4);
         assert_eq!(offbase, 0);
     }
-
 }

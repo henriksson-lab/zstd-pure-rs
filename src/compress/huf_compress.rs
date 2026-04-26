@@ -1268,7 +1268,153 @@ pub fn HUF_encodeSymbol(
 }
 
 /// Port of `HUF_compress1X_usingCTable_internal_body_loop`.
+///
+/// Const-generic on `KU` (kUnroll), `KFF` (kFastFlush) and `KLF` (kLastFast)
+/// so the compiler can fully unroll the inner loops, dead-strip the
+/// `kFastFlush` branches in `HUF_flushBits`, and pick the right
+/// `HUF_addBits` fast-path. Upstream achieves the same shape via the
+/// `HUF_GEN_COMPRESS_*` C macros.
+#[inline(always)]
+pub fn HUF_compress1X_usingCTable_body_loop_specialized<
+    const KU: usize,
+    const KFF: bool,
+    const KLF: bool,
+>(
+    bitC: &mut HUF_CStream_t,
+    ip: &[u8],
+    srcSize: usize,
+    ctable: &[HUF_CElt],
+) {
+    let mut n = srcSize;
+    let mut rem = n % KU;
+    if rem > 0 {
+        while rem > 0 {
+            rem -= 1;
+            n -= 1;
+            // SAFETY: n < ip.len() since n started at srcSize == ip.len() and decrements.
+            HUF_encodeSymbol(
+                bitC,
+                unsafe { *ip.get_unchecked(n) } as u32,
+                ctable,
+                0,
+                false,
+            );
+        }
+        HUF_flushBits(bitC, KFF);
+    }
+    debug_assert_eq!(n % KU, 0);
+
+    if !n.is_multiple_of(2 * KU) {
+        let mut u = 1usize;
+        while u < KU {
+            HUF_encodeSymbol(
+                bitC,
+                unsafe { *ip.get_unchecked(n - u) } as u32,
+                ctable,
+                0,
+                true,
+            );
+            u += 1;
+        }
+        HUF_encodeSymbol(
+            bitC,
+            unsafe { *ip.get_unchecked(n - KU) } as u32,
+            ctable,
+            0,
+            KLF,
+        );
+        HUF_flushBits(bitC, KFF);
+        n -= KU;
+    }
+    debug_assert_eq!(n % (2 * KU), 0);
+
+    while n > 0 {
+        let mut u = 1usize;
+        while u < KU {
+            HUF_encodeSymbol(
+                bitC,
+                unsafe { *ip.get_unchecked(n - u) } as u32,
+                ctable,
+                0,
+                true,
+            );
+            u += 1;
+        }
+        HUF_encodeSymbol(
+            bitC,
+            unsafe { *ip.get_unchecked(n - KU) } as u32,
+            ctable,
+            0,
+            KLF,
+        );
+        HUF_flushBits(bitC, KFF);
+
+        HUF_zeroIndex1(bitC);
+        let mut u = 1usize;
+        while u < KU {
+            HUF_encodeSymbol(
+                bitC,
+                unsafe { *ip.get_unchecked(n - KU - u) } as u32,
+                ctable,
+                1,
+                true,
+            );
+            u += 1;
+        }
+        HUF_encodeSymbol(
+            bitC,
+            unsafe { *ip.get_unchecked(n - (2 * KU)) } as u32,
+            ctable,
+            1,
+            KLF,
+        );
+        HUF_mergeIndex1(bitC);
+        HUF_flushBits(bitC, KFF);
+        n -= 2 * KU;
+    }
+}
+
+/// Runtime-arg dispatcher used by tests / non-hot callers. The hot
+/// `HUF_compress1X_usingCTable_internal_body` calls the specialized
+/// const-generic form directly so each combination is its own monomorphized
+/// function.
 pub fn HUF_compress1X_usingCTable_body_loop(
+    bitC: &mut HUF_CStream_t,
+    ip: &[u8],
+    srcSize: usize,
+    ctable: &[HUF_CElt],
+    kUnroll: usize,
+    kFastFlush: bool,
+    kLastFast: bool,
+) {
+    macro_rules! d {
+        ($u:literal, $ff:literal, $lf:literal) => {
+            HUF_compress1X_usingCTable_body_loop_specialized::<$u, $ff, $lf>(
+                bitC, ip, srcSize, ctable,
+            )
+        };
+    }
+    match (kUnroll, kFastFlush, kLastFast) {
+        (2, false, false) => d!(2, false, false),
+        (2, true, false) => d!(2, true, false),
+        (2, true, true) => d!(2, true, true),
+        (3, true, true) => d!(3, true, true),
+        (4, false, false) => d!(4, false, false),
+        (5, true, false) => d!(5, true, false),
+        (5, true, true) => d!(5, true, true),
+        (6, true, false) => d!(6, true, false),
+        (7, true, false) => d!(7, true, false),
+        (8, true, false) => d!(8, true, false),
+        (9, true, true) => d!(9, true, true),
+        // Fallback for any combination not pre-specialized — still
+        // const-incorrect, but functionally correct.
+        _ => HUF_compress1X_usingCTable_body_loop_runtime(
+            bitC, ip, srcSize, ctable, kUnroll, kFastFlush, kLastFast,
+        ),
+    }
+}
+
+fn HUF_compress1X_usingCTable_body_loop_runtime(
     bitC: &mut HUF_CStream_t,
     ip: &[u8],
     srcSize: usize,
@@ -1287,8 +1433,6 @@ pub fn HUF_compress1X_usingCTable_body_loop(
         }
         HUF_flushBits(bitC, kFastFlush);
     }
-    debug_assert_eq!(n % kUnroll, 0);
-
     if !n.is_multiple_of(2 * kUnroll) {
         let mut u = 1usize;
         while u < kUnroll {
@@ -1299,8 +1443,6 @@ pub fn HUF_compress1X_usingCTable_body_loop(
         HUF_flushBits(bitC, kFastFlush);
         n -= kUnroll;
     }
-    debug_assert_eq!(n % (2 * kUnroll), 0);
-
     while n > 0 {
         let mut u = 1usize;
         while u < kUnroll {
@@ -1309,20 +1451,13 @@ pub fn HUF_compress1X_usingCTable_body_loop(
         }
         HUF_encodeSymbol(bitC, ip[n - kUnroll] as u32, ctable, 0, kLastFast);
         HUF_flushBits(bitC, kFastFlush);
-
         HUF_zeroIndex1(bitC);
         let mut u = 1usize;
         while u < kUnroll {
             HUF_encodeSymbol(bitC, ip[n - kUnroll - u] as u32, ctable, 1, true);
             u += 1;
         }
-        HUF_encodeSymbol(
-            bitC,
-            ip[n - (2 * kUnroll)] as u32,
-            ctable,
-            1,
-            kLastFast,
-        );
+        HUF_encodeSymbol(bitC, ip[n - (2 * kUnroll)] as u32, ctable, 1, kLastFast);
         HUF_mergeIndex1(bitC);
         HUF_flushBits(bitC, kFastFlush);
         n -= 2 * kUnroll;
@@ -1360,46 +1495,79 @@ pub fn HUF_compress1X_usingCTable_internal_body(
         return 0;
     }
     if dstSize < HUF_tightCompressBound(src.len(), tableLog) || tableLog > 11 {
-        HUF_compress1X_usingCTable_body_loop(
-            &mut bitC,
-            src,
-            src.len(),
-            ctable,
-            if crate::common::mem::MEM_32bits() != 0 { 2 } else { 4 },
-            false,
-            false,
-        );
+        if crate::common::mem::MEM_32bits() != 0 {
+            HUF_compress1X_usingCTable_body_loop_specialized::<2, false, false>(
+                &mut bitC,
+                src,
+                src.len(),
+                ctable,
+            );
+        } else {
+            HUF_compress1X_usingCTable_body_loop_specialized::<4, false, false>(
+                &mut bitC,
+                src,
+                src.len(),
+                ctable,
+            );
+        }
     } else if crate::common::mem::MEM_32bits() != 0 {
         match tableLog {
-            11 => HUF_compress1X_usingCTable_body_loop(
-                &mut bitC, src, src.len(), ctable, 2, true, false,
+            11 => HUF_compress1X_usingCTable_body_loop_specialized::<2, true, false>(
+                &mut bitC,
+                src,
+                src.len(),
+                ctable,
             ),
-            8..=10 => HUF_compress1X_usingCTable_body_loop(
-                &mut bitC, src, src.len(), ctable, 2, true, true,
+            8..=10 => HUF_compress1X_usingCTable_body_loop_specialized::<2, true, true>(
+                &mut bitC,
+                src,
+                src.len(),
+                ctable,
             ),
-            _ => HUF_compress1X_usingCTable_body_loop(
-                &mut bitC, src, src.len(), ctable, 3, true, true,
+            _ => HUF_compress1X_usingCTable_body_loop_specialized::<3, true, true>(
+                &mut bitC,
+                src,
+                src.len(),
+                ctable,
             ),
         }
     } else {
         match tableLog {
-            11 => HUF_compress1X_usingCTable_body_loop(
-                &mut bitC, src, src.len(), ctable, 5, true, false,
+            11 => HUF_compress1X_usingCTable_body_loop_specialized::<5, true, false>(
+                &mut bitC,
+                src,
+                src.len(),
+                ctable,
             ),
-            10 => HUF_compress1X_usingCTable_body_loop(
-                &mut bitC, src, src.len(), ctable, 5, true, true,
+            10 => HUF_compress1X_usingCTable_body_loop_specialized::<5, true, true>(
+                &mut bitC,
+                src,
+                src.len(),
+                ctable,
             ),
-            9 => HUF_compress1X_usingCTable_body_loop(
-                &mut bitC, src, src.len(), ctable, 6, true, false,
+            9 => HUF_compress1X_usingCTable_body_loop_specialized::<6, true, false>(
+                &mut bitC,
+                src,
+                src.len(),
+                ctable,
             ),
-            8 => HUF_compress1X_usingCTable_body_loop(
-                &mut bitC, src, src.len(), ctable, 7, true, false,
+            8 => HUF_compress1X_usingCTable_body_loop_specialized::<7, true, false>(
+                &mut bitC,
+                src,
+                src.len(),
+                ctable,
             ),
-            7 => HUF_compress1X_usingCTable_body_loop(
-                &mut bitC, src, src.len(), ctable, 8, true, false,
+            7 => HUF_compress1X_usingCTable_body_loop_specialized::<8, true, false>(
+                &mut bitC,
+                src,
+                src.len(),
+                ctable,
             ),
-            _ => HUF_compress1X_usingCTable_body_loop(
-                &mut bitC, src, src.len(), ctable, 9, true, true,
+            _ => HUF_compress1X_usingCTable_body_loop_specialized::<9, true, true>(
+                &mut bitC,
+                src,
+                src.len(),
+                ctable,
             ),
         }
     }
@@ -1618,8 +1786,7 @@ pub fn HUF_compress_internal(
     }
 
     if (flags & crate::decompress::huf_decompress::HUF_flags_suspectUncompressible) != 0
-        && srcSize
-            >= (SUSPECT_INCOMPRESSIBLE_SAMPLE_SIZE * SUSPECT_INCOMPRESSIBLE_SAMPLE_RATIO)
+        && srcSize >= (SUSPECT_INCOMPRESSIBLE_SAMPLE_SIZE * SUSPECT_INCOMPRESSIBLE_SAMPLE_RATIO)
     {
         let mut count = vec![0u32; (HUF_SYMBOLVALUE_MAX + 1) as usize];
         let mut maxSymbolValueBegin = maxSymbolValue;
@@ -1673,7 +1840,8 @@ pub fn HUF_compress_internal(
 
     // Build fresh CTable.
     let mut ctable = vec![0u64; (HUF_SYMBOLVALUE_MAX + 2) as usize];
-    huffLog = HUF_optimalTableLog_internal(huffLog, srcSize, maxSymbolValue, &mut ctable, &count, flags);
+    huffLog =
+        HUF_optimalTableLog_internal(huffLog, srcSize, maxSymbolValue, &mut ctable, &count, flags);
     let maxBits = HUF_buildCTable(&mut ctable, &count, maxSymbolValue, huffLog);
     if crate::common::error::ERR_isError(maxBits) {
         return maxBits;
@@ -1906,8 +2074,12 @@ mod tests {
             if max_bits < guess as usize && guess > min_table_log {
                 break;
             }
-            let h_size =
-                HUF_writeCTable(&mut [0u8; HUF_CTABLEBOUND], &scratch, max_symbol_value, max_bits as u32);
+            let h_size = HUF_writeCTable(
+                &mut [0u8; HUF_CTABLEBOUND],
+                &scratch,
+                max_symbol_value,
+                max_bits as u32,
+            );
             if crate::common::error::ERR_isError(h_size) {
                 continue;
             }
@@ -1925,7 +2097,8 @@ mod tests {
 
     #[test]
     fn compress_internal_rejects_large_suspect_incompressible_input_early() {
-        let mut src = vec![0u8; SUSPECT_INCOMPRESSIBLE_SAMPLE_SIZE * SUSPECT_INCOMPRESSIBLE_SAMPLE_RATIO];
+        let mut src =
+            vec![0u8; SUSPECT_INCOMPRESSIBLE_SAMPLE_SIZE * SUSPECT_INCOMPRESSIBLE_SAMPLE_RATIO];
         let mut x = 0x1234_5678u32;
         for b in &mut src {
             x ^= x << 13;

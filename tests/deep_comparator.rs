@@ -13,7 +13,9 @@ fn comparator_bin() -> PathBuf {
     std::env::var_os("ZSTD_PURE_RS_CCC_BIN")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
-            PathBuf::from("/data/henriksson/github/claude/code-complexity-comparator/target/release/ccc-rs")
+            PathBuf::from(
+                "/data/henriksson/github/claude/code-complexity-comparator/target/release/ccc-rs",
+            )
         })
 }
 

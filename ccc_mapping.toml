@@ -2908,3 +2908,42 @@ other_path = "zstd/lib/decompress/zstd_decompress.c"
 rust  = "sum_u32"
 other = "sum_u32"
 other_path = "zstd/lib/compress/zstd_opt.c"
+
+# =====================================================================
+# Late additions — closing gaps caught by `ccc-rs missing` after the
+# Rust report scope was widened to all of `src/compress/` (was just
+# `zstd_compress.rs`).
+# =====================================================================
+
+# `ZSTD_selectAddr` is a header-inlined helper in upstream that uses
+# inline asm to force CMOV codegen. Our Rust port lives in
+# `src/common/zstd_internal.rs` and uses an `if` expression that LLVM
+# lowers to a conditional move.
+[[entries]]
+rust       = "ZSTD_selectAddr"
+rust_path  = "src/common/zstd_internal.rs"
+other      = "ZSTD_selectAddr"
+other_path = "zstd/lib/compress/zstd_compress_internal.h"
+
+# `HUF_compress1X_usingCTable_internal` dispatch wrapper. We also have
+# `_default` / `_bmi2` / `_body` / `_body_loop` variants below.
+[[entries]]
+rust       = "HUF_compress1X_usingCTable_internal"
+rust_path  = "src/compress/huf_compress.rs"
+other      = "HUF_compress1X_usingCTable_internal"
+other_path = "zstd/lib/compress/huf_compress.c"
+
+# `convertSequences_noRepcodes` and `ZSTD_get1BlockSummary` each appear
+# as 3 / 2 separate def sites in upstream under different `#if` guards;
+# they all share the same name and map to one Rust counterpart.
+[[entries]]
+rust       = "convertSequences_noRepcodes"
+rust_path  = "src/compress/zstd_compress.rs"
+other      = "convertSequences_noRepcodes"
+other_path = "zstd/lib/compress/zstd_compress.c"
+
+[[entries]]
+rust       = "ZSTD_get1BlockSummary"
+rust_path  = "src/compress/zstd_compress.rs"
+other      = "ZSTD_get1BlockSummary"
+other_path = "zstd/lib/compress/zstd_compress.c"

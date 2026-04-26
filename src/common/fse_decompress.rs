@@ -28,17 +28,17 @@ pub const FSE_MAX_SYMBOL_VALUE: u32 = 255;
 pub const FSE_MIN_TABLELOG: u32 = 5;
 pub const FSE_TABLELOG_ABSOLUTE_MAX: u32 = 15;
 
-#[inline]
+#[inline(always)]
 pub const fn FSE_TABLESTEP(tableSize: u32) -> u32 {
     (tableSize >> 1) + (tableSize >> 3) + 3
 }
 
-#[inline]
+#[inline(always)]
 pub const fn FSE_DTABLE_SIZE_U32(maxTableLog: u32) -> usize {
     1 + (1 << maxTableLog) as usize
 }
 
-#[inline]
+#[inline(always)]
 pub const fn FSE_BUILD_DTABLE_WKSP_SIZE(maxTableLog: u32, maxSymbolValue: u32) -> usize {
     2 * (maxSymbolValue as usize + 1) + (1 << maxTableLog as usize) + 8
 }
@@ -46,39 +46,39 @@ pub const fn FSE_BUILD_DTABLE_WKSP_SIZE(maxTableLog: u32, maxSymbolValue: u32) -
 pub type FSE_DTable = u32;
 
 /// Pack (newState, symbol, nbBits) into a single `u32` slot.
-#[inline]
+#[inline(always)]
 fn pack_decode(newState: u16, symbol: u8, nbBits: u8) -> u32 {
     (newState as u32) | ((symbol as u32) << 16) | ((nbBits as u32) << 24)
 }
 
-#[inline]
+#[inline(always)]
 fn unpack_newState(slot: u32) -> u16 {
     slot as u16
 }
 
-#[inline]
+#[inline(always)]
 fn unpack_symbol(slot: u32) -> u8 {
     (slot >> 16) as u8
 }
 
-#[inline]
+#[inline(always)]
 fn unpack_nbBits(slot: u32) -> u8 {
     (slot >> 24) as u8
 }
 
 /// `FSE_DTableHeader` packed into the DTable's first u32:
 ///   bits 0..16 = tableLog, bits 16..32 = fastMode.
-#[inline]
+#[inline(always)]
 fn pack_header(tableLog: u16, fastMode: u16) -> u32 {
     (tableLog as u32) | ((fastMode as u32) << 16)
 }
 
-#[inline]
+#[inline(always)]
 fn header_tableLog(slot: u32) -> u32 {
     slot & 0xFFFF
 }
 
-#[inline]
+#[inline(always)]
 fn header_fastMode(slot: u32) -> u32 {
     (slot >> 16) & 0xFFFF
 }
@@ -95,6 +95,7 @@ pub struct FSE_DState_t {
 }
 
 /// Port of `FSE_initDState`.
+#[inline(always)]
 pub fn FSE_initDState(dsp: &mut FSE_DState_t, bitD: &mut BIT_DStream_t, dt: &[FSE_DTable]) {
     let header = dt[0];
     let tableLog = header_tableLog(header);
@@ -104,14 +105,14 @@ pub fn FSE_initDState(dsp: &mut FSE_DState_t, bitD: &mut BIT_DStream_t, dt: &[FS
 }
 
 /// Port of `FSE_peekSymbol`.
-#[inline]
+#[inline(always)]
 pub fn FSE_peekSymbol(dsp: &FSE_DState_t, dt: &[FSE_DTable]) -> u8 {
     let slot = dt[dsp.table_offset + dsp.state];
     unpack_symbol(slot)
 }
 
 /// Port of `FSE_updateState`.
-#[inline]
+#[inline(always)]
 pub fn FSE_updateState(dsp: &mut FSE_DState_t, bitD: &mut BIT_DStream_t, dt: &[FSE_DTable]) {
     let slot = dt[dsp.table_offset + dsp.state];
     let nbBits = unpack_nbBits(slot);
@@ -120,7 +121,7 @@ pub fn FSE_updateState(dsp: &mut FSE_DState_t, bitD: &mut BIT_DStream_t, dt: &[F
 }
 
 /// Port of `FSE_decodeSymbol`.
-#[inline]
+#[inline(always)]
 pub fn FSE_decodeSymbol(dsp: &mut FSE_DState_t, bitD: &mut BIT_DStream_t, dt: &[FSE_DTable]) -> u8 {
     let slot = dt[dsp.table_offset + dsp.state];
     let nbBits = unpack_nbBits(slot);
@@ -131,7 +132,7 @@ pub fn FSE_decodeSymbol(dsp: &mut FSE_DState_t, bitD: &mut BIT_DStream_t, dt: &[
 }
 
 /// Port of `FSE_decodeSymbolFast`.
-#[inline]
+#[inline(always)]
 pub fn FSE_decodeSymbolFast(
     dsp: &mut FSE_DState_t,
     bitD: &mut BIT_DStream_t,
@@ -146,7 +147,7 @@ pub fn FSE_decodeSymbolFast(
 }
 
 /// Port of `FSE_endOfDState`.
-#[inline]
+#[inline(always)]
 pub fn FSE_endOfDState(dsp: &FSE_DState_t) -> u32 {
     (dsp.state == 0) as u32
 }

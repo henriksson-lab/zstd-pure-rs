@@ -35,8 +35,8 @@ pub const fn MEM_32bits() -> u32 {
 
 #[inline(always)]
 pub fn MEM_read16(ptr: &[u8]) -> u16 {
-    let bytes: [u8; 2] = ptr[..2].try_into().expect("MEM_read16 needs >=2 bytes");
-    u16::from_ne_bytes(bytes)
+    debug_assert!(ptr.len() >= 2);
+    unsafe { (ptr.as_ptr() as *const u16).read_unaligned() }
 }
 
 #[inline(always)]
@@ -47,14 +47,14 @@ pub fn MEM_read24(ptr: &[u8]) -> u32 {
 
 #[inline(always)]
 pub fn MEM_read32(ptr: &[u8]) -> u32 {
-    let bytes: [u8; 4] = ptr[..4].try_into().expect("MEM_read32 needs >=4 bytes");
-    u32::from_ne_bytes(bytes)
+    debug_assert!(ptr.len() >= 4);
+    unsafe { (ptr.as_ptr() as *const u32).read_unaligned() }
 }
 
 #[inline(always)]
 pub fn MEM_read64(ptr: &[u8]) -> u64 {
-    let bytes: [u8; 8] = ptr[..8].try_into().expect("MEM_read64 needs >=8 bytes");
-    u64::from_ne_bytes(bytes)
+    debug_assert!(ptr.len() >= 8);
+    unsafe { (ptr.as_ptr() as *const u64).read_unaligned() }
 }
 
 /// `size_t` load (`MEM_readST`): 4 or 8 bytes depending on target.
@@ -89,8 +89,8 @@ pub fn MEM_write64(dst: &mut [u8], value: u64) {
 
 #[inline(always)]
 pub fn MEM_readLE16(ptr: &[u8]) -> u16 {
-    let bytes: [u8; 2] = ptr[..2].try_into().expect("MEM_readLE16 needs >=2 bytes");
-    u16::from_le_bytes(bytes)
+    debug_assert!(ptr.len() >= 2);
+    u16::from_le(unsafe { (ptr.as_ptr() as *const u16).read_unaligned() })
 }
 
 #[inline(always)]
@@ -100,14 +100,14 @@ pub fn MEM_readLE24(ptr: &[u8]) -> u32 {
 
 #[inline(always)]
 pub fn MEM_readLE32(ptr: &[u8]) -> u32 {
-    let bytes: [u8; 4] = ptr[..4].try_into().expect("MEM_readLE32 needs >=4 bytes");
-    u32::from_le_bytes(bytes)
+    debug_assert!(ptr.len() >= 4);
+    u32::from_le(unsafe { (ptr.as_ptr() as *const u32).read_unaligned() })
 }
 
 #[inline(always)]
 pub fn MEM_readLE64(ptr: &[u8]) -> u64 {
-    let bytes: [u8; 8] = ptr[..8].try_into().expect("MEM_readLE64 needs >=8 bytes");
-    u64::from_le_bytes(bytes)
+    debug_assert!(ptr.len() >= 8);
+    u64::from_le(unsafe { (ptr.as_ptr() as *const u64).read_unaligned() })
 }
 
 #[inline(always)]

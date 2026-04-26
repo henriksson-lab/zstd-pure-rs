@@ -14,9 +14,7 @@
 //! requirement.
 
 use crate::common::bits::ZSTD_NbCommonBytes;
-use crate::common::mem::{
-    MEM_64bits, MEM_read16, MEM_read32, MEM_readLE32, MEM_readLE64, MEM_readST,
-};
+use crate::common::mem::{MEM_64bits, MEM_readLE32, MEM_readLE64};
 
 // Primes from upstream — must not drift.
 pub const PRIME_3BYTES: u32 = 506_832_829;
@@ -193,6 +191,45 @@ pub fn ZSTD_hashPtr(p: &[u8], hBits: u32, mls: u32) -> usize {
     }
 }
 
+/// Bounds-check-free variant of `ZSTD_hashPtr`. Used on the matcher
+/// inner-loop hot paths where the caller's loop invariant proves that
+/// at least 8 bytes (for `mls >= 5`) or 4 bytes (for `mls == 4`) are
+/// available at `buf[pos..]`. The slice-based `ZSTD_hashPtr` emits a
+/// bounds check inside `MEM_readLE{32,64}` that the compiler can't
+/// elide through the safe-Rust slice interface, defeating CMOV
+/// codegen on per-byte hash computations.
+///
+/// # Safety
+/// `pos + bytes_needed(mls) <= buf.len()` where
+/// `bytes_needed = 4 if mls == 4 else 8`.
+#[inline(always)]
+pub unsafe fn ZSTD_hashPtr_at_unchecked(buf: &[u8], pos: usize, hBits: u32, mls: u32) -> usize {
+    debug_assert!(hBits <= 32);
+    let p = buf.as_ptr().wrapping_add(pos);
+    match mls {
+        5 => {
+            let u = unsafe { (p as *const u64).read_unaligned() }.to_le();
+            ZSTD_hash5(u, hBits, 0)
+        }
+        6 => {
+            let u = unsafe { (p as *const u64).read_unaligned() }.to_le();
+            ZSTD_hash6(u, hBits, 0)
+        }
+        7 => {
+            let u = unsafe { (p as *const u64).read_unaligned() }.to_le();
+            ZSTD_hash7(u, hBits, 0)
+        }
+        8 => {
+            let u = unsafe { (p as *const u64).read_unaligned() }.to_le();
+            ZSTD_hash8(u, hBits, 0)
+        }
+        _ => {
+            let u = unsafe { (p as *const u32).read_unaligned() }.to_le();
+            ZSTD_hash4(u, hBits, 0) as usize
+        }
+    }
+}
+
 /// Port of `ZSTD_hashPtrSalted`.
 #[inline]
 pub fn ZSTD_hashPtrSalted(p: &[u8], hBits: u32, mls: u32, hashSalt: u64) -> usize {
@@ -203,6 +240,47 @@ pub fn ZSTD_hashPtrSalted(p: &[u8], hBits: u32, mls: u32, hashSalt: u64) -> usiz
         7 => ZSTD_hash7PtrS(p, hBits, hashSalt),
         8 => ZSTD_hash8PtrS(p, hBits, hashSalt),
         _ => ZSTD_hash4PtrS(p, hBits, hashSalt as u32),
+    }
+}
+
+/// Bounds-check-free variant of `ZSTD_hashPtrSalted`. Used in the
+/// row-hash matcher's per-byte inner loops where the loop invariant
+/// proves the read is in-range.
+///
+/// # Safety
+/// `pos + bytes_needed(mls) <= buf.len()` where
+/// `bytes_needed = 4 if mls == 4 else 8`.
+#[inline(always)]
+pub unsafe fn ZSTD_hashPtrSalted_at_unchecked(
+    buf: &[u8],
+    pos: usize,
+    hBits: u32,
+    mls: u32,
+    hashSalt: u64,
+) -> usize {
+    debug_assert!(hBits <= 32);
+    let p = buf.as_ptr().wrapping_add(pos);
+    match mls {
+        5 => {
+            let u = unsafe { (p as *const u64).read_unaligned() }.to_le();
+            ZSTD_hash5(u, hBits, hashSalt)
+        }
+        6 => {
+            let u = unsafe { (p as *const u64).read_unaligned() }.to_le();
+            ZSTD_hash6(u, hBits, hashSalt)
+        }
+        7 => {
+            let u = unsafe { (p as *const u64).read_unaligned() }.to_le();
+            ZSTD_hash7(u, hBits, hashSalt)
+        }
+        8 => {
+            let u = unsafe { (p as *const u64).read_unaligned() }.to_le();
+            ZSTD_hash8(u, hBits, hashSalt)
+        }
+        _ => {
+            let u = unsafe { (p as *const u32).read_unaligned() }.to_le();
+            ZSTD_hash4(u, hBits, hashSalt as u32) as usize
+        }
     }
 }
 
@@ -267,22 +345,42 @@ pub fn ZSTD_count_2segments(
 ///
 /// Rust signature note: upstream takes three raw `BYTE*` pointers
 /// into the same buffer. We take one `&[u8]` + three byte indices.
+///
+/// Marked `#[inline(always)]` to match upstream's `MEM_STATIC FORCE_INLINE_TEMPLATE`
+/// — this is the per-match inner kernel of every strategy's matcher.
+/// Profile showed `#[inline]` alone wasn't enough: ZSTD_count's call
+/// boundary (push/pop/ret) consumed ~40% of its self-time at L1
+/// because LLVM was reluctant to fully inline the moderate-sized
+/// body. Forcing inline lets the matchers pay only for the actual
+/// 8-byte-stride compare loop.
+#[inline(always)]
 pub fn ZSTD_count(buf: &[u8], in_pos: usize, match_pos: usize, in_limit: usize) -> usize {
     let word = core::mem::size_of::<usize>();
     let start = in_pos;
     let mut pIn = in_pos;
     let mut pMatch = match_pos;
     let inLoopLimit = in_limit.saturating_sub(word - 1);
+    let base = buf.as_ptr();
 
     if pIn < inLoopLimit {
-        let diff = MEM_readST(&buf[pMatch..]) ^ MEM_readST(&buf[pIn..]);
+        debug_assert!(pMatch + word <= buf.len());
+        debug_assert!(pIn + word <= buf.len());
+        let diff = unsafe {
+            (base.add(pMatch) as *const usize).read_unaligned()
+                ^ (base.add(pIn) as *const usize).read_unaligned()
+        };
         if diff != 0 {
             return ZSTD_NbCommonBytes(diff) as usize;
         }
         pIn += word;
         pMatch += word;
         while pIn < inLoopLimit {
-            let diff = MEM_readST(&buf[pMatch..]) ^ MEM_readST(&buf[pIn..]);
+            debug_assert!(pMatch + word <= buf.len());
+            debug_assert!(pIn + word <= buf.len());
+            let diff = unsafe {
+                (base.add(pMatch) as *const usize).read_unaligned()
+                    ^ (base.add(pIn) as *const usize).read_unaligned()
+            };
             if diff == 0 {
                 pIn += word;
                 pMatch += word;
@@ -292,19 +390,25 @@ pub fn ZSTD_count(buf: &[u8], in_pos: usize, match_pos: usize, in_limit: usize) 
             return pIn - start;
         }
     }
-    if MEM_64bits() != 0
-        && pIn + 3 < in_limit
-        && MEM_read32(&buf[pMatch..]) == MEM_read32(&buf[pIn..])
-    {
-        pIn += 4;
-        pMatch += 4;
-    }
-    if pIn + 1 < in_limit && MEM_read16(&buf[pMatch..]) == MEM_read16(&buf[pIn..]) {
-        pIn += 2;
-        pMatch += 2;
-    }
-    if pIn < in_limit && buf[pMatch] == buf[pIn] {
-        pIn += 1;
+    unsafe {
+        if MEM_64bits() != 0
+            && pIn + 3 < in_limit
+            && (base.add(pMatch) as *const u32).read_unaligned()
+                == (base.add(pIn) as *const u32).read_unaligned()
+        {
+            pIn += 4;
+            pMatch += 4;
+        }
+        if pIn + 1 < in_limit
+            && (base.add(pMatch) as *const u16).read_unaligned()
+                == (base.add(pIn) as *const u16).read_unaligned()
+        {
+            pIn += 2;
+            pMatch += 2;
+        }
+        if pIn < in_limit && *base.add(pMatch) == *base.add(pIn) {
+            pIn += 1;
+        }
     }
     pIn - start
 }

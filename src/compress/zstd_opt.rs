@@ -446,6 +446,21 @@ pub struct ZSTD_optLdm_t {
     pub offset: u32,
 }
 
+#[inline]
+fn ZSTD_cloneActiveRawSeqStore(src: Option<&RawSeqStore_t>) -> RawSeqStore_t {
+    let Some(src) = src else {
+        return RawSeqStore_t::default();
+    };
+    let end = src.size.min(src.seq.len());
+    RawSeqStore_t {
+        seq: src.seq[..end].to_vec(),
+        pos: src.pos.min(end),
+        posInSequence: src.posInSequence,
+        size: end,
+        capacity: end,
+    }
+}
+
 /// Port of `ZSTD_optLdm_skipRawSeqStoreBytes`. Advances both `pos`
 /// and `posInSequence` forward by `nbBytes`, popping full sequences
 /// as they're consumed. Symmetric to LDM's `skipSequences` but treats
@@ -534,9 +549,9 @@ pub fn ZSTD_opt_getNextMatchAndUpdateSeqStore(
         .litLength
         .saturating_sub(optLdm.seqStore.posInSequence as u32);
     let matchBytesRemaining = if literalsBytesRemaining == 0 {
-        currSeq.matchLength.wrapping_sub(
-            (optLdm.seqStore.posInSequence as u32).wrapping_sub(currSeq.litLength),
-        )
+        currSeq
+            .matchLength
+            .wrapping_sub((optLdm.seqStore.posInSequence as u32).wrapping_sub(currSeq.litLength))
     } else {
         currSeq.matchLength
     };
@@ -644,7 +659,7 @@ pub fn ZSTD_insertBt1(
     let mut nbCompares = 1u32 << ms.cParams.searchLog;
     let dictLimit = ms.window.dictLimit;
     let prefixStart = dictLimit.saturating_sub(ms.window.base_offset) as usize;
-    let dict = ms.dictContent.clone();
+    let dict = &ms.dictContent;
     let dictEnd = dict.len();
     let dictBaseOffset = ms.window.dictBase_offset;
 
@@ -704,12 +719,7 @@ pub fn ZSTD_insertBt1(
 
         let mut match_pos = matchIndex.saturating_sub(ms.window.base_offset) as usize;
         if !extDict || matchIndex.wrapping_add(matchLength as u32) >= dictLimit {
-            matchLength += ZSTD_count(
-                buf,
-                ip_pos + matchLength,
-                match_pos + matchLength,
-                iend_pos,
-            );
+            matchLength += ZSTD_count(buf, ip_pos + matchLength, match_pos + matchLength, iend_pos);
         } else {
             match_pos = matchIndex.saturating_sub(dictBaseOffset) as usize;
             matchLength += ZSTD_count_2segments(
@@ -717,7 +727,7 @@ pub fn ZSTD_insertBt1(
                 ip_pos + matchLength,
                 iend_pos,
                 prefixStart,
-                &dict,
+                dict,
                 match_pos + matchLength,
                 dictEnd,
             );
@@ -1005,16 +1015,23 @@ pub fn ZSTD_insertBtAndGetAllMatches(
     let matchLow = if windowLow == 0 { 1 } else { windowLow };
     let prefixStart = dictLimit.saturating_sub(ms.window.base_offset) as usize;
     let dictBaseOffset = ms.window.dictBase_offset;
-    let extDict = ms.dictContent.clone();
-    let extDictEnd = extDict.len();
+    let extDictPtr = ms.dictContent.as_ptr();
+    let extDictEnd = ms.dictContent.len();
+    let extDict = || unsafe { core::slice::from_raw_parts(extDictPtr, extDictEnd) };
 
-    let dms_owned = if dictMode == ZSTD_dictMode_e::ZSTD_dictMatchState {
-        ms.dictMatchState.as_deref().cloned()
+    let dms_ptr = if dictMode == ZSTD_dictMode_e::ZSTD_dictMatchState {
+        ms.dictMatchState
+            .as_deref()
+            .map_or(core::ptr::null(), |dms| dms as *const ZSTD_MatchState_t)
     } else {
-        None
+        core::ptr::null()
     };
+    // The current match state is mutated below, while the attached
+    // dictionary match state is read-only. A raw pointer preserves
+    // upstream's two-state model without cloning dictionary tables.
+    let dms_ref = || unsafe { dms_ptr.as_ref() };
     let (dmsBaseOff, dmsLowLimit, dmsHighLimit, dmsIndexDelta, dmsHashLog, dmsBtMask, dmsBtLow) =
-        if let Some(dms) = dms_owned.as_ref() {
+        if let Some(dms) = dms_ref() {
             let dmsHighLimit = dms.window.nextSrc;
             let dmsLowLimit = dms.window.lowLimit;
             let dmsIndexDelta = windowLow.wrapping_sub(dmsHighLimit);
@@ -1092,7 +1109,7 @@ pub fn ZSTD_insertBtAndGetAllMatches(
                         buf,
                         ip_pos,
                         prefixStart,
-                        &extDict,
+                        extDict(),
                         repMatch,
                         minMatch,
                     )
@@ -1102,13 +1119,15 @@ pub fn ZSTD_insertBtAndGetAllMatches(
                         ip_pos + minMatch as usize,
                         ilimit_pos,
                         prefixStart,
-                        &extDict,
+                        extDict(),
                         repMatch + minMatch as usize,
                         extDictEnd,
                     ) + minMatch as usize;
                 }
-            } else if let Some(dms) = dms_owned.as_ref() {
-                let repMatch = repIndex.wrapping_sub(dmsIndexDelta).wrapping_sub(dmsBaseOff) as usize;
+            } else if let Some(dms) = dms_ref() {
+                let repMatch = repIndex
+                    .wrapping_sub(dmsIndexDelta)
+                    .wrapping_sub(dmsBaseOff) as usize;
                 if repOffset.wrapping_sub(1)
                     < curr.wrapping_sub(dmsLowLimit.wrapping_add(dmsIndexDelta))
                     && ZSTD_index_overlap_check(dictLimit, repIndex)
@@ -1155,7 +1174,7 @@ pub fn ZSTD_insertBtAndGetAllMatches(
                     ip_pos,
                     ilimit_pos,
                     prefixStart,
-                    &extDict,
+                    extDict(),
                     match_pos,
                     extDictEnd,
                 )
@@ -1203,7 +1222,7 @@ pub fn ZSTD_insertBtAndGetAllMatches(
                 ip_pos + matchLength,
                 ilimit_pos,
                 prefixStart,
-                &extDict,
+                extDict(),
                 match_pos + matchLength,
                 extDictEnd,
             );
@@ -1262,7 +1281,7 @@ pub fn ZSTD_insertBtAndGetAllMatches(
     }
 
     if dictMode == ZSTD_dictMode_e::ZSTD_dictMatchState && nbCompares > 0 {
-        if let Some(dms) = dms_owned.as_ref() {
+        if let Some(dms) = dms_ref() {
             let dmsH = ZSTD_hashPtr(&buf[ip_pos..], dmsHashLog, mls);
             let mut dictMatchIndex = dms.hashTable[dmsH];
             commonLengthSmaller = 0;
@@ -1585,7 +1604,7 @@ fn ZSTD_compressBlock_opt_generic_window(
 ) -> usize {
     let mut optState = core::mem::take(&mut ms.opt);
     let mut optLdm = ZSTD_optLdm_t {
-        seqStore: ms.ldmSeqStore.clone().unwrap_or_default(),
+        seqStore: ZSTD_cloneActiveRawSeqStore(ms.ldmSeqStore.as_ref()),
         ..Default::default()
     };
     let src = &window_buf[src_pos..src_end];
@@ -1605,7 +1624,13 @@ fn ZSTD_compressBlock_opt_generic_window(
 
     debug_assert!(optLevel <= 2);
     ZSTD_opt_getNextMatchAndUpdateSeqStore(&mut optLdm, ip as u32, (iend - ip) as u32);
-    ZSTD_rescaleFreqs(&mut optState, src, src_len, optLevel, ms.entropySeed.as_ref());
+    ZSTD_rescaleFreqs(
+        &mut optState,
+        src,
+        src_len,
+        optLevel,
+        ms.entropySeed.as_ref(),
+    );
     ip += usize::from(src_pos + ip == prefixStart);
 
     'match_loop: while ip < ilimit {
@@ -1881,6 +1906,12 @@ fn ZSTD_compressBlock_opt_generic_window(
     iend - anchor
 }
 
+/// Mirrors upstream's `FORCE_INLINE_TEMPLATE` declaration: each public
+/// entry (btopt/btultra/btultra2/btopt_dictMatchState/...) calls this
+/// with literal `optLevel` and `dictMode`, so `#[inline(always)]`
+/// lets LLVM constant-propagate those values, eliminating per-byte
+/// runtime branches on `optLevel == 0/1/2` and `dictMode == ...`.
+#[inline(always)]
 fn ZSTD_compressBlock_opt_generic(
     ms: &mut ZSTD_MatchState_t,
     seqStore: &mut crate::compress::seq_store::SeqStore_t,
@@ -1891,7 +1922,7 @@ fn ZSTD_compressBlock_opt_generic(
 ) -> usize {
     let mut optState = core::mem::take(&mut ms.opt);
     let mut optLdm = ZSTD_optLdm_t {
-        seqStore: ms.ldmSeqStore.clone().unwrap_or_default(),
+        seqStore: ZSTD_cloneActiveRawSeqStore(ms.ldmSeqStore.as_ref()),
         ..Default::default()
     };
     let cParams = ms.cParams;
@@ -1909,7 +1940,13 @@ fn ZSTD_compressBlock_opt_generic(
 
     debug_assert!(optLevel <= 2);
     ZSTD_opt_getNextMatchAndUpdateSeqStore(&mut optLdm, ip as u32, (iend - ip) as u32);
-    ZSTD_rescaleFreqs(&mut optState, src, src.len(), optLevel, ms.entropySeed.as_ref());
+    ZSTD_rescaleFreqs(
+        &mut optState,
+        src,
+        src.len(),
+        optLevel,
+        ms.entropySeed.as_ref(),
+    );
     ip += usize::from(ip == prefixStart);
 
     'match_loop: while ip < ilimit {
@@ -2490,7 +2527,10 @@ mod tests {
         // = bitWeight + 256.
         for k in 1..10 {
             let stat = (1u32 << k) - 1;
-            assert_eq!(ZSTD_fracWeight(stat), ZSTD_bitWeight(stat).wrapping_add(256));
+            assert_eq!(
+                ZSTD_fracWeight(stat),
+                ZSTD_bitWeight(stat).wrapping_add(256)
+            );
         }
     }
 
@@ -2519,7 +2559,10 @@ mod tests {
         assert_eq!(t, vec![1u32, 3, 4, 9, 1]);
         assert_eq!(
             sum,
-            1u32.wrapping_add(3).wrapping_add(4).wrapping_add(9).wrapping_add(1)
+            1u32.wrapping_add(3)
+                .wrapping_add(4)
+                .wrapping_add(9)
+                .wrapping_add(1)
         );
     }
 
@@ -3128,8 +3171,7 @@ mod tests {
         // 3-byte prefix).
         let found = ZSTD_insertAndFindFirstIndexHash3(&mut ms, &mut n, &pat, ip_abs);
         assert_eq!(
-            found,
-            ms.window.base_offset,
+            found, ms.window.base_offset,
             "prior position of same 3-byte hash"
         );
     }
@@ -3245,10 +3287,7 @@ mod tests {
         assert_eq!(t, vec![65u32, 129, 257, 577]);
         assert_eq!(
             s,
-            65u32
-                .wrapping_add(129)
-                .wrapping_add(257)
-                .wrapping_add(577)
+            65u32.wrapping_add(129).wrapping_add(257).wrapping_add(577)
         );
     }
 
@@ -3505,8 +3544,8 @@ mod tests {
         ZSTD_initStats_ultra(&mut ms, &mut seq_store, &mut rep, src);
 
         assert!(seq_store.sequences.is_empty());
-        let shifted = (src.len() as u32)
-            .wrapping_add(crate::compress::match_state::ZSTD_WINDOW_START_INDEX);
+        let shifted =
+            (src.len() as u32).wrapping_add(crate::compress::match_state::ZSTD_WINDOW_START_INDEX);
         assert_eq!(ms.window.dictLimit, shifted);
         assert_eq!(ms.window.lowLimit, shifted);
         assert_eq!(ms.window.nextSrc, shifted);

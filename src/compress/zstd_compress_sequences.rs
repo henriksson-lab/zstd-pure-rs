@@ -469,13 +469,18 @@ pub fn ZSTD_encodeSequences_body(
 
     // --- iterate remaining sequences in reverse order ---
     if nbSeq >= 2 {
+        // SAFETY: n ∈ [0, nbSeq-2]; nbSeq-1 was already accessed above (the
+        // `last` init), so all four tables are guaranteed to have ≥ nbSeq
+        // entries. LL_bits/ML_bits are 36-entry const tables and llCode/mlCode
+        // are FSE-table symbol indices ≤ MaxLL=35 / MaxML=52 (we constrain
+        // ll/ml codes to ≤35; ofCode is its own bit count, no LUT needed).
         for n in (0..=nbSeq - 2).rev() {
-            let llCode = llCodeTable[n];
-            let ofCode = ofCodeTable[n];
-            let mlCode = mlCodeTable[n];
-            let llBits = LL_bits[llCode as usize] as u32;
+            let llCode = unsafe { *llCodeTable.get_unchecked(n) };
+            let ofCode = unsafe { *ofCodeTable.get_unchecked(n) };
+            let mlCode = unsafe { *mlCodeTable.get_unchecked(n) };
+            let llBits = unsafe { *LL_bits.get_unchecked(llCode as usize) } as u32;
             let ofBits = ofCode as u32;
-            let mlBits = ML_bits[mlCode as usize] as u32;
+            let mlBits = unsafe { *ML_bits.get_unchecked(mlCode as usize) } as u32;
             FSE_encodeSymbol(
                 &mut blockStream,
                 &mut stateOffsetBits,
@@ -502,27 +507,28 @@ pub fn ZSTD_encodeSequences_body(
             {
                 BIT_flushBits(&mut blockStream);
             }
-            BIT_addBits(&mut blockStream, sequences[n].litLength as usize, llBits);
+            let seq = unsafe { sequences.get_unchecked(n) };
+            BIT_addBits(&mut blockStream, seq.litLength as usize, llBits);
             if MEM_32bits() != 0 && (llBits + mlBits) > 24 {
                 BIT_flushBits(&mut blockStream);
             }
-            BIT_addBits(&mut blockStream, sequences[n].mlBase as usize, mlBits);
+            BIT_addBits(&mut blockStream, seq.mlBase as usize, mlBits);
             if MEM_32bits() != 0 || ofBits + mlBits + llBits > 56 {
                 BIT_flushBits(&mut blockStream);
             }
             if longOffsets != 0 {
                 let extraBits = ofBits - ofBits.min(STREAM_ACCUMULATOR_MIN() - 1);
                 if extraBits != 0 {
-                    BIT_addBits(&mut blockStream, sequences[n].offBase as usize, extraBits);
+                    BIT_addBits(&mut blockStream, seq.offBase as usize, extraBits);
                     BIT_flushBits(&mut blockStream);
                 }
                 BIT_addBits(
                     &mut blockStream,
-                    (sequences[n].offBase >> extraBits) as usize,
+                    (seq.offBase >> extraBits) as usize,
                     ofBits - extraBits,
                 );
             } else {
-                BIT_addBits(&mut blockStream, sequences[n].offBase as usize, ofBits);
+                BIT_addBits(&mut blockStream, seq.offBase as usize, ofBits);
             }
             BIT_flushBits(&mut blockStream);
         }

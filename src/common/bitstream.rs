@@ -8,7 +8,7 @@
 
 use crate::common::bits::ZSTD_highbit32;
 use crate::common::error::{ErrorCode, ERROR};
-use crate::common::mem::{MEM_readLEST, MEM_writeLEST};
+use crate::common::mem::MEM_readLEST;
 
 // ---- status codes (mirror upstream `BIT_DStream_status`) ----
 pub const BIT_DStream_unfinished: u32 = 0;
@@ -66,7 +66,7 @@ pub fn BIT_initCStream<'a>(
 }
 
 /// Port of `BIT_addBits` — safe variant; masks the high bits before OR-ing.
-#[inline]
+#[inline(always)]
 pub fn BIT_addBits(bitC: &mut BIT_CStream_t, value: usize, nbBits: u32) {
     debug_assert!(nbBits < 32);
     debug_assert!(nbBits + bitC.bitPos < CONTAINER_BITS);
@@ -75,7 +75,7 @@ pub fn BIT_addBits(bitC: &mut BIT_CStream_t, value: usize, nbBits: u32) {
 }
 
 /// Port of `BIT_addBitsFast` — caller guarantees `value>>nbBits == 0`.
-#[inline]
+#[inline(always)]
 pub fn BIT_addBitsFast(bitC: &mut BIT_CStream_t, value: usize, nbBits: u32) {
     debug_assert!(value >> nbBits == 0);
     debug_assert!(nbBits + bitC.bitPos < CONTAINER_BITS);
@@ -84,11 +84,30 @@ pub fn BIT_addBitsFast(bitC: &mut BIT_CStream_t, value: usize, nbBits: u32) {
 }
 
 /// Port of `BIT_flushBits` — safe variant: caps `ptr` at `endPtr`.
-#[inline]
+///
+/// Hot-path note: `BIT_initCStream` rejects buffers smaller than
+/// `CONTAINER_BYTES` and sets `endPtr = capacity - CONTAINER_BYTES`,
+/// so any `ptr ≤ endPtr` admits a full 8-byte (or 4-byte on 32-bit)
+/// store starting at `ptr`. The 8-byte unaligned write below is sound
+/// for every valid call site — the slice-bounds-check that
+/// `MEM_writeLEST(&mut bitC.dst[bitC.ptr..], …)` would emit is
+/// per-flush overhead in the FSE encoder's inner loop.
+#[inline(always)]
 pub fn BIT_flushBits(bitC: &mut BIT_CStream_t) {
     let nbBytes = (bitC.bitPos >> 3) as usize;
     debug_assert!(bitC.bitPos < CONTAINER_BITS);
-    MEM_writeLEST(&mut bitC.dst[bitC.ptr..], bitC.bitContainer);
+    debug_assert!(bitC.ptr <= bitC.endPtr);
+    debug_assert!(bitC.endPtr + CONTAINER_BYTES <= bitC.dst.len());
+    // SAFETY: ptr ≤ endPtr ≤ dst.len() - CONTAINER_BYTES, so a
+    // CONTAINER_BYTES-wide unaligned store at ptr stays in-bounds.
+    unsafe {
+        let p = bitC.dst.as_mut_ptr().add(bitC.ptr);
+        if core::mem::size_of::<usize>() == 8 {
+            (p as *mut u64).write_unaligned((bitC.bitContainer as u64).to_le());
+        } else {
+            (p as *mut u32).write_unaligned((bitC.bitContainer as u32).to_le());
+        }
+    }
     bitC.ptr += nbBytes;
     if bitC.ptr > bitC.endPtr {
         bitC.ptr = bitC.endPtr;
@@ -102,11 +121,21 @@ pub fn BIT_flushBits(bitC: &mut BIT_CStream_t) {
 }
 
 /// Port of `BIT_flushBitsFast` — unsafe variant: no endPtr cap.
-#[inline]
+#[inline(always)]
 pub fn BIT_flushBitsFast(bitC: &mut BIT_CStream_t) {
     let nbBytes = (bitC.bitPos >> 3) as usize;
     debug_assert!(bitC.bitPos < CONTAINER_BITS);
-    MEM_writeLEST(&mut bitC.dst[bitC.ptr..], bitC.bitContainer);
+    debug_assert!(bitC.ptr <= bitC.endPtr);
+    debug_assert!(bitC.endPtr + CONTAINER_BYTES <= bitC.dst.len());
+    // SAFETY: same as `BIT_flushBits`.
+    unsafe {
+        let p = bitC.dst.as_mut_ptr().add(bitC.ptr);
+        if core::mem::size_of::<usize>() == 8 {
+            (p as *mut u64).write_unaligned((bitC.bitContainer as u64).to_le());
+        } else {
+            (p as *mut u32).write_unaligned((bitC.bitContainer as u32).to_le());
+        }
+    }
     bitC.ptr += nbBytes;
     bitC.bitPos &= 7;
     if nbBytes * 8 >= CONTAINER_BITS as usize {
@@ -248,7 +277,7 @@ pub fn BIT_getMiddleBits(bitContainer: usize, start: u32, nbBits: u32) -> usize 
 }
 
 /// Port of `BIT_getLowerBits`.
-#[inline]
+#[inline(always)]
 pub fn BIT_getLowerBits(bitContainer: usize, nbBits: u32) -> usize {
     let mask = (1usize << nbBits).wrapping_sub(1);
     bitContainer & mask
@@ -259,7 +288,7 @@ pub fn BIT_getLowerBits(bitContainer: usize, nbBits: u32) -> usize {
 /// CONTAINER_BITS`, the caller is reading into already-consumed
 /// territory (corrupt bitstream), and the value returned is
 /// undefined-but-safe. Rust needs `wrapping_sub` to avoid trapping.
-#[inline]
+#[inline(always)]
 pub fn BIT_lookBits(bitD: &BIT_DStream_t, nbBits: u32) -> usize {
     let start = CONTAINER_BITS
         .wrapping_sub(bitD.bitsConsumed)
@@ -282,7 +311,7 @@ pub fn BIT_skipBits(bitD: &mut BIT_DStream_t, nbBits: u32) {
 }
 
 /// Port of `BIT_readBits`.
-#[inline]
+#[inline(always)]
 pub fn BIT_readBits(bitD: &mut BIT_DStream_t, nbBits: u32) -> usize {
     let v = BIT_lookBits(bitD, nbBits);
     BIT_skipBits(bitD, nbBits);
@@ -290,7 +319,7 @@ pub fn BIT_readBits(bitD: &mut BIT_DStream_t, nbBits: u32) -> usize {
 }
 
 /// Port of `BIT_readBitsFast`.
-#[inline]
+#[inline(always)]
 pub fn BIT_readBitsFast(bitD: &mut BIT_DStream_t, nbBits: u32) -> usize {
     debug_assert!(nbBits >= 1);
     let v = BIT_lookBitsFast(bitD, nbBits);
@@ -308,7 +337,7 @@ fn BIT_reloadDStream_internal(bitD: &mut BIT_DStream_t) -> u32 {
 }
 
 /// Port of `BIT_reloadDStreamFast`.
-#[inline]
+#[inline(always)]
 pub fn BIT_reloadDStreamFast(bitD: &mut BIT_DStream_t) -> u32 {
     if bitD.ptr < bitD.limitPtr {
         return BIT_DStream_overflow;
@@ -316,7 +345,10 @@ pub fn BIT_reloadDStreamFast(bitD: &mut BIT_DStream_t) -> u32 {
     BIT_reloadDStream_internal(bitD)
 }
 
-/// Port of `BIT_reloadDStream`.
+/// Port of `BIT_reloadDStream`. Upstream marks this
+/// `FORCE_INLINE_TEMPLATE` — it's called per-symbol in FSE/Huffman
+/// decoder hot loops where call boundary overhead dominates.
+#[inline(always)]
 pub fn BIT_reloadDStream(bitD: &mut BIT_DStream_t) -> u32 {
     if bitD.bitsConsumed > CONTAINER_BITS {
         // Mirror upstream's behaviour: on overflow, force ptr to a
@@ -351,7 +383,7 @@ pub fn BIT_reloadDStream(bitD: &mut BIT_DStream_t) -> u32 {
 }
 
 /// Port of `BIT_endOfDStream`.
-#[inline]
+#[inline(always)]
 pub fn BIT_endOfDStream(bitD: &BIT_DStream_t) -> u32 {
     (bitD.ptr == bitD.start && bitD.bitsConsumed == CONTAINER_BITS) as u32
 }

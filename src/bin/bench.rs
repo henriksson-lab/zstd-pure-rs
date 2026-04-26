@@ -1,7 +1,7 @@
 use std::env;
 use std::fs;
 use std::time::Instant;
-use zstd_pure_rs::common::error::{ERR_isError, ERR_getErrorName};
+use zstd_pure_rs::common::error::{ERR_getErrorName, ERR_isError};
 use zstd_pure_rs::compress::zstd_compress::{ZSTD_compress, ZSTD_compressBound};
 use zstd_pure_rs::decompress::zstd_decompress::ZSTD_decompress;
 
@@ -11,7 +11,13 @@ fn main() {
     let iterations: usize = env::args().nth(3).and_then(|s| s.parse().ok()).unwrap_or(3);
 
     let payload = fs::read(&path).unwrap();
-    eprintln!("file={} size={} level={} iters={}", path, payload.len(), level, iterations);
+    eprintln!(
+        "file={} size={} level={} iters={}",
+        path,
+        payload.len(),
+        level,
+        iterations
+    );
 
     let mut compressed = vec![0u8; ZSTD_compressBound(payload.len()).max(64)];
     let mut decoded = vec![0u8; payload.len()];
@@ -52,7 +58,9 @@ fn main() {
     let compress_speed = (payload.len() * iterations) as f64 / elapsed.as_secs_f64() / 1_000_000.0;
     eprintln!(
         "compress L{}: {} -> {} ({:.2}x) | {:.1} MB/s",
-        level, payload.len(), total_compressed,
+        level,
+        payload.len(),
+        total_compressed,
         payload.len() as f64 / total_compressed as f64,
         compress_speed
     );
@@ -63,6 +71,7 @@ fn main() {
         let _ = ZSTD_decompress(&mut decoded, &compressed[..total_compressed]);
     }
     let elapsed = start.elapsed();
-    let decompress_speed = (payload.len() * iterations) as f64 / elapsed.as_secs_f64() / 1_000_000.0;
+    let decompress_speed =
+        (payload.len() * iterations) as f64 / elapsed.as_secs_f64() / 1_000_000.0;
     eprintln!("decompress: {:.1} MB/s", decompress_speed);
 }

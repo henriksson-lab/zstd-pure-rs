@@ -52,7 +52,10 @@ fn candidate_corpora() -> Vec<(&'static str, PathBuf)> {
             "fastq",
             "/husky/henriksson/for_claude/skesa/external/err486835_mgenitalium/subset_2.fastq",
         ),
-        ("fastq", "/husky/henriksson/for_claude/skesa/mm2rs-rnafull-focus.fq"),
+        (
+            "fastq",
+            "/husky/henriksson/for_claude/skesa/mm2rs-rnafull-focus.fq",
+        ),
     ] {
         let path = PathBuf::from(raw);
         if path.exists() && !out.iter().any(|(_, existing)| existing == &path) {
@@ -103,7 +106,9 @@ fn decompress_with_upstream(bin: &Path, frame: &[u8]) -> Vec<u8> {
     let mut stdin = child.stdin.take().expect("zstd stdin");
     let frame_owned = frame.to_vec();
     let writer = std::thread::spawn(move || {
-        stdin.write_all(&frame_owned).expect("write_all to zstd stdin");
+        stdin
+            .write_all(&frame_owned)
+            .expect("write_all to zstd stdin");
         drop(stdin);
     });
     let out = child.wait_with_output().expect("wait upstream");

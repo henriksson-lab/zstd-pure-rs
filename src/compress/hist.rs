@@ -3,7 +3,6 @@
 //! portable "parallel stripe" loop is the reference implementation.
 
 use crate::common::error::{ErrorCode, ERROR};
-use crate::common::mem::MEM_read32;
 
 /// Upstream threshold below which we use the simple single-counter
 /// loop; above it, the 4-way parallel counters amortize cache-miss
@@ -115,44 +114,60 @@ pub fn HIST_count_parallel_wksp(
     } else {
         // Pipeline the first u32 like upstream's `cached` variable.
         let mut ip = 4usize;
-        let mut cached = MEM_read32(&src[0..4]);
+        let src_ptr = src.as_ptr();
+        // SAFETY: ip + 4 ≤ iend on each read (loop condition `ip + 15 < iend`
+        // gives us 16 bytes of headroom, dwarfing the 4-byte read). Counter
+        // arrays c1/c2/c3/c4 are 256 entries; all symbols are u8 so indices
+        // are in 0..256.
+        let mut cached: u32 = unsafe { (src_ptr as *const u32).read_unaligned() };
         // Process in stripes of 16 bytes (4 × u32 loads).
         while ip + 15 < iend {
             let c = cached;
-            cached = MEM_read32(&src[ip..ip + 4]);
+            cached = unsafe { (src_ptr.add(ip) as *const u32).read_unaligned() };
             ip += 4;
-            c1[(c & 0xFF) as usize] += 1;
-            c2[((c >> 8) & 0xFF) as usize] += 1;
-            c3[((c >> 16) & 0xFF) as usize] += 1;
-            c4[(c >> 24) as usize] += 1;
+            unsafe {
+                *c1.get_unchecked_mut((c & 0xFF) as usize) += 1;
+                *c2.get_unchecked_mut(((c >> 8) & 0xFF) as usize) += 1;
+                *c3.get_unchecked_mut(((c >> 16) & 0xFF) as usize) += 1;
+                *c4.get_unchecked_mut((c >> 24) as usize) += 1;
+            }
             let c = cached;
-            cached = MEM_read32(&src[ip..ip + 4]);
+            cached = unsafe { (src_ptr.add(ip) as *const u32).read_unaligned() };
             ip += 4;
-            c1[(c & 0xFF) as usize] += 1;
-            c2[((c >> 8) & 0xFF) as usize] += 1;
-            c3[((c >> 16) & 0xFF) as usize] += 1;
-            c4[(c >> 24) as usize] += 1;
+            unsafe {
+                *c1.get_unchecked_mut((c & 0xFF) as usize) += 1;
+                *c2.get_unchecked_mut(((c >> 8) & 0xFF) as usize) += 1;
+                *c3.get_unchecked_mut(((c >> 16) & 0xFF) as usize) += 1;
+                *c4.get_unchecked_mut((c >> 24) as usize) += 1;
+            }
             let c = cached;
-            cached = MEM_read32(&src[ip..ip + 4]);
+            cached = unsafe { (src_ptr.add(ip) as *const u32).read_unaligned() };
             ip += 4;
-            c1[(c & 0xFF) as usize] += 1;
-            c2[((c >> 8) & 0xFF) as usize] += 1;
-            c3[((c >> 16) & 0xFF) as usize] += 1;
-            c4[(c >> 24) as usize] += 1;
+            unsafe {
+                *c1.get_unchecked_mut((c & 0xFF) as usize) += 1;
+                *c2.get_unchecked_mut(((c >> 8) & 0xFF) as usize) += 1;
+                *c3.get_unchecked_mut(((c >> 16) & 0xFF) as usize) += 1;
+                *c4.get_unchecked_mut((c >> 24) as usize) += 1;
+            }
             let c = cached;
-            cached = MEM_read32(&src[ip..ip + 4]);
+            cached = unsafe { (src_ptr.add(ip) as *const u32).read_unaligned() };
             ip += 4;
-            c1[(c & 0xFF) as usize] += 1;
-            c2[((c >> 8) & 0xFF) as usize] += 1;
-            c3[((c >> 16) & 0xFF) as usize] += 1;
-            c4[(c >> 24) as usize] += 1;
+            unsafe {
+                *c1.get_unchecked_mut((c & 0xFF) as usize) += 1;
+                *c2.get_unchecked_mut(((c >> 8) & 0xFF) as usize) += 1;
+                *c3.get_unchecked_mut(((c >> 16) & 0xFF) as usize) += 1;
+                *c4.get_unchecked_mut((c >> 24) as usize) += 1;
+            }
         }
         // Roll back the "cached" prefetch: its 4 bytes weren't yet
         // counted.
         ip -= 4;
         // Tail: remaining bytes counted scalar.
         while ip < iend {
-            c1[src[ip] as usize] += 1;
+            // SAFETY: ip < iend == src.len(). c1 is 256 entries.
+            unsafe {
+                *c1.get_unchecked_mut(*src.get_unchecked(ip) as usize) += 1;
+            }
             ip += 1;
         }
     }

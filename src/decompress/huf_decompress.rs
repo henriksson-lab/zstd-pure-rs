@@ -1779,7 +1779,10 @@ mod tests {
             !crate::common::error::ERR_isError(n),
             "compress1X failed: {n:#x}"
         );
-        assert!(n > 0 && n < src.len(), "expected actual compression, got n={n}");
+        assert!(
+            n > 0 && n < src.len(),
+            "expected actual compression, got n={n}"
+        );
         compressed.truncate(n);
 
         let mut dtable = vec![0u32; HUF_DTABLE_SIZE_U32(HUF_TABLELOG_MAX)];

@@ -28,6 +28,7 @@ const KNUTH: u32 = 0x9e3779b9;
 /// Port of `hash2`. For `hashLog==8` it returns the byte value; for
 /// `hashLog > 8` it reads 2 bytes, multiplies by Knuth's constant,
 /// and shifts down. Must be called with at least 2 bytes available.
+#[cfg(test)]
 #[inline]
 fn hash2(p: &[u8], hashLog: u32) -> usize {
     debug_assert!(hashLog >= 8);
@@ -39,17 +40,28 @@ fn hash2(p: &[u8], hashLog: u32) -> usize {
     ((v.wrapping_mul(KNUTH)) >> (32 - hashLog)) as usize
 }
 
+#[inline(always)]
+fn hash2_const<const HASH_LOG: u32>(p: &[u8]) -> usize {
+    debug_assert!(HASH_LOG >= 8);
+    if HASH_LOG == 8 {
+        return p[0] as usize;
+    }
+    debug_assert!(HASH_LOG <= HASHLOG_MAX);
+    let v = MEM_read16(p) as u32;
+    ((v.wrapping_mul(KNUTH)) >> (32 - HASH_LOG)) as usize
+}
+
 /// Port of `Fingerprint`.
 #[derive(Debug, Clone)]
 struct Fingerprint {
-    events: Vec<u32>,
+    events: [u32; HASHTABLESIZE],
     nbEvents: usize,
 }
 
 impl Fingerprint {
     fn new() -> Self {
         Self {
-            events: vec![0u32; HASHTABLESIZE],
+            events: [0u32; HASHTABLESIZE],
             nbEvents: 0,
         }
     }
@@ -78,55 +90,30 @@ impl FPStats {
     }
 }
 
-/// Port of `initStats`.
-fn initStats(fpstats: &mut FPStats) {
-    fpstats.pastEvents.reset(HASHLOG_MAX);
-    fpstats.newEvents.reset(HASHLOG_MAX);
-}
-
-/// Port of `addEvents_generic`.
-fn addEvents_generic(fp: &mut Fingerprint, src: &[u8], samplingRate: usize, hashLog: u32) {
+#[inline(always)]
+fn addEvents_const<const SAMPLING_RATE: usize, const HASH_LOG: u32>(
+    fp: &mut Fingerprint,
+    src: &[u8],
+) {
     const HASHLENGTH: usize = 2;
     debug_assert!(src.len() >= HASHLENGTH);
     let limit = src.len() - HASHLENGTH + 1;
     let mut n = 0;
     while n < limit {
-        let h = hash2(&src[n..], hashLog);
+        let h = hash2_const::<HASH_LOG>(&src[n..]);
         fp.events[h] += 1;
-        n += samplingRate;
+        n += SAMPLING_RATE;
     }
-    // Upstream's `limit/samplingRate` is integer floor division — when
-    // `limit % samplingRate != 0`, the loop above records ceil(limit/rate)
-    // events but `nbEvents` is incremented by floor(limit/rate). This
-    // off-by-one is intentional for faithful threshold math; matching
-    // it is required for byte-identical split decisions.
-    fp.nbEvents += limit / samplingRate;
+    fp.nbEvents += limit / SAMPLING_RATE;
 }
 
-/// Port of `recordFingerprint_generic`.
-fn recordFingerprint_generic(fp: &mut Fingerprint, src: &[u8], samplingRate: usize, hashLog: u32) {
-    fp.reset(hashLog);
-    addEvents_generic(fp, src, samplingRate, hashLog);
-}
-
-/// Port of `ZSTD_recordFingerprint_1`.
-fn ZSTD_recordFingerprint_1(fp: &mut Fingerprint, src: &[u8]) {
-    recordFingerprint_generic(fp, src, 1, 10);
-}
-
-/// Port of `ZSTD_recordFingerprint_5`.
-fn ZSTD_recordFingerprint_5(fp: &mut Fingerprint, src: &[u8]) {
-    recordFingerprint_generic(fp, src, 5, 10);
-}
-
-/// Port of `ZSTD_recordFingerprint_11`.
-fn ZSTD_recordFingerprint_11(fp: &mut Fingerprint, src: &[u8]) {
-    recordFingerprint_generic(fp, src, 11, 9);
-}
-
-/// Port of `ZSTD_recordFingerprint_43`.
-fn ZSTD_recordFingerprint_43(fp: &mut Fingerprint, src: &[u8]) {
-    recordFingerprint_generic(fp, src, 43, 8);
+#[inline(always)]
+fn recordFingerprint_const<const SAMPLING_RATE: usize, const HASH_LOG: u32>(
+    fp: &mut Fingerprint,
+    src: &[u8],
+) {
+    fp.reset(HASH_LOG);
+    addEvents_const::<SAMPLING_RATE, HASH_LOG>(fp, src);
 }
 
 #[inline]
@@ -204,24 +191,35 @@ const CHUNKSIZE: usize = 8 << 10;
 ///   - 3 → (rate=1,  hashLog=10)  — most accurate
 fn ZSTD_splitBlock_byChunks(block: &[u8], level: i32) -> usize {
     debug_assert!((0..=3).contains(&level));
-    let (record_f, hashLog): (fn(&mut Fingerprint, &[u8]), u32) = match level {
-        0 => (ZSTD_recordFingerprint_43, 8),
-        1 => (ZSTD_recordFingerprint_11, 9),
-        2 => (ZSTD_recordFingerprint_5, 10),
-        _ => (ZSTD_recordFingerprint_1, 10),
-    };
+    match level {
+        0 => ZSTD_splitBlock_byChunks_specialized::<43, 8>(block),
+        1 => ZSTD_splitBlock_byChunks_specialized::<11, 9>(block),
+        2 => ZSTD_splitBlock_byChunks_specialized::<5, 10>(block),
+        _ => ZSTD_splitBlock_byChunks_specialized::<1, 10>(block),
+    }
+}
+
+#[inline(never)]
+fn ZSTD_splitBlock_byChunks_specialized<const SAMPLING_RATE: usize, const HASH_LOG: u32>(
+    block: &[u8],
+) -> usize {
     debug_assert_eq!(block.len(), 128 << 10);
 
     let mut fpstats = FPStats::new();
     let mut penalty = THRESHOLD_PENALTY;
 
-    initStats(&mut fpstats);
-    record_f(&mut fpstats.pastEvents, &block[..CHUNKSIZE]);
+    recordFingerprint_const::<SAMPLING_RATE, HASH_LOG>(
+        &mut fpstats.pastEvents,
+        &block[..CHUNKSIZE],
+    );
 
     let mut pos = CHUNKSIZE;
     while pos <= block.len() - CHUNKSIZE {
-        record_f(&mut fpstats.newEvents, &block[pos..pos + CHUNKSIZE]);
-        if compareFingerprints(&fpstats.pastEvents, &fpstats.newEvents, penalty, hashLog) {
+        recordFingerprint_const::<SAMPLING_RATE, HASH_LOG>(
+            &mut fpstats.newEvents,
+            &block[pos..pos + CHUNKSIZE],
+        );
+        if compareFingerprints(&fpstats.pastEvents, &fpstats.newEvents, penalty, HASH_LOG) {
             return pos;
         }
         mergeEvents(&mut fpstats.pastEvents, &fpstats.newEvents);
@@ -241,7 +239,6 @@ fn ZSTD_splitBlock_fromBorders(block: &[u8]) -> usize {
     debug_assert_eq!(block.len(), 128 << 10);
 
     let mut fpstats = FPStats::new();
-    initStats(&mut fpstats);
     HIST_add(&mut fpstats.pastEvents.events, &block[..SEGMENT_SIZE]);
     HIST_add(
         &mut fpstats.newEvents.events,

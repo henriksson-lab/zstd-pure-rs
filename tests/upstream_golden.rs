@@ -86,7 +86,8 @@ fn upstream_golden_decompression_frames_decode_successfully() {
             );
         } else {
             assert!(
-                !decoded.is_empty() || path.file_name().and_then(|s| s.to_str()) == Some("empty-block.zst"),
+                !decoded.is_empty()
+                    || path.file_name().and_then(|s| s.to_str()) == Some("empty-block.zst"),
                 "{} decoded to an unexpected empty output",
                 path.display()
             );

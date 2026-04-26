@@ -61,10 +61,16 @@ pub struct SeqStore_t {
 impl SeqStore_t {
     /// Create an empty store with upstream's typical capacities
     /// (maxNbSeq = `ZSTD_BLOCKSIZE_MAX / 3`, maxNbLit = `128 KB`).
+    /// The literals buffer is over-allocated by `WILDCOPY_OVERLENGTH`
+    /// (32 bytes) so `ZSTD_storeSeq`'s inline 16-byte SIMD wildcopy
+    /// can write past `litLength` without checking — mirroring
+    /// upstream's `litLimit_w = litLimit - WILDCOPY_OVERLENGTH` slack.
     pub fn with_capacity(maxNbSeq: usize, maxNbLit: usize) -> Self {
         Self {
             sequences: Vec::with_capacity(maxNbSeq),
-            literals: Vec::with_capacity(maxNbLit),
+            literals: Vec::with_capacity(
+                maxNbLit + crate::common::zstd_internal::WILDCOPY_OVERLENGTH,
+            ),
             llCode: Vec::with_capacity(maxNbSeq),
             mlCode: Vec::with_capacity(maxNbSeq),
             ofCode: Vec::with_capacity(maxNbSeq),
@@ -303,7 +309,7 @@ pub fn OFFBASE_TO_REPCODE(o: u32) -> u32 {
 /// Port of `ZSTD_storeSeqOnly`. Appends a `SeqDef` to the store
 /// without copying literal bytes. Long litLength / mlBase are
 /// flagged by setting `longLengthType` + `longLengthPos`.
-#[inline]
+#[inline(always)]
 pub fn ZSTD_storeSeqOnly(
     seqStore: &mut SeqStore_t,
     litLength: usize,
@@ -342,12 +348,19 @@ pub fn ZSTD_storeSeqOnly(
 /// `litLength` bytes from `literals` into the store's literal
 /// buffer, then calls `ZSTD_storeSeqOnly`.
 ///
-/// Rust signature note: upstream takes raw `BYTE*` into the source
-/// buffer plus a `litLimit` guard. The Rust port takes `literals:
-/// &[u8]` whose length is the upper bound — upstream's wildcopy
-/// over-read optimization isn't portable without more ceremony, so
-/// we `copy_from_slice` (one memcpy) and accept the small perf loss.
-#[inline]
+/// Mirrors upstream's `ZSTD_copy16` + `ZSTD_wildcopy` pattern: literal
+/// runs are typically short (avg 5–10 bytes for silesia L1), and going
+/// through `Vec::extend_from_slice` → glibc memmove dispatch is far
+/// slower than an inline 16-byte SIMD copy. The destination buffer is
+/// over-allocated by `WILDCOPY_OVERLENGTH` so a 16-byte write past
+/// `litLength` never overruns capacity. The source slice's overrun
+/// protection is the responsibility of the caller — for callers
+/// that pass `&src[anchor..]` (most matchers do), there's at least
+/// `src.len() - anchor ≥ litLength + 16` bytes available unless we're
+/// near end-of-block where the wildcopy could fault. We guard against
+/// that by falling back to `copy_nonoverlapping(litLength)` when the
+/// source slice itself doesn't have 16 bytes available.
+#[inline(always)]
 pub fn ZSTD_storeSeq(
     seqStore: &mut SeqStore_t,
     litLength: usize,
@@ -357,7 +370,31 @@ pub fn ZSTD_storeSeq(
 ) {
     debug_assert!(litLength <= literals.len());
     debug_assert!(seqStore.literals.len() + litLength <= seqStore.maxNbLit);
-    seqStore.literals.extend_from_slice(&literals[..litLength]);
+    if litLength != 0 {
+        let cur_len = seqStore.literals.len();
+        // Match upstream's ZSTD_copy16 + ZSTD_wildcopy pattern:
+        // always copy 16 bytes (single xmm load+store), then loop
+        // 16-byte chunks until litLength is reached. Destination has
+        // `WILDCOPY_OVERLENGTH=32` bytes of slack past `maxNbLit`.
+        unsafe {
+            let dst = seqStore.literals.as_mut_ptr().add(cur_len);
+            let src = literals.as_ptr();
+            if literals.len() >= 16 {
+                // Fast wildcopy path: source has 16-byte slack.
+                // Always copy 16, then 16-byte loop for the rest.
+                core::ptr::copy_nonoverlapping(src, dst, 16);
+                let mut off = 16;
+                while off < litLength {
+                    core::ptr::copy_nonoverlapping(src.add(off), dst.add(off), 16);
+                    off += 16;
+                }
+            } else {
+                // Source slice is shorter than 16 bytes — exact copy.
+                core::ptr::copy_nonoverlapping(src, dst, litLength);
+            }
+            seqStore.literals.set_len(cur_len + litLength);
+        }
+    }
     ZSTD_storeSeqOnly(seqStore, litLength, offBase, matchLength);
 }
 

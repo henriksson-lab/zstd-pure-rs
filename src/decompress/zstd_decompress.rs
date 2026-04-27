@@ -3657,7 +3657,9 @@ mod tests {
         // Start from a real full dictionary, then mutate only the
         // dictID field to create a mismatch without corrupting the
         // entropy tables or raw content.
-        let mut dict_a = include_bytes!("../../zstd/tests/dict-files/zero-weight-dict").to_vec();
+        let mut dict_a =
+            include_bytes!("../../tests/fixtures/upstream-zstd/dict-files/zero-weight-dict")
+                .to_vec();
         MEM_writeLE32(&mut dict_a[4..8], 0x11111111);
         let mut dict_b = dict_a.clone();
         MEM_writeLE32(&mut dict_b[4..8], 0x22222222);
@@ -3685,7 +3687,9 @@ mod tests {
         use crate::common::mem::MEM_writeLE32;
         use crate::decompress::zstd_ddict::ZSTD_createDDict;
 
-        let mut dict_a = include_bytes!("../../zstd/tests/dict-files/zero-weight-dict").to_vec();
+        let mut dict_a =
+            include_bytes!("../../tests/fixtures/upstream-zstd/dict-files/zero-weight-dict")
+                .to_vec();
         MEM_writeLE32(&mut dict_a[4..8], 0x11111111);
         let mut dict_b = dict_a.clone();
         MEM_writeLE32(&mut dict_b[4..8], 0x22222222);

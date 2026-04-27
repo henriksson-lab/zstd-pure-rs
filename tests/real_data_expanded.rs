@@ -1,5 +1,5 @@
 //! Expanded real-data integration tests over committed fixtures and
-//! vendored upstream golden inputs.
+//! copied upstream golden inputs.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -288,8 +288,8 @@ fn dictionary_roundtrips_cover_http_fastq_and_header_payloads() {
     let cases: Vec<(&str, Vec<u8>, Vec<u8>)> = vec![
         (
             "http",
-            include_bytes!("../zstd/tests/golden-compression/http").to_vec(),
-            include_bytes!("../zstd/tests/golden-compression/http").repeat(4),
+            include_bytes!("fixtures/upstream-zstd/golden-compression/http").to_vec(),
+            include_bytes!("fixtures/upstream-zstd/golden-compression/http").repeat(4),
         ),
         (
             "fastq",
@@ -379,10 +379,10 @@ fn concatenated_and_skippable_real_frames_decode_in_order() {
 fn vendored_upstream_golden_compression_inputs_emit_decodable_frames() {
     let upstream = upstream_zstd();
     for input in [
-        "zstd/tests/golden-compression/http",
-        "zstd/tests/golden-compression/huffman-compressed-larger",
-        "zstd/tests/golden-compression/large-literal-and-match-lengths",
-        "zstd/tests/golden-compression/PR-3517-block-splitter-corruption-test",
+        "tests/fixtures/upstream-zstd/golden-compression/http",
+        "tests/fixtures/upstream-zstd/golden-compression/huffman-compressed-larger",
+        "tests/fixtures/upstream-zstd/golden-compression/large-literal-and-match-lengths",
+        "tests/fixtures/upstream-zstd/golden-compression/PR-3517-block-splitter-corruption-test",
     ] {
         let payload = std::fs::read(input).unwrap_or_else(|e| panic!("read {input}: {e}"));
         for level in [1, 3, 9, 19] {

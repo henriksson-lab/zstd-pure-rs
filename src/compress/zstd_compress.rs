@@ -14334,7 +14334,8 @@ mod tests {
         // Real full-dict fixture: both CDict and DDict must parse
         // the same dictID from it.
         use crate::decompress::zstd_ddict::{ZSTD_createDDict, ZSTD_getDictID_fromDDict};
-        let dict: &[u8] = include_bytes!("../../zstd/tests/dict-files/zero-weight-dict");
+        let dict: &[u8] =
+            include_bytes!("../../tests/fixtures/upstream-zstd/dict-files/zero-weight-dict");
 
         let cdict = ZSTD_createCDict(dict, 3).unwrap();
         let ddict = ZSTD_createDDict(dict).unwrap();
@@ -14858,7 +14859,8 @@ mod tests {
         use crate::decompress::zstd_ddict::{
             ZSTD_DDict_dictContent, ZSTD_createDDict, ZSTD_getDictID_fromDDict,
         };
-        let magic_dict: &[u8] = include_bytes!("../../zstd/tests/dict-files/zero-weight-dict");
+        let magic_dict: &[u8] =
+            include_bytes!("../../tests/fixtures/upstream-zstd/dict-files/zero-weight-dict");
         let cdict = ZSTD_createCDict(magic_dict, 5).unwrap();
         let ddict = ZSTD_createDDict(magic_dict).unwrap();
         assert_eq!(cdict.dictContent, ZSTD_DDict_dictContent(&ddict));
@@ -15213,7 +15215,8 @@ mod tests {
         // same `noDictIDFlag=0` fix must carry through. Confirms no
         // separate hardcoded-dictID site exists on the CDict track.
         use crate::decompress::zstd_decompress::ZSTD_getDictID_fromFrame;
-        let magic_dict: &[u8] = include_bytes!("../../zstd/tests/dict-files/zero-weight-dict");
+        let magic_dict: &[u8] =
+            include_bytes!("../../tests/fixtures/upstream-zstd/dict-files/zero-weight-dict");
         let cdict = ZSTD_createCDict(magic_dict, 5).unwrap();
         let src = b"ZSTD_compress_usingCDict dictID parity ".repeat(20);
         let mut cctx = ZSTD_createCCtx().unwrap();
@@ -15527,7 +15530,8 @@ mod tests {
         use crate::decompress::zstd_ddict::ZSTD_getDictID_fromDict;
         use crate::decompress::zstd_decompress::ZSTD_getDictID_fromFrame;
 
-        let magic_dict = include_bytes!("../../zstd/tests/dict-files/zero-weight-dict");
+        let magic_dict =
+            include_bytes!("../../tests/fixtures/upstream-zstd/dict-files/zero-weight-dict");
         let expected_dict_id = ZSTD_getDictID_fromDict(magic_dict);
         assert_ne!(
             expected_dict_id, 0,
@@ -16638,7 +16642,8 @@ mod tests {
             let cd_raw = ZSTD_createCDict(b"raw-bytes", 3).unwrap();
             assert_eq!(ZSTD_getDictID_fromCDict(&cd_raw), 0);
 
-            let magic_dict: &[u8] = include_bytes!("../../zstd/tests/dict-files/zero-weight-dict");
+            let magic_dict: &[u8] =
+                include_bytes!("../../tests/fixtures/upstream-zstd/dict-files/zero-weight-dict");
             let cd_magic = ZSTD_createCDict(magic_dict, 3).unwrap();
             assert_eq!(
                 ZSTD_getDictID_fromCDict(&cd_magic),

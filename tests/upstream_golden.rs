@@ -1,6 +1,6 @@
-//! Port of a small, durable subset of upstream `zstd/tests/` golden
-//! decompression checks. These fixtures live in the vendored upstream
-//! tree, so the tests stay self-contained.
+//! Port of a small, durable subset of upstream zstd golden
+//! decompression checks. These fixtures are copied into
+//! `tests/fixtures/upstream-zstd`, so the tests stay self-contained.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -16,7 +16,7 @@ fn repo_root() -> PathBuf {
 }
 
 fn upstream_golden_dir(kind: &str) -> PathBuf {
-    repo_root().join("zstd/tests").join(kind)
+    repo_root().join("tests/fixtures/upstream-zstd").join(kind)
 }
 
 fn upstream_zstd() -> Option<PathBuf> {

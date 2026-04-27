@@ -161,6 +161,8 @@ pub use common::zstd_common::{
 /// `compress::zstd_compress` / `decompress::zstd_decompress`.
 pub mod prelude {
     // One-shot compression.
+    #[cfg(feature = "mt")]
+    pub use crate::compress::zstd_compress::ZSTD_CCtx_refRayonThreadPool;
     pub use crate::compress::zstd_compress::{
         ZSTD_CCtx, ZSTD_CCtx_loadDictionary, ZSTD_CCtx_loadDictionary_advanced,
         ZSTD_CCtx_loadDictionary_byReference, ZSTD_CCtx_refCDict, ZSTD_CCtx_refPrefix,

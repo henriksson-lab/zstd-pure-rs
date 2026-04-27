@@ -128,6 +128,7 @@ pub struct ZSTDMT_CCtx {
     pub jobs: Vec<ZSTDMT_jobDescription>,
     pub threadPool: Option<Box<POOL_ctx>>,
     pub threadPoolRef: usize,
+    pub rayonThreadPoolRef: usize,
     jobReceivers: Vec<Option<Receiver<ZSTDMT_completedJob>>>,
     pub bufPool: Option<Box<ZSTDMT_bufferPool>>,
     pub cctxPool: Option<Box<ZSTDMT_CCtxPool>>,
@@ -158,6 +159,7 @@ impl Default for ZSTDMT_CCtx {
             jobs: Vec::new(),
             threadPool: None,
             threadPoolRef: 0,
+            rayonThreadPoolRef: 0,
             jobReceivers: Vec::new(),
             bufPool: None,
             cctxPool: None,
@@ -665,9 +667,23 @@ pub fn ZSTDMT_setThreadPool(mtctx: &mut ZSTDMT_CCtx, pool: Option<&POOL_ctx>) {
     if let Some(pool) = pool {
         POOL_free(mtctx.threadPool.take());
         mtctx.threadPoolRef = pool as *const POOL_ctx as usize;
+        mtctx.rayonThreadPoolRef = 0;
     } else {
         mtctx.threadPoolRef = 0;
         if mtctx.threadPool.is_none() && mtctx.params.nbWorkers > 0 {
+            mtctx.threadPool = ZSTD_createThreadPool(mtctx.params.nbWorkers as usize);
+        }
+    }
+}
+
+pub fn ZSTDMT_setRayonThreadPool(mtctx: &mut ZSTDMT_CCtx, pool: Option<&rayon::ThreadPool>) {
+    if let Some(pool) = pool {
+        POOL_free(mtctx.threadPool.take());
+        mtctx.threadPoolRef = 0;
+        mtctx.rayonThreadPoolRef = pool as *const rayon::ThreadPool as usize;
+    } else {
+        mtctx.rayonThreadPoolRef = 0;
+        if mtctx.threadPool.is_none() && mtctx.threadPoolRef == 0 && mtctx.params.nbWorkers > 0 {
             mtctx.threadPool = ZSTD_createThreadPool(mtctx.params.nbWorkers as usize);
         }
     }
@@ -773,7 +789,7 @@ fn ZSTDMT_spawnCompressionJob(mtctx: &mut ZSTDMT_CCtx, wJobID: usize) -> usize {
         .as_ref()
         .map(|p| p.as_ref() as *const POOL_ctx as usize)
         .unwrap_or(mtctx.threadPoolRef);
-    if pool_ptr == 0 {
+    if pool_ptr == 0 && mtctx.rayonThreadPoolRef == 0 {
         return crate::common::error::ERROR(crate::common::error::ErrorCode::Generic);
     }
     let cctx = if let Some(pool) = mtctx.cctxPool.as_mut() {
@@ -787,12 +803,15 @@ fn ZSTDMT_spawnCompressionJob(mtctx: &mut ZSTDMT_CCtx, wJobID: usize) -> usize {
     let (tx, rx) = mpsc::channel();
     let queued = Box::new(ZSTDMT_queuedJob { job, cctx, tx });
     mtctx.jobReceivers[wJobID] = Some(rx);
-    let pool = unsafe { &*(pool_ptr as *const POOL_ctx) };
-    POOL_add(
-        pool,
-        ZSTDMT_runQueuedJob,
-        Box::into_raw(queued) as *mut core::ffi::c_void,
-    );
+    let queued_ptr = Box::into_raw(queued) as *mut core::ffi::c_void;
+    if mtctx.rayonThreadPoolRef != 0 {
+        let pool = unsafe { &*(mtctx.rayonThreadPoolRef as *const rayon::ThreadPool) };
+        let queued_addr = queued_ptr as usize;
+        pool.spawn(move || ZSTDMT_runQueuedJob(queued_addr as *mut core::ffi::c_void));
+    } else {
+        let pool = unsafe { &*(pool_ptr as *const POOL_ctx) };
+        POOL_add(pool, ZSTDMT_runQueuedJob, queued_ptr);
+    }
     0
 }
 
@@ -863,7 +882,7 @@ pub fn ZSTDMT_resize(mtctx: &mut ZSTDMT_CCtx, nbWorkers: u32) -> usize {
     }
     if let Some(pool) = mtctx.threadPool.as_mut() {
         let _ = POOL_resize(pool, nbWorkers as usize);
-    } else if mtctx.threadPoolRef == 0 {
+    } else if mtctx.threadPoolRef == 0 && mtctx.rayonThreadPoolRef == 0 {
         mtctx.threadPool = ZSTD_createThreadPool(nbWorkers as usize);
     }
     ZSTDMT_CCtxParam_setNbWorkers(&mut mtctx.params, nbWorkers)
@@ -1474,6 +1493,7 @@ pub fn ZSTDMT_freeCCtx(mtctx: Option<Box<ZSTDMT_CCtx>>) -> usize {
     ZSTDMT_freeSeqPool(mtctx.seqPool.take());
     POOL_free(mtctx.threadPool.take());
     mtctx.threadPoolRef = 0;
+    mtctx.rayonThreadPoolRef = 0;
     ZSTDMT_serialState_free(&mut mtctx.serial);
     mtctx.roundBuff.buffer = Buffer::default();
     mtctx.roundBuff.capacity = 0;

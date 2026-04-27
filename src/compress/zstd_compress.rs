@@ -73,6 +73,10 @@ pub struct ZSTD_CCtx {
     /// Stored as a raw pointer-sized token because the public API
     /// borrows the pool rather than transferring ownership.
     pub threadPoolRef: usize,
+    /// Attached external rayon thread pool reference for MT-capable builds.
+    /// Stored separately from `threadPoolRef` because the existing pool API
+    /// uses zstd's `POOL_ctx` type.
+    pub rayonThreadPoolRef: usize,
     /// Cached size hint for the attached thread pool / MT surface.
     pub mtctxSizeHint: usize,
 
@@ -202,6 +206,7 @@ impl Default for ZSTD_CCtx {
             ldmState: None,
             ldmSequences: crate::compress::zstd_ldm::RawSeqStore_t::default(),
             threadPoolRef: 0,
+            rayonThreadPoolRef: 0,
             mtctxSizeHint: 0,
             stream_level: None,
             pledged_src_size: None,
@@ -2387,7 +2392,35 @@ pub fn ZSTD_CCtx_refThreadPool(
         return ERROR(ErrorCode::StageWrong);
     }
     cctx.threadPoolRef = pool.map_or(0, |p| p as *const crate::common::pool::POOL_ctx as usize);
+    cctx.rayonThreadPoolRef = 0;
     cctx.mtctxSizeHint = pool.map_or(0, crate::common::pool::POOL_sizeof);
+    0
+}
+
+/// Attaches an external rayon thread pool for multi-threaded compression.
+///
+/// The caller owns the rayon pool and must keep it alive while operations
+/// using this context run. Passing `None` clears the rayon pool reference.
+#[cfg(feature = "mt")]
+#[inline]
+pub fn ZSTD_CCtx_refRayonThreadPool(
+    cctx: &mut ZSTD_CCtx,
+    pool: Option<&rayon::ThreadPool>,
+) -> usize {
+    if !cctx_is_in_init_stage(cctx) {
+        return ERROR(ErrorCode::StageWrong);
+    }
+    cctx.rayonThreadPoolRef = pool.map_or(0, |p| p as *const rayon::ThreadPool as usize);
+    if pool.is_some() {
+        cctx.threadPoolRef = 0;
+    }
+    cctx.mtctxSizeHint = if pool.is_some() {
+        core::mem::size_of::<rayon::ThreadPool>()
+    } else if cctx.threadPoolRef == 0 {
+        0
+    } else {
+        cctx.mtctxSizeHint
+    };
     0
 }
 
@@ -10665,6 +10698,7 @@ fn zstd_endStream_buffered(
                 zcs.requestedParams,
                 zcs.format,
                 zcs.threadPoolRef,
+                zcs.rayonThreadPoolRef,
                 level,
                 &src,
                 effective_prefix,
@@ -10833,6 +10867,7 @@ fn zstd_endstream_mt_compress(
     requested_params: ZSTD_CCtx_params,
     format: crate::decompress::zstd_decompress::ZSTD_format_e,
     thread_pool_ref: usize,
+    rayon_thread_pool_ref: usize,
     level: i32,
     src: &[u8],
     effective_prefix: &[u8],
@@ -10840,7 +10875,7 @@ fn zstd_endstream_mt_compress(
 ) -> Result<Vec<u8>, usize> {
     use crate::compress::zstdmt_compress::{
         Range, ZSTDMT_compressStream_generic, ZSTDMT_createCCtx, ZSTDMT_freeCCtx,
-        ZSTDMT_initCStream_internal, ZSTDMT_setThreadPool,
+        ZSTDMT_initCStream_internal, ZSTDMT_setRayonThreadPool, ZSTDMT_setThreadPool,
     };
 
     let nb_workers = requested_params.nbWorkers.max(1) as u32;
@@ -10858,7 +10893,10 @@ fn zstd_endstream_mt_compress(
         let _ = ZSTDMT_freeCCtx(Some(mtctx));
         return Err(init);
     }
-    if thread_pool_ref != 0 {
+    if rayon_thread_pool_ref != 0 {
+        let pool = unsafe { &*(rayon_thread_pool_ref as *const rayon::ThreadPool) };
+        ZSTDMT_setRayonThreadPool(&mut mtctx, Some(pool));
+    } else if thread_pool_ref != 0 {
         let pool = unsafe { &*(thread_pool_ref as *const crate::common::pool::POOL_ctx) };
         ZSTDMT_setThreadPool(&mut mtctx, Some(pool));
     }
@@ -11607,6 +11645,38 @@ mod tests {
         let d = ZSTD_decompress(&mut decoded, &compressed);
         assert!(!ERR_isError(d), "decompress err={d:#x}");
         assert_eq!(&decoded[..d], &src[..]);
+    }
+
+    #[cfg(feature = "mt")]
+    #[test]
+    fn compresscctx_roundtrip_with_nbworkers_and_attached_rayon_pool() {
+        use crate::decompress::zstd_decompress::ZSTD_decompress;
+
+        let mut cctx = ZSTD_createCCtx().unwrap();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .expect("rayon thread pool");
+        assert_eq!(ZSTD_CCtx_refRayonThreadPool(&mut cctx, Some(&pool)), 0);
+        assert_eq!(
+            ZSTD_CCtx_setParameter(&mut cctx, ZSTD_cParameter::ZSTD_c_nbWorkers, 2),
+            0
+        );
+        let src = b"mt-compresscctx-attached-rayon-pool payload ".repeat(180);
+        let mut compressed = vec![0u8; ZSTD_compressBound(src.len())];
+        let n = ZSTD_compressCCtx(&mut cctx, &mut compressed, &src, 4);
+        assert!(!ERR_isError(n), "compressCCtx err={n:#x}");
+        compressed.truncate(n);
+
+        let mut decoded = vec![0u8; src.len() + 16];
+        let d = ZSTD_decompress(&mut decoded, &compressed);
+        assert!(!ERR_isError(d), "decompress err={d:#x}");
+        assert_eq!(&decoded[..d], &src[..]);
+
+        let mut cleared = ZSTD_createCCtx().unwrap();
+        assert_eq!(ZSTD_CCtx_refRayonThreadPool(&mut cleared, Some(&pool)), 0);
+        assert_eq!(ZSTD_CCtx_refRayonThreadPool(&mut cleared, None), 0);
+        assert_eq!(ZSTD_sizeof_mtctx(&cleared), 0);
     }
 
     #[test]

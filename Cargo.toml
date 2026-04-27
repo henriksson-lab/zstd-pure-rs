@@ -2,6 +2,7 @@
 name = "zstd-pure-rs"
 version = "0.1.0"
 edition = "2021"
+autoexamples = false
 description = "Pure-Rust port of the Zstandard (zstd) compression library"
 license = "BSD-3-Clause OR GPL-2.0-only"
 repository = "https://github.com/henriksson-lab/zstd-pure-rs"
@@ -9,16 +10,23 @@ readme = "README.md"
 keywords = ["compression", "zstd", "zstandard", "decompression", "pure-rust"]
 categories = ["compression"]
 include = [
-    "src/**/*.rs",
-    "tests/**/*.rs",
-    "tests/fixtures/**",
-    "Cargo.toml",
-    "LICENSE",
-    "COPYING",
-    "README.md",
-    "TODO.md",
-    "FUNCTIONS.md",
-    "ccc_mapping.toml",
+    "/src/**/*.rs",
+    "/tests/**/*.rs",
+    "/tests/fixtures/**",
+    "/zstd/tests/dict-files/zero-weight-dict",
+    "/zstd/tests/golden-compression/http",
+    "/zstd/tests/golden-compression/huffman-compressed-larger",
+    "/zstd/tests/golden-compression/large-literal-and-match-lengths",
+    "/zstd/tests/golden-compression/PR-3517-block-splitter-corruption-test",
+    "/zstd/tests/golden-decompression/**",
+    "/zstd/tests/golden-decompression-errors/**",
+    "/Cargo.toml",
+    "/LICENSE",
+    "/COPYING",
+    "/README.md",
+    "/TODO.md",
+    "/FUNCTIONS.md",
+    "/ccc_mapping.toml",
 ]
 
 [lib]

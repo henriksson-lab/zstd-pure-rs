@@ -1066,9 +1066,10 @@ mod tests {
     #[test]
     fn decompresses_upstream_level10_large_real_text_frame() {
         use crate::decompress::zstd_decompress_block::{
-            blockProperties_t, blockType_e, streaming_operation, ZSTD_DCtx, ZSTD_blockHeaderSize,
-            ZSTD_buildDefaultSeqTables, ZSTD_decodeLiteralsBlock, ZSTD_decodeSeqHeaders,
-            ZSTD_decoder_entropy_rep, ZSTD_decompressSequences_body, ZSTD_getcBlockSize,
+            active_ll_table, active_ml_table, active_of_table, blockProperties_t, blockType_e,
+            streaming_operation, ZSTD_DCtx, ZSTD_blockHeaderSize, ZSTD_buildDefaultSeqTables,
+            ZSTD_decodeLiteralsBlock, ZSTD_decodeSeqHeaders, ZSTD_decoder_entropy_rep,
+            ZSTD_decompressSequences_body, ZSTD_getcBlockSize,
         };
         use std::fs;
         use std::io::Write;
@@ -1147,9 +1148,9 @@ mod tests {
                         crate::common::error::ERR_getErrorName(seq_header)
                     );
                     let lit_snapshot = dctx.litExtraBuffer[..dctx.litSize].to_vec();
-                    let ll = dctx.LLTable.clone();
-                    let of = dctx.OFTable.clone();
-                    let ml = dctx.MLTable.clone();
+                    let ll = active_ll_table(&dctx).to_vec();
+                    let of = active_of_table(&dctx).to_vec();
+                    let ml = active_ml_table(&dctx).to_vec();
                     let seq_rc = ZSTD_decompressSequences_body(
                         &mut decoded,
                         op,

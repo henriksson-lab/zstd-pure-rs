@@ -8,7 +8,6 @@
 
 use crate::common::bits::ZSTD_highbit32;
 use crate::common::error::{ErrorCode, ERROR};
-use crate::common::mem::MEM_readLEST;
 
 // ---- status codes (mirror upstream `BIT_DStream_status`) ----
 pub const BIT_DStream_unfinished: u32 = 0;
@@ -19,6 +18,19 @@ pub const BIT_DStream_overflow: u32 = 3;
 /// Bit-container width in bytes. `size_t` upstream; `usize` here.
 const CONTAINER_BYTES: usize = core::mem::size_of::<usize>();
 const CONTAINER_BITS: u32 = (CONTAINER_BYTES as u32) * 8;
+
+#[inline(always)]
+fn BIT_readContainer(src: &[u8], ptr: usize) -> usize {
+    debug_assert!(ptr + CONTAINER_BYTES <= src.len());
+    unsafe {
+        let p = src.as_ptr().add(ptr);
+        if core::mem::size_of::<usize>() == 8 {
+            u64::from_le((p as *const u64).read_unaligned()) as usize
+        } else {
+            u32::from_le((p as *const u32).read_unaligned()) as usize
+        }
+    }
+}
 
 // ========================================================================
 // Encoder (BIT_CStream_t)
@@ -204,7 +216,7 @@ pub fn BIT_initDStream<'a>(
 
     if srcSize >= CONTAINER_BYTES {
         bitD.ptr = srcSize - CONTAINER_BYTES;
-        bitD.bitContainer = MEM_readLEST(&src[bitD.ptr..]);
+        bitD.bitContainer = BIT_readContainer(src, bitD.ptr);
         let lastByte = src[srcSize - 1];
         if lastByte == 0 {
             return ERROR(ErrorCode::Generic);
@@ -332,7 +344,7 @@ pub fn BIT_readBitsFast(bitD: &mut BIT_DStream_t, nbBits: u32) -> usize {
 fn BIT_reloadDStream_internal(bitD: &mut BIT_DStream_t) -> u32 {
     bitD.ptr -= (bitD.bitsConsumed >> 3) as usize;
     bitD.bitsConsumed &= 7;
-    bitD.bitContainer = MEM_readLEST(&bitD.src[bitD.ptr..]);
+    bitD.bitContainer = BIT_readContainer(bitD.src, bitD.ptr);
     BIT_DStream_unfinished
 }
 
@@ -378,7 +390,8 @@ pub fn BIT_reloadDStream(bitD: &mut BIT_DStream_t) -> u32 {
     }
     bitD.ptr -= nbBytes;
     bitD.bitsConsumed -= (nbBytes as u32) * 8;
-    bitD.bitContainer = MEM_readLEST(&bitD.src[bitD.ptr..]);
+    debug_assert!(bitD.ptr + CONTAINER_BYTES <= bitD.src.len());
+    bitD.bitContainer = BIT_readContainer(bitD.src, bitD.ptr);
     result
 }
 

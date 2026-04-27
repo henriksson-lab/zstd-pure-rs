@@ -112,6 +112,25 @@ pub fn FSE_readNCount(
     tableLogPtr: &mut u32,
     src: &[u8],
 ) -> usize {
+    FSE_readNCount_body(normalizedCounter, maxSVPtr, tableLogPtr, src, true)
+}
+
+pub(crate) fn FSE_readNCount_no_clear(
+    normalizedCounter: &mut [i16],
+    maxSVPtr: &mut u32,
+    tableLogPtr: &mut u32,
+    src: &[u8],
+) -> usize {
+    FSE_readNCount_body(normalizedCounter, maxSVPtr, tableLogPtr, src, false)
+}
+
+fn FSE_readNCount_body(
+    normalizedCounter: &mut [i16],
+    maxSVPtr: &mut u32,
+    tableLogPtr: &mut u32,
+    src: &[u8],
+    clear_counts: bool,
+) -> usize {
     let hbSize = src.len();
 
     // Upstream: if hbSize < 8, pad into an 8-byte zero-filled buffer and
@@ -120,7 +139,13 @@ pub fn FSE_readNCount(
     if hbSize < 8 {
         let mut buffer = [0u8; 8];
         buffer[..hbSize].copy_from_slice(src);
-        let countSize = FSE_readNCount(normalizedCounter, maxSVPtr, tableLogPtr, &buffer);
+        let countSize = FSE_readNCount_body(
+            normalizedCounter,
+            maxSVPtr,
+            tableLogPtr,
+            &buffer,
+            clear_counts,
+        );
         if crate::common::error::ERR_isError(countSize) {
             return countSize;
         }
@@ -137,8 +162,8 @@ pub fn FSE_readNCount(
     let mut previous0 = false;
 
     // Zero out the counter; symbols not present stay at 0.
-    for c in normalizedCounter.iter_mut().take(maxSV1 as usize) {
-        *c = 0;
+    if clear_counts {
+        normalizedCounter[..maxSV1 as usize].fill(0);
     }
 
     let mut bitStream: u32 = MEM_readLE32(&src[ip..]);

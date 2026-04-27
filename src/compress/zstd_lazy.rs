@@ -53,7 +53,7 @@ pub enum searchMethod_e {
 }
 
 /// Port of `ZSTD_VecMask_next`.
-#[inline]
+#[inline(always)]
 pub fn ZSTD_VecMask_next(val: ZSTD_VecMask) -> u32 {
     ZSTD_countTrailingZeros64(val)
 }
@@ -77,7 +77,7 @@ pub fn ZSTD_isAligned<T>(ptr: *const T, align: usize) -> bool {
 /// Port of `ZSTD_row_prefetch`. Mirrors upstream's `PREFETCH_L1` macro
 /// — issues real `_mm_prefetch` / `prfm pldl1keep` hints rather than
 /// hint-stubbed slice creations.
-#[inline]
+#[inline(always)]
 pub fn ZSTD_row_prefetch(hashTable: &[u32], tagTable: &[u8], relRow: u32, rowLog: u32) {
     use crate::common::zstd_internal::ZSTD_prefetchL1;
     // `relRow` is always `< hashTable.len()` and `< tagTable.len()` by
@@ -104,6 +104,7 @@ pub fn ZSTD_row_prefetch(hashTable: &[u32], tagTable: &[u8], relRow: u32, rowLog
 /// pre-filling from; `iLimit` is the slice-offset upper bound on bytes
 /// the matcher may still inspect.
 ///
+#[inline(always)]
 pub fn ZSTD_row_fillHashCache(
     ms: &mut ZSTD_MatchState_t,
     base: &[u8],
@@ -148,7 +149,7 @@ pub fn ZSTD_row_fillHashCache(
 /// window-space index. `base_off` lets us recover the slice offset
 /// (= `idx - base_off`) for byte reads.
 #[allow(clippy::too_many_arguments)]
-#[inline]
+#[inline(always)]
 pub fn ZSTD_row_nextCachedHash(
     cache: &mut [u32; crate::compress::match_state::ZSTD_ROW_HASH_CACHE_SIZE],
     hashTable: &[u32],
@@ -174,8 +175,10 @@ pub fn ZSTD_row_nextCachedHash(
     let row = (newHash >> ZSTD_ROW_HASH_TAG_BITS) << rowLog;
     ZSTD_row_prefetch(hashTable, tagTable, row, rowLog);
     let slot = idx as usize & ZSTD_ROW_HASH_CACHE_MASK;
-    let hash = cache[slot];
-    cache[slot] = newHash;
+    let hash = unsafe { *cache.get_unchecked(slot) };
+    unsafe {
+        *cache.get_unchecked_mut(slot) = newHash;
+    }
     hash
 }
 
@@ -183,6 +186,7 @@ pub fn ZSTD_row_nextCachedHash(
 /// are absolute indices (matching upstream's `(U32)(ip - base)` and the
 /// chain-hash convention). The `base` slice is the matcher's input buffer;
 /// we subtract `base_off` to recover the slice offset for byte reads.
+#[inline(always)]
 pub fn ZSTD_row_update_internalImpl(
     ms: &mut ZSTD_MatchState_t,
     mut updateStartIdx: u32,
@@ -257,6 +261,7 @@ pub fn ZSTD_row_update_internalImpl(
 /// for any window) and keeps row-hash compatible with the chain-hash
 /// nextToUpdate convention so the same field can be shared and clamped
 /// against `ms.window.lowLimit` between blocks.
+#[inline(always)]
 pub fn ZSTD_row_update_internal(
     ms: &mut ZSTD_MatchState_t,
     ip: usize,
@@ -344,7 +349,7 @@ pub fn ZSTD_row_getRVVMask(rowEntries: i32, src: &[u8], tag: u8, head: u32) -> Z
 /// time, detecting matching bytes via `((x | 0x80) - 0x01) | x) & 0x80`
 /// after `x ^= splat(tag)`. Per-byte high bits are then packed via the
 /// `extractMagic` multiply trick. Matches upstream's little-endian path.
-#[inline]
+#[inline(always)]
 fn ZSTD_row_getMatchMask_scalar(
     src: &[u8],
     tag: u8,
@@ -361,7 +366,9 @@ fn ZSTD_row_getMatchMask_scalar(
 
     let mut matches: u64 = 0;
     let mut i: i32 = (rowEntries as i32) - (CHUNK_SIZE as i32);
-    debug_assert!(CHUNK_SIZE == 4 || CHUNK_SIZE == 8);
+    const {
+        assert!(core::mem::size_of::<usize>() == 4 || core::mem::size_of::<usize>() == 8);
+    }
     while i >= 0 {
         let off = i as usize;
         debug_assert!(off + CHUNK_SIZE <= src.len());
@@ -381,7 +388,36 @@ fn ZSTD_row_getMatchMask_scalar(
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+unsafe fn ZSTD_row_getMatchMask_sse2(
+    src: &[u8],
+    tag: u8,
+    headGrouped: u32,
+    rowEntries: u32,
+) -> ZSTD_VecMask {
+    use std::arch::x86_64::{_mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8, _mm_set1_epi8};
+
+    debug_assert!(matches!(rowEntries, 16 | 32 | 64));
+    debug_assert!(src.len() >= rowEntries as usize);
+    let tagv = _mm_set1_epi8(tag as i8);
+    let base = src.as_ptr();
+    let mut matches = 0u64;
+    let chunks = rowEntries as usize / 16;
+    for chunk in 0..chunks {
+        let v = _mm_loadu_si128(base.add(chunk * 16) as *const _);
+        let eq = _mm_cmpeq_epi8(v, tagv);
+        matches |= (_mm_movemask_epi8(eq) as u32 as u64) << (chunk * 16);
+    }
+    match rowEntries {
+        16 => ZSTD_rotateRight_U16(matches as u16, headGrouped) as u64,
+        32 => ZSTD_rotateRight_U32(matches as u32, headGrouped) as u64,
+        _ => ZSTD_rotateRight_U64(matches, headGrouped),
+    }
+}
+
 /// Port of `ZSTD_row_getMatchMask`.
+#[inline(always)]
 pub fn ZSTD_row_getMatchMask(
     tagRow: &[u8],
     tag: u8,
@@ -390,6 +426,11 @@ pub fn ZSTD_row_getMatchMask(
 ) -> ZSTD_VecMask {
     debug_assert!(matches!(rowEntries, 16 | 32 | 64));
     debug_assert!(rowEntries <= ZSTD_ROW_HASH_MAX_ENTRIES);
+    #[cfg(target_arch = "x86_64")]
+    {
+        return unsafe { ZSTD_row_getMatchMask_sse2(tagRow, tag, headGrouped, rowEntries) };
+    }
+    #[cfg(not(target_arch = "x86_64"))]
     ZSTD_row_getMatchMask_scalar(tagRow, tag, headGrouped, rowEntries)
 }
 
@@ -710,34 +751,32 @@ pub fn ZSTD_RowFindBestMatch(
     {
         let relRow = ((hash >> ZSTD_ROW_HASH_TAG_BITS) << rowLog) as usize;
         let tag = (hash & ZSTD_ROW_HASH_TAG_MASK) as u8;
-        let headGrouped = ms.tagTable[relRow] as u32 & rowMask;
-        let matches = ZSTD_row_getMatchMask(
-            &ms.tagTable[relRow..relRow + rowEntries as usize],
-            tag,
-            headGrouped,
-            rowEntries,
-        );
+        let tag_row = unsafe {
+            let ptr = ms.tagTable.as_ptr().add(relRow);
+            std::slice::from_raw_parts(ptr, rowEntries as usize)
+        };
+        let headGrouped = unsafe { *tag_row.get_unchecked(0) } as u32 & rowMask;
+        let matches = ZSTD_row_getMatchMask(tag_row, tag, headGrouped, rowEntries);
         // The no-dict row-hash path is the dominant L10 hot loop. It
         // doesn't need the temporary match buffer that the ext-dict and
         // dictMatchState paths use to satisfy borrowing around table
         // mutation, so evaluate candidates inline and only insert the
         // current position after the row has been scanned.
         if dictMode == ZSTD_dictMode_e::ZSTD_noDict {
-            let hash_row = &ms.hashTable[relRow..relRow + rowEntries as usize];
+            let hash_row = unsafe { ms.hashTable.as_ptr().add(relRow) };
             let mut mask = matches;
 
             while mask > 0 && nbAttempts > 0 {
                 let matchPos = (headGrouped + ZSTD_VecMask_next(mask)) & rowMask;
                 if matchPos != 0 {
-                    let matchIndex = hash_row[matchPos as usize];
+                    let matchIndex = unsafe { *hash_row.add(matchPos as usize) };
                     if matchIndex < lowLimit {
                         break;
                     }
 
                     let matchBytePos = matchIndex.wrapping_sub(base_off) as usize;
 
-                    let prefilter_valid =
-                        matchBytePos + ml + 1 <= input_buf.len() && ip + ml + 1 <= iLimit;
+                    let prefilter_valid = matchBytePos + ml < input_buf.len() && ip + ml < iLimit;
                     if prefilter_valid {
                         let m_ptr = input_buf.as_ptr().wrapping_add(matchBytePos + ml - 3);
                         let c_ptr = input_buf.as_ptr().wrapping_add(ip + ml - 3);
@@ -758,7 +797,6 @@ pub fn ZSTD_RowFindBestMatch(
                 }
                 mask &= mask - 1;
             }
-            let _ = hash_row;
 
             let pos = unsafe {
                 let head = ms.tagTable.get_unchecked_mut(relRow);
@@ -849,7 +887,7 @@ pub fn ZSTD_RowFindBestMatch(
                 // needed. The bounds checks remain because matchIndex
                 // can be from a prior block (saturating_sub won't catch
                 // wraparound past `iLimit`).
-                let prefilter_valid = matchPos + ml + 1 <= input_buf.len() && ip + ml + 1 <= iLimit;
+                let prefilter_valid = matchPos + ml < input_buf.len() && ip + ml < iLimit;
                 // CMOV-friendly select: read from real `matchPos+ml-3`
                 // when valid, else from a dummy. Mirrors upstream's
                 // `ZSTD_selectAddr`-style pointer pick. Slice-indexed

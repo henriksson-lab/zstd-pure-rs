@@ -3311,7 +3311,7 @@ pub fn ZSTD_estimateCStreamSize_usingCCtxParams(params: &ZSTD_CCtx_params) -> us
 
 std::thread_local! {
     static ZSTD_COMPRESS_CCTX: std::cell::RefCell<Option<Box<ZSTD_CCtx>>> =
-        std::cell::RefCell::new(None);
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Port of upstream's one-shot `ZSTD_compress` (`zstd.h:160`).

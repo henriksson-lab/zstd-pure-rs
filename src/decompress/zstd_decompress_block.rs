@@ -21,8 +21,8 @@ use crate::common::error::{ErrorCode, ERROR};
 use crate::common::mem::{MEM_readLE16, MEM_readLE24, MEM_readLE32};
 use crate::decompress::huf_decompress::{
     HUF_DTable, HUF_decompress1X1_DCtx_wksp, HUF_decompress1X_usingDTable,
-    HUF_decompress4X_hufOnly_wksp, HUF_decompress4X_usingDTable, HUF_DTABLE_SIZE_U32,
-    HUF_TABLELOG_MAX,
+    HUF_decompress4X_hufOnly_wksp, HUF_decompress4X_usingDTable, HUF_flags_bmi2,
+    HUF_flags_disableAsm, HUF_DTABLE_SIZE_U32, HUF_TABLELOG_MAX,
 };
 
 /// Mirror of upstream `blockType_e`.
@@ -215,8 +215,10 @@ pub fn ZSTD_copy8(dst: &mut [u8], src: &[u8]) {
 /// Upstream uses pointer pairs into a single buffer; the Rust port
 /// takes one `&mut [u8]` plus two indices to keep the aliasing
 /// single-borrow.
+#[inline(always)]
 pub fn ZSTD_overlapCopy8(buf: &mut [u8], op: &mut usize, ip: &mut usize, offset: usize) {
     debug_assert!(*ip <= *op);
+    debug_assert!(*op + 8 <= buf.len());
     if offset < 8 {
         // Spread the low bytes until op-ip >= 8. Upstream runs
         // `size_t` arithmetic that can transiently underflow the
@@ -226,21 +228,32 @@ pub fn ZSTD_overlapCopy8(buf: &mut [u8], op: &mut usize, ip: &mut usize, offset:
         const DEC32: [usize; 8] = [0, 1, 2, 1, 4, 4, 4, 4];
         const DEC64: [usize; 8] = [8, 8, 8, 7, 8, 9, 10, 11];
         let sub2 = DEC64[offset];
-        buf[*op] = buf[*ip];
-        buf[*op + 1] = buf[*ip + 1];
-        buf[*op + 2] = buf[*ip + 2];
-        buf[*op + 3] = buf[*ip + 3];
-        *ip = ip.wrapping_add(DEC32[offset]);
-        let (s0, s1, s2, s3) = (buf[*ip], buf[*ip + 1], buf[*ip + 2], buf[*ip + 3]);
-        buf[*op + 4] = s0;
-        buf[*op + 5] = s1;
-        buf[*op + 6] = s2;
-        buf[*op + 7] = s3;
-        *ip = ip.wrapping_sub(sub2);
+        unsafe {
+            let ptr = buf.as_mut_ptr();
+            let op0 = *op;
+            let ip0 = *ip;
+            *ptr.add(op0) = *ptr.add(ip0);
+            *ptr.add(op0 + 1) = *ptr.add(ip0 + 1);
+            *ptr.add(op0 + 2) = *ptr.add(ip0 + 2);
+            *ptr.add(op0 + 3) = *ptr.add(ip0 + 3);
+            *ip = ip.wrapping_add(DEC32[offset]);
+            let ip1 = *ip;
+            let s0 = *ptr.add(ip1);
+            let s1 = *ptr.add(ip1 + 1);
+            let s2 = *ptr.add(ip1 + 2);
+            let s3 = *ptr.add(ip1 + 3);
+            *ptr.add(op0 + 4) = s0;
+            *ptr.add(op0 + 5) = s1;
+            *ptr.add(op0 + 6) = s2;
+            *ptr.add(op0 + 7) = s3;
+            *ip = ip.wrapping_sub(sub2);
+        }
     } else {
         // Non-overlapping 8-byte copy.
-        for k in 0..8 {
-            buf[*op + k] = buf[*ip + k];
+        unsafe {
+            let ptr = buf.as_mut_ptr();
+            let v = (ptr.add(*ip) as *const [u8; 8]).read_unaligned();
+            (ptr.add(*op) as *mut [u8; 8]).write_unaligned(v);
         }
     }
     *ip = ip.wrapping_add(8);
@@ -282,7 +295,7 @@ pub fn ZSTD_initFseState(
 }
 
 /// Port of `ZSTD_updateFseStateWithDInfo`.
-#[inline]
+#[inline(always)]
 pub fn ZSTD_updateFseStateWithDInfo(
     dsp: &mut ZSTD_fseState,
     bitD: &mut crate::common::bitstream::BIT_DStream_t,
@@ -290,6 +303,48 @@ pub fn ZSTD_updateFseStateWithDInfo(
     nbBits: u32,
 ) {
     let lowBits = crate::common::bitstream::BIT_readBits(bitD, nbBits);
+    dsp.state = nextState as usize + lowBits;
+}
+
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+#[target_feature(enable = "bmi1,bmi2,lzcnt")]
+unsafe fn BIT_readBitsFast_bmi2(
+    bitD: &mut crate::common::bitstream::BIT_DStream_t,
+    nbBits: u32,
+) -> usize {
+    debug_assert!(nbBits >= 1);
+    let reg_mask = 63u32;
+    let v = ((bitD.bitContainer as u64) << (bitD.bitsConsumed & reg_mask))
+        >> ((64u32 - nbBits) & reg_mask);
+    crate::common::bitstream::BIT_skipBits(bitD, nbBits);
+    v as usize
+}
+
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+#[target_feature(enable = "bmi1,bmi2,lzcnt")]
+unsafe fn BIT_readBits_bmi2(
+    bitD: &mut crate::common::bitstream::BIT_DStream_t,
+    nbBits: u32,
+) -> usize {
+    let v = if bitD.bitsConsumed + nbBits <= 64 {
+        let start = 64 - bitD.bitsConsumed - nbBits;
+        core::arch::x86_64::_bextr_u64(bitD.bitContainer as u64, start, nbBits) as usize
+    } else {
+        crate::common::bitstream::BIT_lookBits(bitD, nbBits)
+    };
+    crate::common::bitstream::BIT_skipBits(bitD, nbBits);
+    v
+}
+
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+#[target_feature(enable = "bmi1,bmi2,lzcnt")]
+unsafe fn ZSTD_updateFseStateWithDInfo_bmi2(
+    dsp: &mut ZSTD_fseState,
+    bitD: &mut crate::common::bitstream::BIT_DStream_t,
+    nextState: u16,
+    nbBits: u32,
+) {
+    let lowBits = BIT_readBits_bmi2(bitD, nbBits);
     dsp.state = nextState as usize + lowBits;
 }
 
@@ -317,9 +372,15 @@ pub fn ZSTD_decodeSequence(
 ) -> seq_t {
     use crate::common::bitstream::{BIT_readBitsFast, BIT_reloadDStream};
 
-    let llDInfo = LLTable[seqState.stateLL.table_offset + seqState.stateLL.state];
-    let mlDInfo = MLTable[seqState.stateML.table_offset + seqState.stateML.state];
-    let ofDInfo = OFTable[seqState.stateOffb.table_offset + seqState.stateOffb.state];
+    let ll_idx = seqState.stateLL.table_offset + seqState.stateLL.state;
+    let ml_idx = seqState.stateML.table_offset + seqState.stateML.state;
+    let of_idx = seqState.stateOffb.table_offset + seqState.stateOffb.state;
+    debug_assert!(ll_idx < LLTable.len());
+    debug_assert!(ml_idx < MLTable.len());
+    debug_assert!(of_idx < OFTable.len());
+    let llDInfo = unsafe { *LLTable.get_unchecked(ll_idx) };
+    let mlDInfo = unsafe { *MLTable.get_unchecked(ml_idx) };
+    let ofDInfo = unsafe { *OFTable.get_unchecked(of_idx) };
 
     let mut seq = seq_t {
         litLength: llDInfo.baseValue as usize,
@@ -419,6 +480,217 @@ pub fn ZSTD_decodeSequence(
     seq
 }
 
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+#[target_feature(enable = "bmi1,bmi2,lzcnt")]
+unsafe fn ZSTD_decodeSequence_bmi2(
+    seqState: &mut seqState_t,
+    LLTable: &[ZSTD_seqSymbol],
+    OFTable: &[ZSTD_seqSymbol],
+    MLTable: &[ZSTD_seqSymbol],
+    isLastSeq: bool,
+) -> seq_t {
+    use crate::common::bitstream::BIT_reloadDStream;
+
+    let ll_idx = seqState.stateLL.table_offset + seqState.stateLL.state;
+    let ml_idx = seqState.stateML.table_offset + seqState.stateML.state;
+    let of_idx = seqState.stateOffb.table_offset + seqState.stateOffb.state;
+    debug_assert!(ll_idx < LLTable.len());
+    debug_assert!(ml_idx < MLTable.len());
+    debug_assert!(of_idx < OFTable.len());
+    let llDInfo = *LLTable.get_unchecked(ll_idx);
+    let mlDInfo = *MLTable.get_unchecked(ml_idx);
+    let ofDInfo = *OFTable.get_unchecked(of_idx);
+
+    let mut seq = seq_t {
+        litLength: llDInfo.baseValue as usize,
+        matchLength: mlDInfo.baseValue as usize,
+        offset: 0,
+    };
+
+    let ofBase = ofDInfo.baseValue as usize;
+    let llBits = llDInfo.nbAdditionalBits;
+    let mlBits = mlDInfo.nbAdditionalBits;
+    let ofBits = ofDInfo.nbAdditionalBits;
+    let totalBits = llBits as u32 + mlBits as u32 + ofBits as u32;
+
+    let mut prev0 = seqState.prevOffset[0];
+    let mut prev1 = seqState.prevOffset[1];
+    let mut prev2 = seqState.prevOffset[2];
+    let offset;
+    if ofBits > 1 {
+        offset = ofBase + BIT_readBitsFast_bmi2(&mut seqState.DStream, ofBits as u32);
+        prev2 = prev1;
+        prev1 = prev0;
+        prev0 = offset;
+    } else {
+        let ll0 = (llDInfo.baseValue == 0) as usize;
+        if ofBits == 0 {
+            if ll0 != 0 {
+                offset = prev1;
+                prev1 = prev0;
+                prev0 = offset;
+            } else {
+                offset = prev0;
+            }
+        } else {
+            let raw = ofBase + ll0 + BIT_readBitsFast_bmi2(&mut seqState.DStream, 1);
+            let mut temp = match raw {
+                1 => prev1,
+                3 => prev0 - 1,
+                r if r >= 2 => prev2,
+                _ => prev0,
+            };
+            if temp == 0 {
+                temp = temp.wrapping_sub(1);
+            }
+            prev2 = if raw == 1 { prev2 } else { prev1 };
+            prev1 = prev0;
+            prev0 = temp;
+            offset = temp;
+        }
+    }
+    seq.offset = offset;
+
+    if mlBits > 0 {
+        seq.matchLength += BIT_readBitsFast_bmi2(&mut seqState.DStream, mlBits as u32);
+    }
+
+    if totalBits
+        >= crate::common::bitstream::BIT_DStream_unfinished + 57 - (LLFSELog + MLFSELog + OffFSELog)
+    {
+        BIT_reloadDStream(&mut seqState.DStream);
+    }
+
+    if llBits > 0 {
+        seq.litLength += BIT_readBitsFast_bmi2(&mut seqState.DStream, llBits as u32);
+    }
+
+    if !isLastSeq {
+        ZSTD_updateFseStateWithDInfo_bmi2(
+            &mut seqState.stateLL,
+            &mut seqState.DStream,
+            llDInfo.nextState,
+            llDInfo.nbBits as u32,
+        );
+        ZSTD_updateFseStateWithDInfo_bmi2(
+            &mut seqState.stateML,
+            &mut seqState.DStream,
+            mlDInfo.nextState,
+            mlDInfo.nbBits as u32,
+        );
+        ZSTD_updateFseStateWithDInfo_bmi2(
+            &mut seqState.stateOffb,
+            &mut seqState.DStream,
+            ofDInfo.nextState,
+            ofDInfo.nbBits as u32,
+        );
+        BIT_reloadDStream(&mut seqState.DStream);
+    }
+
+    seqState.prevOffset[0] = prev0;
+    seqState.prevOffset[1] = prev1;
+    seqState.prevOffset[2] = prev2;
+    seq
+}
+
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+macro_rules! ZSTD_decodeSequence_bmi2_inline {
+    (
+        $DStream:expr,
+        $stateLL:expr,
+        $stateOffb:expr,
+        $stateML:expr,
+        $prev0:expr,
+        $prev1:expr,
+        $prev2:expr,
+        $LLTablePtr:expr,
+        $OFTablePtr:expr,
+        $MLTablePtr:expr,
+        $isLastSeq:expr
+    ) => {{
+        use crate::common::bitstream::BIT_reloadDStream;
+        macro_rules! update_fse_state {
+            ($state:expr, $info:expr) => {{
+                let lowBits = BIT_readBits_bmi2(&mut $DStream, $info.nbBits as u32);
+                $state.state = $info.nextState as usize + lowBits;
+            }};
+        }
+
+        let ll_idx = $stateLL.table_offset + $stateLL.state;
+        let ml_idx = $stateML.table_offset + $stateML.state;
+        let of_idx = $stateOffb.table_offset + $stateOffb.state;
+        let llDInfo = *$LLTablePtr.add(ll_idx);
+        let mlDInfo = *$MLTablePtr.add(ml_idx);
+        let ofDInfo = *$OFTablePtr.add(of_idx);
+
+        let ofBase = ofDInfo.baseValue as usize;
+        let llBits = llDInfo.nbAdditionalBits;
+        let mlBits = mlDInfo.nbAdditionalBits;
+        let ofBits = ofDInfo.nbAdditionalBits;
+        let totalBits = llBits as u32 + mlBits as u32 + ofBits as u32;
+
+        let mut litLength = llDInfo.baseValue as usize;
+        let mut matchLength = mlDInfo.baseValue as usize;
+
+        let offset;
+        if ofBits > 1 {
+            offset = ofBase + BIT_readBitsFast_bmi2(&mut $DStream, ofBits as u32);
+            $prev2 = $prev1;
+            $prev1 = $prev0;
+            $prev0 = offset;
+        } else {
+            let ll0 = (llDInfo.baseValue == 0) as usize;
+            if ofBits == 0 {
+                if ll0 != 0 {
+                    offset = $prev1;
+                    $prev1 = $prev0;
+                    $prev0 = offset;
+                } else {
+                    offset = $prev0;
+                }
+            } else {
+                let raw = ofBase + ll0 + BIT_readBitsFast_bmi2(&mut $DStream, 1);
+                let mut temp = match raw {
+                    1 => $prev1,
+                    3 => $prev0 - 1,
+                    r if r >= 2 => $prev2,
+                    _ => $prev0,
+                };
+                if temp == 0 {
+                    temp = temp.wrapping_sub(1);
+                }
+                $prev2 = if raw == 1 { $prev2 } else { $prev1 };
+                $prev1 = $prev0;
+                $prev0 = temp;
+                offset = temp;
+            }
+        }
+        if mlBits > 0 {
+            matchLength += BIT_readBitsFast_bmi2(&mut $DStream, mlBits as u32);
+        }
+
+        if totalBits
+            >= crate::common::bitstream::BIT_DStream_unfinished + 57
+                - (LLFSELog + MLFSELog + OffFSELog)
+        {
+            BIT_reloadDStream(&mut $DStream);
+        }
+
+        if llBits > 0 {
+            litLength += BIT_readBitsFast_bmi2(&mut $DStream, llBits as u32);
+        }
+
+        if !$isLastSeq {
+            update_fse_state!($stateLL, llDInfo);
+            update_fse_state!($stateML, mlDInfo);
+            update_fse_state!($stateOffb, ofDInfo);
+            BIT_reloadDStream(&mut $DStream);
+        }
+
+        (litLength, matchLength, offset)
+    }};
+}
+
 /// Port of `ZSTD_execSequence`. Executes a single (litLength,
 /// matchLength, offset) sequence: copies literals from `litBuf[litPtr..]`
 /// to `dst[op..]`, then back-references `matchLength` bytes starting
@@ -437,13 +709,38 @@ pub fn ZSTD_decodeSequence(
 /// out-of-buffer history is reachable; one-shot decode paths that
 /// concatenate `dict || scratch` into `dst` already have everything
 /// in-buffer and can leave `ext_history` empty.
-#[inline]
+#[inline(always)]
 pub fn ZSTD_execSequence(
     dst: &mut [u8],
     op: usize,
     sequence: seq_t,
     ext_history: &[u8],
     litBuf: &[u8],
+    litPtr_offset: usize,
+    out_litPtr: &mut usize,
+) -> usize {
+    unsafe {
+        ZSTD_execSequence_rawLit(
+            dst,
+            op,
+            sequence,
+            ext_history,
+            litBuf.as_ptr(),
+            litBuf.len(),
+            litPtr_offset,
+            out_litPtr,
+        )
+    }
+}
+
+#[inline(always)]
+unsafe fn ZSTD_execSequence_rawLit(
+    dst: &mut [u8],
+    op: usize,
+    sequence: seq_t,
+    ext_history: &[u8],
+    lit_base: *const u8,
+    lit_len_total: usize,
     litPtr_offset: usize,
     out_litPtr: &mut usize,
 ) -> usize {
@@ -455,7 +752,7 @@ pub fn ZSTD_execSequence(
         return ERROR(ErrorCode::DstSizeTooSmall);
     }
     let iLitEnd = litPtr_offset + sequence.litLength;
-    if iLitEnd > litBuf.len() {
+    if iLitEnd > lit_len_total {
         return ERROR(ErrorCode::CorruptionDetected);
     }
     // Offset reaches before dst[0] — must come from ext_history.
@@ -480,7 +777,7 @@ pub fn ZSTD_execSequence(
     // write to `dst[op..op+16]` cannot corrupt litBuf even if
     // `lit_len < 16`.
     let lit_len = sequence.litLength;
-    if lit_len <= 16 && iLitEnd + 16 <= litBuf.len() && oLitEnd + 16 <= oend {
+    if lit_len <= 16 && iLitEnd + 16 <= lit_len_total && oLitEnd + 16 <= oend {
         // SAFETY: bounds verified above. Read of 16 bytes from
         // `litBuf[litPtr_offset..]` is in-range; write of 16 bytes to
         // `dst[op..op+16]` is in-range (op + 16 ≤ oLitEnd + 16 ≤ oend).
@@ -488,32 +785,32 @@ pub fn ZSTD_execSequence(
         // bytes but get overwritten by the immediately-following match
         // copy (when ml + lit_len ≥ 16) or by the next sequence's
         // literal/match writes.
-        unsafe {
-            let src_p = litBuf.as_ptr().add(litPtr_offset);
-            let dst_p = dst.as_mut_ptr().add(op);
-            let v = (src_p as *const [u8; 16]).read_unaligned();
-            (dst_p as *mut [u8; 16]).write_unaligned(v);
-        }
-    } else if lit_len > 16 && iLitEnd + 16 <= litBuf.len() && oLitEnd + 16 <= oend {
+        let src_p = lit_base.add(litPtr_offset);
+        let dst_p = dst.as_mut_ptr().add(op);
+        let v = (src_p as *const [u8; 16]).read_unaligned();
+        (dst_p as *mut [u8; 16]).write_unaligned(v);
+    } else if lit_len > 16 && iLitEnd + 16 <= lit_len_total && oLitEnd + 16 <= oend {
         // Wildcopy 16-byte stamps when both sides have slack. The
         // 16-byte overshoot past oLitEnd is bounded at ≤ 15 bytes
         // (since end = op + ceil(lit_len/16)*16 ≤ oLitEnd + 15).
         // SAFETY: each stamp's read/write is bounded by the slack guard.
-        unsafe {
-            let mut copied = 0usize;
-            let src_p = litBuf.as_ptr().add(litPtr_offset);
-            let dst_p = dst.as_mut_ptr().add(op);
-            loop {
-                let v = (src_p.add(copied) as *const [u8; 16]).read_unaligned();
-                (dst_p.add(copied) as *mut [u8; 16]).write_unaligned(v);
-                copied += 16;
-                if copied >= lit_len {
-                    break;
-                }
+        let mut copied = 0usize;
+        let src_p = lit_base.add(litPtr_offset);
+        let dst_p = dst.as_mut_ptr().add(op);
+        loop {
+            let v = (src_p.add(copied) as *const [u8; 16]).read_unaligned();
+            (dst_p.add(copied) as *mut [u8; 16]).write_unaligned(v);
+            copied += 16;
+            if copied >= lit_len {
+                break;
             }
         }
     } else {
-        dst[op..oLitEnd].copy_from_slice(&litBuf[litPtr_offset..iLitEnd]);
+        std::ptr::copy_nonoverlapping(
+            lit_base.add(litPtr_offset),
+            dst.as_mut_ptr().add(op),
+            lit_len,
+        );
     }
     *out_litPtr = iLitEnd;
 
@@ -582,6 +879,11 @@ pub fn ZSTD_execSequence(
                     let v = (src_p as *const [u8; 16]).read_unaligned();
                     (dst_p as *mut [u8; 16]).write_unaligned(v);
                 }
+            } else if ml >= 32 {
+                unsafe {
+                    let dst_ptr = dst.as_mut_ptr();
+                    std::ptr::copy_nonoverlapping(dst_ptr.add(match_src), dst_ptr.add(oLitEnd), ml);
+                }
             } else if oLitEnd + ml + 16 <= oend {
                 // Wildcopy fast path for longer matches with full slack.
                 // Stamps end at oLitEnd + ((ml-1) | 15) + 1 ≤ oLitEnd +
@@ -606,7 +908,10 @@ pub fn ZSTD_execSequence(
                     }
                 }
             } else {
-                dst.copy_within(match_src..match_src + ml, oLitEnd);
+                unsafe {
+                    let dst_ptr = dst.as_mut_ptr();
+                    std::ptr::copy_nonoverlapping(dst_ptr.add(match_src), dst_ptr.add(oLitEnd), ml);
+                }
             }
         } else {
             // Wildcopy-style overlapping case: offset >= 16 but the
@@ -624,15 +929,28 @@ pub fn ZSTD_execSequence(
             // `ZSTD_wildcopy(..., ZSTD_overlap_src_before_dst)` for
             // the medium-offset overlap case.
             let mut copied = 0usize;
-            while copied + 16 <= sequence.matchLength {
-                let mut buf = [0u8; 16];
-                buf.copy_from_slice(&dst[match_src + copied..match_src + copied + 16]);
-                dst[oLitEnd + copied..oLitEnd + copied + 16].copy_from_slice(&buf);
-                copied += 16;
+            unsafe {
+                let dst_ptr = dst.as_mut_ptr();
+                while copied + 16 <= sequence.matchLength {
+                    let v = (dst_ptr.add(match_src + copied) as *const [u8; 16]).read_unaligned();
+                    (dst_ptr.add(oLitEnd + copied) as *mut [u8; 16]).write_unaligned(v);
+                    copied += 16;
+                }
             }
-            while copied < sequence.matchLength {
-                dst[oLitEnd + copied] = dst[match_src + copied];
-                copied += 1;
+            if copied < sequence.matchLength {
+                if oLitEnd + copied + 16 <= oend {
+                    unsafe {
+                        let dst_ptr = dst.as_mut_ptr();
+                        let v =
+                            (dst_ptr.add(match_src + copied) as *const [u8; 16]).read_unaligned();
+                        (dst_ptr.add(oLitEnd + copied) as *mut [u8; 16]).write_unaligned(v);
+                    }
+                } else {
+                    while copied < sequence.matchLength {
+                        dst[oLitEnd + copied] = dst[match_src + copied];
+                        copied += 1;
+                    }
+                }
             }
         }
     } else {
@@ -646,10 +964,199 @@ pub fn ZSTD_execSequence(
             }
         } else {
             ZSTD_overlapCopy8(dst, &mut out_idx, &mut match_idx, sequence.offset);
-            // out_idx is now oLitEnd + 8; remaining is matchLength - 8.
+            // out_idx is now oLitEnd + 8. The overlap spreader has moved
+            // match_idx far enough behind out_idx that 8-byte stamps are
+            // overlap-safe while preserving pattern expansion semantics.
+            let mut copied = 0usize;
             let remaining = sequence.matchLength - 8;
-            for i in 0..remaining {
-                dst[out_idx + i] = dst[match_idx + i];
+            unsafe {
+                let dst_ptr = dst.as_mut_ptr();
+                while copied + 8 <= remaining {
+                    let v = (dst_ptr.add(match_idx + copied) as *const [u8; 8]).read_unaligned();
+                    (dst_ptr.add(out_idx + copied) as *mut [u8; 8]).write_unaligned(v);
+                    copied += 8;
+                }
+            }
+            while copied < remaining {
+                dst[out_idx + copied] = dst[match_idx + copied];
+                copied += 1;
+            }
+        }
+    }
+    sequenceLength
+}
+
+#[cold]
+#[inline(never)]
+unsafe fn ZSTD_execSequence_rawLit_fallback(
+    dst: &mut [u8],
+    op: usize,
+    sequence: seq_t,
+    ext_history: &[u8],
+    lit_base: *const u8,
+    lit_len_total: usize,
+    litPtr_offset: usize,
+    out_litPtr: &mut usize,
+) -> usize {
+    ZSTD_execSequence_rawLit(
+        dst,
+        op,
+        sequence,
+        ext_history,
+        lit_base,
+        lit_len_total,
+        litPtr_offset,
+        out_litPtr,
+    )
+}
+
+#[inline(always)]
+unsafe fn ZSTD_execSequence_rawLit_fast(
+    dst: &mut [u8],
+    op: usize,
+    litLength: usize,
+    matchLength: usize,
+    offset: usize,
+    lit_base: *const u8,
+    litPtr_offset: usize,
+) -> usize {
+    let oLitEnd = op + litLength;
+    let sequenceLength = litLength + matchLength;
+
+    let dst_ptr = dst.as_mut_ptr();
+    let lit_src = lit_base.add(litPtr_offset);
+    let lit_dst = dst_ptr.add(op);
+    let v = (lit_src as *const [u8; 16]).read_unaligned();
+    (lit_dst as *mut [u8; 16]).write_unaligned(v);
+    if litLength > 16 {
+        let mut copied = 16usize;
+        while copied < litLength {
+            let v = (lit_src.add(copied) as *const [u8; 16]).read_unaligned();
+            (lit_dst.add(copied) as *mut [u8; 16]).write_unaligned(v);
+            copied += 16;
+            let v = (lit_src.add(copied) as *const [u8; 16]).read_unaligned();
+            (lit_dst.add(copied) as *mut [u8; 16]).write_unaligned(v);
+            copied += 16;
+        }
+    }
+    let match_src = oLitEnd - offset;
+    let mut match_idx = match_src;
+    let mut out_idx = oLitEnd;
+    if offset >= WILDCOPY_VECLEN {
+        let v = (dst_ptr.add(match_src) as *const [u8; 16]).read_unaligned();
+        (dst_ptr.add(oLitEnd) as *mut [u8; 16]).write_unaligned(v);
+        if matchLength > 16 {
+            let mut copied = 16usize;
+            while copied < matchLength {
+                let v = (dst_ptr.add(match_src + copied) as *const [u8; 16]).read_unaligned();
+                (dst_ptr.add(oLitEnd + copied) as *mut [u8; 16]).write_unaligned(v);
+                copied += 16;
+                let v = (dst_ptr.add(match_src + copied) as *const [u8; 16]).read_unaligned();
+                (dst_ptr.add(oLitEnd + copied) as *mut [u8; 16]).write_unaligned(v);
+                copied += 16;
+            }
+        }
+    } else {
+        ZSTD_overlapCopy8(dst, &mut out_idx, &mut match_idx, offset);
+        if matchLength > 8 {
+            let mut copied = 0usize;
+            let remaining = matchLength - 8;
+            while copied < remaining {
+                let v = (dst_ptr.add(match_idx + copied) as *const [u8; 8]).read_unaligned();
+                (dst_ptr.add(out_idx + copied) as *mut [u8; 8]).write_unaligned(v);
+                copied += 8;
+            }
+        }
+    }
+    sequenceLength
+}
+
+#[inline(always)]
+unsafe fn ZSTD_overlapCopy8_ptr(ptr: *mut u8, op: &mut usize, ip: &mut usize, offset: usize) {
+    debug_assert!(*ip <= *op);
+    if offset < 8 {
+        const DEC32: [usize; 8] = [0, 1, 2, 1, 4, 4, 4, 4];
+        const DEC64: [usize; 8] = [8, 8, 8, 7, 8, 9, 10, 11];
+        let sub2 = DEC64[offset];
+        let op0 = *op;
+        let ip0 = *ip;
+        *ptr.add(op0) = *ptr.add(ip0);
+        *ptr.add(op0 + 1) = *ptr.add(ip0 + 1);
+        *ptr.add(op0 + 2) = *ptr.add(ip0 + 2);
+        *ptr.add(op0 + 3) = *ptr.add(ip0 + 3);
+        *ip = ip.wrapping_add(DEC32[offset]);
+        let ip1 = *ip;
+        let s0 = *ptr.add(ip1);
+        let s1 = *ptr.add(ip1 + 1);
+        let s2 = *ptr.add(ip1 + 2);
+        let s3 = *ptr.add(ip1 + 3);
+        *ptr.add(op0 + 4) = s0;
+        *ptr.add(op0 + 5) = s1;
+        *ptr.add(op0 + 6) = s2;
+        *ptr.add(op0 + 7) = s3;
+        *ip = ip.wrapping_sub(sub2);
+    } else {
+        let v = (ptr.add(*ip) as *const [u8; 8]).read_unaligned();
+        (ptr.add(*op) as *mut [u8; 8]).write_unaligned(v);
+    }
+    *ip = ip.wrapping_add(8);
+    *op = op.wrapping_add(8);
+}
+
+#[inline(always)]
+unsafe fn ZSTD_execSequence_rawLit_fast_ptr(
+    dst_ptr: *mut u8,
+    op: usize,
+    litLength: usize,
+    matchLength: usize,
+    offset: usize,
+    lit_base: *const u8,
+    litPtr_offset: usize,
+) -> usize {
+    let oLitEnd = op + litLength;
+    let sequenceLength = litLength + matchLength;
+
+    let lit_src = lit_base.add(litPtr_offset);
+    let lit_dst = dst_ptr.add(op);
+    let v = (lit_src as *const [u8; 16]).read_unaligned();
+    (lit_dst as *mut [u8; 16]).write_unaligned(v);
+    if litLength > 16 {
+        let mut copied = 16usize;
+        while copied < litLength {
+            let v = (lit_src.add(copied) as *const [u8; 16]).read_unaligned();
+            (lit_dst.add(copied) as *mut [u8; 16]).write_unaligned(v);
+            copied += 16;
+            let v = (lit_src.add(copied) as *const [u8; 16]).read_unaligned();
+            (lit_dst.add(copied) as *mut [u8; 16]).write_unaligned(v);
+            copied += 16;
+        }
+    }
+    let match_src = oLitEnd - offset;
+    let mut match_idx = match_src;
+    let mut out_idx = oLitEnd;
+    if offset >= WILDCOPY_VECLEN {
+        let v = (dst_ptr.add(match_src) as *const [u8; 16]).read_unaligned();
+        (dst_ptr.add(oLitEnd) as *mut [u8; 16]).write_unaligned(v);
+        if matchLength > 16 {
+            let mut copied = 16usize;
+            while copied < matchLength {
+                let v = (dst_ptr.add(match_src + copied) as *const [u8; 16]).read_unaligned();
+                (dst_ptr.add(oLitEnd + copied) as *mut [u8; 16]).write_unaligned(v);
+                copied += 16;
+                let v = (dst_ptr.add(match_src + copied) as *const [u8; 16]).read_unaligned();
+                (dst_ptr.add(oLitEnd + copied) as *mut [u8; 16]).write_unaligned(v);
+                copied += 16;
+            }
+        }
+    } else {
+        ZSTD_overlapCopy8_ptr(dst_ptr, &mut out_idx, &mut match_idx, offset);
+        if matchLength > 8 {
+            let mut copied = 0usize;
+            let remaining = matchLength - 8;
+            while copied < remaining {
+                let v = (dst_ptr.add(match_idx + copied) as *const [u8; 8]).read_unaligned();
+                (dst_ptr.add(out_idx + copied) as *mut [u8; 8]).write_unaligned(v);
+                copied += 8;
             }
         }
     }
@@ -849,6 +1356,9 @@ pub struct ZSTD_DCtx {
     pub LLTable: Vec<ZSTD_seqSymbol>,
     pub OFTable: Vec<ZSTD_seqSymbol>,
     pub MLTable: Vec<ZSTD_seqSymbol>,
+    pub ll_default_active: bool,
+    pub of_default_active: bool,
+    pub ml_default_active: bool,
     pub fseEntropy: u32,
     /// `1` if the last sequences block had its FSE tables fresh
     /// (`set_compressed`) — gates `set_repeat` validity for the next
@@ -921,7 +1431,7 @@ pub struct ZSTD_DCtx {
     pub customMem: crate::compress::zstd_compress::ZSTD_customMem,
 }
 
-fn build_default_ll_dtable() -> Vec<ZSTD_seqSymbol> {
+fn build_default_ll_dtable_fresh() -> Vec<ZSTD_seqSymbol> {
     let mut t = vec![ZSTD_seqSymbol::default(); SEQSYMBOL_TABLE_SIZE(LLFSELog)];
     ZSTD_buildFSETable(
         &mut t,
@@ -934,7 +1444,7 @@ fn build_default_ll_dtable() -> Vec<ZSTD_seqSymbol> {
     t
 }
 
-fn build_default_of_dtable() -> Vec<ZSTD_seqSymbol> {
+fn build_default_of_dtable_fresh() -> Vec<ZSTD_seqSymbol> {
     let mut t = vec![ZSTD_seqSymbol::default(); SEQSYMBOL_TABLE_SIZE(OffFSELog)];
     ZSTD_buildFSETable(
         &mut t,
@@ -947,7 +1457,7 @@ fn build_default_of_dtable() -> Vec<ZSTD_seqSymbol> {
     t
 }
 
-fn build_default_ml_dtable() -> Vec<ZSTD_seqSymbol> {
+fn build_default_ml_dtable_fresh() -> Vec<ZSTD_seqSymbol> {
     let mut t = vec![ZSTD_seqSymbol::default(); SEQSYMBOL_TABLE_SIZE(MLFSELog)];
     ZSTD_buildFSETable(
         &mut t,
@@ -958,6 +1468,25 @@ fn build_default_ml_dtable() -> Vec<ZSTD_seqSymbol> {
         ML_defaultNormLog,
     );
     t
+}
+
+pub(crate) fn default_ll_dtable() -> &'static [ZSTD_seqSymbol] {
+    static TABLE: std::sync::OnceLock<Vec<ZSTD_seqSymbol>> = std::sync::OnceLock::new();
+    TABLE.get_or_init(build_default_ll_dtable_fresh).as_slice()
+}
+
+pub(crate) fn default_of_dtable() -> &'static [ZSTD_seqSymbol] {
+    static TABLE: std::sync::OnceLock<Vec<ZSTD_seqSymbol>> = std::sync::OnceLock::new();
+    TABLE.get_or_init(build_default_of_dtable_fresh).as_slice()
+}
+
+pub(crate) fn default_ml_dtable() -> &'static [ZSTD_seqSymbol] {
+    static TABLE: std::sync::OnceLock<Vec<ZSTD_seqSymbol>> = std::sync::OnceLock::new();
+    TABLE.get_or_init(build_default_ml_dtable_fresh).as_slice()
+}
+
+fn alloc_seq_table(table_log: u32) -> Vec<ZSTD_seqSymbol> {
+    vec![ZSTD_seqSymbol::default(); SEQSYMBOL_TABLE_SIZE(table_log)]
 }
 
 impl Default for ZSTD_DCtx {
@@ -995,11 +1524,14 @@ impl Default for ZSTD_DCtx {
             isFrameDecompression: 0,
             blockSizeMax: ZSTD_BLOCKSIZE_MAX,
             disableHufAsm: 0,
-            bmi2: 0,
+            bmi2: crate::common::zstd_internal::ZSTD_cpuSupportsBmi2(),
             ddictIsCold: 0,
-            LLTable: build_default_ll_dtable(),
-            OFTable: build_default_of_dtable(),
-            MLTable: build_default_ml_dtable(),
+            LLTable: alloc_seq_table(LLFSELog),
+            OFTable: alloc_seq_table(OffFSELog),
+            MLTable: alloc_seq_table(MLFSELog),
+            ll_default_active: true,
+            of_default_active: true,
+            ml_default_active: true,
             fseEntropy: 0,
             fse_ll_fresh: false,
             fse_of_fresh: false,
@@ -1058,20 +1590,37 @@ fn ZSTD_blockSizeMax(dctx: &ZSTD_DCtx) -> usize {
 fn ZSTD_allocateLiteralsBuffer(
     dctx: &mut ZSTD_DCtx,
     _dst_len: usize,
-    _dst_capacity: usize,
+    dst_capacity: usize,
     litSize: usize,
-    _streaming: streaming_operation,
-    _expectedWriteSize: usize,
-    _splitImmediately: u32,
+    streaming: streaming_operation,
+    expectedWriteSize: usize,
+    splitImmediately: u32,
 ) {
-    // Always place in the owned extra buffer. Fidelity note: upstream
-    // spills into `dst` when it can to avoid a double-copy; our port
-    // keeps the simpler extra-buffer layout since `ZSTD_execSequence`
-    // reads literals through `dctx.litPtr` regardless of which buffer
-    // holds them — the spill is a perf win, not a correctness gate.
+    let blockSizeMax = ZSTD_blockSizeMax(dctx);
+    if streaming == streaming_operation::not_streaming
+        && dst_capacity > blockSizeMax + WILDCOPY_OVERLENGTH + litSize + WILDCOPY_OVERLENGTH
+    {
+        dctx.litBuffer_offset = blockSizeMax + WILDCOPY_OVERLENGTH;
+        dctx.litBufferEnd_offset = dctx.litBuffer_offset + litSize;
+        dctx.litBufferLocation = ZSTD_litLocation_e::ZSTD_in_dst;
+        return;
+    }
+
     let needed = litSize.saturating_add(WILDCOPY_OVERLENGTH);
     if dctx.litExtraBuffer.len() < needed {
         dctx.litExtraBuffer.resize(needed, 0);
+    }
+    if litSize > ZSTD_LITBUFFEREXTRASIZE {
+        if splitImmediately != 0 {
+            dctx.litBuffer_offset =
+                expectedWriteSize - litSize + ZSTD_LITBUFFEREXTRASIZE - WILDCOPY_OVERLENGTH;
+            dctx.litBufferEnd_offset = dctx.litBuffer_offset + litSize - ZSTD_LITBUFFEREXTRASIZE;
+        } else {
+            dctx.litBuffer_offset = expectedWriteSize - litSize;
+            dctx.litBufferEnd_offset = expectedWriteSize;
+        }
+        dctx.litBufferLocation = ZSTD_litLocation_e::ZSTD_split;
+        return;
     }
     dctx.litBuffer_offset = 0;
     dctx.litBufferEnd_offset = litSize;
@@ -1116,6 +1665,36 @@ pub fn ZSTD_decompressSequences_body(
     MLTable: &[ZSTD_seqSymbol],
     entropy_rep: &mut ZSTD_decoder_entropy_rep,
 ) -> usize {
+    unsafe {
+        ZSTD_decompressSequences_body_rawLit(
+            dst,
+            op_start,
+            ext_history,
+            seqSrc,
+            nbSeq,
+            litBuf.as_ptr(),
+            litSize,
+            LLTable,
+            OFTable,
+            MLTable,
+            entropy_rep,
+        )
+    }
+}
+
+unsafe fn ZSTD_decompressSequences_body_rawLit(
+    dst: &mut [u8],
+    op_start: usize,
+    ext_history: &[u8],
+    seqSrc: &[u8],
+    nbSeq: i32,
+    lit_base: *const u8,
+    litSize: usize,
+    LLTable: &[ZSTD_seqSymbol],
+    OFTable: &[ZSTD_seqSymbol],
+    MLTable: &[ZSTD_seqSymbol],
+    entropy_rep: &mut ZSTD_decoder_entropy_rep,
+) -> usize {
     use crate::common::bitstream::{BIT_DStream_t, BIT_endOfDStream, BIT_initDStream};
 
     // `op_start` is the byte index into `dst` where the current block's
@@ -1154,8 +1733,16 @@ pub fn ZSTD_decompressSequences_body(
         while remaining > 0 {
             let sequence =
                 ZSTD_decodeSequence(&mut seqState, LLTable, OFTable, MLTable, remaining == 1);
-            let oneSeqSize =
-                ZSTD_execSequence(dst, op, sequence, ext_history, litBuf, litPtr, &mut litPtr);
+            let oneSeqSize = ZSTD_execSequence_rawLit(
+                dst,
+                op,
+                sequence,
+                ext_history,
+                lit_base,
+                litSize,
+                litPtr,
+                &mut litPtr,
+            );
             if crate::common::error::ERR_isError(oneSeqSize) {
                 return oneSeqSize;
             }
@@ -1180,11 +1767,652 @@ pub fn ZSTD_decompressSequences_body(
         return ERROR(ErrorCode::DstSizeTooSmall);
     }
     if lastLLSize > 0 {
-        dst[op..op + lastLLSize].copy_from_slice(&litBuf[litPtr..litPtr + lastLLSize]);
+        std::ptr::copy_nonoverlapping(lit_base.add(litPtr), dst.as_mut_ptr().add(op), lastLLSize);
         op += lastLLSize;
     }
     // Return bytes emitted by this call (not total dst position).
     op - op_start
+}
+
+unsafe fn ZSTD_decompressSequences_bodySplitLitBuffer_raw_impl<const BMI2: bool>(
+    dst: &mut [u8],
+    op_start: usize,
+    dst_limit: usize,
+    ext_history: &[u8],
+    seqSrc: &[u8],
+    nbSeq: i32,
+    lit_dst_base: *const u8,
+    lit_dst_len: usize,
+    lit_extra: &[u8],
+    litSize: usize,
+    LLTable: &[ZSTD_seqSymbol],
+    OFTable: &[ZSTD_seqSymbol],
+    MLTable: &[ZSTD_seqSymbol],
+    entropy_rep: &mut ZSTD_decoder_entropy_rep,
+) -> usize {
+    use crate::common::bitstream::{BIT_DStream_t, BIT_endOfDStream, BIT_initDStream};
+
+    let mut op = op_start;
+    let mut litPtr = 0usize;
+    let mut extraPtr = 0usize;
+    let mut using_extra = false;
+    let dst_ptr = dst.as_mut_ptr();
+
+    if nbSeq > 0 {
+        let mut seqState = seqState_t {
+            DStream: BIT_DStream_t::default(),
+            stateLL: ZSTD_fseState::default(),
+            stateOffb: ZSTD_fseState::default(),
+            stateML: ZSTD_fseState::default(),
+            prevOffset: [
+                entropy_rep.rep[0] as usize,
+                entropy_rep.rep[1] as usize,
+                entropy_rep.rep[2] as usize,
+            ],
+        };
+
+        let rc = BIT_initDStream(&mut seqState.DStream, seqSrc, seqSrc.len());
+        if crate::common::error::ERR_isError(rc) {
+            return ERROR(ErrorCode::CorruptionDetected);
+        }
+        ZSTD_initFseState(&mut seqState.stateLL, &mut seqState.DStream, LLTable);
+        ZSTD_initFseState(&mut seqState.stateOffb, &mut seqState.DStream, OFTable);
+        ZSTD_initFseState(&mut seqState.stateML, &mut seqState.DStream, MLTable);
+
+        let mut remaining = nbSeq;
+        while remaining > 0 {
+            let mut sequence = if BMI2 {
+                #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+                {
+                    ZSTD_decodeSequence_bmi2(
+                        &mut seqState,
+                        LLTable,
+                        OFTable,
+                        MLTable,
+                        remaining == 1,
+                    )
+                }
+                #[cfg(not(all(target_arch = "x86_64", target_pointer_width = "64")))]
+                {
+                    unreachable!("BMI2 split decoder is x86_64-only")
+                }
+            } else {
+                ZSTD_decodeSequence(&mut seqState, LLTable, OFTable, MLTable, remaining == 1)
+            };
+            if !using_extra && litPtr + sequence.litLength > lit_dst_len {
+                let leftover = lit_dst_len.saturating_sub(litPtr);
+                if leftover > dst.len().saturating_sub(op) {
+                    return ERROR(ErrorCode::DstSizeTooSmall);
+                }
+                if leftover != 0 {
+                    std::ptr::copy(lit_dst_base.add(litPtr), dst_ptr.add(op), leftover);
+                    sequence.litLength -= leftover;
+                    op += leftover;
+                }
+                using_extra = true;
+                extraPtr = 0;
+            }
+
+            let (lit_base, lit_total, lit_ptr_ref) = if using_extra {
+                (lit_extra.as_ptr(), lit_extra.len(), &mut extraPtr)
+            } else {
+                let dst_limited = std::slice::from_raw_parts_mut(dst_ptr, dst_limit);
+                let oneSeqSize = ZSTD_execSequence_rawLit(
+                    dst_limited,
+                    op,
+                    sequence,
+                    ext_history,
+                    lit_dst_base,
+                    lit_dst_len,
+                    litPtr,
+                    &mut litPtr,
+                );
+                if crate::common::error::ERR_isError(oneSeqSize) {
+                    return oneSeqSize;
+                }
+                op += oneSeqSize;
+                remaining -= 1;
+                continue;
+            };
+            let oneSeqSize = ZSTD_execSequence_rawLit(
+                dst,
+                op,
+                sequence,
+                ext_history,
+                lit_base,
+                lit_total,
+                *lit_ptr_ref,
+                lit_ptr_ref,
+            );
+            if crate::common::error::ERR_isError(oneSeqSize) {
+                return oneSeqSize;
+            }
+            op += oneSeqSize;
+            remaining -= 1;
+        }
+
+        if BIT_endOfDStream(&seqState.DStream) == 0 {
+            return ERROR(ErrorCode::CorruptionDetected);
+        }
+        entropy_rep.rep[0] = seqState.prevOffset[0] as u32;
+        entropy_rep.rep[1] = seqState.prevOffset[1] as u32;
+        entropy_rep.rep[2] = seqState.prevOffset[2] as u32;
+    }
+
+    if !using_extra {
+        let last = lit_dst_len - litPtr;
+        if op + last > dst.len() {
+            return ERROR(ErrorCode::DstSizeTooSmall);
+        }
+        if last != 0 {
+            std::ptr::copy(lit_dst_base.add(litPtr), dst_ptr.add(op), last);
+            op += last;
+        }
+        extraPtr = 0;
+    }
+    let last = litSize - lit_dst_len - extraPtr;
+    if op + last > dst.len() {
+        return ERROR(ErrorCode::DstSizeTooSmall);
+    }
+    if last != 0 {
+        std::ptr::copy_nonoverlapping(lit_extra.as_ptr().add(extraPtr), dst_ptr.add(op), last);
+        op += last;
+    }
+    op - op_start
+}
+
+#[inline(always)]
+unsafe fn ZSTD_execSequenceSplitLitBuffer_raw(
+    dst: &mut [u8],
+    dst_limit: usize,
+    op: usize,
+    sequence: &mut seq_t,
+    ext_history: &[u8],
+    lit_dst_base: *const u8,
+    lit_dst_len: usize,
+    lit_extra: &[u8],
+    litPtr: &mut usize,
+    extraPtr: &mut usize,
+    using_extra: &mut bool,
+) -> usize {
+    let op_start = op;
+    let mut op = op;
+    if !*using_extra && *litPtr + sequence.litLength > lit_dst_len {
+        let leftover = lit_dst_len.saturating_sub(*litPtr);
+        if leftover > dst.len().saturating_sub(op) {
+            return ERROR(ErrorCode::DstSizeTooSmall);
+        }
+        if leftover != 0 {
+            std::ptr::copy(
+                lit_dst_base.add(*litPtr),
+                dst.as_mut_ptr().add(op),
+                leftover,
+            );
+            sequence.litLength -= leftover;
+            op += leftover;
+        }
+        *using_extra = true;
+        *extraPtr = 0;
+    }
+
+    let oneSeqSize = if *using_extra {
+        ZSTD_execSequence_rawLit(
+            dst,
+            op,
+            *sequence,
+            ext_history,
+            lit_extra.as_ptr(),
+            lit_extra.len(),
+            *extraPtr,
+            extraPtr,
+        )
+    } else {
+        let dst_ptr = dst.as_mut_ptr();
+        let dst_limited = std::slice::from_raw_parts_mut(dst_ptr, dst_limit);
+        ZSTD_execSequence_rawLit(
+            dst_limited,
+            op,
+            *sequence,
+            ext_history,
+            lit_dst_base,
+            lit_dst_len,
+            *litPtr,
+            litPtr,
+        )
+    };
+    if crate::common::error::ERR_isError(oneSeqSize) {
+        return oneSeqSize;
+    }
+    oneSeqSize + (op - op_start)
+}
+
+unsafe fn ZSTD_decompressSequences_bodySplitLitBuffer_raw(
+    dst: &mut [u8],
+    op_start: usize,
+    dst_limit: usize,
+    ext_history: &[u8],
+    seqSrc: &[u8],
+    nbSeq: i32,
+    lit_dst_base: *const u8,
+    lit_dst_len: usize,
+    lit_extra: &[u8],
+    litSize: usize,
+    LLTable: &[ZSTD_seqSymbol],
+    OFTable: &[ZSTD_seqSymbol],
+    MLTable: &[ZSTD_seqSymbol],
+    entropy_rep: &mut ZSTD_decoder_entropy_rep,
+) -> usize {
+    ZSTD_decompressSequences_bodySplitLitBuffer_raw_impl::<false>(
+        dst,
+        op_start,
+        dst_limit,
+        ext_history,
+        seqSrc,
+        nbSeq,
+        lit_dst_base,
+        lit_dst_len,
+        lit_extra,
+        litSize,
+        LLTable,
+        OFTable,
+        MLTable,
+        entropy_rep,
+    )
+}
+
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+#[target_feature(enable = "bmi1,bmi2,lzcnt")]
+unsafe fn ZSTD_decompressSequences_bodySplitLitBuffer_bmi2_raw(
+    dst: &mut [u8],
+    op_start: usize,
+    dst_limit: usize,
+    ext_history: &[u8],
+    seqSrc: &[u8],
+    nbSeq: i32,
+    lit_dst_base: *const u8,
+    lit_dst_len: usize,
+    lit_extra: &[u8],
+    litSize: usize,
+    LLTable: &[ZSTD_seqSymbol],
+    OFTable: &[ZSTD_seqSymbol],
+    MLTable: &[ZSTD_seqSymbol],
+    entropy_rep: &mut ZSTD_decoder_entropy_rep,
+) -> usize {
+    ZSTD_decompressSequences_bodySplitLitBuffer_raw_impl::<true>(
+        dst,
+        op_start,
+        dst_limit,
+        ext_history,
+        seqSrc,
+        nbSeq,
+        lit_dst_base,
+        lit_dst_len,
+        lit_extra,
+        litSize,
+        LLTable,
+        OFTable,
+        MLTable,
+        entropy_rep,
+    )
+}
+
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+#[target_feature(enable = "bmi1,bmi2,lzcnt")]
+unsafe fn ZSTD_decompressSequences_body_bmi2_impl(
+    dst: &mut [u8],
+    op_start: usize,
+    ext_history: &[u8],
+    seqSrc: &[u8],
+    nbSeq: i32,
+    litBuf: &[u8],
+    litSize: usize,
+    LLTable: &[ZSTD_seqSymbol],
+    OFTable: &[ZSTD_seqSymbol],
+    MLTable: &[ZSTD_seqSymbol],
+    entropy_rep: &mut ZSTD_decoder_entropy_rep,
+) -> usize {
+    ZSTD_decompressSequences_body_bmi2_rawLit(
+        dst,
+        op_start,
+        ext_history,
+        seqSrc,
+        nbSeq,
+        litBuf.as_ptr(),
+        litSize,
+        LLTable,
+        OFTable,
+        MLTable,
+        entropy_rep,
+    )
+}
+
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+#[target_feature(enable = "bmi1,bmi2,lzcnt")]
+unsafe fn ZSTD_decompressSequences_body_bmi2_rawLit(
+    dst: &mut [u8],
+    op_start: usize,
+    ext_history: &[u8],
+    seqSrc: &[u8],
+    nbSeq: i32,
+    lit_base: *const u8,
+    litSize: usize,
+    LLTable: &[ZSTD_seqSymbol],
+    OFTable: &[ZSTD_seqSymbol],
+    MLTable: &[ZSTD_seqSymbol],
+    entropy_rep: &mut ZSTD_decoder_entropy_rep,
+) -> usize {
+    if ext_history.is_empty() {
+        return ZSTD_decompressSequences_body_bmi2_noExt_rawLit(
+            dst,
+            op_start,
+            seqSrc,
+            nbSeq,
+            lit_base,
+            litSize,
+            LLTable.as_ptr(),
+            OFTable.as_ptr(),
+            MLTable.as_ptr(),
+            entropy_rep,
+        );
+    }
+
+    use crate::common::bitstream::{BIT_DStream_t, BIT_endOfDStream, BIT_initDStream};
+
+    let mut op: usize = op_start;
+    let mut litPtr: usize = 0;
+    let litEnd = litSize;
+
+    if nbSeq > 0 {
+        let mut DStream = BIT_DStream_t::default();
+        let mut stateLL = ZSTD_fseState::default();
+        let mut stateOffb = ZSTD_fseState::default();
+        let mut stateML = ZSTD_fseState::default();
+        let mut prevOffset0 = entropy_rep.rep[0] as usize;
+        let mut prevOffset1 = entropy_rep.rep[1] as usize;
+        let mut prevOffset2 = entropy_rep.rep[2] as usize;
+
+        let rc = BIT_initDStream(&mut DStream, seqSrc, seqSrc.len());
+        if crate::common::error::ERR_isError(rc) {
+            return ERROR(ErrorCode::CorruptionDetected);
+        }
+
+        ZSTD_initFseState(&mut stateLL, &mut DStream, LLTable);
+        ZSTD_initFseState(&mut stateOffb, &mut DStream, OFTable);
+        ZSTD_initFseState(&mut stateML, &mut DStream, MLTable);
+
+        let mut remaining = nbSeq;
+        #[cfg(target_arch = "x86_64")]
+        core::arch::asm!(
+            ".p2align 6",
+            "nop",
+            ".p2align 5",
+            "nop",
+            ".p2align 3",
+            options(nomem, nostack, preserves_flags)
+        );
+        while remaining > 0 {
+            let (litLength, matchLength, offset) = ZSTD_decodeSequence_bmi2_inline!(
+                DStream,
+                stateLL,
+                stateOffb,
+                stateML,
+                prevOffset0,
+                prevOffset1,
+                prevOffset2,
+                LLTable.as_ptr(),
+                OFTable.as_ptr(),
+                MLTable.as_ptr(),
+                remaining == 1
+            );
+            let oLitEnd = op + litLength;
+            let sequenceLength = litLength + matchLength;
+            let oneSeqSize = if ext_history.is_empty()
+                && matchLength != 0
+                && litPtr + litLength + 16 <= litSize
+                && op + sequenceLength + WILDCOPY_OVERLENGTH <= dst.len()
+                && offset <= oLitEnd
+            {
+                let oneSeqSize = ZSTD_execSequence_rawLit_fast(
+                    dst,
+                    op,
+                    litLength,
+                    matchLength,
+                    offset,
+                    lit_base,
+                    litPtr,
+                );
+                litPtr += litLength;
+                oneSeqSize
+            } else {
+                ZSTD_execSequence_rawLit_fallback(
+                    dst,
+                    op,
+                    seq_t {
+                        litLength,
+                        matchLength,
+                        offset,
+                    },
+                    ext_history,
+                    lit_base,
+                    litSize,
+                    litPtr,
+                    &mut litPtr,
+                )
+            };
+            if crate::common::error::ERR_isError(oneSeqSize) {
+                return oneSeqSize;
+            }
+            op += oneSeqSize;
+            remaining -= 1;
+        }
+
+        if BIT_endOfDStream(&DStream) == 0 {
+            return ERROR(ErrorCode::CorruptionDetected);
+        }
+
+        entropy_rep.rep[0] = prevOffset0 as u32;
+        entropy_rep.rep[1] = prevOffset1 as u32;
+        entropy_rep.rep[2] = prevOffset2 as u32;
+    }
+
+    let lastLLSize = litEnd - litPtr;
+    if op + lastLLSize > dst.len() {
+        return ERROR(ErrorCode::DstSizeTooSmall);
+    }
+    if lastLLSize > 0 {
+        std::ptr::copy_nonoverlapping(lit_base.add(litPtr), dst.as_mut_ptr().add(op), lastLLSize);
+        op += lastLLSize;
+    }
+    op - op_start
+}
+
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+#[inline(never)]
+#[target_feature(enable = "bmi1,bmi2,lzcnt")]
+unsafe fn ZSTD_decompressSequences_body_bmi2_noExt_rawLit(
+    dst: &mut [u8],
+    op_start: usize,
+    seqSrc: &[u8],
+    nbSeq: i32,
+    lit_base: *const u8,
+    litSize: usize,
+    LLTable: *const ZSTD_seqSymbol,
+    OFTable: *const ZSTD_seqSymbol,
+    MLTable: *const ZSTD_seqSymbol,
+    entropy_rep: &mut ZSTD_decoder_entropy_rep,
+) -> usize {
+    use crate::common::bitstream::{BIT_DStream_t, BIT_endOfDStream, BIT_initDStream};
+
+    let mut op: usize = op_start;
+    let mut litPtr: usize = 0;
+    let dst_ptr = dst.as_mut_ptr();
+    let dst_len = dst.len();
+
+    if nbSeq > 0 {
+        let mut DStream = BIT_DStream_t::default();
+        let mut stateLL = ZSTD_fseState::default();
+        let mut stateOffb = ZSTD_fseState::default();
+        let mut stateML = ZSTD_fseState::default();
+        let mut prevOffset0 = entropy_rep.rep[0] as usize;
+        let mut prevOffset1 = entropy_rep.rep[1] as usize;
+        let mut prevOffset2 = entropy_rep.rep[2] as usize;
+
+        let rc = BIT_initDStream(&mut DStream, seqSrc, seqSrc.len());
+        if crate::common::error::ERR_isError(rc) {
+            return ERROR(ErrorCode::CorruptionDetected);
+        }
+
+        ZSTD_initFseState(
+            &mut stateLL,
+            &mut DStream,
+            core::slice::from_raw_parts(LLTable, 1),
+        );
+        ZSTD_initFseState(
+            &mut stateOffb,
+            &mut DStream,
+            core::slice::from_raw_parts(OFTable, 1),
+        );
+        ZSTD_initFseState(
+            &mut stateML,
+            &mut DStream,
+            core::slice::from_raw_parts(MLTable, 1),
+        );
+
+        let mut remaining = nbSeq;
+        #[cfg(target_arch = "x86_64")]
+        core::arch::asm!(
+            ".p2align 6",
+            "nop",
+            ".p2align 5",
+            "nop",
+            ".p2align 3",
+            options(nomem, nostack, preserves_flags)
+        );
+        while remaining > 0 {
+            let (litLength, matchLength, offset) = ZSTD_decodeSequence_bmi2_inline!(
+                DStream,
+                stateLL,
+                stateOffb,
+                stateML,
+                prevOffset0,
+                prevOffset1,
+                prevOffset2,
+                LLTable,
+                OFTable,
+                MLTable,
+                remaining == 1
+            );
+            let oLitEnd = op + litLength;
+            let sequenceLength = litLength + matchLength;
+            let oneSeqSize = if matchLength != 0
+                && litPtr + litLength + 16 <= litSize
+                && op + sequenceLength + WILDCOPY_OVERLENGTH <= dst_len
+                && offset <= oLitEnd
+            {
+                let oneSeqSize = ZSTD_execSequence_rawLit_fast_ptr(
+                    dst_ptr,
+                    op,
+                    litLength,
+                    matchLength,
+                    offset,
+                    lit_base,
+                    litPtr,
+                );
+                litPtr += litLength;
+                oneSeqSize
+            } else {
+                ZSTD_execSequence_rawLit_fallback(
+                    dst,
+                    op,
+                    seq_t {
+                        litLength,
+                        matchLength,
+                        offset,
+                    },
+                    &[],
+                    lit_base,
+                    litSize,
+                    litPtr,
+                    &mut litPtr,
+                )
+            };
+            if crate::common::error::ERR_isError(oneSeqSize) {
+                return oneSeqSize;
+            }
+            op += oneSeqSize;
+            remaining -= 1;
+        }
+
+        if BIT_endOfDStream(&DStream) == 0 {
+            return ERROR(ErrorCode::CorruptionDetected);
+        }
+
+        entropy_rep.rep[0] = prevOffset0 as u32;
+        entropy_rep.rep[1] = prevOffset1 as u32;
+        entropy_rep.rep[2] = prevOffset2 as u32;
+    }
+
+    let lastLLSize = litSize - litPtr;
+    if op + lastLLSize > dst.len() {
+        return ERROR(ErrorCode::DstSizeTooSmall);
+    }
+    if lastLLSize > 0 {
+        std::ptr::copy_nonoverlapping(lit_base.add(litPtr), dst.as_mut_ptr().add(op), lastLLSize);
+        op += lastLLSize;
+    }
+    op - op_start
+}
+
+fn ZSTD_decompressSequences_body_bmi2(
+    dst: &mut [u8],
+    op_start: usize,
+    ext_history: &[u8],
+    seqSrc: &[u8],
+    nbSeq: i32,
+    litBuf: &[u8],
+    litSize: usize,
+    LLTable: &[ZSTD_seqSymbol],
+    OFTable: &[ZSTD_seqSymbol],
+    MLTable: &[ZSTD_seqSymbol],
+    entropy_rep: &mut ZSTD_decoder_entropy_rep,
+) -> usize {
+    #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+    {
+        if std::is_x86_feature_detected!("bmi1")
+            && std::is_x86_feature_detected!("bmi2")
+            && std::is_x86_feature_detected!("lzcnt")
+        {
+            return unsafe {
+                ZSTD_decompressSequences_body_bmi2_impl(
+                    dst,
+                    op_start,
+                    ext_history,
+                    seqSrc,
+                    nbSeq,
+                    litBuf,
+                    litSize,
+                    LLTable,
+                    OFTable,
+                    MLTable,
+                    entropy_rep,
+                )
+            };
+        }
+    }
+
+    ZSTD_decompressSequences_body(
+        dst,
+        op_start,
+        ext_history,
+        seqSrc,
+        nbSeq,
+        litBuf,
+        litSize,
+        LLTable,
+        OFTable,
+        MLTable,
+        entropy_rep,
+    )
 }
 
 /// Default wrapper for `ZSTD_decompressSequences_default`.
@@ -1231,7 +2459,7 @@ pub fn ZSTD_decompressSequencesSplitLitBuffer_default(
     MLTable: &[ZSTD_seqSymbol],
     entropy_rep: &mut ZSTD_decoder_entropy_rep,
 ) -> usize {
-    ZSTD_decompressSequences_default(
+    ZSTD_decompressSequences_body(
         dst,
         op_start,
         ext_history,
@@ -1246,8 +2474,7 @@ pub fn ZSTD_decompressSequencesSplitLitBuffer_default(
     )
 }
 
-/// Port of `ZSTD_prefetchMatch`. Rust has no explicit prefetch
-/// intrinsic here; preserve the position arithmetic.
+/// Port of `ZSTD_prefetchMatch`.
 pub fn ZSTD_prefetchMatch(
     mut prefetchPos: usize,
     sequence: seq_t,
@@ -1258,8 +2485,199 @@ pub fn ZSTD_prefetchMatch(
     prefetchPos + sequence.matchLength
 }
 
+#[inline]
+fn ZSTD_prefetchMatch_rust(
+    mut prefetchPos: usize,
+    sequence: seq_t,
+    dst: &[u8],
+    ext_history: &[u8],
+) -> usize {
+    prefetchPos += sequence.litLength;
+
+    #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+    unsafe {
+        use core::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+
+        let match_ptr = if sequence.offset > prefetchPos {
+            let into_ext = sequence.offset - prefetchPos;
+            if into_ext <= ext_history.len() {
+                Some(ext_history.as_ptr().add(ext_history.len() - into_ext))
+            } else {
+                None
+            }
+        } else {
+            let idx = prefetchPos - sequence.offset;
+            if idx < dst.len() {
+                Some(dst.as_ptr().add(idx))
+            } else {
+                None
+            }
+        };
+
+        if let Some(ptr) = match_ptr {
+            _mm_prefetch(ptr as *const i8, _MM_HINT_T0);
+            _mm_prefetch(ptr.add(64) as *const i8, _MM_HINT_T0);
+        }
+    }
+
+    prefetchPos + sequence.matchLength
+}
+
 /// Long-offset body wrapper. On 64-bit Rust targets the normal decoder
-/// can read all legal zstd offsets without a mid-offset refill.
+/// can read all legal zstd offsets without a mid-offset refill, but
+/// upstream also uses this body as the "prefetch" decoder. It decodes
+/// a small ring of sequences ahead of execution to give long-distance
+/// matches more time to reach cache.
+fn ZSTD_decompressSequencesLong_body_impl<const BMI2: bool>(
+    dst: &mut [u8],
+    op_start: usize,
+    ext_history: &[u8],
+    seqSrc: &[u8],
+    nbSeq: i32,
+    litBuf: &[u8],
+    litSize: usize,
+    LLTable: &[ZSTD_seqSymbol],
+    OFTable: &[ZSTD_seqSymbol],
+    MLTable: &[ZSTD_seqSymbol],
+    entropy_rep: &mut ZSTD_decoder_entropy_rep,
+) -> usize {
+    use crate::common::bitstream::{BIT_DStream_t, BIT_endOfDStream, BIT_initDStream};
+
+    const STORED_SEQS: usize = 8;
+    const STORED_SEQS_MASK: usize = STORED_SEQS - 1;
+    let mut op: usize = op_start;
+    let mut litPtr: usize = 0;
+    let litEnd = litSize;
+
+    if nbSeq > 0 {
+        let mut seqState = seqState_t {
+            DStream: BIT_DStream_t::default(),
+            stateLL: ZSTD_fseState::default(),
+            stateOffb: ZSTD_fseState::default(),
+            stateML: ZSTD_fseState::default(),
+            prevOffset: [
+                entropy_rep.rep[0] as usize,
+                entropy_rep.rep[1] as usize,
+                entropy_rep.rep[2] as usize,
+            ],
+        };
+
+        let rc = BIT_initDStream(&mut seqState.DStream, seqSrc, seqSrc.len());
+        if crate::common::error::ERR_isError(rc) {
+            return ERROR(ErrorCode::CorruptionDetected);
+        }
+
+        ZSTD_initFseState(&mut seqState.stateLL, &mut seqState.DStream, LLTable);
+        ZSTD_initFseState(&mut seqState.stateOffb, &mut seqState.DStream, OFTable);
+        ZSTD_initFseState(&mut seqState.stateML, &mut seqState.DStream, MLTable);
+
+        let total = nbSeq as usize;
+        let seqAdvance = total.min(STORED_SEQS);
+        let mut sequences = [seq_t::default(); STORED_SEQS];
+        let mut seqNb = 0usize;
+        let mut prefetchPos = op_start;
+
+        while seqNb < seqAdvance {
+            let sequence = if BMI2 {
+                #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+                unsafe {
+                    ZSTD_decodeSequence_bmi2(
+                        &mut seqState,
+                        LLTable,
+                        OFTable,
+                        MLTable,
+                        seqNb + 1 == total,
+                    )
+                }
+                #[cfg(not(all(target_arch = "x86_64", target_pointer_width = "64")))]
+                {
+                    unreachable!("BMI2 long decoder is x86_64-only")
+                }
+            } else {
+                ZSTD_decodeSequence(&mut seqState, LLTable, OFTable, MLTable, seqNb + 1 == total)
+            };
+            prefetchPos = ZSTD_prefetchMatch_rust(prefetchPos, sequence, dst, ext_history);
+            sequences[seqNb] = sequence;
+            seqNb += 1;
+        }
+
+        while seqNb < total {
+            let sequence = if BMI2 {
+                #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+                unsafe {
+                    ZSTD_decodeSequence_bmi2(
+                        &mut seqState,
+                        LLTable,
+                        OFTable,
+                        MLTable,
+                        seqNb + 1 == total,
+                    )
+                }
+                #[cfg(not(all(target_arch = "x86_64", target_pointer_width = "64")))]
+                {
+                    unreachable!("BMI2 long decoder is x86_64-only")
+                }
+            } else {
+                ZSTD_decodeSequence(&mut seqState, LLTable, OFTable, MLTable, seqNb + 1 == total)
+            };
+            let execute_idx = (seqNb - STORED_SEQS) & STORED_SEQS_MASK;
+            let oneSeqSize = ZSTD_execSequence(
+                dst,
+                op,
+                sequences[execute_idx],
+                ext_history,
+                litBuf,
+                litPtr,
+                &mut litPtr,
+            );
+            if crate::common::error::ERR_isError(oneSeqSize) {
+                return oneSeqSize;
+            }
+            prefetchPos = ZSTD_prefetchMatch_rust(prefetchPos, sequence, dst, ext_history);
+            sequences[seqNb & STORED_SEQS_MASK] = sequence;
+            op += oneSeqSize;
+            seqNb += 1;
+        }
+
+        let mut finish = total - seqAdvance;
+        while finish < total {
+            let sequence = sequences[finish & STORED_SEQS_MASK];
+            let oneSeqSize =
+                ZSTD_execSequence(dst, op, sequence, ext_history, litBuf, litPtr, &mut litPtr);
+            if crate::common::error::ERR_isError(oneSeqSize) {
+                return oneSeqSize;
+            }
+            op += oneSeqSize;
+            finish += 1;
+        }
+
+        if BIT_endOfDStream(&seqState.DStream) == 0 {
+            return ERROR(ErrorCode::CorruptionDetected);
+        }
+
+        entropy_rep.rep[0] = seqState.prevOffset[0] as u32;
+        entropy_rep.rep[1] = seqState.prevOffset[1] as u32;
+        entropy_rep.rep[2] = seqState.prevOffset[2] as u32;
+    }
+
+    let lastLLSize = litEnd - litPtr;
+    if op + lastLLSize > dst.len() {
+        return ERROR(ErrorCode::DstSizeTooSmall);
+    }
+    if lastLLSize > 0 {
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                litBuf.as_ptr().add(litPtr),
+                dst.as_mut_ptr().add(op),
+                lastLLSize,
+            );
+        }
+        op += lastLLSize;
+    }
+
+    op - op_start
+}
+
 pub fn ZSTD_decompressSequencesLong_body(
     dst: &mut [u8],
     op_start: usize,
@@ -1273,7 +2691,220 @@ pub fn ZSTD_decompressSequencesLong_body(
     MLTable: &[ZSTD_seqSymbol],
     entropy_rep: &mut ZSTD_decoder_entropy_rep,
 ) -> usize {
-    ZSTD_decompressSequences_body(
+    ZSTD_decompressSequencesLong_body_impl::<false>(
+        dst,
+        op_start,
+        ext_history,
+        seqSrc,
+        nbSeq,
+        litBuf,
+        litSize,
+        LLTable,
+        OFTable,
+        MLTable,
+        entropy_rep,
+    )
+}
+
+fn ZSTD_decompressSequencesLong_bodySplitLitBuffer_impl<const BMI2: bool>(
+    dst: &mut [u8],
+    op_start: usize,
+    dst_limit: usize,
+    ext_history: &[u8],
+    seqSrc: &[u8],
+    nbSeq: i32,
+    lit_dst_base: *const u8,
+    lit_dst_len: usize,
+    lit_extra: &[u8],
+    litSize: usize,
+    LLTable: &[ZSTD_seqSymbol],
+    OFTable: &[ZSTD_seqSymbol],
+    MLTable: &[ZSTD_seqSymbol],
+    entropy_rep: &mut ZSTD_decoder_entropy_rep,
+) -> usize {
+    use crate::common::bitstream::{BIT_DStream_t, BIT_endOfDStream, BIT_initDStream};
+
+    const STORED_SEQS: usize = 8;
+    const STORED_SEQS_MASK: usize = STORED_SEQS - 1;
+    let mut op = op_start;
+    let mut litPtr = 0usize;
+    let mut extraPtr = 0usize;
+    let mut using_extra = false;
+
+    if nbSeq > 0 {
+        let mut seqState = seqState_t {
+            DStream: BIT_DStream_t::default(),
+            stateLL: ZSTD_fseState::default(),
+            stateOffb: ZSTD_fseState::default(),
+            stateML: ZSTD_fseState::default(),
+            prevOffset: [
+                entropy_rep.rep[0] as usize,
+                entropy_rep.rep[1] as usize,
+                entropy_rep.rep[2] as usize,
+            ],
+        };
+
+        let rc = BIT_initDStream(&mut seqState.DStream, seqSrc, seqSrc.len());
+        if crate::common::error::ERR_isError(rc) {
+            return ERROR(ErrorCode::CorruptionDetected);
+        }
+        ZSTD_initFseState(&mut seqState.stateLL, &mut seqState.DStream, LLTable);
+        ZSTD_initFseState(&mut seqState.stateOffb, &mut seqState.DStream, OFTable);
+        ZSTD_initFseState(&mut seqState.stateML, &mut seqState.DStream, MLTable);
+
+        let total = nbSeq as usize;
+        let seqAdvance = total.min(STORED_SEQS);
+        let mut sequences = [seq_t::default(); STORED_SEQS];
+        let mut seqNb = 0usize;
+        let mut prefetchPos = op_start;
+
+        while seqNb < seqAdvance {
+            let sequence = if BMI2 {
+                #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+                unsafe {
+                    ZSTD_decodeSequence_bmi2(
+                        &mut seqState,
+                        LLTable,
+                        OFTable,
+                        MLTable,
+                        seqNb + 1 == total,
+                    )
+                }
+                #[cfg(not(all(target_arch = "x86_64", target_pointer_width = "64")))]
+                {
+                    unreachable!("BMI2 long split decoder is x86_64-only")
+                }
+            } else {
+                ZSTD_decodeSequence(&mut seqState, LLTable, OFTable, MLTable, seqNb + 1 == total)
+            };
+            prefetchPos = ZSTD_prefetchMatch_rust(prefetchPos, sequence, dst, ext_history);
+            sequences[seqNb] = sequence;
+            seqNb += 1;
+        }
+
+        while seqNb < total {
+            let sequence = if BMI2 {
+                #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+                unsafe {
+                    ZSTD_decodeSequence_bmi2(
+                        &mut seqState,
+                        LLTable,
+                        OFTable,
+                        MLTable,
+                        seqNb + 1 == total,
+                    )
+                }
+                #[cfg(not(all(target_arch = "x86_64", target_pointer_width = "64")))]
+                {
+                    unreachable!("BMI2 long split decoder is x86_64-only")
+                }
+            } else {
+                ZSTD_decodeSequence(&mut seqState, LLTable, OFTable, MLTable, seqNb + 1 == total)
+            };
+            let execute_idx = (seqNb - STORED_SEQS) & STORED_SEQS_MASK;
+            let mut queued = sequences[execute_idx];
+            let oneSeqSize = unsafe {
+                ZSTD_execSequenceSplitLitBuffer_raw(
+                    dst,
+                    dst_limit,
+                    op,
+                    &mut queued,
+                    ext_history,
+                    lit_dst_base,
+                    lit_dst_len,
+                    lit_extra,
+                    &mut litPtr,
+                    &mut extraPtr,
+                    &mut using_extra,
+                )
+            };
+            if crate::common::error::ERR_isError(oneSeqSize) {
+                return oneSeqSize;
+            }
+            prefetchPos = ZSTD_prefetchMatch_rust(prefetchPos, sequence, dst, ext_history);
+            sequences[seqNb & STORED_SEQS_MASK] = sequence;
+            op += oneSeqSize;
+            seqNb += 1;
+        }
+
+        let mut finish = total - seqAdvance;
+        while finish < total {
+            let mut sequence = sequences[finish & STORED_SEQS_MASK];
+            let oneSeqSize = unsafe {
+                ZSTD_execSequenceSplitLitBuffer_raw(
+                    dst,
+                    dst_limit,
+                    op,
+                    &mut sequence,
+                    ext_history,
+                    lit_dst_base,
+                    lit_dst_len,
+                    lit_extra,
+                    &mut litPtr,
+                    &mut extraPtr,
+                    &mut using_extra,
+                )
+            };
+            if crate::common::error::ERR_isError(oneSeqSize) {
+                return oneSeqSize;
+            }
+            op += oneSeqSize;
+            finish += 1;
+        }
+
+        if BIT_endOfDStream(&seqState.DStream) == 0 {
+            return ERROR(ErrorCode::CorruptionDetected);
+        }
+        entropy_rep.rep[0] = seqState.prevOffset[0] as u32;
+        entropy_rep.rep[1] = seqState.prevOffset[1] as u32;
+        entropy_rep.rep[2] = seqState.prevOffset[2] as u32;
+    }
+
+    unsafe {
+        if !using_extra {
+            let last = lit_dst_len - litPtr;
+            if op + last > dst.len() {
+                return ERROR(ErrorCode::DstSizeTooSmall);
+            }
+            if last != 0 {
+                std::ptr::copy(lit_dst_base.add(litPtr), dst.as_mut_ptr().add(op), last);
+                op += last;
+            }
+            extraPtr = 0;
+        }
+        let last = litSize - lit_dst_len - extraPtr;
+        if op + last > dst.len() {
+            return ERROR(ErrorCode::DstSizeTooSmall);
+        }
+        if last != 0 {
+            std::ptr::copy_nonoverlapping(
+                lit_extra.as_ptr().add(extraPtr),
+                dst.as_mut_ptr().add(op),
+                last,
+            );
+            op += last;
+        }
+    }
+
+    op - op_start
+}
+
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+#[target_feature(enable = "bmi1,bmi2,lzcnt")]
+unsafe fn ZSTD_decompressSequencesLong_body_bmi2_impl(
+    dst: &mut [u8],
+    op_start: usize,
+    ext_history: &[u8],
+    seqSrc: &[u8],
+    nbSeq: i32,
+    litBuf: &[u8],
+    litSize: usize,
+    LLTable: &[ZSTD_seqSymbol],
+    OFTable: &[ZSTD_seqSymbol],
+    MLTable: &[ZSTD_seqSymbol],
+    entropy_rep: &mut ZSTD_decoder_entropy_rep,
+) -> usize {
+    ZSTD_decompressSequencesLong_body_impl::<true>(
         dst,
         op_start,
         ext_history,
@@ -1329,7 +2960,7 @@ pub fn ZSTD_decompressSequences_bmi2(
     MLTable: &[ZSTD_seqSymbol],
     entropy_rep: &mut ZSTD_decoder_entropy_rep,
 ) -> usize {
-    ZSTD_decompressSequences_default(
+    ZSTD_decompressSequences_body_bmi2(
         dst,
         op_start,
         ext_history,
@@ -1357,7 +2988,7 @@ pub fn ZSTD_decompressSequencesSplitLitBuffer_bmi2(
     MLTable: &[ZSTD_seqSymbol],
     entropy_rep: &mut ZSTD_decoder_entropy_rep,
 ) -> usize {
-    ZSTD_decompressSequencesSplitLitBuffer_default(
+    ZSTD_decompressSequences_body_bmi2(
         dst,
         op_start,
         ext_history,
@@ -1385,7 +3016,30 @@ pub fn ZSTD_decompressSequencesLong_bmi2(
     MLTable: &[ZSTD_seqSymbol],
     entropy_rep: &mut ZSTD_decoder_entropy_rep,
 ) -> usize {
-    ZSTD_decompressSequencesLong_default(
+    #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+    {
+        if std::is_x86_feature_detected!("bmi1")
+            && std::is_x86_feature_detected!("bmi2")
+            && std::is_x86_feature_detected!("lzcnt")
+        {
+            return unsafe {
+                ZSTD_decompressSequencesLong_body_bmi2_impl(
+                    dst,
+                    op_start,
+                    ext_history,
+                    seqSrc,
+                    nbSeq,
+                    litBuf,
+                    litSize,
+                    LLTable,
+                    OFTable,
+                    MLTable,
+                    entropy_rep,
+                )
+            };
+        }
+    }
+    ZSTD_decompressSequencesLong_body(
         dst,
         op_start,
         ext_history,
@@ -1532,16 +3186,29 @@ pub fn ZSTD_decompressBlock_internal(
     if srcSize > ZSTD_blockSizeMax(dctx) {
         return ERROR(ErrorCode::SrcSizeWrong);
     }
+    if srcSize < MIN_CBLOCK_SIZE {
+        return ERROR(ErrorCode::CorruptionDetected);
+    }
 
     // 1. Decode literals block header + payload. Literals are buffered
     //    in the DCtx's owned scratch; the `dst` slice is only used by
     //    the future spill-into-dst optimization, so we feed it the
     //    remaining-capacity slice starting at op_start.
     let (_, dst_tail) = dst.split_at_mut(op_start);
-    let litCSize = ZSTD_decodeLiteralsBlock(dctx, src, dst_tail, streaming);
+    let litEncType = SymbolEncodingType_e::from_bits(src[0] as u32);
+    let litCSize = if litEncType == SymbolEncodingType_e::set_basic {
+        ZSTD_decodeBasicLiteralsBlock_direct(dctx, src, dst_tail.len())
+    } else {
+        ZSTD_decodeLiteralsBlock(dctx, src, dst_tail, streaming)
+    };
     if crate::common::error::ERR_isError(litCSize) {
         return litCSize;
     }
+    let direct_lit_start = if litEncType == SymbolEncodingType_e::set_basic {
+        litCSize - dctx.litSize
+    } else {
+        0
+    };
     let mut ip: usize = litCSize;
     srcSize -= litCSize;
 
@@ -1558,15 +3225,23 @@ pub fn ZSTD_decompressBlock_internal(
         return ERROR(ErrorCode::DstSizeTooSmall);
     }
 
-    // 3. Regenerate sequences into dst. The literals come from the
-    //    DCtx's owned buffer — we copy to a local vec to detach the
-    //    borrow from `dctx` (which `ZSTD_decompressSequences_body`
-    //    needs for the FSE tables).
-    let litSize = dctx.litSize;
-    let lit_snapshot: Vec<u8> = dctx.litExtraBuffer[..litSize].to_vec();
-    let LL = dctx.LLTable.clone();
-    let OF = dctx.OFTable.clone();
-    let ML = dctx.MLTable.clone();
+    let blockSizeMax = dstCapacity.min(ZSTD_blockSizeMax(dctx));
+    let totalHistorySize =
+        dctx.stream_dict.len() + dctx.historyBuffer.len() + op_start + blockSizeMax;
+    let mut usePrefetchDecoder = dctx.ddictIsCold != 0;
+    if !usePrefetchDecoder && totalHistorySize > (1usize << 24) && nbSeq > 8 {
+        let info = ZSTD_getOffsetInfo(
+            active_of_table_from(&dctx.OFTable, dctx.of_default_active),
+            nbSeq,
+        );
+        usePrefetchDecoder = info.longOffsetShare >= 7;
+    }
+    dctx.ddictIsCold = 0;
+
+    let LL = active_ll_table_from(&dctx.LLTable, dctx.ll_default_active);
+    let OF = active_of_table_from(&dctx.OFTable, dctx.of_default_active);
+    let ML = active_ml_table_from(&dctx.MLTable, dctx.ml_default_active);
+
     // Build the ext-dict history slice. The virtual layout the
     // sequence decoder reasons about is:
     //
@@ -1590,17 +3265,186 @@ pub fn ZSTD_decompressBlock_internal(
         v
     };
 
-    ZSTD_decompressSequences_body(
+    // 3. Regenerate sequences into dst. Keep literal and FSE table
+    // snapshots detached from `dctx` so the hot sequence loop gets
+    // non-aliasing inputs without per-block heap table allocation.
+    let litSize = dctx.litSize;
+    let lit_snapshot = if litEncType == SymbolEncodingType_e::set_basic {
+        Some(&src[direct_lit_start..direct_lit_start + litSize])
+    } else if dctx.litPtr_from_dst {
+        None
+    } else {
+        Some(&dctx.litExtraBuffer[..litSize])
+    };
+    if dctx.litBufferLocation == ZSTD_litLocation_e::ZSTD_split {
+        let lit_abs = op_start + dctx.litPtr_offset;
+        let lit_dst_len = dctx.litBufferEnd_offset - dctx.litBuffer_offset;
+        let out_limit = op_start + dctx.litBuffer_offset;
+        let dst_ptr = dst.as_mut_ptr();
+        let lit_base = unsafe { dst_ptr.add(lit_abs) as *const u8 };
+        if usePrefetchDecoder {
+            #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+            if ZSTD_DCtx_get_bmi2(dctx) != 0
+                && std::is_x86_feature_detected!("bmi1")
+                && std::is_x86_feature_detected!("bmi2")
+                && std::is_x86_feature_detected!("lzcnt")
+            {
+                return ZSTD_decompressSequencesLong_bodySplitLitBuffer_impl::<true>(
+                    dst,
+                    op_start,
+                    out_limit,
+                    &ext_history,
+                    &src[ip..ip + srcSize],
+                    nbSeq,
+                    lit_base,
+                    lit_dst_len,
+                    &dctx.litExtraBuffer[..ZSTD_LITBUFFEREXTRASIZE],
+                    litSize,
+                    LL,
+                    OF,
+                    ML,
+                    entropy_rep,
+                );
+            }
+            return ZSTD_decompressSequencesLong_bodySplitLitBuffer_impl::<false>(
+                dst,
+                op_start,
+                out_limit,
+                &ext_history,
+                &src[ip..ip + srcSize],
+                nbSeq,
+                lit_base,
+                lit_dst_len,
+                &dctx.litExtraBuffer[..ZSTD_LITBUFFEREXTRASIZE],
+                litSize,
+                LL,
+                OF,
+                ML,
+                entropy_rep,
+            );
+        }
+        #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+        if ZSTD_DCtx_get_bmi2(dctx) != 0
+            && !usePrefetchDecoder
+            && std::is_x86_feature_detected!("bmi1")
+            && std::is_x86_feature_detected!("bmi2")
+            && std::is_x86_feature_detected!("lzcnt")
+        {
+            return unsafe {
+                ZSTD_decompressSequences_bodySplitLitBuffer_bmi2_raw(
+                    dst,
+                    op_start,
+                    out_limit,
+                    &ext_history,
+                    &src[ip..ip + srcSize],
+                    nbSeq,
+                    lit_base,
+                    lit_dst_len,
+                    &dctx.litExtraBuffer[..ZSTD_LITBUFFEREXTRASIZE],
+                    litSize,
+                    LL,
+                    OF,
+                    ML,
+                    entropy_rep,
+                )
+            };
+        }
+        return unsafe {
+            ZSTD_decompressSequences_bodySplitLitBuffer_raw(
+                dst,
+                op_start,
+                out_limit,
+                &ext_history,
+                &src[ip..ip + srcSize],
+                nbSeq,
+                lit_base,
+                lit_dst_len,
+                &dctx.litExtraBuffer[..ZSTD_LITBUFFEREXTRASIZE],
+                litSize,
+                LL,
+                OF,
+                ML,
+                entropy_rep,
+            )
+        };
+    }
+
+    if dctx.litPtr_from_dst {
+        let lit_abs = op_start + dctx.litPtr_offset;
+        let out_limit = op_start + dctx.litBuffer_offset;
+        let dst_ptr = dst.as_mut_ptr();
+        let lit_base = unsafe { dst_ptr.add(lit_abs) as *const u8 };
+        let dst_limited = unsafe { std::slice::from_raw_parts_mut(dst_ptr, out_limit) };
+        if usePrefetchDecoder {
+            debug_assert_eq!(ZSTD_DCtx_get_bmi2(dctx), 0);
+            // Raw-literal long-body dispatch is still scalar here; keep
+            // prefetch sequencing for correctness of the chosen control
+            // flow, but avoid manufacturing a Rust slice alias into dst.
+        }
+        #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+        if ZSTD_DCtx_get_bmi2(dctx) != 0
+            && !usePrefetchDecoder
+            && std::is_x86_feature_detected!("bmi1")
+            && std::is_x86_feature_detected!("bmi2")
+            && std::is_x86_feature_detected!("lzcnt")
+        {
+            return unsafe {
+                ZSTD_decompressSequences_body_bmi2_rawLit(
+                    dst_limited,
+                    op_start,
+                    &ext_history,
+                    &src[ip..ip + srcSize],
+                    nbSeq,
+                    lit_base,
+                    litSize,
+                    LL,
+                    OF,
+                    ML,
+                    entropy_rep,
+                )
+            };
+        }
+        return unsafe {
+            ZSTD_decompressSequences_body_rawLit(
+                dst_limited,
+                op_start,
+                &ext_history,
+                &src[ip..ip + srcSize],
+                nbSeq,
+                lit_base,
+                litSize,
+                LL,
+                OF,
+                ML,
+                entropy_rep,
+            )
+        };
+    }
+
+    let lit_snapshot = lit_snapshot.expect("non-dst literal buffer must be available");
+    let decompress_sequences = if usePrefetchDecoder {
+        if ZSTD_DCtx_get_bmi2(dctx) != 0 {
+            ZSTD_decompressSequencesLong_bmi2
+        } else {
+            ZSTD_decompressSequencesLong_default
+        }
+    } else if ZSTD_DCtx_get_bmi2(dctx) != 0 {
+        ZSTD_decompressSequences_bmi2
+    } else {
+        ZSTD_decompressSequences_default
+    };
+
+    decompress_sequences(
         dst,
         op_start,
         &ext_history,
         &src[ip..ip + srcSize],
         nbSeq,
-        &lit_snapshot,
+        lit_snapshot,
         litSize,
-        &LL,
-        &OF,
-        &ML,
+        LL,
+        OF,
+        ML,
         entropy_rep,
     )
 }
@@ -1612,6 +3456,54 @@ pub fn ZSTD_decompressBlock_internal(
 pub fn ZSTD_decodeLiteralsBlock_wrapper(dctx: &mut ZSTD_DCtx, src: &[u8], dst: &mut [u8]) -> usize {
     dctx.isFrameDecompression = 0;
     ZSTD_decodeLiteralsBlock(dctx, src, dst, streaming_operation::not_streaming)
+}
+
+fn ZSTD_decodeBasicLiteralsBlock_direct(
+    dctx: &mut ZSTD_DCtx,
+    src: &[u8],
+    dstCapacity: usize,
+) -> usize {
+    let srcSize = src.len();
+    if srcSize < MIN_CBLOCK_SIZE {
+        return ERROR(ErrorCode::CorruptionDetected);
+    }
+    if SymbolEncodingType_e::from_bits(src[0] as u32) != SymbolEncodingType_e::set_basic {
+        return ERROR(ErrorCode::CorruptionDetected);
+    }
+
+    let lhlCode = (src[0] >> 2) & 3;
+    let (lhSize, litSize) = match lhlCode {
+        0 | 2 => (1usize, (src[0] >> 3) as usize),
+        1 => {
+            if srcSize < 2 {
+                return ERROR(ErrorCode::CorruptionDetected);
+            }
+            (2usize, (MEM_readLE16(&src[..2]) >> 4) as usize)
+        }
+        _ => {
+            if srcSize < 3 {
+                return ERROR(ErrorCode::CorruptionDetected);
+            }
+            (3usize, (MEM_readLE24(&src[..3]) >> 4) as usize)
+        }
+    };
+
+    if litSize > ZSTD_blockSizeMax(dctx) {
+        return ERROR(ErrorCode::CorruptionDetected);
+    }
+    if ZSTD_blockSizeMax(dctx).min(dstCapacity) < litSize {
+        return ERROR(ErrorCode::DstSizeTooSmall);
+    }
+    if litSize + lhSize > srcSize {
+        return ERROR(ErrorCode::CorruptionDetected);
+    }
+
+    dctx.litPtr_from_dst = false;
+    dctx.litPtr_offset = 0;
+    dctx.litSize = litSize;
+    dctx.litBufferEnd_offset = litSize;
+    dctx.litBufferLocation = ZSTD_litLocation_e::ZSTD_not_in_dst;
+    lhSize + litSize
 }
 
 /// Port of `ZSTD_decodeLiteralsBlock`. Decodes a literals-block header,
@@ -1697,41 +3589,85 @@ pub fn ZSTD_decodeLiteralsBlock(
                 0,
             );
 
+            let huf_flags = if ZSTD_DCtx_get_bmi2(dctx) != 0 {
+                HUF_flags_bmi2
+            } else {
+                0
+            } | if dctx.disableHufAsm != 0 {
+                HUF_flags_disableAsm
+            } else {
+                0
+            };
+
             // Split HUFptr borrow from dctx borrow: decompress into
             // litExtraBuffer. Upstream uses `dctx->HUFptr` (set by the
             // previous `set_compressed` block) for `set_repeat`, and
             // `dctx->entropy.hufTable` for the fresh-header path. Here
             // the two live in the same `hufTable` field.
+            let in_dst_lit = dctx.litBufferLocation == ZSTD_litLocation_e::ZSTD_in_dst
+                || dctx.litBufferLocation == ZSTD_litLocation_e::ZSTD_split;
             let hufSuccess = if litEncType == SymbolEncodingType_e::set_repeat {
                 let huf_table = &dctx.hufTable.clone();
+                let lit_dst: &mut [u8] = if in_dst_lit {
+                    let start = dctx.litBuffer_offset;
+                    &mut dst[start..start + litSize]
+                } else {
+                    &mut dctx.litExtraBuffer[..litSize]
+                };
                 if singleStream {
-                    HUF_decompress1X_usingDTable::<false>(
-                        &mut dctx.litExtraBuffer[..litSize],
+                    if (huf_flags & HUF_flags_bmi2) != 0 {
+                        HUF_decompress1X_usingDTable::<true>(
+                            lit_dst,
+                            &src[lhSize..lhSize + litCSize],
+                            huf_table,
+                        )
+                    } else {
+                        HUF_decompress1X_usingDTable::<false>(
+                            lit_dst,
+                            &src[lhSize..lhSize + litCSize],
+                            huf_table,
+                        )
+                    }
+                } else if (huf_flags & HUF_flags_bmi2) != 0 {
+                    HUF_decompress4X_usingDTable::<true>(
+                        lit_dst,
                         &src[lhSize..lhSize + litCSize],
                         huf_table,
                     )
                 } else {
                     HUF_decompress4X_usingDTable::<false>(
-                        &mut dctx.litExtraBuffer[..litSize],
+                        lit_dst,
                         &src[lhSize..lhSize + litCSize],
                         huf_table,
                     )
                 }
             } else if singleStream {
+                let lit_dst: &mut [u8] = if in_dst_lit {
+                    let start = dctx.litBuffer_offset;
+                    &mut dst[start..start + litSize]
+                } else {
+                    &mut dctx.litExtraBuffer[..litSize]
+                };
                 HUF_decompress1X1_DCtx_wksp(
                     &mut dctx.hufTable,
-                    &mut dctx.litExtraBuffer[..litSize],
+                    lit_dst,
                     &src[lhSize..lhSize + litCSize],
                     &mut dctx.workspace,
-                    0,
+                    huf_flags,
                 )
             } else {
+                let lit_dst: &mut [u8] = if in_dst_lit {
+                    let start = dctx.litBuffer_offset;
+                    &mut dst[start..start + litSize]
+                } else {
+                    &mut dctx.litExtraBuffer[..litSize]
+                };
                 HUF_decompress4X_hufOnly_wksp(
                     &mut dctx.hufTable,
-                    &mut dctx.litExtraBuffer[..litSize],
+                    lit_dst,
                     &src[lhSize..lhSize + litCSize],
                     &mut dctx.workspace,
-                    0,
+                    huf_flags,
                 )
             };
 
@@ -1739,8 +3675,21 @@ pub fn ZSTD_decodeLiteralsBlock(
                 return ERROR(ErrorCode::CorruptionDetected);
             }
 
-            dctx.litPtr_from_dst = false;
-            dctx.litPtr_offset = 0;
+            if dctx.litBufferLocation == ZSTD_litLocation_e::ZSTD_split {
+                let initial_start = dctx.litBuffer_offset;
+                let final_start = initial_start + ZSTD_LITBUFFEREXTRASIZE - WILDCOPY_OVERLENGTH;
+                let first_len = litSize - ZSTD_LITBUFFEREXTRASIZE;
+                dctx.litExtraBuffer[..ZSTD_LITBUFFEREXTRASIZE].copy_from_slice(
+                    &dst[initial_start + first_len
+                        ..initial_start + first_len + ZSTD_LITBUFFEREXTRASIZE],
+                );
+                dst.copy_within(initial_start..initial_start + first_len, final_start);
+                dctx.litBuffer_offset = final_start;
+                dctx.litBufferEnd_offset = final_start + first_len;
+            }
+
+            dctx.litPtr_from_dst = in_dst_lit;
+            dctx.litPtr_offset = if in_dst_lit { dctx.litBuffer_offset } else { 0 };
             dctx.litSize = litSize;
             dctx.litEntropy = 1;
             litCSize + lhSize
@@ -1779,9 +3728,25 @@ pub fn ZSTD_decodeLiteralsBlock(
                 if litSize + lhSize > srcSize {
                     return ERROR(ErrorCode::CorruptionDetected);
                 }
-                dctx.litExtraBuffer[..litSize].copy_from_slice(&src[lhSize..lhSize + litSize]);
-                dctx.litPtr_from_dst = false;
-                dctx.litPtr_offset = 0;
+                if dctx.litBufferLocation == ZSTD_litLocation_e::ZSTD_in_dst {
+                    let start = dctx.litBuffer_offset;
+                    dst[start..start + litSize].copy_from_slice(&src[lhSize..lhSize + litSize]);
+                    dctx.litPtr_from_dst = true;
+                    dctx.litPtr_offset = start;
+                } else if dctx.litBufferLocation == ZSTD_litLocation_e::ZSTD_split {
+                    let first_len = litSize - ZSTD_LITBUFFEREXTRASIZE;
+                    let start = dctx.litBuffer_offset;
+                    dst[start..start + first_len].copy_from_slice(&src[lhSize..lhSize + first_len]);
+                    dctx.litExtraBuffer[..ZSTD_LITBUFFEREXTRASIZE].copy_from_slice(
+                        &src[lhSize + first_len..lhSize + first_len + ZSTD_LITBUFFEREXTRASIZE],
+                    );
+                    dctx.litPtr_from_dst = true;
+                    dctx.litPtr_offset = start;
+                } else {
+                    dctx.litExtraBuffer[..litSize].copy_from_slice(&src[lhSize..lhSize + litSize]);
+                    dctx.litPtr_from_dst = false;
+                    dctx.litPtr_offset = 0;
+                }
                 dctx.litSize = litSize;
                 return lhSize + litSize;
             }
@@ -1834,11 +3799,31 @@ pub fn ZSTD_decodeLiteralsBlock(
             );
 
             let rle_byte = src[lhSize];
-            for b in dctx.litExtraBuffer[..litSize].iter_mut() {
-                *b = rle_byte;
+            if dctx.litBufferLocation == ZSTD_litLocation_e::ZSTD_in_dst {
+                let start = dctx.litBuffer_offset;
+                for b in dst[start..start + litSize].iter_mut() {
+                    *b = rle_byte;
+                }
+                dctx.litPtr_from_dst = true;
+                dctx.litPtr_offset = start;
+            } else if dctx.litBufferLocation == ZSTD_litLocation_e::ZSTD_split {
+                let first_len = litSize - ZSTD_LITBUFFEREXTRASIZE;
+                let start = dctx.litBuffer_offset;
+                for b in dst[start..start + first_len].iter_mut() {
+                    *b = rle_byte;
+                }
+                for b in dctx.litExtraBuffer[..ZSTD_LITBUFFEREXTRASIZE].iter_mut() {
+                    *b = rle_byte;
+                }
+                dctx.litPtr_from_dst = true;
+                dctx.litPtr_offset = start;
+            } else {
+                for b in dctx.litExtraBuffer[..litSize].iter_mut() {
+                    *b = rle_byte;
+                }
+                dctx.litPtr_from_dst = false;
+                dctx.litPtr_offset = 0;
             }
-            dctx.litPtr_from_dst = false;
-            dctx.litPtr_offset = 0;
             dctx.litSize = litSize;
             lhSize + 1
         }
@@ -1919,6 +3904,7 @@ pub const OF_defaultNormLog: u32 = 5;
 
 /// Mirror of upstream `ZSTD_seqSymbol_header`. Two u32 fields, stored
 /// in the DTable's slot-0 descriptor.
+#[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ZSTD_seqSymbol_header {
     pub fastMode: u32,
@@ -1926,6 +3912,7 @@ pub struct ZSTD_seqSymbol_header {
 }
 
 /// Mirror of upstream `ZSTD_seqSymbol` (decode entry).
+#[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ZSTD_seqSymbol {
     pub nextState: u16,
@@ -1994,6 +3981,55 @@ pub fn seq_header_read(dt: &[ZSTD_seqSymbol]) -> ZSTD_seqSymbol_header {
     }
 }
 
+#[inline]
+fn seq_table_used_len(dt: &[ZSTD_seqSymbol]) -> usize {
+    1 + (1usize << dt[0].baseValue)
+}
+
+#[cfg(test)]
+pub(crate) fn active_ll_table(dctx: &ZSTD_DCtx) -> &[ZSTD_seqSymbol] {
+    active_ll_table_from(&dctx.LLTable, dctx.ll_default_active)
+}
+
+#[inline]
+#[cfg(test)]
+pub(crate) fn active_of_table(dctx: &ZSTD_DCtx) -> &[ZSTD_seqSymbol] {
+    active_of_table_from(&dctx.OFTable, dctx.of_default_active)
+}
+
+#[inline]
+#[cfg(test)]
+pub(crate) fn active_ml_table(dctx: &ZSTD_DCtx) -> &[ZSTD_seqSymbol] {
+    active_ml_table_from(&dctx.MLTable, dctx.ml_default_active)
+}
+
+#[inline]
+fn active_ll_table_from(table: &[ZSTD_seqSymbol], default_active: bool) -> &[ZSTD_seqSymbol] {
+    if default_active {
+        default_ll_dtable()
+    } else {
+        &table[..seq_table_used_len(table)]
+    }
+}
+
+#[inline]
+fn active_of_table_from(table: &[ZSTD_seqSymbol], default_active: bool) -> &[ZSTD_seqSymbol] {
+    if default_active {
+        default_of_dtable()
+    } else {
+        &table[..seq_table_used_len(table)]
+    }
+}
+
+#[inline]
+fn active_ml_table_from(table: &[ZSTD_seqSymbol], default_active: bool) -> &[ZSTD_seqSymbol] {
+    if default_active {
+        default_ml_dtable()
+    } else {
+        &table[..seq_table_used_len(table)]
+    }
+}
+
 /// Port of `ZSTD_buildFSETable_body` / `ZSTD_buildFSETable`. Writes
 /// `1 + (1<<tableLog)` `ZSTD_seqSymbol` entries into `dt`.
 pub fn ZSTD_buildFSETable(
@@ -2008,25 +4044,40 @@ pub fn ZSTD_buildFSETable(
     let tableSize = 1usize << tableLog;
 
     // Rust: stack-allocate the scratch that C takes via workspace.
-    let mut symbolNext = [0u16; (MaxSeq + 1) as usize];
-    let mut spread = [0u8; 1 << 9]; // MaxFSELog
-
+    // Both buffers are fully written in their used ranges before being read.
+    let mut symbolNext: [core::mem::MaybeUninit<u16>; (MaxSeq + 1) as usize] =
+        unsafe { core::mem::MaybeUninit::uninit().assume_init() };
+    let mut spread: [core::mem::MaybeUninit<u8>; 1 << 9] =
+        unsafe { core::mem::MaybeUninit::uninit().assume_init() }; // MaxFSELog
+    let dt_ptr = dt.as_mut_ptr();
+    let nc_ptr = normalizedCounter.as_ptr();
+    let base_value_ptr = baseValue.as_ptr();
+    let nb_additional_bits_ptr = nbAdditionalBits.as_ptr();
+    let symbol_next_ptr = symbolNext.as_mut_ptr() as *mut u16;
+    let spread_ptr = spread.as_mut_ptr() as *mut u8;
     let mut highThreshold: i64 = tableSize as i64 - 1;
     let mut fastMode: u32 = 1;
     let largeLimit: i16 = 1 << (tableLog - 1);
 
-    for (s, &nc) in normalizedCounter.iter().enumerate().take(maxSV1) {
+    for s in 0..maxSV1 {
+        let nc = unsafe { *nc_ptr.add(s) };
         if nc == -1 {
             // Lowprob symbol: place it at `highThreshold` and walk the
             // sink index down.
-            dt[1 + highThreshold as usize].baseValue = s as u32;
+            unsafe {
+                (*dt_ptr.add(1 + highThreshold as usize)).baseValue = s as u32;
+            }
             highThreshold -= 1;
-            symbolNext[s] = 1;
+            unsafe {
+                *symbol_next_ptr.add(s) = 1;
+            }
         } else {
             if nc >= largeLimit {
                 fastMode = 0;
             }
-            symbolNext[s] = nc as u16;
+            unsafe {
+                *symbol_next_ptr.add(s) = nc as u16;
+            }
         }
     }
     seq_header_write(dt, fastMode, tableLog);
@@ -2038,10 +4089,13 @@ pub fn ZSTD_buildFSETable(
     if highThreshold == tableSize as i64 - 1 {
         // Fast path: lay down in order, then spread.
         let mut pos: usize = 0;
-        for (s, &nc) in normalizedCounter.iter().enumerate().take(maxSV1) {
+        for s in 0..maxSV1 {
+            let nc = unsafe { *nc_ptr.add(s) };
             let n = nc as i32;
             for i in 0..n as usize {
-                spread[pos + i] = s as u8;
+                unsafe {
+                    *spread_ptr.add(pos + i) = s as u8;
+                }
             }
             if n > 0 {
                 pos += n as usize;
@@ -2052,7 +4106,9 @@ pub fn ZSTD_buildFSETable(
         while s < tableSize {
             for u in 0..2 {
                 let uPos = (position + (u * step)) & tableMask;
-                dt[1 + uPos].baseValue = spread[s + u] as u32;
+                unsafe {
+                    (*dt_ptr.add(1 + uPos)).baseValue = *spread_ptr.add(s + u) as u32;
+                }
             }
             position = (position + (2 * step)) & tableMask;
             s += 2;
@@ -2060,9 +4116,12 @@ pub fn ZSTD_buildFSETable(
     } else {
         // Slow path with lowprob region skipping.
         let mut position: usize = 0;
-        for (s, &nc) in normalizedCounter.iter().enumerate().take(maxSV1) {
+        for s in 0..maxSV1 {
+            let nc = unsafe { *nc_ptr.add(s) };
             for _ in 0..nc {
-                dt[1 + position].baseValue = s as u32;
+                unsafe {
+                    (*dt_ptr.add(1 + position)).baseValue = s as u32;
+                }
                 position = (position + step) & tableMask;
                 while position as i64 > highThreshold {
                     position = (position + step) & tableMask;
@@ -2073,16 +4132,21 @@ pub fn ZSTD_buildFSETable(
 
     // Build decoding entries.
     for u in 0..tableSize {
-        let symbol = dt[1 + u].baseValue as usize;
-        let nextState = symbolNext[symbol];
-        symbolNext[symbol] = nextState + 1;
+        let entry = unsafe { &mut *dt_ptr.add(1 + u) };
+        let symbol = entry.baseValue as usize;
+        let nextState = unsafe { *symbol_next_ptr.add(symbol) };
+        unsafe {
+            *symbol_next_ptr.add(symbol) = nextState + 1;
+        }
         let hb = crate::common::bits::ZSTD_highbit32(nextState as u32);
         let nbBits = (tableLog - hb) as u8;
         let newState = (((nextState as u32) << nbBits) - tableSize as u32) as u16;
-        dt[1 + u].nbBits = nbBits;
-        dt[1 + u].nextState = newState;
-        dt[1 + u].nbAdditionalBits = nbAdditionalBits[symbol];
-        dt[1 + u].baseValue = baseValue[symbol];
+        entry.nbBits = nbBits;
+        entry.nextState = newState;
+        unsafe {
+            entry.nbAdditionalBits = *nb_additional_bits_ptr.add(symbol);
+            entry.baseValue = *base_value_ptr.add(symbol);
+        }
     }
 }
 
@@ -2188,11 +4252,11 @@ pub fn ZSTD_buildSeqTable(
             if let Some(t) = defaultTable {
                 // Copy the default table into DTableSpace so callers
                 // can read it through the same `&[ZSTD_seqSymbol]`.
-                for (i, src) in t.iter().enumerate() {
-                    if i >= DTableSpace.len() {
-                        break;
+                let len = t.len().min(DTableSpace.len());
+                if len > 0 {
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(t.as_ptr(), DTableSpace.as_mut_ptr(), len);
                     }
-                    DTableSpace[i] = *src;
                 }
             }
             0
@@ -2209,7 +4273,7 @@ pub fn ZSTD_buildSeqTable(
             let mut max_mut = max;
             let mut tableLog: u32 = 0;
             let mut norm = [0i16; (MaxSeq + 1) as usize];
-            let headerSize = crate::common::entropy_common::FSE_readNCount(
+            let headerSize = crate::common::entropy_common::FSE_readNCount_no_clear(
                 &mut norm,
                 &mut max_mut,
                 &mut tableLog,
@@ -2340,6 +4404,9 @@ pub fn ZSTD_buildDefaultSeqTables(dctx: &mut ZSTD_DCtx) {
         &ML_bits,
         ML_defaultNormLog,
     );
+    dctx.ll_default_active = true;
+    dctx.of_default_active = true;
+    dctx.ml_default_active = true;
 }
 
 /// Port of `ZSTD_decodeSeqHeaders`. Full form: header probe + three
@@ -2366,20 +4433,30 @@ pub fn ZSTD_decodeSeqHeaders(dctx: &mut ZSTD_DCtx, nbSeqPtr: &mut i32, src: &[u8
 
     // LL
     {
-        let defaults = build_default_ll_dtable();
-        let ll_sz = ZSTD_buildSeqTable(
-            &mut dctx.LLTable,
-            hdr.LLtype,
-            MaxLL,
-            LLFSELog,
-            &src[ip..],
-            &LL_base,
-            &LL_bits,
-            Some(&defaults),
-            dctx.fse_ll_fresh,
-            dctx.ddictIsCold,
-            hdr.nbSeq,
-        );
+        let ll_sz = if hdr.LLtype == SymbolEncodingType_e::set_basic {
+            dctx.ll_default_active = true;
+            0
+        } else {
+            let sz = ZSTD_buildSeqTable(
+                &mut dctx.LLTable,
+                hdr.LLtype,
+                MaxLL,
+                LLFSELog,
+                &src[ip..],
+                &LL_base,
+                &LL_bits,
+                Some(default_ll_dtable()),
+                dctx.fse_ll_fresh,
+                dctx.ddictIsCold,
+                hdr.nbSeq,
+            );
+            if !crate::common::error::ERR_isError(sz)
+                && hdr.LLtype != SymbolEncodingType_e::set_repeat
+            {
+                dctx.ll_default_active = false;
+            }
+            sz
+        };
         if crate::common::error::ERR_isError(ll_sz) {
             return ERROR(ErrorCode::CorruptionDetected);
         }
@@ -2391,20 +4468,30 @@ pub fn ZSTD_decodeSeqHeaders(dctx: &mut ZSTD_DCtx, nbSeqPtr: &mut i32, src: &[u8
 
     // OF
     {
-        let defaults = build_default_of_dtable();
-        let of_sz = ZSTD_buildSeqTable(
-            &mut dctx.OFTable,
-            hdr.OFtype,
-            MaxOff,
-            OffFSELog,
-            &src[ip..],
-            &OF_base,
-            &OF_bits,
-            Some(&defaults),
-            dctx.fse_of_fresh,
-            dctx.ddictIsCold,
-            hdr.nbSeq,
-        );
+        let of_sz = if hdr.OFtype == SymbolEncodingType_e::set_basic {
+            dctx.of_default_active = true;
+            0
+        } else {
+            let sz = ZSTD_buildSeqTable(
+                &mut dctx.OFTable,
+                hdr.OFtype,
+                MaxOff,
+                OffFSELog,
+                &src[ip..],
+                &OF_base,
+                &OF_bits,
+                Some(default_of_dtable()),
+                dctx.fse_of_fresh,
+                dctx.ddictIsCold,
+                hdr.nbSeq,
+            );
+            if !crate::common::error::ERR_isError(sz)
+                && hdr.OFtype != SymbolEncodingType_e::set_repeat
+            {
+                dctx.of_default_active = false;
+            }
+            sz
+        };
         if crate::common::error::ERR_isError(of_sz) {
             return ERROR(ErrorCode::CorruptionDetected);
         }
@@ -2416,20 +4503,30 @@ pub fn ZSTD_decodeSeqHeaders(dctx: &mut ZSTD_DCtx, nbSeqPtr: &mut i32, src: &[u8
 
     // ML
     {
-        let defaults = build_default_ml_dtable();
-        let ml_sz = ZSTD_buildSeqTable(
-            &mut dctx.MLTable,
-            hdr.MLtype,
-            MaxML,
-            MLFSELog,
-            &src[ip..],
-            &ML_base,
-            &ML_bits,
-            Some(&defaults),
-            dctx.fse_ml_fresh,
-            dctx.ddictIsCold,
-            hdr.nbSeq,
-        );
+        let ml_sz = if hdr.MLtype == SymbolEncodingType_e::set_basic {
+            dctx.ml_default_active = true;
+            0
+        } else {
+            let sz = ZSTD_buildSeqTable(
+                &mut dctx.MLTable,
+                hdr.MLtype,
+                MaxML,
+                MLFSELog,
+                &src[ip..],
+                &ML_base,
+                &ML_bits,
+                Some(default_ml_dtable()),
+                dctx.fse_ml_fresh,
+                dctx.ddictIsCold,
+                hdr.nbSeq,
+            );
+            if !crate::common::error::ERR_isError(sz)
+                && hdr.MLtype != SymbolEncodingType_e::set_repeat
+            {
+                dctx.ml_default_active = false;
+            }
+            sz
+        };
         if crate::common::error::ERR_isError(ml_sz) {
             return ERROR(ErrorCode::CorruptionDetected);
         }
@@ -2470,14 +4567,29 @@ mod tests {
         seq_header_write(&mut dctx.LLTable, 0, LLFSELog);
         seq_header_write(&mut dctx.OFTable, 0, OffFSELog);
         seq_header_write(&mut dctx.MLTable, 0, MLFSELog);
+        dctx.ll_default_active = false;
+        dctx.of_default_active = false;
+        dctx.ml_default_active = false;
 
         let mut nb_seq = 0i32;
         let rc = ZSTD_decodeSeqHeaders(&mut dctx, &mut nb_seq, &[1, 0]);
         assert_eq!(rc, 2);
         assert_eq!(nb_seq, 1);
-        assert_eq!(seq_header_read(&dctx.LLTable).tableLog, LL_defaultNormLog);
-        assert_eq!(seq_header_read(&dctx.OFTable).tableLog, OF_defaultNormLog);
-        assert_eq!(seq_header_read(&dctx.MLTable).tableLog, ML_defaultNormLog);
+        assert!(dctx.ll_default_active);
+        assert!(dctx.of_default_active);
+        assert!(dctx.ml_default_active);
+        assert_eq!(
+            seq_header_read(active_ll_table(&dctx)).tableLog,
+            LL_defaultNormLog
+        );
+        assert_eq!(
+            seq_header_read(active_of_table(&dctx)).tableLog,
+            OF_defaultNormLog
+        );
+        assert_eq!(
+            seq_header_read(active_ml_table(&dctx)).tableLog,
+            ML_defaultNormLog
+        );
     }
 
     #[test]
@@ -2787,6 +4899,60 @@ mod tests {
         for i in 0..5 {
             assert_eq!(dctx.litExtraBuffer[i], 0x5A);
         }
+    }
+
+    #[test]
+    fn decode_literals_block_rle_can_use_dst_literal_buffer() {
+        let src = [41u8, 0x5A];
+        let mut dst = vec![0u8; ZSTD_BLOCKSIZE_MAX + WILDCOPY_OVERLENGTH * 2 + 64];
+        let mut dctx = ZSTD_DCtx::new();
+        dctx.bmi2 = 0;
+        let rc = ZSTD_decodeLiteralsBlock(
+            &mut dctx,
+            &src,
+            &mut dst,
+            streaming_operation::not_streaming,
+        );
+        assert_eq!(rc, 2);
+        assert_eq!(dctx.litSize, 5);
+        assert_eq!(dctx.litBufferLocation, ZSTD_litLocation_e::ZSTD_in_dst);
+        assert!(dctx.litPtr_from_dst);
+        assert_eq!(
+            &dst[dctx.litPtr_offset..dctx.litPtr_offset + dctx.litSize],
+            &[0x5A; 5]
+        );
+    }
+
+    #[test]
+    fn decode_literals_block_rle_can_use_split_literal_buffer() {
+        let lit_size = ZSTD_LITBUFFEREXTRASIZE + 128;
+        let header = ((lit_size as u32) << 4) | (3 << 2) | 1;
+        let src = [
+            (header & 0xFF) as u8,
+            ((header >> 8) & 0xFF) as u8,
+            ((header >> 16) & 0xFF) as u8,
+            0xA5,
+        ];
+        let mut dst = vec![0u8; ZSTD_BLOCKSIZE_MAX];
+        let mut dctx = ZSTD_DCtx::new();
+        dctx.bmi2 = 0;
+        let rc = ZSTD_decodeLiteralsBlock(
+            &mut dctx,
+            &src,
+            &mut dst,
+            streaming_operation::not_streaming,
+        );
+        assert_eq!(rc, 4);
+        assert_eq!(dctx.litSize, lit_size);
+        assert_eq!(dctx.litBufferLocation, ZSTD_litLocation_e::ZSTD_split);
+        assert!(dctx.litPtr_from_dst);
+        assert_eq!(dctx.litBufferEnd_offset - dctx.litBuffer_offset, 128);
+        assert!(dst[dctx.litBuffer_offset..dctx.litBufferEnd_offset]
+            .iter()
+            .all(|&b| b == 0xA5));
+        assert!(dctx.litExtraBuffer[..ZSTD_LITBUFFEREXTRASIZE]
+            .iter()
+            .all(|&b| b == 0xA5));
     }
 
     #[test]

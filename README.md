@@ -2,9 +2,8 @@
 
 A pure-Rust port of the [Zstandard (`zstd`)](https://github.com/facebook/zstd) compression library
 
-**Don't trust anything below**
-
-**This code is incomplete; translation ongoing**
+* 2026-04-27: Tested, speed on par with original. But be vigilant to bugs!
+* Some features out of scope. Contact if you need them
 
 ## This is an LLM-mediated faithful (hopefully) translation, not the original code! 
 
@@ -50,42 +49,30 @@ The full v1.6 public API from `zstd.h` (stable + experimental) is surfaced — e
 
 Test suite: 816 library unit tests without MT and 834 with `--features mt` as of the latest local run, plus CLI/integration/fixture/doc tests in the full suite. Coverage includes cross-compatibility tests that pipe our output through upstream `zstd` when the binary is on `$PATH`, a public-API sentinel that touches every exposed entry point, a boundary-size sweep around block/tail boundaries, a regression gate for a past multi-block repcode bug, end-to-end `--magicless` CLI roundtrips, and `refPrefix` one-shot auto-clear gates proving single-use dict semantics match upstream for both compressor and decompressor sides.
 
-Compression throughput on `tests/fixtures/zstd_h.txt` (182 KB), comparing the current Rust release binary against the vendored upstream `zstd` binary:
+Release throughput on `tests/fixtures/zstd_h.txt` (182 KB), comparing the current working tree against clean `HEAD` built separately from the same repository snapshot:
 
-| Level | Rust MB/s | Original MB/s | Rust / Original |
-|------:|----------:|--------------:|----------------:|
-| 1 | 158.6 | 242.4 | 65.4% |
-| 2 | 123.8 | 205.8 | 60.2% |
-| 3 | 139.8 | 196.6 | 71.1% |
-| 4 | 60.5 | 88.2 | 68.6% |
-| 5 | 48.7 | 73.6 | 66.2% |
-| 6 | 45.5 | 61.3 | 74.2% |
-| 7 | 36.6 | 55.6 | 65.8% |
-| 8 | 28.2 | 44.7 | 63.1% |
-| 9 | 22.9 | 36.9 | 62.1% |
-| 10 | 17.8 | 26.5 | 67.2% |
-| 11 | 9.8 | 12.2 | 80.3% |
-| 12 | 8.9 | 11.3 | 78.8% |
-| 13 | 6.4 | 8.21 | 78.0% |
-| 14 | 5.4 | 7.07 | 76.4% |
-| 15 | 4.7 | 6.37 | 73.8% |
-| 16 | 3.2 | 4.26 | 75.1% |
-| 17 | 3.1 | 3.73 | 83.1% |
-| 18 | 2.0 | 2.40 | 83.3% |
-| 19 | 1.9 | 2.31 | 82.3% |
-| 20 | 1.9 | 2.40 | 79.2% |
-| 21 | 1.8 | 2.46 | 73.2% |
-| 22 | 1.8 | 2.42 | 74.4% |
+| Level | Previous MB/s | Current MB/s | Change |
+|------:|--------------:|-------------:|-------:|
+| 1 | 163.1 | 158.4 | -2.9% |
+| 3 | 137.4 | 139.7 | +1.7% |
+| 5 | 50.6 | 53.4 | +5.5% |
+| 10 | 15.7 | 20.3 | +29.3% |
+
+Decompression spot check on the same fixture:
+
+| Level | Previous MB/s | Current MB/s | Change |
+|------:|--------------:|-------------:|-------:|
+| 1 | 477.7 | 519.0 | +8.6% |
+| 10 | 494.3 | 536.8 | +8.6% |
 
 Commands used:
 
 ```sh
 cargo build --release
-target/release/bench_c tests/fixtures/zstd_h.txt <level> <iters>
-zstd/programs/zstd -b1e22 -i5 tests/fixtures/zstd_h.txt
+target/release/bench tests/fixtures/zstd_h.txt <level> <iters>
 ```
 
-These are local microbenchmarks on a small fixture, not general performance claims. They are useful for tracking translation speed against the vendored original while preserving byte-identical output.
+These are local microbenchmarks on a small fixture, not general performance claims. Compressed sizes were identical in the comparison above; the decompression differences should be treated as noise unless repeated dedicated decompression benchmarks confirm them.
 
 ## Goals
 
@@ -106,6 +93,49 @@ cargo build --release
 cargo build --release --features cli
 cargo build --release --features mt
 cargo test
+```
+
+## Library Use
+
+Add the crate and import the prelude:
+
+```rust
+use zstd_pure_rs::prelude::*;
+
+let src = b"data to compress".to_vec();
+
+let mut compressed = vec![0u8; ZSTD_compressBound(src.len())];
+let c_size = ZSTD_compress(&mut compressed, &src, 3);
+assert!(!ERR_isError(c_size), "compress failed: {}", ERR_getErrorName(c_size));
+compressed.truncate(c_size);
+
+let mut decoded = vec![0u8; src.len()];
+let d_size = ZSTD_decompress(&mut decoded, &compressed);
+assert!(!ERR_isError(d_size), "decompress failed: {}", ERR_getErrorName(d_size));
+decoded.truncate(d_size);
+
+assert_eq!(decoded, src);
+```
+
+Raw-content dictionaries use explicit contexts:
+
+```rust
+use zstd_pure_rs::prelude::*;
+
+let dict = b"common words and prefixes ".to_vec();
+let src = b"common words and prefixes plus message payload".to_vec();
+
+let mut cctx = ZSTD_createCCtx().expect("compression context");
+let mut compressed = vec![0u8; ZSTD_compressBound(src.len())];
+let c_size = ZSTD_compress_usingDict(&mut cctx, &mut compressed, &src, &dict, 3);
+assert!(!ERR_isError(c_size));
+compressed.truncate(c_size);
+
+let mut dctx = ZSTD_createDCtx();
+let mut decoded = vec![0u8; src.len() + 64];
+let d_size = ZSTD_decompress_usingDict(&mut dctx, &mut decoded, &compressed, &dict);
+assert!(!ERR_isError(d_size));
+assert_eq!(&decoded[..d_size], &src[..]);
 ```
 
 For performance measurements:

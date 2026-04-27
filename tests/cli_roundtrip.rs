@@ -1690,3 +1690,81 @@ fn cli_magicless_roundtrip_through_self() {
     );
     assert_eq!(dec_out.stdout, payload, "magicless CLI roundtrip mismatch",);
 }
+
+#[test]
+fn cli_fastq_fixture_dict_roundtrip_and_upstream_cross_decode() {
+    use std::fs;
+
+    let tmp = std::env::temp_dir();
+    let pid = std::process::id();
+    let dict_path = tmp.join(format!("zstd-pure-fastq-dict-{pid}.dict"));
+    let payload_path = tmp.join(format!("zstd-pure-fastq-payload-{pid}.fq"));
+
+    let fastq = include_bytes!("fixtures/small.fastq");
+    let dict = &fastq[..512];
+    let payload = fastq.repeat(24);
+    fs::write(&dict_path, dict).expect("write FASTQ dict");
+    fs::write(&payload_path, &payload).expect("write FASTQ payload");
+
+    let compressed = Command::new(bin_path())
+        .args(["-c", "-q", "-D"])
+        .arg(&dict_path)
+        .arg(&payload_path)
+        .output()
+        .expect("spawn FASTQ dict compressor");
+    assert!(
+        compressed.status.success(),
+        "FASTQ dict compress stderr: {}",
+        String::from_utf8_lossy(&compressed.stderr)
+    );
+
+    let mut dec = Command::new(bin_path())
+        .args(["-d", "-c", "-q", "-D"])
+        .arg(&dict_path)
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn FASTQ dict decompressor");
+    dec.stdin
+        .as_mut()
+        .unwrap()
+        .write_all(&compressed.stdout)
+        .unwrap();
+    let dec_out = dec.wait_with_output().expect("wait FASTQ dict decompress");
+    assert!(
+        dec_out.status.success(),
+        "FASTQ dict decompress stderr: {}",
+        String::from_utf8_lossy(&dec_out.stderr)
+    );
+    assert_eq!(dec_out.stdout, payload);
+
+    if let Some(upstream) = upstream_zstd() {
+        let mut upstream_dec = Command::new(upstream)
+            .args(["-d", "-c", "-q", "-D"])
+            .arg(&dict_path)
+            .arg("-")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn upstream FASTQ dict decompressor");
+        upstream_dec
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(&compressed.stdout)
+            .unwrap();
+        let upstream_out = upstream_dec.wait_with_output().expect("wait upstream");
+        assert!(
+            upstream_out.status.success(),
+            "upstream rejected FASTQ dict frame: {}",
+            String::from_utf8_lossy(&upstream_out.stderr)
+        );
+        assert_eq!(upstream_out.stdout, payload);
+    }
+
+    let _ = fs::remove_file(&dict_path);
+    let _ = fs::remove_file(&payload_path);
+}

@@ -364,8 +364,9 @@ fn ZSTD_row_getMatchMask_scalar(
     debug_assert!(CHUNK_SIZE == 4 || CHUNK_SIZE == 8);
     while i >= 0 {
         let off = i as usize;
-        let bytes: [u8; CHUNK_SIZE] = src[off..off + CHUNK_SIZE].try_into().expect("chunk size");
-        let mut chunk = usize::from_le_bytes(bytes);
+        debug_assert!(off + CHUNK_SIZE <= src.len());
+        let mut chunk = unsafe { (src.as_ptr().add(off) as *const usize).read_unaligned() };
+        chunk = chunk.to_le();
         chunk ^= splat_char;
         chunk = (((chunk | x80).wrapping_sub(x01)) | chunk) & x80;
         matches <<= CHUNK_SIZE;
@@ -709,7 +710,7 @@ pub fn ZSTD_RowFindBestMatch(
     {
         let relRow = ((hash >> ZSTD_ROW_HASH_TAG_BITS) << rowLog) as usize;
         let tag = (hash & ZSTD_ROW_HASH_TAG_MASK) as u8;
-        let headGrouped = (ms.tagTable[relRow] as u32 & rowMask) * groupWidth;
+        let headGrouped = ms.tagTable[relRow] as u32 & rowMask;
         let matches = ZSTD_row_getMatchMask(
             &ms.tagTable[relRow..relRow + rowEntries as usize],
             tag,
@@ -722,44 +723,34 @@ pub fn ZSTD_RowFindBestMatch(
         // mutation, so evaluate candidates inline and only insert the
         // current position after the row has been scanned.
         if dictMode == ZSTD_dictMode_e::ZSTD_noDict {
-            static PREFILTER_DUMMY: [u8; 4] = [0x12, 0x34, 0x56, 0x78];
             let hash_row = &ms.hashTable[relRow..relRow + rowEntries as usize];
             let mut mask = matches;
 
             while mask > 0 && nbAttempts > 0 {
-                let matchPos = ((headGrouped + ZSTD_VecMask_next(mask)) / groupWidth) & rowMask;
-                let matchIndex = hash_row[matchPos as usize];
+                let matchPos = (headGrouped + ZSTD_VecMask_next(mask)) & rowMask;
                 if matchPos != 0 {
+                    let matchIndex = hash_row[matchPos as usize];
                     if matchIndex < lowLimit {
                         break;
                     }
 
                     let matchBytePos = matchIndex.wrapping_sub(base_off) as usize;
-                    if matchBytePos < input_buf.len() {
-                        crate::common::zstd_internal::prefetchSliceByte(input_buf, matchBytePos);
-                    }
 
                     let prefilter_valid =
                         matchBytePos + ml + 1 <= input_buf.len() && ip + ml + 1 <= iLimit;
-                    let m_ptr = if prefilter_valid {
-                        input_buf.as_ptr().wrapping_add(matchBytePos + ml - 3)
-                    } else {
-                        PREFILTER_DUMMY.as_ptr()
-                    };
-                    let c_ptr = if prefilter_valid {
-                        input_buf.as_ptr().wrapping_add(ip + ml - 3)
-                    } else {
-                        PREFILTER_DUMMY.as_ptr()
-                    };
-                    let m_val = unsafe { (m_ptr as *const u32).read_unaligned() };
-                    let c_val = unsafe { (c_ptr as *const u32).read_unaligned() };
-                    if prefilter_valid & (m_val == c_val) {
-                        let currentMl = ZSTD_count(input_buf, ip, matchBytePos, iLimit);
-                        if currentMl > ml {
-                            ml = currentMl;
-                            *offsetPtr = OFFSET_TO_OFFBASE(curr.wrapping_sub(matchIndex));
-                            if ip + currentMl == iLimit {
-                                break;
+                    if prefilter_valid {
+                        let m_ptr = input_buf.as_ptr().wrapping_add(matchBytePos + ml - 3);
+                        let c_ptr = input_buf.as_ptr().wrapping_add(ip + ml - 3);
+                        let m_val = unsafe { (m_ptr as *const u32).read_unaligned() };
+                        let c_val = unsafe { (c_ptr as *const u32).read_unaligned() };
+                        if m_val == c_val {
+                            let currentMl = ZSTD_count(input_buf, ip, matchBytePos, iLimit);
+                            if currentMl > ml {
+                                ml = currentMl;
+                                *offsetPtr = OFFSET_TO_OFFBASE(curr.wrapping_sub(matchIndex));
+                                if ip + currentMl == iLimit {
+                                    break;
+                                }
                             }
                         }
                     }
@@ -796,7 +787,7 @@ pub fn ZSTD_RowFindBestMatch(
         let hash_row = &ms.hashTable[relRow..relRow + rowEntries as usize];
 
         while mask > 0 && nbAttempts > 0 {
-            let matchPos = ((headGrouped + ZSTD_VecMask_next(mask)) / groupWidth) & rowMask;
+            let matchPos = (headGrouped + ZSTD_VecMask_next(mask)) & rowMask;
             let matchIndex = hash_row[matchPos as usize];
             if matchPos != 0 {
                 if matchIndex < lowLimit {

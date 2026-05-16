@@ -48,6 +48,9 @@ impl Drop for POOL_ctx {
     }
 }
 
+/// Port of `POOL_thread` (`pool.c:67`). Worker loop: waits on the
+/// condvar for a job, executes it, and signals idle when the queue
+/// drains. Exits when shutdown or retirement is flagged.
 fn pool_thread(shared: Arc<Shared>) {
     loop {
         let task = {
@@ -83,6 +86,8 @@ fn pool_thread(shared: Arc<Shared>) {
     }
 }
 
+/// Rust-only helper: spawn `count` worker threads onto the pool and
+/// bump `live_workers` accordingly.
 fn spawn_workers(ctx: &mut POOL_ctx, count: usize) {
     for _ in 0..count {
         let shared = Arc::clone(&ctx.shared);
@@ -92,6 +97,8 @@ fn spawn_workers(ctx: &mut POOL_ctx, count: usize) {
     state.live_workers += count;
 }
 
+/// Rust-only helper: reap any worker threads that have already
+/// finished, dropping their `JoinHandle` so the vector stays compact.
 fn join_finished_workers(ctx: &mut POOL_ctx) {
     let mut idx = 0usize;
     while idx < ctx.workers.len() {

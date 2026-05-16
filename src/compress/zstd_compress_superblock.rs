@@ -718,6 +718,10 @@ pub fn sizeBlockSequences(
     n
 }
 
+/// Port of `ZSTD_compressSuperBlock`. Compresses one super-block by
+/// splitting it into multiple sub-blocks sized around
+/// `targetCBlockSize`, building entropy stats once and dispatching to
+/// `ZSTD_compressSubBlock_multi`.
 pub fn ZSTD_compressSuperBlock(
     zc: &mut crate::compress::zstd_compress::ZSTD_CCtx,
     dst: &mut [u8],

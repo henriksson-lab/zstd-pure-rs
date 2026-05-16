@@ -28,16 +28,22 @@ pub const FSE_MAX_SYMBOL_VALUE: u32 = 255;
 pub const FSE_MIN_TABLELOG: u32 = 5;
 pub const FSE_TABLELOG_ABSOLUTE_MAX: u32 = 15;
 
+/// Port of `FSE_TABLESTEP`. Stride used to spread normalized symbols
+/// across the decode table during table construction.
 #[inline(always)]
 pub const fn FSE_TABLESTEP(tableSize: u32) -> u32 {
     (tableSize >> 1) + (tableSize >> 3) + 3
 }
 
+/// Port of `FSE_DTABLE_SIZE_U32`. Number of `u32` entries in a DTable
+/// of `maxTableLog` (1 header word + `1<<maxTableLog` decode entries).
 #[inline(always)]
 pub const fn FSE_DTABLE_SIZE_U32(maxTableLog: u32) -> usize {
     1 + (1 << maxTableLog) as usize
 }
 
+/// Port of `FSE_BUILD_DTABLE_WKSP_SIZE`. Scratch byte count required by
+/// `FSE_buildDTable_wksp` for the given table parameters.
 #[inline(always)]
 pub const fn FSE_BUILD_DTABLE_WKSP_SIZE(maxTableLog: u32, maxSymbolValue: u32) -> usize {
     2 * (maxSymbolValue as usize + 1) + (1 << maxTableLog as usize) + 8
@@ -45,39 +51,45 @@ pub const fn FSE_BUILD_DTABLE_WKSP_SIZE(maxTableLog: u32, maxSymbolValue: u32) -
 
 pub type FSE_DTable = u32;
 
-/// Pack (newState, symbol, nbBits) into a single `u32` slot.
+/// Rust-only helper: pack `(newState, symbol, nbBits)` into a single
+/// `u32` DTable slot, matching upstream's `FSE_decode_t` bit layout.
 #[inline(always)]
 fn pack_decode(newState: u16, symbol: u8, nbBits: u8) -> u32 {
     (newState as u32) | ((symbol as u32) << 16) | ((nbBits as u32) << 24)
 }
 
+/// Rust-only helper: extract `newState` from a packed DTable slot.
 #[inline(always)]
 fn unpack_newState(slot: u32) -> u16 {
     slot as u16
 }
 
+/// Rust-only helper: extract the decoded symbol byte from a packed slot.
 #[inline(always)]
 fn unpack_symbol(slot: u32) -> u8 {
     (slot >> 16) as u8
 }
 
+/// Rust-only helper: extract the `nbBits` field from a packed slot.
 #[inline(always)]
 fn unpack_nbBits(slot: u32) -> u8 {
     (slot >> 24) as u8
 }
 
-/// `FSE_DTableHeader` packed into the DTable's first u32:
-///   bits 0..16 = tableLog, bits 16..32 = fastMode.
+/// Rust-only helper: pack `FSE_DTableHeader` into the DTable's first
+/// `u32` — bits 0..16 = tableLog, bits 16..32 = fastMode.
 #[inline(always)]
 fn pack_header(tableLog: u16, fastMode: u16) -> u32 {
     (tableLog as u32) | ((fastMode as u32) << 16)
 }
 
+/// Rust-only helper: extract `tableLog` from the packed DTable header.
 #[inline(always)]
 fn header_tableLog(slot: u32) -> u32 {
     slot & 0xFFFF
 }
 
+/// Rust-only helper: extract `fastMode` from the packed DTable header.
 #[inline(always)]
 fn header_fastMode(slot: u32) -> u32 {
     (slot >> 16) & 0xFFFF
@@ -273,6 +285,8 @@ pub fn FSE_buildDTable_internal(
     0
 }
 
+/// Port of `FSE_buildDTable_wksp`. Thin wrapper that forwards to
+/// `FSE_buildDTable_internal` using the provided workspace's length.
 pub fn FSE_buildDTable_wksp(
     dt: &mut [FSE_DTable],
     normalizedCounter: &[i16],
@@ -326,8 +340,10 @@ pub fn FSE_buildDTable_rle(dt: &mut [FSE_DTable], symbolValue: u8) -> usize {
 
 // ---- Decompression ----------------------------------------------------
 
-/// Port of `FSE_decompress_usingDTable_generic`. `FAST` const-generic
-/// selects `FSE_decodeSymbolFast` vs `FSE_decodeSymbol`.
+/// Port of `FSE_decompress_usingDTable_generic`. Decodes the FSE
+/// bitstream using two interleaved decoder states and the prebuilt
+/// `dt`. The `FAST` const-generic selects `FSE_decodeSymbolFast` vs
+/// `FSE_decodeSymbol` to match upstream's dual-template instantiation.
 fn FSE_decompress_usingDTable_generic<const FAST: bool>(
     dst: &mut [u8],
     cSrc: &[u8],
@@ -425,6 +441,9 @@ fn FSE_decompress_usingDTable_generic<const FAST: bool>(
     op
 }
 
+/// Port of `FSE_decompress_usingDTable`. Dispatches to the FAST or
+/// non-FAST `FSE_decompress_usingDTable_generic` based on the
+/// `fastMode` flag stored in the DTable header.
 pub fn FSE_decompress_usingDTable(dst: &mut [u8], cSrc: &[u8], dt: &[FSE_DTable]) -> usize {
     let fastMode = header_fastMode(dt[0]);
     if fastMode != 0 {
@@ -450,6 +469,10 @@ pub fn FSE_decompress_wksp(
     FSE_decompress_wksp_bmi2(dst, cSrc, maxLog, workSpace, 0)
 }
 
+/// Port of `FSE_decompress_wksp_bmi2`. Reads the NCount header from
+/// `cSrc`, builds an FSE DTable, then decodes the remaining bytes into
+/// `dst`. `bmi2` is forwarded as a codegen hint; we have a single
+/// scalar path so it is currently ignored.
 pub fn FSE_decompress_wksp_bmi2(
     dst: &mut [u8],
     cSrc: &[u8],

@@ -113,6 +113,9 @@ impl Range {
     }
 }
 
+/// Rust-only helper: reinterpret a `Range` as a borrowed byte slice
+/// pointing at MT-context-owned memory. Returns an empty slice when
+/// `range.size == 0`. Caller must guarantee lifetime.
 #[inline]
 fn range_as_slice(range: Range) -> &'static [u8] {
     if range.size == 0 {
@@ -653,6 +656,8 @@ pub fn ZSTDMT_waitForAllJobsCompleted(mtctx: &mut ZSTDMT_CCtx) {
     mtctx.doneJobID = mtctx.nextJobID;
 }
 
+/// Rust-only helper: returns the active `POOL_ctx`, preferring the
+/// owned `threadPool` over any externally-borrowed `threadPoolRef`.
 fn ZSTDMT_getThreadPool(mtctx: &ZSTDMT_CCtx) -> Option<&POOL_ctx> {
     if let Some(pool) = mtctx.threadPool.as_ref() {
         Some(pool)
@@ -663,6 +668,9 @@ fn ZSTDMT_getThreadPool(mtctx: &ZSTDMT_CCtx) -> Option<&POOL_ctx> {
     }
 }
 
+/// Rust-only helper: binds an externally-owned `POOL_ctx` to the MT
+/// context, freeing any previously-owned pool. Passing `None` falls
+/// back to lazily creating an internal pool sized to `params.nbWorkers`.
 pub fn ZSTDMT_setThreadPool(mtctx: &mut ZSTDMT_CCtx, pool: Option<&POOL_ctx>) {
     if let Some(pool) = pool {
         POOL_free(mtctx.threadPool.take());
@@ -676,6 +684,9 @@ pub fn ZSTDMT_setThreadPool(mtctx: &mut ZSTDMT_CCtx, pool: Option<&POOL_ctx>) {
     }
 }
 
+/// Rust-only helper: routes MT job dispatch through a borrowed Rayon
+/// thread pool instead of the in-house `POOL_ctx`. Mutually exclusive
+/// with `ZSTDMT_setThreadPool`.
 pub fn ZSTDMT_setRayonThreadPool(mtctx: &mut ZSTDMT_CCtx, pool: Option<&rayon::ThreadPool>) {
     if let Some(pool) = pool {
         POOL_free(mtctx.threadPool.take());
@@ -700,6 +711,10 @@ struct ZSTDMT_completedJob {
     cctx: Box<ZSTD_CCtx>,
 }
 
+/// Rust-only helper: thunk used as `POOL_function` for a queued job.
+/// Reconstructs the boxed `ZSTDMT_queuedJob`, runs the upstream
+/// `ZSTDMT_compressionJob` body, then ships the result back through
+/// the channel.
 fn ZSTDMT_runQueuedJob(opaque: *mut core::ffi::c_void) {
     let queued = unsafe { Box::from_raw(opaque as *mut ZSTDMT_queuedJob) };
     let mut job = queued.job;
@@ -708,6 +723,10 @@ fn ZSTDMT_runQueuedJob(opaque: *mut core::ffi::c_void) {
     let _ = queued.tx.send(ZSTDMT_completedJob { job, cctx });
 }
 
+/// Rust-only helper: drives LDM sequence generation for job `wJobID`,
+/// substituting for the upstream worker-side LDM loop. When LDM is
+/// disabled, only advances `serial.nextJobID`; otherwise builds the
+/// `rawSeqStore` over `prefix ++ src` and parks it on the job slot.
 fn ZSTDMT_prepareJobSequences(mtctx: &mut ZSTDMT_CCtx, wJobID: usize) -> usize {
     let Some(job) = mtctx.jobs.get(wJobID) else {
         return crate::common::error::ERROR(crate::common::error::ErrorCode::Generic);
@@ -777,6 +796,10 @@ fn ZSTDMT_prepareJobSequences(mtctx: &mut ZSTDMT_CCtx, wJobID: usize) -> usize {
     0
 }
 
+/// Rust-only helper: queues job `wJobID` onto either the in-house
+/// `POOL_ctx` or the borrowed Rayon pool. Pulls a worker CCtx from the
+/// pool, wires a oneshot `mpsc` channel for completion, and stores the
+/// receiver in `jobReceivers[wJobID]`.
 fn ZSTDMT_spawnCompressionJob(mtctx: &mut ZSTDMT_CCtx, wJobID: usize) -> usize {
     let Some(job) = mtctx.jobs.get(wJobID).cloned() else {
         return crate::common::error::ERROR(crate::common::error::ErrorCode::Generic);
@@ -815,6 +838,9 @@ fn ZSTDMT_spawnCompressionJob(mtctx: &mut ZSTDMT_CCtx, wJobID: usize) -> usize {
     0
 }
 
+/// Rust-only helper: blocks on the completion channel for job
+/// `wJobID`, copies the completed `ZSTDMT_jobDescription` back into
+/// the job table, and returns the worker CCtx to the CCtx pool.
 fn ZSTDMT_joinPendingJob(mtctx: &mut ZSTDMT_CCtx, wJobID: usize) -> usize {
     let Some(slot) = mtctx.jobReceivers.get_mut(wJobID) else {
         return 0;
@@ -839,6 +865,9 @@ fn ZSTDMT_joinPendingJob(mtctx: &mut ZSTDMT_CCtx, wJobID: usize) -> usize {
     }
 }
 
+/// Rust-only helper: non-blocking variant of `ZSTDMT_joinPendingJob`.
+/// Returns 0 if the worker is still running, the completed job state
+/// if ready, or an error on channel disconnect.
 fn ZSTDMT_tryJoinFinishedJob(mtctx: &mut ZSTDMT_CCtx, wJobID: usize) -> usize {
     let Some(slot) = mtctx.jobReceivers.get_mut(wJobID) else {
         return 0;

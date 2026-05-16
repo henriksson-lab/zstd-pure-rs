@@ -81,22 +81,27 @@ pub const HUF_READ_STATS_WORKSPACE_SIZE_U32: usize =
 /// Upstream `HUF_READ_STATS_WORKSPACE_SIZE` — byte count.
 pub const HUF_READ_STATS_WORKSPACE_SIZE: usize = HUF_READ_STATS_WORKSPACE_SIZE_U32 * 4;
 
+/// Port of `FSE_versionNumber`. Returns the FSE library version constant.
 pub fn FSE_versionNumber() -> u32 {
     FSE_VERSION_NUMBER
 }
 
+/// Port of `FSE_isError`. Forwards to the common `ERR_isError` test.
 pub fn FSE_isError(code: usize) -> u32 {
     crate::common::error::ERR_isError(code) as u32
 }
 
+/// Port of `FSE_getErrorName`. Forwards to `ERR_getErrorName`.
 pub fn FSE_getErrorName(code: usize) -> &'static str {
     crate::common::error::ERR_getErrorName(code)
 }
 
+/// Port of `HUF_isError`. Forwards to the common `ERR_isError` test.
 pub fn HUF_isError(code: usize) -> u32 {
     crate::common::error::ERR_isError(code) as u32
 }
 
+/// Port of `HUF_getErrorName`. Forwards to `ERR_getErrorName`.
 pub fn HUF_getErrorName(code: usize) -> &'static str {
     crate::common::error::ERR_getErrorName(code)
 }
@@ -115,6 +120,8 @@ pub fn FSE_readNCount(
     FSE_readNCount_body(normalizedCounter, maxSVPtr, tableLogPtr, src, true)
 }
 
+/// Rust-only helper: `FSE_readNCount` with `clear_counts=false` so the
+/// caller can reuse a pre-zeroed counter buffer across calls.
 pub(crate) fn FSE_readNCount_no_clear(
     normalizedCounter: &mut [i16],
     maxSVPtr: &mut u32,
@@ -124,6 +131,9 @@ pub(crate) fn FSE_readNCount_no_clear(
     FSE_readNCount_body(normalizedCounter, maxSVPtr, tableLogPtr, src, false)
 }
 
+/// Port of `FSE_readNCount_body`. Shared implementation behind
+/// `FSE_readNCount` and `FSE_readNCount_no_clear`; `clear_counts`
+/// toggles the initial zero-fill of `normalizedCounter`.
 fn FSE_readNCount_body(
     normalizedCounter: &mut [i16],
     maxSVPtr: &mut u32,
@@ -429,7 +439,7 @@ pub fn HUF_readStats_wksp(
     iSize + 1
 }
 
-/// Helper: view a `&mut [u32]` as `&mut [u8]` for passing to
+/// Rust-only helper: view a `&mut [u32]` as `&mut [u8]` for passing to
 /// byte-oriented FSE workspaces. Endianness is irrelevant because the
 /// workspace is opaque scratch.
 fn bytemuck_u32_as_u8(words: &mut [u32]) -> &mut [u8] {

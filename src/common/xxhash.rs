@@ -13,6 +13,7 @@ const PRIME64_3: u64 = 0x165667B19E3779F9;
 const PRIME64_4: u64 = 0x85EBCA77C2B2AE63;
 const PRIME64_5: u64 = 0x27D4EB2F165667C5;
 
+/// Port of `XXH64_round`. Mixes one 8-byte lane into an accumulator.
 #[inline]
 fn round(acc: u64, input: u64) -> u64 {
     acc.wrapping_add(input.wrapping_mul(PRIME64_2))
@@ -20,12 +21,16 @@ fn round(acc: u64, input: u64) -> u64 {
         .wrapping_mul(PRIME64_1)
 }
 
+/// Port of `XXH64_mergeRound`. Folds a per-lane accumulator back into
+/// the combined hash during finalization.
 #[inline]
 fn merge_round(acc: u64, val: u64) -> u64 {
     let val = round(0, val);
     (acc ^ val).wrapping_mul(PRIME64_1).wrapping_add(PRIME64_4)
 }
 
+/// Port of `XXH64_avalanche`. Final diffusion step run on the partial
+/// hash to spread input bits across all output bits.
 #[inline]
 fn avalanche(mut h: u64) -> u64 {
     h ^= h >> 33;
@@ -36,6 +41,8 @@ fn avalanche(mut h: u64) -> u64 {
     h
 }
 
+/// Port of `XXH64_finalize`. Consumes any trailing bytes (less than 32)
+/// in 8/4/1-byte steps and runs avalanche to produce the final digest.
 #[inline]
 fn finalize(mut h: u64, mut bytes: &[u8]) -> u64 {
     while bytes.len() >= 8 {
@@ -148,6 +155,8 @@ pub fn XXH64_copyState(dst: &mut XXH64_state_t, src: &XXH64_state_t) {
     dst.clone_from(src);
 }
 
+/// Port of `XXH64_reset`. Reinitializes `state` so subsequent
+/// `XXH64_update`/`XXH64_digest` calls hash a fresh input under `seed`.
 pub fn XXH64_reset(state: &mut XXH64_state_t, seed: u64) -> u32 {
     *state = XXH64_state_t {
         total_len: 0,
@@ -161,6 +170,9 @@ pub fn XXH64_reset(state: &mut XXH64_state_t, seed: u64) -> u32 {
     XXH_OK
 }
 
+/// Port of `XXH64_update`. Feeds another chunk of `input` into the
+/// streaming state, buffering any sub-32-byte remainder for the next
+/// call. Returns `XXH_OK`.
 pub fn XXH64_update(state: &mut XXH64_state_t, mut input: &[u8]) -> u32 {
     state.total_len = state.total_len.wrapping_add(input.len() as u64);
 
@@ -223,6 +235,8 @@ pub fn XXH64_update(state: &mut XXH64_state_t, mut input: &[u8]) -> u32 {
     XXH_OK
 }
 
+/// Port of `XXH64_digest`. Produces the final 64-bit hash from the
+/// streaming state without mutating it.
 pub fn XXH64_digest(state: &XXH64_state_t) -> u64 {
     let mut h = if state.total_len >= 32 {
         let mut h = state

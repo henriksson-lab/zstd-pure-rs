@@ -7,24 +7,30 @@
 
 use crate::common::mem::{is_little_endian, MEM_64bits};
 
+/// Port of `ZSTD_countTrailingZeros32`. Lowered to `tzcnt`/`bsf` by LLVM.
+/// Caller must guarantee `val != 0`.
 #[inline]
 pub fn ZSTD_countTrailingZeros32(val: u32) -> u32 {
     debug_assert!(val != 0);
     val.trailing_zeros()
 }
 
+/// Port of `ZSTD_countLeadingZeros32`. Lowered to `lzcnt`/`bsr` by LLVM.
+/// Caller must guarantee `val != 0`.
 #[inline]
 pub fn ZSTD_countLeadingZeros32(val: u32) -> u32 {
     debug_assert!(val != 0);
     val.leading_zeros()
 }
 
+/// Port of `ZSTD_countTrailingZeros64`. Caller must guarantee `val != 0`.
 #[inline]
 pub fn ZSTD_countTrailingZeros64(val: u64) -> u32 {
     debug_assert!(val != 0);
     val.trailing_zeros()
 }
 
+/// Port of `ZSTD_countLeadingZeros64`. Caller must guarantee `val != 0`.
 #[inline]
 pub fn ZSTD_countLeadingZeros64(val: u64) -> u32 {
     debug_assert!(val != 0);
@@ -48,6 +54,8 @@ pub fn ZSTD_NbCommonBytes(val: usize) -> u32 {
     }
 }
 
+/// Port of `ZSTD_highbit32`. Returns the position of the most-significant
+/// set bit in `val` (0-indexed). Caller must guarantee `val != 0`.
 #[inline]
 pub fn ZSTD_highbit32(val: u32) -> u32 {
     debug_assert!(val != 0);
@@ -60,18 +68,22 @@ pub fn BIT_highbit32(val: u32) -> u32 {
     ZSTD_highbit32(val)
 }
 
+/// Port of `ZSTD_rotateRight_U64`. Rotates `value` right by `count` bits.
+/// Behavior undefined upstream when `count >= 64`.
 #[inline]
 pub const fn ZSTD_rotateRight_U64(value: u64, count: u32) -> u64 {
     debug_assert!(count < 64);
     value.rotate_right(count)
 }
 
+/// Port of `ZSTD_rotateRight_U32`. Rotates `value` right by `count` bits.
 #[inline]
 pub const fn ZSTD_rotateRight_U32(value: u32, count: u32) -> u32 {
     debug_assert!(count < 32);
     value.rotate_right(count)
 }
 
+/// Port of `ZSTD_rotateRight_U16`. Rotates `value` right by `count` bits.
 #[inline]
 pub const fn ZSTD_rotateRight_U16(value: u16, count: u32) -> u16 {
     debug_assert!(count < 16);

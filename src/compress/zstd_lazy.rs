@@ -39,6 +39,9 @@ pub const kLazySkippingStep: usize = 8;
 
 pub type ZSTD_VecMask = u64;
 
+/// Rust-only helper: unaligned 32-bit native-endian load from
+/// `&src[pos..pos+4]`. `unsafe` because it bypasses bounds checks on
+/// the hot lazy/row-hash path.
 #[inline(always)]
 unsafe fn read32_at(src: &[u8], pos: usize) -> u32 {
     debug_assert!(pos + 4 <= src.len());
@@ -388,6 +391,11 @@ fn ZSTD_row_getMatchMask_scalar(
     }
 }
 
+/// SSE2 fast path for `ZSTD_row_getMatchMask` — runs `pcmpeqb` over
+/// 16-byte chunks of the tag row, packs the per-chunk `pmovmskb` bits
+/// into one 64-bit mask, then rotates by `headGrouped` to align with
+/// the row's logical head. Requires SSE2; `unsafe` is gated by
+/// `#[target_feature]`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
 unsafe fn ZSTD_row_getMatchMask_sse2(
@@ -1193,6 +1201,10 @@ pub fn ZSTD_HcFindBestMatch_noDict(
     }
 }
 
+/// Port of `ZSTD_HcFindBestMatch`. Hash-chain match finder covering
+/// all dict modes (`noDict`, `extDict`, `dictMatchState`,
+/// `dedicatedDictSearch`); the `noDict` fast path is split out into
+/// `ZSTD_HcFindBestMatch_noDict`.
 #[allow(clippy::too_many_arguments)]
 pub fn ZSTD_HcFindBestMatch(
     ms: &mut ZSTD_MatchState_t,
@@ -1592,6 +1604,10 @@ pub fn ZSTD_compressBlock_lazy_noDict_generic(
     iend - anchor
 }
 
+/// Rust-only helper: the binary-tree/row-hash slow-search counterpart
+/// to `ZSTD_compressBlock_lazy_noDict_generic`. Used by btlazy2 and
+/// the row-hash with-istart paths; `searchMethod` must not be
+/// `search_hashChain`.
 fn ZSTD_compressBlock_lazy_noDict_generic_search(
     ms: &mut ZSTD_MatchState_t,
     seqStore: &mut SeqStore_t,
@@ -2568,6 +2584,8 @@ pub fn ZSTD_compressBlock_lazy2(
     ZSTD_compressBlock_lazy_noDict_generic(ms, seqStore, rep, src, 0, 2)
 }
 
+/// Port of `ZSTD_compressBlock_greedy_row`. Public entry: row-hash
+/// search, greedy depth (0), no dictionary.
 pub fn ZSTD_compressBlock_greedy_row(
     ms: &mut ZSTD_MatchState_t,
     seqStore: &mut SeqStore_t,
@@ -2585,6 +2603,8 @@ pub fn ZSTD_compressBlock_greedy_row(
     )
 }
 
+/// Port of `ZSTD_compressBlock_lazy_row`. Public entry: row-hash
+/// search, lazy depth (1), no dictionary.
 pub fn ZSTD_compressBlock_lazy_row(
     ms: &mut ZSTD_MatchState_t,
     seqStore: &mut SeqStore_t,
@@ -2602,6 +2622,8 @@ pub fn ZSTD_compressBlock_lazy_row(
     )
 }
 
+/// Port of `ZSTD_compressBlock_lazy2_row`. Public entry: row-hash
+/// search, lazy2 depth (2), no dictionary.
 pub fn ZSTD_compressBlock_lazy2_row(
     ms: &mut ZSTD_MatchState_t,
     seqStore: &mut SeqStore_t,
@@ -2619,6 +2641,8 @@ pub fn ZSTD_compressBlock_lazy2_row(
     )
 }
 
+/// Port of `ZSTD_compressBlock_greedy_dictMatchState_row`. Row-hash,
+/// depth=0, `dictMatchState`.
 pub fn ZSTD_compressBlock_greedy_dictMatchState_row(
     ms: &mut ZSTD_MatchState_t,
     seqStore: &mut SeqStore_t,
@@ -2636,6 +2660,8 @@ pub fn ZSTD_compressBlock_greedy_dictMatchState_row(
     )
 }
 
+/// Port of `ZSTD_compressBlock_lazy_dictMatchState_row`. Row-hash,
+/// depth=1, `dictMatchState`.
 pub fn ZSTD_compressBlock_lazy_dictMatchState_row(
     ms: &mut ZSTD_MatchState_t,
     seqStore: &mut SeqStore_t,
@@ -2653,6 +2679,8 @@ pub fn ZSTD_compressBlock_lazy_dictMatchState_row(
     )
 }
 
+/// Port of `ZSTD_compressBlock_lazy2_dictMatchState_row`. Row-hash,
+/// depth=2, `dictMatchState`.
 pub fn ZSTD_compressBlock_lazy2_dictMatchState_row(
     ms: &mut ZSTD_MatchState_t,
     seqStore: &mut SeqStore_t,
@@ -2670,6 +2698,8 @@ pub fn ZSTD_compressBlock_lazy2_dictMatchState_row(
     )
 }
 
+/// Port of `ZSTD_compressBlock_greedy_extDict_row`. Row-hash, depth=0,
+/// `extDict`.
 pub fn ZSTD_compressBlock_greedy_extDict_row(
     ms: &mut ZSTD_MatchState_t,
     seqStore: &mut SeqStore_t,
@@ -2687,6 +2717,8 @@ pub fn ZSTD_compressBlock_greedy_extDict_row(
     )
 }
 
+/// Port of `ZSTD_compressBlock_lazy_extDict_row`. Row-hash, depth=1,
+/// `extDict`.
 pub fn ZSTD_compressBlock_lazy_extDict_row(
     ms: &mut ZSTD_MatchState_t,
     seqStore: &mut SeqStore_t,
@@ -2704,6 +2736,8 @@ pub fn ZSTD_compressBlock_lazy_extDict_row(
     )
 }
 
+/// Port of `ZSTD_compressBlock_lazy2_extDict_row`. Row-hash, depth=2,
+/// `extDict`.
 pub fn ZSTD_compressBlock_lazy2_extDict_row(
     ms: &mut ZSTD_MatchState_t,
     seqStore: &mut SeqStore_t,
@@ -2721,6 +2755,8 @@ pub fn ZSTD_compressBlock_lazy2_extDict_row(
     )
 }
 
+/// Port of `ZSTD_compressBlock_greedy_dedicatedDictSearch`.
+/// Hash-chain, depth=0, `dedicatedDictSearch`.
 pub fn ZSTD_compressBlock_greedy_dedicatedDictSearch(
     ms: &mut ZSTD_MatchState_t,
     seqStore: &mut SeqStore_t,
@@ -2738,6 +2774,8 @@ pub fn ZSTD_compressBlock_greedy_dedicatedDictSearch(
     )
 }
 
+/// Port of `ZSTD_compressBlock_lazy_dedicatedDictSearch`. Hash-chain,
+/// depth=1, `dedicatedDictSearch`.
 pub fn ZSTD_compressBlock_lazy_dedicatedDictSearch(
     ms: &mut ZSTD_MatchState_t,
     seqStore: &mut SeqStore_t,
@@ -2755,6 +2793,8 @@ pub fn ZSTD_compressBlock_lazy_dedicatedDictSearch(
     )
 }
 
+/// Port of `ZSTD_compressBlock_lazy2_dedicatedDictSearch`. Hash-chain,
+/// depth=2, `dedicatedDictSearch`.
 pub fn ZSTD_compressBlock_lazy2_dedicatedDictSearch(
     ms: &mut ZSTD_MatchState_t,
     seqStore: &mut SeqStore_t,
@@ -2772,6 +2812,8 @@ pub fn ZSTD_compressBlock_lazy2_dedicatedDictSearch(
     )
 }
 
+/// Port of `ZSTD_compressBlock_greedy_dedicatedDictSearch_row`.
+/// Row-hash, depth=0, `dedicatedDictSearch`.
 pub fn ZSTD_compressBlock_greedy_dedicatedDictSearch_row(
     ms: &mut ZSTD_MatchState_t,
     seqStore: &mut SeqStore_t,
@@ -2789,6 +2831,8 @@ pub fn ZSTD_compressBlock_greedy_dedicatedDictSearch_row(
     )
 }
 
+/// Port of `ZSTD_compressBlock_lazy_dedicatedDictSearch_row`. Row-hash,
+/// depth=1, `dedicatedDictSearch`.
 pub fn ZSTD_compressBlock_lazy_dedicatedDictSearch_row(
     ms: &mut ZSTD_MatchState_t,
     seqStore: &mut SeqStore_t,
@@ -2806,6 +2850,8 @@ pub fn ZSTD_compressBlock_lazy_dedicatedDictSearch_row(
     )
 }
 
+/// Port of `ZSTD_compressBlock_lazy2_dedicatedDictSearch_row`.
+/// Row-hash, depth=2, `dedicatedDictSearch`.
 pub fn ZSTD_compressBlock_lazy2_dedicatedDictSearch_row(
     ms: &mut ZSTD_MatchState_t,
     seqStore: &mut SeqStore_t,
@@ -2823,6 +2869,8 @@ pub fn ZSTD_compressBlock_lazy2_dedicatedDictSearch_row(
     )
 }
 
+/// Port of `ZSTD_compressBlock_greedy_dictMatchState`. Hash-chain,
+/// depth=0, `dictMatchState`.
 pub fn ZSTD_compressBlock_greedy_dictMatchState(
     ms: &mut ZSTD_MatchState_t,
     seqStore: &mut SeqStore_t,
@@ -2840,6 +2888,8 @@ pub fn ZSTD_compressBlock_greedy_dictMatchState(
     )
 }
 
+/// Port of `ZSTD_compressBlock_lazy_dictMatchState`. Hash-chain,
+/// depth=1, `dictMatchState`.
 pub fn ZSTD_compressBlock_lazy_dictMatchState(
     ms: &mut ZSTD_MatchState_t,
     seqStore: &mut SeqStore_t,
@@ -2857,6 +2907,8 @@ pub fn ZSTD_compressBlock_lazy_dictMatchState(
     )
 }
 
+/// Port of `ZSTD_compressBlock_lazy2_dictMatchState`. Hash-chain,
+/// depth=2, `dictMatchState`.
 pub fn ZSTD_compressBlock_lazy2_dictMatchState(
     ms: &mut ZSTD_MatchState_t,
     seqStore: &mut SeqStore_t,
@@ -2874,6 +2926,8 @@ pub fn ZSTD_compressBlock_lazy2_dictMatchState(
     )
 }
 
+/// Port of `ZSTD_compressBlock_btlazy2_dictMatchState`. Binary-tree
+/// search at depth=2, `dictMatchState`.
 pub fn ZSTD_compressBlock_btlazy2_dictMatchState(
     ms: &mut ZSTD_MatchState_t,
     seqStore: &mut SeqStore_t,
@@ -2891,6 +2945,8 @@ pub fn ZSTD_compressBlock_btlazy2_dictMatchState(
     )
 }
 
+/// Port of `ZSTD_compressBlock_greedy_extDict`. Hash-chain, depth=0,
+/// `extDict`.
 pub fn ZSTD_compressBlock_greedy_extDict(
     ms: &mut ZSTD_MatchState_t,
     seqStore: &mut SeqStore_t,
@@ -2908,6 +2964,8 @@ pub fn ZSTD_compressBlock_greedy_extDict(
     )
 }
 
+/// Port of `ZSTD_compressBlock_lazy_extDict`. Hash-chain, depth=1,
+/// `extDict`.
 pub fn ZSTD_compressBlock_lazy_extDict(
     ms: &mut ZSTD_MatchState_t,
     seqStore: &mut SeqStore_t,
@@ -2925,6 +2983,8 @@ pub fn ZSTD_compressBlock_lazy_extDict(
     )
 }
 
+/// Port of `ZSTD_compressBlock_lazy2_extDict`. Hash-chain, depth=2,
+/// `extDict`.
 pub fn ZSTD_compressBlock_lazy2_extDict(
     ms: &mut ZSTD_MatchState_t,
     seqStore: &mut SeqStore_t,
@@ -2942,6 +3002,8 @@ pub fn ZSTD_compressBlock_lazy2_extDict(
     )
 }
 
+/// Port of `ZSTD_compressBlock_btlazy2_extDict`. Binary-tree search at
+/// depth=2, `extDict`.
 pub fn ZSTD_compressBlock_btlazy2_extDict(
     ms: &mut ZSTD_MatchState_t,
     seqStore: &mut SeqStore_t,
@@ -2959,6 +3021,11 @@ pub fn ZSTD_compressBlock_btlazy2_extDict(
     )
 }
 
+/// Port of `ZSTD_compressBlock_lazy_extDict_generic`. Generic extDict
+/// dispatcher: forwards to the no-dict path when the window has no
+/// extDict yet, to the `dictMatchState` variants when a dictionary is
+/// attached, and otherwise to the strategy/depth-matched `_extDict`
+/// or `_extDict_row` shim.
 pub fn ZSTD_compressBlock_lazy_extDict_generic(
     ms: &mut ZSTD_MatchState_t,
     seqStore: &mut SeqStore_t,
@@ -3003,6 +3070,11 @@ pub fn ZSTD_compressBlock_lazy_extDict_generic(
     }
 }
 
+/// Port of `ZSTD_DUBT_findBetterDictMatch`. Walks the dictionary's
+/// pre-sorted binary tree looking for a longer match than `bestLength`
+/// at `ip`. On improvement, updates `*offsetPtr` with the appropriate
+/// offset-code and returns the new best length; otherwise returns the
+/// input `bestLength` unchanged.
 pub fn ZSTD_DUBT_findBetterDictMatch(
     ms: &mut ZSTD_MatchState_t,
     dictMS: &ZSTD_MatchState_t,
@@ -3105,6 +3177,13 @@ pub fn ZSTD_DUBT_findBetterDictMatch(
     bestLength
 }
 
+/// Port of `ZSTD_DUBT_findBestMatch`. Deferred-update binary-tree
+/// match finder: first sorts any pending `ZSTD_DUBT_UNSORTED_MARK`
+/// entries via `ZSTD_insertDUBT1`, then walks the freshly-sorted tree
+/// at `ip` to find the best match. When `dictMode` is
+/// `dictMatchState`, falls back to `ZSTD_DUBT_findBetterDictMatch`
+/// against the attached dictionary tree. Writes the chosen offset
+/// code to `*offBasePtr` and returns the match length.
 pub fn ZSTD_DUBT_findBestMatch(
     ms: &mut ZSTD_MatchState_t,
     src: &[u8],
@@ -3288,6 +3367,9 @@ pub fn ZSTD_DUBT_findBestMatch(
     bestLength
 }
 
+/// Port of `ZSTD_BtFindBestMatch`. Tree-updater facade: brings the
+/// binary tree up to `ip` via `ZSTD_updateDUBT`, then defers to
+/// `ZSTD_DUBT_findBestMatch` for the actual search.
 pub fn ZSTD_BtFindBestMatch(
     ms: &mut ZSTD_MatchState_t,
     src: &[u8],
@@ -3337,6 +3419,8 @@ pub fn ZSTD_compressBlock_lazy_with_history(
     ZSTD_compressBlock_lazy_noDict_generic(ms, seqStore, rep, src, istart, depth)
 }
 
+/// Port of `ZSTD_compressBlock_btlazy2`. Binary-tree search at depth=2,
+/// no dictionary.
 pub fn ZSTD_compressBlock_btlazy2(
     ms: &mut ZSTD_MatchState_t,
     seqStore: &mut SeqStore_t,

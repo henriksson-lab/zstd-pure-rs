@@ -82,97 +82,129 @@ pub fn ZSTD_rollingHash_rotate(hash: u64, toRemove: u8, toAdd: u8, primePower: u
     after_mult.wrapping_add(toAdd as u64 + ZSTD_ROLL_HASH_CHAR_OFFSET)
 }
 
+/// Port of `ZSTD_hash3`. 3-byte multiplicative hash; left-shifts `u`
+/// by 8 so the low 24 bits act as the 3-byte key, then mixes with
+/// `PRIME_3BYTES`, salts with `s`, and right-shifts to `h` bits.
 #[inline]
 pub fn ZSTD_hash3(u: u32, h: u32, s: u32) -> u32 {
     debug_assert!(h <= 32);
     (((u << 8).wrapping_mul(PRIME_3BYTES)) ^ s) >> (32 - h)
 }
 
+/// Port of `ZSTD_hash3Ptr`. Reads 3 bytes from `ptr` (LE) and hashes
+/// them with `ZSTD_hash3`, salt = 0. Used only by `zstd_opt`.
 #[inline]
 pub fn ZSTD_hash3Ptr(ptr: &[u8], h: u32) -> usize {
     ZSTD_hash3(MEM_readLE32(ptr), h, 0) as usize
 }
 
+/// Port of `ZSTD_hash3PtrS`. Salted variant of `ZSTD_hash3Ptr`.
 #[inline]
 pub fn ZSTD_hash3PtrS(ptr: &[u8], h: u32, s: u32) -> usize {
     ZSTD_hash3(MEM_readLE32(ptr), h, s) as usize
 }
 
+/// Port of `ZSTD_hash4`. 4-byte multiplicative hash by `PRIME_4BYTES`
+/// with salt `s`, reduced to `h` bits.
 #[inline]
 pub fn ZSTD_hash4(u: u32, h: u32, s: u32) -> u32 {
     debug_assert!(h <= 32);
     (u.wrapping_mul(PRIME_4BYTES) ^ s) >> (32 - h)
 }
 
+/// Port of `ZSTD_hash4Ptr`. Reads 4 bytes from `ptr` (LE) and hashes
+/// with `ZSTD_hash4`, salt = 0.
 #[inline]
 pub fn ZSTD_hash4Ptr(ptr: &[u8], h: u32) -> usize {
     ZSTD_hash4(MEM_readLE32(ptr), h, 0) as usize
 }
 
+/// Port of `ZSTD_hash4PtrS`. Salted variant of `ZSTD_hash4Ptr`.
 #[inline]
 pub fn ZSTD_hash4PtrS(ptr: &[u8], h: u32, s: u32) -> usize {
     ZSTD_hash4(MEM_readLE32(ptr), h, s) as usize
 }
 
+/// Port of `ZSTD_hash5`. 5-byte multiplicative hash; left-shifts `u`
+/// by 24 to anchor the 5-byte key in the high 40 bits, then mixes
+/// with `PRIME_5BYTES`, salts with `s`, reduces to `h` bits.
 #[inline]
 pub fn ZSTD_hash5(u: u64, h: u32, s: u64) -> usize {
     debug_assert!(h <= 64);
     ((((u << 24).wrapping_mul(PRIME_5BYTES)) ^ s) >> (64 - h)) as usize
 }
 
+/// Port of `ZSTD_hash5Ptr`. Reads 8 bytes (LE), hashes with `ZSTD_hash5`,
+/// salt = 0; only the low 5 of the 8 bytes matter after the shift.
 #[inline]
 pub fn ZSTD_hash5Ptr(p: &[u8], h: u32) -> usize {
     ZSTD_hash5(MEM_readLE64(p), h, 0)
 }
 
+/// Port of `ZSTD_hash5PtrS`. Salted variant of `ZSTD_hash5Ptr`.
 #[inline]
 pub fn ZSTD_hash5PtrS(p: &[u8], h: u32, s: u64) -> usize {
     ZSTD_hash5(MEM_readLE64(p), h, s)
 }
 
+/// Port of `ZSTD_hash6`. 6-byte multiplicative hash, analogous to
+/// `ZSTD_hash5` with a 16-bit pre-shift and `PRIME_6BYTES`.
 #[inline]
 pub fn ZSTD_hash6(u: u64, h: u32, s: u64) -> usize {
     debug_assert!(h <= 64);
     ((((u << 16).wrapping_mul(PRIME_6BYTES)) ^ s) >> (64 - h)) as usize
 }
 
+/// Port of `ZSTD_hash6Ptr`. Reads 8 bytes (LE), hashes with `ZSTD_hash6`,
+/// salt = 0.
 #[inline]
 pub fn ZSTD_hash6Ptr(p: &[u8], h: u32) -> usize {
     ZSTD_hash6(MEM_readLE64(p), h, 0)
 }
 
+/// Port of `ZSTD_hash6PtrS`. Salted variant of `ZSTD_hash6Ptr`.
 #[inline]
 pub fn ZSTD_hash6PtrS(p: &[u8], h: u32, s: u64) -> usize {
     ZSTD_hash6(MEM_readLE64(p), h, s)
 }
 
+/// Port of `ZSTD_hash7`. 7-byte multiplicative hash, analogous to
+/// `ZSTD_hash5` with an 8-bit pre-shift and `PRIME_7BYTES`.
 #[inline]
 pub fn ZSTD_hash7(u: u64, h: u32, s: u64) -> usize {
     debug_assert!(h <= 64);
     ((((u << 8).wrapping_mul(PRIME_7BYTES)) ^ s) >> (64 - h)) as usize
 }
 
+/// Port of `ZSTD_hash7Ptr`. Reads 8 bytes (LE), hashes with `ZSTD_hash7`,
+/// salt = 0.
 #[inline]
 pub fn ZSTD_hash7Ptr(p: &[u8], h: u32) -> usize {
     ZSTD_hash7(MEM_readLE64(p), h, 0)
 }
 
+/// Port of `ZSTD_hash7PtrS`. Salted variant of `ZSTD_hash7Ptr`.
 #[inline]
 pub fn ZSTD_hash7PtrS(p: &[u8], h: u32, s: u64) -> usize {
     ZSTD_hash7(MEM_readLE64(p), h, s)
 }
 
+/// Port of `ZSTD_hash8`. Full 64-bit multiplicative hash by
+/// `PRIME_8BYTES` with salt `s`, reduced to `h` bits.
 #[inline]
 pub fn ZSTD_hash8(u: u64, h: u32, s: u64) -> usize {
     debug_assert!(h <= 64);
     ((u.wrapping_mul(PRIME_8BYTES) ^ s) >> (64 - h)) as usize
 }
 
+/// Port of `ZSTD_hash8Ptr`. Reads 8 bytes (LE), hashes with `ZSTD_hash8`,
+/// salt = 0. Used by the double-fast long table.
 #[inline]
 pub fn ZSTD_hash8Ptr(p: &[u8], h: u32) -> usize {
     ZSTD_hash8(MEM_readLE64(p), h, 0)
 }
 
+/// Port of `ZSTD_hash8PtrS`. Salted variant of `ZSTD_hash8Ptr`.
 #[inline]
 pub fn ZSTD_hash8PtrS(p: &[u8], h: u32, s: u64) -> usize {
     ZSTD_hash8(MEM_readLE64(p), h, s)

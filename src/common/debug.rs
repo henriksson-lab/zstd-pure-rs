@@ -8,11 +8,14 @@ use core::sync::atomic::{AtomicI32, Ordering};
 
 static G_DEBUGLEVEL: AtomicI32 = AtomicI32::new(0);
 
+/// Rust-only setter for the global `g_debuglevel`. Upstream exposes the
+/// global directly; we wrap it in an atomic to keep it safely mutable.
 #[inline]
 pub fn set_debug_level(lvl: i32) {
     G_DEBUGLEVEL.store(lvl, Ordering::Relaxed);
 }
 
+/// Rust-only getter for the global `g_debuglevel`.
 #[inline]
 pub fn debug_level() -> i32 {
     G_DEBUGLEVEL.load(Ordering::Relaxed)

@@ -110,16 +110,19 @@ pub fn FSE_getMaxNbBits(symbolTT: &[FSE_symbolCompressionTransform], symbolValue
 //   ct[1 .. 1+tableSize/2] : U16 nextState table, two entries per u32
 //   ct[1+tableSize/2 ..]: pairs of u32 for symbolCompressionTransform
 
+/// Internal helper: pack `tableLog` and `maxSymbolValue` into the CTable header slot `ct[0]`.
 #[inline(always)]
 fn ct_header_write(ct: &mut [FSE_CTable], tableLog: u16, maxSymbolValue: u16) {
     ct[0] = (tableLog as u32) | ((maxSymbolValue as u32) << 16);
 }
 
+/// Decode the `tableLog` field from a CTable's packed header slot.
 #[inline(always)]
 pub fn ct_header_tableLog(ct: &[FSE_CTable]) -> u32 {
     ct[0] & 0xFFFF
 }
 
+/// Decode the `maxSymbolValue` field from a CTable's packed header slot.
 #[inline(always)]
 pub fn ct_header_maxSV(ct: &[FSE_CTable]) -> u32 {
     (ct[0] >> 16) & 0xFFFF
@@ -137,12 +140,14 @@ fn ct_u16_write(ct: &mut [FSE_CTable], i: usize, val: u16) {
     }
 }
 
+/// Internal helper: u32 offset within the CTable where the symbolTT array starts.
 #[inline(always)]
 fn symbolTT_offset(tableLog: u32) -> usize {
     let tableSize = 1usize << tableLog;
     1 + tableSize / 2
 }
 
+/// Internal helper: write the `FSE_symbolCompressionTransform` entry for symbol `s`.
 #[inline(always)]
 fn symbolTT_write(
     ct: &mut [FSE_CTable],
@@ -155,6 +160,7 @@ fn symbolTT_write(
     ct[base + 1] = t.deltaFindState as u32;
 }
 
+/// Read the `FSE_symbolCompressionTransform` entry for symbol `s` from a CTable.
 #[inline(always)]
 pub fn symbolTT_read(ct: &[FSE_CTable], tableLog: u32, s: usize) -> FSE_symbolCompressionTransform {
     let base = symbolTT_offset(tableLog) + 2 * s;

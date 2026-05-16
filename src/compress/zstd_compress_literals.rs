@@ -394,10 +394,14 @@ pub fn ZSTD_compressLiterals(
     lhSize + cLitSize
 }
 
+/// Rust-only helper: returns the `set_basic` discriminant as a `u8` for
+/// shifting into the literals-block header low bits.
 #[inline]
 fn set_basic_bits() -> u8 {
     SymbolEncodingType_e::set_basic as u8
 }
+/// Rust-only helper: returns the `set_rle` discriminant as a `u8` for
+/// shifting into the literals-block header low bits.
 #[inline]
 fn set_rle_bits() -> u8 {
     SymbolEncodingType_e::set_rle as u8

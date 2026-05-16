@@ -53,11 +53,16 @@ impl Default for ZSTD_cwksp_static_alloc_e {
     }
 }
 
+/// Rust-only internal helper: unsigned `<=` compare of two raw pointers
+/// via their addresses, mirroring C's pointer ordering used throughout
+/// `zstd_cwksp.h`'s consistency asserts.
 #[inline]
 fn ptr_le(a: *mut u8, b: *mut u8) -> bool {
     (a as usize) <= (b as usize)
 }
 
+/// Rust-only internal helper: unsigned `<` compare of two raw pointers
+/// via their addresses, used by the reserve / overflow checks.
 #[inline]
 fn ptr_lt(a: *mut u8, b: *mut u8) -> bool {
     (a as usize) < (b as usize)

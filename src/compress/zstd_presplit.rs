@@ -40,6 +40,9 @@ fn hash2(p: &[u8], hashLog: u32) -> usize {
     ((v.wrapping_mul(KNUTH)) >> (32 - hashLog)) as usize
 }
 
+/// Rust-only const-generic variant of `hash2`: `HASH_LOG` is fixed at
+/// compile time so the `hashLog == 8` branch and the shift amount fold
+/// in each `splitBlock_byChunks_specialized` instantiation.
 #[inline(always)]
 fn hash2_const<const HASH_LOG: u32>(p: &[u8]) -> usize {
     debug_assert!(HASH_LOG >= 8);
@@ -90,6 +93,10 @@ impl FPStats {
     }
 }
 
+/// Port of `addEvents` (zstd_preSplit.c). Walks `src` at stride
+/// `SAMPLING_RATE`, hashing each 2-byte window and incrementing the
+/// matching bucket in `fp.events`. Rust-only const generics specialize
+/// the sampling rate / hash width.
 #[inline(always)]
 fn addEvents_const<const SAMPLING_RATE: usize, const HASH_LOG: u32>(
     fp: &mut Fingerprint,
@@ -107,6 +114,9 @@ fn addEvents_const<const SAMPLING_RATE: usize, const HASH_LOG: u32>(
     fp.nbEvents += limit / SAMPLING_RATE;
 }
 
+/// Port of `recordFingerprint`. Resets `fp` then populates it via
+/// `addEvents_const` — i.e. a fresh fingerprint of `src` under the
+/// given sampling rate / hash width.
 #[inline(always)]
 fn recordFingerprint_const<const SAMPLING_RATE: usize, const HASH_LOG: u32>(
     fp: &mut Fingerprint,
@@ -116,6 +126,9 @@ fn recordFingerprint_const<const SAMPLING_RATE: usize, const HASH_LOG: u32>(
     addEvents_const::<SAMPLING_RATE, HASH_LOG>(fp, src);
 }
 
+/// Port of `abs64`. Absolute value of a signed 64-bit difference,
+/// returned as `u64` so wide histogram cross-products can sum without
+/// risking signed overflow.
 #[inline]
 fn abs64(x: i64) -> u64 {
     x.unsigned_abs()
@@ -199,6 +212,11 @@ fn ZSTD_splitBlock_byChunks(block: &[u8], level: i32) -> usize {
     }
 }
 
+/// `(SAMPLING_RATE, HASH_LOG)`-monomorphized core of
+/// `ZSTD_splitBlock_byChunks`. Walks the 128 KB block one 8 KB chunk
+/// at a time, comparing the new chunk's fingerprint to the running
+/// past-fingerprint and returning the first split position where they
+/// diverge past threshold. Rust-only split.
 #[inline(never)]
 fn ZSTD_splitBlock_byChunks_specialized<const SAMPLING_RATE: usize, const HASH_LOG: u32>(
     block: &[u8],

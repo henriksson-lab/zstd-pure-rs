@@ -306,6 +306,8 @@ pub fn ZSTD_updateFseStateWithDInfo(
     dsp.state = nextState as usize + lowBits;
 }
 
+/// BMI2 variant of `BIT_readBitsFast` used by the BMI2-targeted
+/// sequence decoder. Reads `nbBits` from the container, then skips.
 #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
 #[target_feature(enable = "bmi1,bmi2,lzcnt")]
 unsafe fn BIT_readBitsFast_bmi2(
@@ -320,6 +322,8 @@ unsafe fn BIT_readBitsFast_bmi2(
     v as usize
 }
 
+/// BMI2 variant of `BIT_readBits` used by the BMI2-targeted FSE state
+/// update path. Uses `BEXTR` when the request fits in the container.
 #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
 #[target_feature(enable = "bmi1,bmi2,lzcnt")]
 unsafe fn BIT_readBits_bmi2(
@@ -336,6 +340,7 @@ unsafe fn BIT_readBits_bmi2(
     v
 }
 
+/// BMI2 specialization of `ZSTD_updateFseStateWithDInfo`.
 #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
 #[target_feature(enable = "bmi1,bmi2,lzcnt")]
 unsafe fn ZSTD_updateFseStateWithDInfo_bmi2(
@@ -480,6 +485,8 @@ pub fn ZSTD_decodeSequence(
     seq
 }
 
+/// BMI2 specialization of `ZSTD_decodeSequence`. Same control flow as
+/// the portable path, with `BIT_readBitsFast_bmi2` substituted in.
 #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
 #[target_feature(enable = "bmi1,bmi2,lzcnt")]
 unsafe fn ZSTD_decodeSequence_bmi2(
@@ -733,6 +740,11 @@ pub fn ZSTD_execSequence(
     }
 }
 
+/// Rust-only helper: raw-pointer literal-base variant of
+/// `ZSTD_execSequence`. Lets the caller hand off the literal buffer
+/// as a `(base, total_len)` pair so a single `*const u8` covers both
+/// the in-DCtx `litBuffer` and the in-`dst` literal regions used by
+/// the split-literal-buffer fast path.
 #[inline(always)]
 unsafe fn ZSTD_execSequence_rawLit(
     dst: &mut [u8],
@@ -986,6 +998,8 @@ unsafe fn ZSTD_execSequence_rawLit(
     sequenceLength
 }
 
+/// Rust-only helper: cold fallback path for `ZSTD_execSequence_rawLit`.
+/// Marked `#[cold]` so the optimizer keeps the inline fast path lean.
 #[cold]
 #[inline(never)]
 unsafe fn ZSTD_execSequence_rawLit_fallback(
@@ -1010,6 +1024,9 @@ unsafe fn ZSTD_execSequence_rawLit_fallback(
     )
 }
 
+/// Rust-only helper: bounds-precheck-free fast variant of
+/// `ZSTD_execSequence_rawLit`. Called only after the body decoder has
+/// already verified that 16-byte slack exists on both sides.
 #[inline(always)]
 unsafe fn ZSTD_execSequence_rawLit_fast(
     dst: &mut [u8],
@@ -1071,6 +1088,9 @@ unsafe fn ZSTD_execSequence_rawLit_fast(
     sequenceLength
 }
 
+/// Rust-only helper: raw-pointer twin of `ZSTD_overlapCopy8`. Used by
+/// the bounds-precheck-free fast sequence executor where the buffer is
+/// already pinned to a `*mut u8`.
 #[inline(always)]
 unsafe fn ZSTD_overlapCopy8_ptr(ptr: *mut u8, op: &mut usize, ip: &mut usize, offset: usize) {
     debug_assert!(*ip <= *op);
@@ -1103,6 +1123,9 @@ unsafe fn ZSTD_overlapCopy8_ptr(ptr: *mut u8, op: &mut usize, ip: &mut usize, of
     *op = op.wrapping_add(8);
 }
 
+/// Rust-only helper: raw-pointer twin of
+/// `ZSTD_execSequence_rawLit_fast`. Avoids the `&mut [u8]` borrow so
+/// the split-literal-buffer decoder can write through one pointer.
 #[inline(always)]
 unsafe fn ZSTD_execSequence_rawLit_fast_ptr(
     dst_ptr: *mut u8,
@@ -1431,6 +1454,8 @@ pub struct ZSTD_DCtx {
     pub customMem: crate::compress::zstd_compress::ZSTD_customMem,
 }
 
+/// Rust-only helper: build the canonical default LL FSE decode table
+/// from the upstream-spec `LL_defaultNorm` / `LL_defaultNormLog`.
 fn build_default_ll_dtable_fresh() -> Vec<ZSTD_seqSymbol> {
     let mut t = vec![ZSTD_seqSymbol::default(); SEQSYMBOL_TABLE_SIZE(LLFSELog)];
     ZSTD_buildFSETable(
@@ -1444,6 +1469,7 @@ fn build_default_ll_dtable_fresh() -> Vec<ZSTD_seqSymbol> {
     t
 }
 
+/// Rust-only helper: build the canonical default OF FSE decode table.
 fn build_default_of_dtable_fresh() -> Vec<ZSTD_seqSymbol> {
     let mut t = vec![ZSTD_seqSymbol::default(); SEQSYMBOL_TABLE_SIZE(OffFSELog)];
     ZSTD_buildFSETable(
@@ -1457,6 +1483,7 @@ fn build_default_of_dtable_fresh() -> Vec<ZSTD_seqSymbol> {
     t
 }
 
+/// Rust-only helper: build the canonical default ML FSE decode table.
 fn build_default_ml_dtable_fresh() -> Vec<ZSTD_seqSymbol> {
     let mut t = vec![ZSTD_seqSymbol::default(); SEQSYMBOL_TABLE_SIZE(MLFSELog)];
     ZSTD_buildFSETable(
@@ -1470,21 +1497,26 @@ fn build_default_ml_dtable_fresh() -> Vec<ZSTD_seqSymbol> {
     t
 }
 
+/// Rust-only helper: cached canonical LL decode table, built lazily.
 pub(crate) fn default_ll_dtable() -> &'static [ZSTD_seqSymbol] {
     static TABLE: std::sync::OnceLock<Vec<ZSTD_seqSymbol>> = std::sync::OnceLock::new();
     TABLE.get_or_init(build_default_ll_dtable_fresh).as_slice()
 }
 
+/// Rust-only helper: cached canonical OF decode table, built lazily.
 pub(crate) fn default_of_dtable() -> &'static [ZSTD_seqSymbol] {
     static TABLE: std::sync::OnceLock<Vec<ZSTD_seqSymbol>> = std::sync::OnceLock::new();
     TABLE.get_or_init(build_default_of_dtable_fresh).as_slice()
 }
 
+/// Rust-only helper: cached canonical ML decode table, built lazily.
 pub(crate) fn default_ml_dtable() -> &'static [ZSTD_seqSymbol] {
     static TABLE: std::sync::OnceLock<Vec<ZSTD_seqSymbol>> = std::sync::OnceLock::new();
     TABLE.get_or_init(build_default_ml_dtable_fresh).as_slice()
 }
 
+/// Rust-only helper: allocate a zero-initialized FSE decode table of
+/// size `SEQSYMBOL_TABLE_SIZE(table_log)`.
 fn alloc_seq_table(table_log: u32) -> Vec<ZSTD_seqSymbol> {
     vec![ZSTD_seqSymbol::default(); SEQSYMBOL_TABLE_SIZE(table_log)]
 }
@@ -1682,6 +1714,9 @@ pub fn ZSTD_decompressSequences_body(
     }
 }
 
+/// Rust-only helper: raw-literal-pointer variant of
+/// `ZSTD_decompressSequences_body`. Forms the unsafe core that the
+/// safe `_body` entry forwards to after splatting `litBuf.as_ptr()`.
 unsafe fn ZSTD_decompressSequences_body_rawLit(
     dst: &mut [u8],
     op_start: usize,
@@ -1774,6 +1809,10 @@ unsafe fn ZSTD_decompressSequences_body_rawLit(
     op - op_start
 }
 
+/// Rust-only helper: split-literal-buffer sequence decoder body. The
+/// const-generic `BMI2` flag picks between the portable and BMI2
+/// per-sequence decoders. Handles the seam where literals straddle
+/// the in-dst buffer and the extra-literal scratch.
 unsafe fn ZSTD_decompressSequences_bodySplitLitBuffer_raw_impl<const BMI2: bool>(
     dst: &mut [u8],
     op_start: usize,
@@ -1921,6 +1960,9 @@ unsafe fn ZSTD_decompressSequences_bodySplitLitBuffer_raw_impl<const BMI2: bool>
     op - op_start
 }
 
+/// Rust-only helper: split-literal-buffer variant of `ZSTD_execSequence`.
+/// Walks the seam between the in-dst literal region and the extra
+/// scratch buffer when a single sequence's literals straddle them.
 #[inline(always)]
 unsafe fn ZSTD_execSequenceSplitLitBuffer_raw(
     dst: &mut [u8],
@@ -1986,6 +2028,8 @@ unsafe fn ZSTD_execSequenceSplitLitBuffer_raw(
     oneSeqSize + (op - op_start)
 }
 
+/// Rust-only helper: portable specialization of
+/// `ZSTD_decompressSequences_bodySplitLitBuffer_raw_impl::<false>`.
 unsafe fn ZSTD_decompressSequences_bodySplitLitBuffer_raw(
     dst: &mut [u8],
     op_start: usize,
@@ -2020,6 +2064,8 @@ unsafe fn ZSTD_decompressSequences_bodySplitLitBuffer_raw(
     )
 }
 
+/// Rust-only helper: BMI2 specialization of
+/// `ZSTD_decompressSequences_bodySplitLitBuffer_raw_impl::<true>`.
 #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
 #[target_feature(enable = "bmi1,bmi2,lzcnt")]
 unsafe fn ZSTD_decompressSequences_bodySplitLitBuffer_bmi2_raw(
@@ -2056,6 +2102,8 @@ unsafe fn ZSTD_decompressSequences_bodySplitLitBuffer_bmi2_raw(
     )
 }
 
+/// Rust-only helper: BMI2-targeted body of `ZSTD_decompressSequences`.
+/// Forwards to `_body_bmi2_rawLit` after splatting the literal pointer.
 #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
 #[target_feature(enable = "bmi1,bmi2,lzcnt")]
 unsafe fn ZSTD_decompressSequences_body_bmi2_impl(
@@ -2086,6 +2134,9 @@ unsafe fn ZSTD_decompressSequences_body_bmi2_impl(
     )
 }
 
+/// Rust-only helper: raw-literal-pointer BMI2 body. Splits the path
+/// based on whether `ext_history` is empty so the hot no-ext-dict path
+/// gets its own monomorphized routine.
 #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
 #[target_feature(enable = "bmi1,bmi2,lzcnt")]
 unsafe fn ZSTD_decompressSequences_body_bmi2_rawLit(
@@ -2226,6 +2277,9 @@ unsafe fn ZSTD_decompressSequences_body_bmi2_rawLit(
     op - op_start
 }
 
+/// Rust-only helper: no-ext-dict specialization of the BMI2 sequence
+/// decoder body. Hot path for one-shot frames that don't reach into a
+/// dictionary or prior streaming-block tail.
 #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
 #[inline(never)]
 #[target_feature(enable = "bmi1,bmi2,lzcnt")]
@@ -2363,6 +2417,10 @@ unsafe fn ZSTD_decompressSequences_body_bmi2_noExt_rawLit(
     op - op_start
 }
 
+/// Port of `ZSTD_decompressSequences_body_bmi2`. Runtime-dispatches to
+/// the BMI2-targeted impl when the CPU advertises the required
+/// features, otherwise falls back to the portable
+/// `ZSTD_decompressSequences_body`.
 fn ZSTD_decompressSequences_body_bmi2(
     dst: &mut [u8],
     op_start: usize,
@@ -2485,6 +2543,9 @@ pub fn ZSTD_prefetchMatch(
     prefetchPos + sequence.matchLength
 }
 
+/// Rust-only helper: `_mm_prefetch`-emitting variant of
+/// `ZSTD_prefetchMatch`. Hints the match's source bytes into L1 ahead
+/// of execution; no-op on non-x86_64 targets.
 #[inline]
 fn ZSTD_prefetchMatch_rust(
     mut prefetchPos: usize,
@@ -2678,6 +2739,8 @@ fn ZSTD_decompressSequencesLong_body_impl<const BMI2: bool>(
     op - op_start
 }
 
+/// Port of `ZSTD_decompressSequencesLong_body`. Portable wrapper that
+/// delegates to the const-generic `_body_impl::<false>` long decoder.
 pub fn ZSTD_decompressSequencesLong_body(
     dst: &mut [u8],
     op_start: usize,
@@ -2706,6 +2769,10 @@ pub fn ZSTD_decompressSequencesLong_body(
     )
 }
 
+/// Rust-only helper: split-literal-buffer long-prefetch body. The
+/// const-generic `BMI2` flag picks between the portable and BMI2
+/// per-sequence decoders; ring-buffers 8 sequences ahead so the match
+/// loads have time to reach L1 before execution.
 fn ZSTD_decompressSequencesLong_bodySplitLitBuffer_impl<const BMI2: bool>(
     dst: &mut [u8],
     op_start: usize,
@@ -2889,6 +2956,8 @@ fn ZSTD_decompressSequencesLong_bodySplitLitBuffer_impl<const BMI2: bool>(
     op - op_start
 }
 
+/// Rust-only helper: BMI2-targeted long-prefetch body. Forwards to
+/// `_body_impl::<true>`.
 #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
 #[target_feature(enable = "bmi1,bmi2,lzcnt")]
 unsafe fn ZSTD_decompressSequencesLong_body_bmi2_impl(
@@ -2919,6 +2988,8 @@ unsafe fn ZSTD_decompressSequencesLong_body_bmi2_impl(
     )
 }
 
+/// Port of `ZSTD_decompressSequencesLong_default`. Portable
+/// long-prefetch entry; forwards to `ZSTD_decompressSequencesLong_body`.
 pub fn ZSTD_decompressSequencesLong_default(
     dst: &mut [u8],
     op_start: usize,
@@ -2947,6 +3018,8 @@ pub fn ZSTD_decompressSequencesLong_default(
     )
 }
 
+/// Port of `ZSTD_decompressSequences_bmi2`. BMI2 entry point that runs
+/// the BMI2-targeted body when the CPU supports it.
 pub fn ZSTD_decompressSequences_bmi2(
     dst: &mut [u8],
     op_start: usize,
@@ -2975,6 +3048,9 @@ pub fn ZSTD_decompressSequences_bmi2(
     )
 }
 
+/// Port of `ZSTD_decompressSequencesSplitLitBuffer_bmi2`. The Rust
+/// literal layout doesn't actually split, so it forwards to the
+/// regular BMI2 body.
 pub fn ZSTD_decompressSequencesSplitLitBuffer_bmi2(
     dst: &mut [u8],
     op_start: usize,
@@ -3003,6 +3079,8 @@ pub fn ZSTD_decompressSequencesSplitLitBuffer_bmi2(
     )
 }
 
+/// Port of `ZSTD_decompressSequencesLong_bmi2`. BMI2 long-prefetch
+/// entry point; runtime-dispatches to the BMI2 impl when supported.
 pub fn ZSTD_decompressSequencesLong_bmi2(
     dst: &mut [u8],
     op_start: usize,
@@ -3054,6 +3132,8 @@ pub fn ZSTD_decompressSequencesLong_bmi2(
     )
 }
 
+/// Port of `ZSTD_decompressSequences`. Public-facing portable entry
+/// point — forwards to `ZSTD_decompressSequences_default`.
 pub fn ZSTD_decompressSequences(
     dst: &mut [u8],
     op_start: usize,
@@ -3082,6 +3162,8 @@ pub fn ZSTD_decompressSequences(
     )
 }
 
+/// Port of `ZSTD_decompressSequencesSplitLitBuffer`. Public split-buffer
+/// entry; the Rust layout doesn't split, so forwards to the default.
 pub fn ZSTD_decompressSequencesSplitLitBuffer(
     dst: &mut [u8],
     op_start: usize,
@@ -3110,6 +3192,8 @@ pub fn ZSTD_decompressSequencesSplitLitBuffer(
     )
 }
 
+/// Port of `ZSTD_decompressSequencesLong`. Public long-prefetch entry
+/// point — forwards to `ZSTD_decompressSequencesLong_default`.
 pub fn ZSTD_decompressSequencesLong(
     dst: &mut [u8],
     op_start: usize,
@@ -3458,6 +3542,9 @@ pub fn ZSTD_decodeLiteralsBlock_wrapper(dctx: &mut ZSTD_DCtx, src: &[u8], dst: &
     ZSTD_decodeLiteralsBlock(dctx, src, dst, streaming_operation::not_streaming)
 }
 
+/// Rust-only helper: directly materializes a raw or RLE literals block
+/// into the DCtx's `litExtraBuffer`. Split out of
+/// `ZSTD_decodeLiteralsBlock` so the slow-path branches stay readable.
 fn ZSTD_decodeBasicLiteralsBlock_direct(
     dctx: &mut ZSTD_DCtx,
     src: &[u8],
@@ -3973,6 +4060,8 @@ fn seq_header_write(dt: &mut [ZSTD_seqSymbol], fastMode: u32, tableLog: u32) {
     };
 }
 
+/// Rust-only helper: read the `(fastMode, tableLog)` header out of slot
+/// 0 of an FSE decode table.
 #[inline]
 pub fn seq_header_read(dt: &[ZSTD_seqSymbol]) -> ZSTD_seqSymbol_header {
     ZSTD_seqSymbol_header {
@@ -3981,28 +4070,36 @@ pub fn seq_header_read(dt: &[ZSTD_seqSymbol]) -> ZSTD_seqSymbol_header {
     }
 }
 
+/// Rust-only helper: number of FSE decode entries actually populated
+/// (header slot + `1 << tableLog` entries).
 #[inline]
 fn seq_table_used_len(dt: &[ZSTD_seqSymbol]) -> usize {
     1 + (1usize << dt[0].baseValue)
 }
 
+/// Test-only helper: returns the LL FSE table the decoder would
+/// currently dispatch through (canonical default vs. parsed table).
 #[cfg(test)]
 pub(crate) fn active_ll_table(dctx: &ZSTD_DCtx) -> &[ZSTD_seqSymbol] {
     active_ll_table_from(&dctx.LLTable, dctx.ll_default_active)
 }
 
+/// Test-only helper: see `active_ll_table` — same pattern for OF.
 #[inline]
 #[cfg(test)]
 pub(crate) fn active_of_table(dctx: &ZSTD_DCtx) -> &[ZSTD_seqSymbol] {
     active_of_table_from(&dctx.OFTable, dctx.of_default_active)
 }
 
+/// Test-only helper: see `active_ll_table` — same pattern for ML.
 #[inline]
 #[cfg(test)]
 pub(crate) fn active_ml_table(dctx: &ZSTD_DCtx) -> &[ZSTD_seqSymbol] {
     active_ml_table_from(&dctx.MLTable, dctx.ml_default_active)
 }
 
+/// Rust-only helper: pick between the canonical LL default table and
+/// the DCtx-held parsed table, based on the `default_active` flag.
 #[inline]
 fn active_ll_table_from(table: &[ZSTD_seqSymbol], default_active: bool) -> &[ZSTD_seqSymbol] {
     if default_active {
@@ -4012,6 +4109,8 @@ fn active_ll_table_from(table: &[ZSTD_seqSymbol], default_active: bool) -> &[ZST
     }
 }
 
+/// Rust-only helper: pick between the canonical OF default table and
+/// the DCtx-held parsed table.
 #[inline]
 fn active_of_table_from(table: &[ZSTD_seqSymbol], default_active: bool) -> &[ZSTD_seqSymbol] {
     if default_active {
@@ -4021,6 +4120,8 @@ fn active_of_table_from(table: &[ZSTD_seqSymbol], default_active: bool) -> &[ZST
     }
 }
 
+/// Rust-only helper: pick between the canonical ML default table and
+/// the DCtx-held parsed table.
 #[inline]
 fn active_ml_table_from(table: &[ZSTD_seqSymbol], default_active: bool) -> &[ZSTD_seqSymbol] {
     if default_active {

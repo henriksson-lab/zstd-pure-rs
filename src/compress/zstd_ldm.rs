@@ -1045,6 +1045,14 @@ pub fn ZSTD_ldm_generateSequences(
     0
 }
 
+/// Port of `ZSTD_ldm_blockCompress`. Drives block compression
+/// alongside a precomputed `rawSeqStore` of LDM sequences. For
+/// optimal-parser strategies (`ZSTD_btopt` and above), LDM matches
+/// are exposed to the parser as candidates via `ms.ldmSeqStore`.
+/// For greedy/lazy strategies, this function alternates between
+/// emitting LDM sequences directly and forwarding the literal gaps
+/// to the inner `blockCompressor`. Returns the size of the trailing
+/// literals (last LL).
 pub fn ZSTD_ldm_blockCompress(
     rawSeqStore: &mut RawSeqStore_t,
     ms: &mut ZSTD_MatchState_t,

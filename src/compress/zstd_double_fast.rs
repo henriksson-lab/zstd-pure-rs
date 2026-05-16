@@ -25,12 +25,18 @@ use crate::compress::zstd_hashes::{
     ZSTD_count, ZSTD_count_2segments, ZSTD_hashPtr, ZSTD_hashPtr_at_unchecked,
 };
 
+/// Rust-only helper: unaligned 4-byte read at `src[pos..pos+4]` via a
+/// raw pointer to avoid the slice bounds check in the hot loop. Caller
+/// must uphold the asserted invariant `pos + 4 <= src.len()`.
 #[inline(always)]
 unsafe fn read32_at(src: &[u8], pos: usize) -> u32 {
     debug_assert!(pos + 4 <= src.len());
     (src.as_ptr().add(pos) as *const u32).read_unaligned()
 }
 
+/// Rust-only helper: unaligned 8-byte read at `src[pos..pos+8]`,
+/// counterpart to `read32_at` for the long-hash compares. Caller must
+/// uphold `pos + 8 <= src.len()`.
 #[inline(always)]
 unsafe fn read64_at(src: &[u8], pos: usize) -> u64 {
     debug_assert!(pos + 8 <= src.len());
@@ -179,6 +185,10 @@ pub fn ZSTD_compressBlock_doubleFast_noDict_generic(
     }
 }
 
+/// MLS-monomorphized core of `ZSTD_compressBlock_doubleFast_noDict_generic`.
+/// Mirrors upstream's `ZSTD_GEN_DOUBLEFAST_FN(noDict, mml)` template
+/// expansions; the const generic lets LLVM fold the short-table hash
+/// width per specialization. Rust-only split.
 #[inline(never)]
 fn ZSTD_compressBlock_doubleFast_noDict_generic_mls<const MLS: u32>(
     ms: &mut ZSTD_MatchState_t,
@@ -977,6 +987,10 @@ pub fn ZSTD_compressBlock_doubleFast_dictMatchState_generic(
     iend - anchor
 }
 
+/// Port of `ZSTD_compressBlock_doubleFast_extDict`. Public entry for
+/// the double-fast strategy when the window holds an external
+/// dictionary segment; dispatches to
+/// `ZSTD_compressBlock_doubleFast_extDict_generic`.
 pub fn ZSTD_compressBlock_doubleFast_extDict(
     ms: &mut ZSTD_MatchState_t,
     seqStore: &mut SeqStore_t,

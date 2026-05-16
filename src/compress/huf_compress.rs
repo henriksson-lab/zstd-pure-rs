@@ -1414,6 +1414,10 @@ pub fn HUF_compress1X_usingCTable_body_loop(
     }
 }
 
+/// Internal helper: runtime-dispatched body for combinations of
+/// `(kUnroll, kFastFlush, kLastFast)` that `HUF_compress1X_usingCTable_body_loop`
+/// did not pre-monomorphize. Functionally equivalent to the const-generic
+/// specialization but without the const-folding wins.
 fn HUF_compress1X_usingCTable_body_loop_runtime(
     bitC: &mut HUF_CStream_t,
     ip: &[u8],

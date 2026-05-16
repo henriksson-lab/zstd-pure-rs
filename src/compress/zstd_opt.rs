@@ -446,6 +446,9 @@ pub struct ZSTD_optLdm_t {
     pub offset: u32,
 }
 
+/// Rust-only helper: snapshot the active LDM `RawSeqStore_t` (or an
+/// empty one when none is attached) so the optimal parser can advance
+/// `pos` without mutating shared state.
 #[inline]
 fn ZSTD_cloneActiveRawSeqStore(src: Option<&RawSeqStore_t>) -> RawSeqStore_t {
     let Some(src) = src else {
@@ -837,6 +840,9 @@ pub fn ZSTD_fWeight(rawStat: u32) -> f64 {
     ZSTD_fracWeight(rawStat) as f64 / BITCOST_MULTIPLIER as f64
 }
 
+/// Rust-only helper: returns the maximum encoded bit-width for
+/// `symbol` under FSE compression table `ctable`. Used to bound symbol
+/// prices when seeding from dictionary entropy tables.
 #[inline]
 fn fse_max_nb_bits_from_ctable(ctable: &[u32], symbol: u32) -> u32 {
     let mut state = FSE_CState_t {
@@ -1353,6 +1359,10 @@ pub fn ZSTD_insertBtAndGetAllMatches(
     mnum
 }
 
+/// Rust-only helper: returns the byte at `matchLength` past the
+/// candidate's start, choosing either the prefix or the dict-match-
+/// state buffer based on whether the candidate has crossed back into
+/// the prefix. Used as a tiebreak when ranking equal-length matches.
 #[inline]
 fn ZSTD_dmsOrderingByte(
     prefix_buf: &[u8],
@@ -1369,6 +1379,10 @@ fn ZSTD_dmsOrderingByte(
     }
 }
 
+/// Rust-only helper: byte-wise equality check across the dictionary→
+/// prefix boundary for `min_match` bytes. Returns true when the
+/// candidate at `prefix_pos` matches `dict_pos` and then continues
+/// into the prefix once the dict buffer is exhausted.
 #[inline]
 fn ZSTD_minMatchEquals_2segments(
     prefix_buf: &[u8],
@@ -1430,6 +1444,8 @@ pub fn ZSTD_btGetAllMatches_internal(
     )
 }
 
+/// Port of `ZSTD_btGetAllMatches_noDict`. Thin shim selecting
+/// `ZSTD_noDict` dictMode for `ZSTD_btGetAllMatches_internal`.
 pub fn ZSTD_btGetAllMatches_noDict(
     matches: &mut [ZSTD_match_t],
     ms: &mut ZSTD_MatchState_t,
@@ -1457,6 +1473,8 @@ pub fn ZSTD_btGetAllMatches_noDict(
     )
 }
 
+/// Port of `ZSTD_btGetAllMatches_extDict`. Thin shim selecting
+/// `ZSTD_extDict` dictMode for `ZSTD_btGetAllMatches_internal`.
 pub fn ZSTD_btGetAllMatches_extDict(
     matches: &mut [ZSTD_match_t],
     ms: &mut ZSTD_MatchState_t,
@@ -1484,6 +1502,8 @@ pub fn ZSTD_btGetAllMatches_extDict(
     )
 }
 
+/// Port of `ZSTD_btGetAllMatches_dictMatchState`. Thin shim selecting
+/// `ZSTD_dictMatchState` dictMode for `ZSTD_btGetAllMatches_internal`.
 pub fn ZSTD_btGetAllMatches_dictMatchState(
     matches: &mut [ZSTD_match_t],
     ms: &mut ZSTD_MatchState_t,
@@ -1575,16 +1595,20 @@ pub fn ZSTD_updateTree(ms: &mut ZSTD_MatchState_t, buf: &[u8], ip_abs: u32, iend
     ZSTD_updateTree_internal(ms, buf, iend_pos, ip_abs, mls, ZSTD_dictMode_e::ZSTD_noDict);
 }
 
+/// Port of the `LIT_PRICE` macro: one-literal raw cost as `i32`.
 #[inline]
 fn LIT_PRICE(literals: &[u8], optPtr: &optState_t, optLevel: i32) -> i32 {
     ZSTD_rawLiteralsCost(literals, 1, optPtr, optLevel) as i32
 }
 
+/// Port of the `LL_PRICE` macro: total literal-length code price as `i32`.
 #[inline]
 fn LL_PRICE(litLength: u32, optPtr: &optState_t, optLevel: i32) -> i32 {
     ZSTD_litLengthPrice(litLength, optPtr, optLevel) as i32
 }
 
+/// Port of the `LL_INCPRICE` macro: incremental cost of bumping the
+/// literal-length count by one (`LL_PRICE(n) - LL_PRICE(n-1)`).
 #[inline]
 fn LL_INCPRICE(litLength: u32, optPtr: &optState_t, optLevel: i32) -> i32 {
     LL_PRICE(litLength, optPtr, optLevel) - LL_PRICE(litLength - 1, optPtr, optLevel)
@@ -2222,6 +2246,11 @@ fn ZSTD_compressBlock_opt_generic(
     src.len() - anchor
 }
 
+/// Rust-only helper: mirrors upstream's `_shortest_path:` goto block.
+/// Walks back through `priceTable` from `lastStretch` to recover the
+/// optimal stretch sequence, then emits each stretch via
+/// `ZSTD_storeSeq`/`ZSTD_updateStats` and rebases prices via
+/// `ZSTD_setBasePrices`.
 #[allow(clippy::too_many_arguments)]
 fn goto_shortest_path(
     lastStretch: &mut ZSTD_optimal_t,
@@ -2294,6 +2323,8 @@ fn goto_shortest_path(
     ZSTD_setBasePrices(optStatePtr, optLevel);
 }
 
+/// Port of `ZSTD_compressBlock_opt0`. Optimal parser with `optLevel=0`
+/// (btopt strategy).
 fn ZSTD_compressBlock_opt0(
     ms: &mut ZSTD_MatchState_t,
     seqStore: &mut crate::compress::seq_store::SeqStore_t,
@@ -2304,6 +2335,8 @@ fn ZSTD_compressBlock_opt0(
     ZSTD_compressBlock_opt_generic(ms, seqStore, rep, src, 0, dictMode)
 }
 
+/// Port of `ZSTD_compressBlock_opt2`. Optimal parser with `optLevel=2`
+/// (btultra strategy).
 fn ZSTD_compressBlock_opt2(
     ms: &mut ZSTD_MatchState_t,
     seqStore: &mut crate::compress::seq_store::SeqStore_t,
@@ -2314,6 +2347,11 @@ fn ZSTD_compressBlock_opt2(
     ZSTD_compressBlock_opt_generic(ms, seqStore, rep, src, 2, dictMode)
 }
 
+/// Port of `ZSTD_initStats_ultra`. First-pass compression purely to
+/// seed `ms.opt` entropy stats with realistic starting values; the
+/// sequence store is reset afterwards and the window is rebased so the
+/// "real" second pass starts clean. Only valid on the first block,
+/// with no dictionary, no prefix, and no LDM.
 #[allow(dead_code)]
 fn ZSTD_initStats_ultra(
     ms: &mut ZSTD_MatchState_t,
@@ -2347,6 +2385,10 @@ pub fn ZSTD_compressBlock_btopt(
     ZSTD_compressBlock_opt0(ms, seqStore, rep, src, ZSTD_dictMode_e::ZSTD_noDict)
 }
 
+/// Rust-only window-buffer variant of `ZSTD_compressBlock_btopt`:
+/// dispatches to the slice-relative `_generic_window` path when
+/// `src_pos > 0` so the optimal parser can read history bytes lying
+/// before the block start.
 pub fn ZSTD_compressBlock_btopt_window(
     ms: &mut ZSTD_MatchState_t,
     seqStore: &mut crate::compress::seq_store::SeqStore_t,
@@ -2380,6 +2422,8 @@ pub fn ZSTD_compressBlock_btultra(
     ZSTD_compressBlock_opt2(ms, seqStore, rep, src, ZSTD_dictMode_e::ZSTD_noDict)
 }
 
+/// Rust-only window-buffer variant of `ZSTD_compressBlock_btultra` —
+/// see `ZSTD_compressBlock_btopt_window` for the dispatch rationale.
 pub fn ZSTD_compressBlock_btultra_window(
     ms: &mut ZSTD_MatchState_t,
     seqStore: &mut crate::compress::seq_store::SeqStore_t,
@@ -2420,6 +2464,8 @@ pub fn ZSTD_compressBlock_btultra2(
     ZSTD_compressBlock_opt2(ms, seqStore, rep, src, ZSTD_dictMode_e::ZSTD_noDict)
 }
 
+/// Rust-only window-buffer variant of `ZSTD_compressBlock_btultra2` —
+/// see `ZSTD_compressBlock_btopt_window` for the dispatch rationale.
 pub fn ZSTD_compressBlock_btultra2_window(
     ms: &mut ZSTD_MatchState_t,
     seqStore: &mut crate::compress::seq_store::SeqStore_t,
@@ -2443,6 +2489,9 @@ pub fn ZSTD_compressBlock_btultra2_window(
     )
 }
 
+/// Rust-only helper: encapsulates the four assertions upstream's
+/// `ZSTD_compressBlock_btultra2` uses to gate `ZSTD_initStats_ultra`
+/// (first block, empty seqStore, no dictionary, no prefix).
 #[inline]
 fn opt_state_is_fresh(
     ms: &ZSTD_MatchState_t,

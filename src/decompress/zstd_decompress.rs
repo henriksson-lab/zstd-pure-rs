@@ -4089,19 +4089,11 @@ pub fn ZSTD_setRleBlock(dst: &mut [u8], b: u8, regenSize: usize) -> usize {
     regenSize
 }
 
-/// Port of `ZSTD_decompressFrame` — the block-loop driver. Given a
-/// fully-initialized `ZSTD_DCtx`, reads the frame header, iterates
-/// blocks until `lastBlock`, handles RAW / RLE / compressed block
-/// types, validates the frame checksum if present, and returns the
-/// decompressed payload size.
-///
-/// Rust signature note: upstream mutates `*srcPtr` and `*srcSizePtr`
-/// to advance the source cursor; we accept `src` by value and return
-/// the tuple `(decoded_size, src_consumed)` via out-params.
-/// Variant of `ZSTD_decompressFrame` that begins writing at
+/// Rust-only variant of `ZSTD_decompressFrame` that begins writing at
 /// `dst[op_start..]` instead of `dst[0..]`. Used by
 /// `ZSTD_decompress_usingDict` to decode into a buffer whose initial
-/// `op_start` bytes hold the dict history. Returns the number of
+/// `op_start` bytes hold the dict history; back-references into the
+/// dict resolve naturally against that prefix. Returns the number of
 /// decoded bytes (i.e., `final_op - op_start`).
 #[allow(clippy::too_many_arguments)]
 pub fn ZSTD_decompressFrame_withOpStart(
@@ -4210,6 +4202,12 @@ pub fn ZSTD_decompressFrame_withOpStart(
     decoded
 }
 
+/// Port of `ZSTD_decompressFrame` (`zstd_decompress.c:949`). Frame-level
+/// driver: parses the frame header, iterates blocks until `lastBlock`,
+/// dispatches RAW / RLE / compressed paths, and validates the frame
+/// checksum when present. Rust signature returns the decoded byte count
+/// and reports input consumption via `*src_consumed` (upstream mutates
+/// `*srcPtr` / `*srcSizePtr`).
 pub fn ZSTD_decompressFrame(
     dctx: &mut crate::decompress::zstd_decompress_block::ZSTD_DCtx,
     entropy_rep: &mut crate::decompress::zstd_decompress_block::ZSTD_decoder_entropy_rep,
@@ -5646,6 +5644,9 @@ pub struct ZSTD_frameSizeInfo {
     pub decompressedBound: u64,
 }
 
+/// Rust-only internal helper: builds an error-marker `ZSTD_frameSizeInfo`
+/// carrying the upstream error code in `compressedSize` and
+/// `ZSTD_CONTENTSIZE_ERROR` in `decompressedBound`.
 fn frameSizeInfo_error(err_code: usize) -> ZSTD_frameSizeInfo {
     ZSTD_frameSizeInfo {
         nbBlocks: 0,

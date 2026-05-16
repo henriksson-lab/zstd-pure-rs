@@ -19,6 +19,8 @@ pub const BIT_DStream_overflow: u32 = 3;
 const CONTAINER_BYTES: usize = core::mem::size_of::<usize>();
 const CONTAINER_BITS: u32 = (CONTAINER_BYTES as u32) * 8;
 
+/// Rust-only helper: read one `size_t`-wide little-endian word from
+/// `src[ptr..]`. Used by `BIT_DStream_t` to refill its `bitContainer`.
 #[inline(always)]
 fn BIT_readContainer(src: &[u8], ptr: usize) -> usize {
     debug_assert!(ptr + CONTAINER_BYTES <= src.len());

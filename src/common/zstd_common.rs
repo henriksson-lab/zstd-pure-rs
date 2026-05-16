@@ -14,31 +14,39 @@ pub const ZSTD_VERSION_NUMBER: u32 =
     ZSTD_VERSION_MAJOR * 100 * 100 + ZSTD_VERSION_MINOR * 100 + ZSTD_VERSION_RELEASE;
 pub const ZSTD_VERSION_STRING: &str = "1.6.0";
 
+/// Port of `ZSTD_versionNumber`. Returns the upstream version integer
+/// (`MAJOR*10000 + MINOR*100 + RELEASE`).
 #[inline]
 pub fn ZSTD_versionNumber() -> u32 {
     ZSTD_VERSION_NUMBER
 }
 
+/// Port of `ZSTD_versionString`. Returns the `"X.Y.Z"` literal.
 #[inline]
 pub fn ZSTD_versionString() -> &'static str {
     ZSTD_VERSION_STRING
 }
 
+/// Port of `ZSTD_isError`. Forwards to `ERR_isError`.
 #[inline]
 pub fn ZSTD_isError(code: usize) -> bool {
     ERR_isError(code)
 }
 
+/// Port of `ZSTD_getErrorName`. Forwards to `ERR_getErrorName`.
 #[inline]
 pub fn ZSTD_getErrorName(code: usize) -> &'static str {
     ERR_getErrorName(code)
 }
 
+/// Port of `ZSTD_getErrorCode`. Forwards to `ERR_getErrorCode`.
 #[inline]
 pub fn ZSTD_getErrorCode(code: usize) -> ErrorCode {
     ERR_getErrorCode(code)
 }
 
+/// Port of `ZSTD_getErrorString`. Returns the static message for the
+/// given `ErrorCode`.
 #[inline]
 pub fn ZSTD_getErrorString(code: ErrorCode) -> &'static str {
     crate::common::error::ERR_getErrorString(code)

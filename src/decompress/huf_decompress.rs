@@ -23,6 +23,9 @@ pub const HUF_flags_suspectUncompressible: i32 = 1 << 3;
 pub const HUF_flags_disableAsm: i32 = 1 << 4;
 pub const HUF_flags_disableFast: i32 = 1 << 5;
 
+/// BMI2 variant of `BIT_lookBitsFast`: uses `BEXTR` to extract `nbBits`
+/// from the bit container. Rust-only specialization for the
+/// `bmi1,bmi2,lzcnt` target-feature set.
 #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
 #[target_feature(enable = "bmi1,bmi2,lzcnt")]
 unsafe fn HUF_lookBitsFast_bmi2(
@@ -60,6 +63,9 @@ struct HUF_DecompressFastArgs {
     iend: [usize; 4],
 }
 
+/// Port of `HUF_initFastDStream`. Seeds a 64-bit bit container from the
+/// 8 bytes at `cSrc[ip..]`, applying the final-byte alignment so the
+/// stream's start-of-decode bit lands at bit-63.
 #[inline(always)]
 fn HUF_initFastDStream(cSrc: &[u8], ip: usize) -> u64 {
     let lastByte = cSrc[ip + 7];
@@ -72,6 +78,10 @@ fn HUF_initFastDStream(cSrc: &[u8], ip: usize) -> u64 {
     (crate::common::mem::MEM_readLE64(&cSrc[ip..]) | 1) << bitsConsumed
 }
 
+/// Port of `HUF_DecompressFastArgs_init`. Validates the 4-stream
+/// preconditions for the fast-loop decoder and lays out the per-stream
+/// input/output cursors plus the initial bit containers. Returns
+/// `Ok(None)` to signal "fall back to the body decoder".
 fn HUF_DecompressFastArgs_init(
     dstSize: usize,
     cSrc: &[u8],
@@ -144,6 +154,9 @@ fn HUF_DecompressFastArgs_init(
     Ok(Some(args))
 }
 
+/// Rust-only helper: rebuild a regular `BIT_DStream_t` from a fast-loop
+/// `HUF_DecompressFastArgs` so the tail-stage decoder can finish a
+/// stream after the fast loop yields control.
 #[inline]
 fn HUF_initRemainingDStream_fromFast<'a>(
     bit: &mut crate::common::bitstream::BIT_DStream_t<'a>,
@@ -188,6 +201,9 @@ pub struct DTableDesc {
     pub reserved: u8,
 }
 
+/// Rust-only helper: pack a `DTableDesc` into the u32 stored in
+/// `dtable[0]`. Mirrors the byte order used by upstream's
+/// `memcpy(&desc, DTable, sizeof(desc))`.
 #[inline]
 fn pack_dtable_desc(d: DTableDesc) -> u32 {
     (d.maxTableLog as u32)
@@ -196,6 +212,7 @@ fn pack_dtable_desc(d: DTableDesc) -> u32 {
         | ((d.reserved as u32) << 24)
 }
 
+/// Rust-only helper: inverse of `pack_dtable_desc`.
 #[inline]
 fn unpack_dtable_desc(s: u32) -> DTableDesc {
     DTableDesc {
@@ -239,11 +256,14 @@ pub struct HUF_DEltX1 {
     pub byte: u8,
 }
 
+/// Rust-only helper: pack a `HUF_DEltX1` into the u16 layout used by
+/// `HUF_DEltX1_set4`.
 #[inline]
 pub fn HUF_DEltX1_pack(e: HUF_DEltX1) -> u16 {
     (e.nbBits as u16) | ((e.byte as u16) << 8)
 }
 
+/// Rust-only helper: inverse of `HUF_DEltX1_pack`.
 #[inline]
 pub fn HUF_DEltX1_unpack(s: u16) -> HUF_DEltX1 {
     HUF_DEltX1 {
@@ -317,11 +337,13 @@ pub struct HUF_DEltX2 {
     pub length: u8,
 }
 
+/// Rust-only helper: pack a `HUF_DEltX2` into one u32 DTable slot.
 #[inline]
 pub fn HUF_DEltX2_pack(e: HUF_DEltX2) -> u32 {
     (e.sequence as u32) | ((e.nbBits as u32) << 16) | ((e.length as u32) << 24)
 }
 
+/// Rust-only helper: inverse of `HUF_DEltX2_pack`.
 #[inline]
 pub fn HUF_DEltX2_unpack(s: u32) -> HUF_DEltX2 {
     HUF_DEltX2 {
@@ -339,6 +361,8 @@ pub fn read_entry_x2(dtable: &[HUF_DTable], idx: usize) -> HUF_DEltX2 {
     HUF_DEltX2_unpack(dtable[1 + idx])
 }
 
+/// Rust-only helper: write a packed `HUF_DEltX2` at entry index `idx`.
+/// Counterpart to `read_entry_x2`.
 #[inline]
 pub fn write_entry_x2(dtable: &mut [HUF_DTable], idx: usize, e: HUF_DEltX2) {
     dtable[1 + idx] = HUF_DEltX2_pack(e);
@@ -368,6 +392,7 @@ pub fn HUF_buildDEltX2U32(symbol: u32, nbBits: u32, baseSeq: u32, level: i32) ->
     }
 }
 
+/// Port of `HUF_buildDEltX2`. Thin alias for `HUF_buildDEltX2U32`.
 #[inline]
 pub fn HUF_buildDEltX2(symbol: u32, nbBits: u32, baseSeq: u32, level: i32) -> u32 {
     HUF_buildDEltX2U32(symbol, nbBits, baseSeq, level)
@@ -542,6 +567,8 @@ pub fn HUF_decodeSymbolX2(
     e.length as u32
 }
 
+/// BMI2 specialization of `HUF_decodeSymbolX2`. Same behaviour, routed
+/// through `HUF_lookBitsFast_bmi2` so the look-up uses `BEXTR`.
 #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
 #[target_feature(enable = "bmi1,bmi2,lzcnt")]
 unsafe fn HUF_decodeSymbolX2_bmi2(
@@ -587,6 +614,7 @@ pub fn HUF_decodeLastSymbolX2(
     1
 }
 
+/// BMI2 specialization of `HUF_decodeLastSymbolX2`.
 #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
 #[target_feature(enable = "bmi1,bmi2,lzcnt")]
 unsafe fn HUF_decodeLastSymbolX2_bmi2(
@@ -683,6 +711,9 @@ pub fn HUF_decodeStreamX2(
     p - pStart
 }
 
+/// BMI2 specialization of `HUF_decodeStreamX2`. Same fast/tail
+/// structure, with each per-symbol decode routed through
+/// `HUF_decodeSymbolX2_bmi2`.
 #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
 #[target_feature(enable = "bmi1,bmi2,lzcnt")]
 unsafe fn HUF_decodeStreamX2_bmi2(
@@ -923,6 +954,7 @@ pub fn HUF_readDTableX1(
     iSize
 }
 
+/// Port of `HUF_readDTableX1_wksp`. Thin alias for `HUF_readDTableX1`.
 #[inline]
 pub fn HUF_readDTableX1_wksp(
     dtable: &mut [HUF_DTable],
@@ -1091,6 +1123,7 @@ pub fn HUF_readDTableX2(
     iSize
 }
 
+/// Port of `HUF_readDTableX2_wksp`. Thin alias for `HUF_readDTableX2`.
 #[inline]
 pub fn HUF_readDTableX2_wksp(
     dtable: &mut [HUF_DTable],
@@ -1115,6 +1148,7 @@ pub fn HUF_decodeSymbolX1(
     e.byte
 }
 
+/// BMI2 specialization of `HUF_decodeSymbolX1`.
 #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
 #[target_feature(enable = "bmi1,bmi2,lzcnt")]
 unsafe fn HUF_decodeSymbolX1_bmi2(
@@ -1172,6 +1206,7 @@ pub fn HUF_decodeStreamX1(
     p - pStart
 }
 
+/// BMI2 specialization of `HUF_decodeStreamX1`.
 #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
 #[target_feature(enable = "bmi1,bmi2,lzcnt")]
 unsafe fn HUF_decodeStreamX1_bmi2(
@@ -1239,6 +1274,9 @@ pub fn HUF_decompress1X1_usingDTable_internal(
     dstSize
 }
 
+/// Port-name wrapper for `HUF_decompress1X1_usingDTable_internal_body`.
+/// Forwards to `HUF_decompress1X1_usingDTable_internal` since the Rust
+/// port doesn't split a separate fast/body variant for 1X1.
 #[inline]
 pub fn HUF_decompress1X1_usingDTable_internal_body(
     dst: &mut [u8],
@@ -1248,6 +1286,9 @@ pub fn HUF_decompress1X1_usingDTable_internal_body(
     HUF_decompress1X1_usingDTable_internal(dst, cSrc, dtable)
 }
 
+/// Rust-only helper: BMI2-targeted body of
+/// `HUF_decompress1X1_usingDTable_internal_bmi2`. Pulled out so the
+/// public entry point can runtime-dispatch on the actual CPU features.
 #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
 #[target_feature(enable = "bmi1,bmi2,lzcnt")]
 unsafe fn HUF_decompress1X1_usingDTable_internal_bmi2_impl(
@@ -1278,6 +1319,9 @@ unsafe fn HUF_decompress1X1_usingDTable_internal_bmi2_impl(
     dstSize
 }
 
+/// Port of `HUF_decompress1X1_usingDTable_internal_bmi2`. Runtime
+/// dispatch: uses the BMI2 impl when the CPU advertises the required
+/// features, otherwise falls back to the portable scalar decoder.
 #[inline]
 pub fn HUF_decompress1X1_usingDTable_internal_bmi2(
     dst: &mut [u8],
@@ -1296,6 +1340,9 @@ pub fn HUF_decompress1X1_usingDTable_internal_bmi2(
     HUF_decompress1X1_usingDTable_internal(dst, cSrc, dtable)
 }
 
+/// Port of `HUF_decompress1X_usingDTable`. Dispatches between the X1
+/// and X2 single-stream decoders based on `dtable`'s `tableType`, with
+/// a const-generic `BMI2` flag selecting the BMI2-targeted variants.
 pub fn HUF_decompress1X_usingDTable<const BMI2: bool>(
     dst: &mut [u8],
     cSrc: &[u8],
@@ -1315,6 +1362,10 @@ pub fn HUF_decompress1X_usingDTable<const BMI2: bool>(
     }
 }
 
+/// Rust-only helper: fast-loop body of
+/// `HUF_decompress4X1_usingDTable_internal_fast`. Returns 0 when the
+/// fast path is not applicable so the caller can fall back to the
+/// body decoder; otherwise returns the decoded length or an error.
 fn HUF_decompress4X1_usingDTable_internal_fast_impl(
     dst: &mut [u8],
     cSrc: &[u8],
@@ -1360,6 +1411,10 @@ fn HUF_decompress4X1_usingDTable_internal_fast_impl(
     dst.len()
 }
 
+/// Rust-only helper: portable C-style fast loop for
+/// `HUF_decompress4X1_usingDTable_internal_fast`. Steps four streams in
+/// parallel, decoding five symbols per stream per iteration while
+/// margin is available in each output segment.
 fn HUF_decompress4X1_usingDTable_internal_fast_c_loop_impl(
     args: &mut HUF_DecompressFastArgs,
     dst: &mut [u8],
@@ -1567,6 +1622,9 @@ fn HUF_decompress4X1_usingDTable_internal_body_impl(
     dstSize
 }
 
+/// Port of `HUF_decompress4X1_usingDTable_internal`. Tries the guarded
+/// fast loop first; on opt-out (returns 0) falls back to the body
+/// decoder.
 pub fn HUF_decompress4X1_usingDTable_internal(
     dst: &mut [u8],
     cSrc: &[u8],
@@ -1618,6 +1676,9 @@ pub fn HUF_decompress4X1_usingDTable_internal_bmi2(
     HUF_decompress4X1_usingDTable_internal(dst, cSrc, dtable)
 }
 
+/// Rust-only helper: BMI2-targeted body of the 4X1 quad-stream
+/// decoder. Mirrors the portable `_body_impl` decode loop with
+/// `HUF_decodeSymbolX1_bmi2` substituted in.
 #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
 #[target_feature(enable = "bmi1,bmi2,lzcnt")]
 unsafe fn HUF_decompress4X1_usingDTable_internal_bmi2_impl(
@@ -1789,6 +1850,9 @@ pub fn HUF_decompress4X1_usingDTable_internal_fast_c_loop(
     HUF_decompress4X1_usingDTable_internal_fast(dst, cSrc, dtable)
 }
 
+/// Port of `HUF_decompress4X_usingDTable`. Quad-stream counterpart of
+/// `HUF_decompress1X_usingDTable`; routes by `dtable.tableType` and the
+/// const-generic BMI2 flag.
 pub fn HUF_decompress4X_usingDTable<const BMI2: bool>(
     dst: &mut [u8],
     cSrc: &[u8],
@@ -1857,6 +1921,8 @@ pub fn HUF_decompress1X2_usingDTable_internal(
     dstSize
 }
 
+/// Port-name wrapper for `HUF_decompress1X2_usingDTable_internal_body`.
+/// Forwards to `HUF_decompress1X2_usingDTable_internal`.
 #[inline]
 pub fn HUF_decompress1X2_usingDTable_internal_body(
     dst: &mut [u8],
@@ -1866,6 +1932,8 @@ pub fn HUF_decompress1X2_usingDTable_internal_body(
     HUF_decompress1X2_usingDTable_internal(dst, cSrc, dtable)
 }
 
+/// Rust-only helper: BMI2-targeted body of
+/// `HUF_decompress1X2_usingDTable_internal_bmi2`.
 #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
 #[target_feature(enable = "bmi1,bmi2,lzcnt")]
 unsafe fn HUF_decompress1X2_usingDTable_internal_bmi2_impl(
@@ -1892,6 +1960,9 @@ unsafe fn HUF_decompress1X2_usingDTable_internal_bmi2_impl(
     dstSize
 }
 
+/// Port of `HUF_decompress1X2_usingDTable_internal_bmi2`. Runtime
+/// dispatches to the BMI2 impl when supported, otherwise the portable
+/// `HUF_decompress1X2_usingDTable_internal`.
 #[inline]
 pub fn HUF_decompress1X2_usingDTable_internal_bmi2(
     dst: &mut [u8],
@@ -1996,6 +2067,9 @@ pub fn HUF_decompress4X1_DCtx_wksp(
     }
 }
 
+/// Rust-only helper: fast-loop body of
+/// `HUF_decompress4X2_usingDTable_internal_fast`. Returns 0 to opt
+/// out (caller falls back to the body decoder).
 fn HUF_decompress4X2_usingDTable_internal_fast_impl(
     dst: &mut [u8],
     cSrc: &[u8],
@@ -2041,6 +2115,10 @@ fn HUF_decompress4X2_usingDTable_internal_fast_impl(
     dst.len()
 }
 
+/// Rust-only helper: portable C-style fast loop for
+/// `HUF_decompress4X2_usingDTable_internal_fast`. Decodes X2 symbols
+/// from four streams in parallel; each output slot may absorb 1 or 2
+/// bytes per decode step.
 fn HUF_decompress4X2_usingDTable_internal_fast_c_loop_impl(
     args: &mut HUF_DecompressFastArgs,
     dst: &mut [u8],
@@ -2252,6 +2330,8 @@ fn HUF_decompress4X2_usingDTable_internal_body_impl(
     dstSize
 }
 
+/// Port of `HUF_decompress4X2_usingDTable_internal`. Tries the guarded
+/// fast loop first; on opt-out falls back to the body decoder.
 pub fn HUF_decompress4X2_usingDTable_internal(
     dst: &mut [u8],
     cSrc: &[u8],
@@ -2303,6 +2383,9 @@ pub fn HUF_decompress4X2_usingDTable_internal_bmi2(
     HUF_decompress4X2_usingDTable_internal(dst, cSrc, dtable)
 }
 
+/// Rust-only helper: BMI2-targeted body of the 4X2 quad-stream
+/// decoder. Mirrors `_body_impl` with `HUF_decodeSymbolX2_bmi2`
+/// substituted in.
 #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
 #[target_feature(enable = "bmi1,bmi2,lzcnt")]
 unsafe fn HUF_decompress4X2_usingDTable_internal_bmi2_impl(

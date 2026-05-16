@@ -272,34 +272,46 @@ pub fn ZSTD_getSequenceLength(seqStore: &SeqStore_t, seqIdx: usize) -> ZSTD_Sequ
 
 // ---- offBase helpers (match upstream's macros) ---------------------------
 
+/// Port of `REPCODE_TO_OFFBASE` macro. Encodes a repcode ID (1, 2, or 3)
+/// as its offBase value — identity in the low-id half of the sumtype.
 #[inline]
 pub fn REPCODE_TO_OFFBASE(r: u32) -> u32 {
     debug_assert!(r >= 1 && r <= ZSTD_REP_NUM as u32);
     r
 }
 
+/// Port of `OFFSET_TO_OFFBASE` macro. Encodes a positive raw offset as
+/// `offset + ZSTD_REP_NUM`, placing it above the repcode reserved range.
 #[inline]
 pub fn OFFSET_TO_OFFBASE(offset: u32) -> u32 {
     debug_assert!(offset > 0);
     offset + ZSTD_REP_NUM as u32
 }
 
+/// Port of `OFFBASE_IS_OFFSET` macro. True when `o` carries a full raw
+/// offset (`> ZSTD_REP_NUM`) rather than a repcode ID.
 #[inline]
 pub fn OFFBASE_IS_OFFSET(o: u32) -> bool {
     o > ZSTD_REP_NUM as u32
 }
 
+/// Port of `OFFBASE_IS_REPCODE` macro. True when `o` is a repcode ID in
+/// `1..=ZSTD_REP_NUM`.
 #[inline]
 pub fn OFFBASE_IS_REPCODE(o: u32) -> bool {
     o <= ZSTD_REP_NUM as u32
 }
 
+/// Port of `OFFBASE_TO_OFFSET` macro. Inverse of `OFFSET_TO_OFFBASE` —
+/// strips the `ZSTD_REP_NUM` bias to recover the raw offset.
 #[inline]
 pub fn OFFBASE_TO_OFFSET(o: u32) -> u32 {
     debug_assert!(OFFBASE_IS_OFFSET(o));
     o - ZSTD_REP_NUM as u32
 }
 
+/// Port of `OFFBASE_TO_REPCODE` macro. Inverse of `REPCODE_TO_OFFBASE` —
+/// identity for IDs 1/2/3.
 #[inline]
 pub fn OFFBASE_TO_REPCODE(o: u32) -> u32 {
     debug_assert!(OFFBASE_IS_REPCODE(o));

@@ -285,6 +285,11 @@ pub fn ZSTD_compressBlock_fast_noDict_generic(
     }
 }
 
+/// MLS+CMOV-monomorphized core of `ZSTD_compressBlock_fast_noDict_generic`.
+/// Mirrors upstream's `ZSTD_GEN_FAST_FN(noDict, MLS, useCmov)` template
+/// expansions; const generics let LLVM inline the hash width and match
+/// predicate. Rust-only split so the dispatch in
+/// `ZSTD_compressBlock_fast_noDict_generic` stays small.
 #[inline(never)]
 fn ZSTD_compressBlock_fast_noDict_generic_mls<const MLS: u32, const USE_CMOV: bool>(
     ms: &mut ZSTD_MatchState_t,
@@ -597,6 +602,9 @@ pub fn ZSTD_compressBlock_fast(
     ZSTD_compressBlock_fast_noDict_generic(ms, seqStore, rep, src, 0, mml)
 }
 
+/// Port of `ZSTD_compressBlock_fast_dictMatchState`. Public entry for
+/// the fast strategy when a digested dictionary is attached; dispatches
+/// to `ZSTD_compressBlock_fast_dictMatchState_generic` on `minMatch`.
 pub fn ZSTD_compressBlock_fast_dictMatchState(
     ms: &mut ZSTD_MatchState_t,
     seqStore: &mut SeqStore_t,
@@ -892,6 +900,9 @@ pub fn ZSTD_compressBlock_fast_dictMatchState_generic(
     iend - anchor
 }
 
+/// Port of `ZSTD_compressBlock_fast_extDict`. Public entry for the
+/// fast strategy when the window has an external dictionary segment;
+/// dispatches to `ZSTD_compressBlock_fast_extDict_generic`.
 pub fn ZSTD_compressBlock_fast_extDict(
     ms: &mut ZSTD_MatchState_t,
     seqStore: &mut SeqStore_t,

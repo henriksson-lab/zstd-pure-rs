@@ -25,20 +25,78 @@ pub enum ZSTD_dictContentType_e {
 }
 
 /// Digested dictionary. Rust-side port owns its content via a `Vec<u8>`
-/// in `dictBuffer`; the `byReference` variant still stores the borrow
-/// via lifetime gymnastics in a future revision — for now, all dicts
-/// are copied (`byCopy` semantics).
+/// in `dictBuffer`; this lifetime-free public type cannot safely
+/// model a borrowed caller dictionary, so all heap-created DDicts use
+/// by-copy semantics.
 pub struct ZSTD_DDict {
-    pub dictBuffer: Vec<u8>,
-    pub dictContent: *const u8,
-    pub dictSize: usize,
-    pub dictID: u32,
-    pub entropyPresent: u32,
+    dictBuffer: Vec<u8>,
+    dictContent: *const u8,
+    dictSize: usize,
+    dictContentOriginal: *const u8,
+    dictSizeOriginal: usize,
+    dictID: u32,
+    entropyPresent: u32,
+}
+
+impl ZSTD_DDict {
+    pub(crate) fn empty() -> Self {
+        Self {
+            dictBuffer: Vec::new(),
+            dictContent: core::ptr::null(),
+            dictSize: 0,
+            dictContentOriginal: core::ptr::null(),
+            dictSizeOriginal: 0,
+            dictID: 0,
+            entropyPresent: 0,
+        }
+    }
+
+    pub(crate) fn borrowed(dict: &[u8]) -> Self {
+        let ptr = if dict.is_empty() {
+            core::ptr::null()
+        } else {
+            dict.as_ptr()
+        };
+        Self {
+            dictBuffer: Vec::new(),
+            dictContent: ptr,
+            dictSize: dict.len(),
+            dictContentOriginal: ptr,
+            dictSizeOriginal: dict.len(),
+            dictID: 0,
+            entropyPresent: 0,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn raw_with_dict_id(dictID: u32, content: &[u8]) -> Self {
+        let mut ddict = Self {
+            dictBuffer: content.to_vec(),
+            dictContent: core::ptr::null(),
+            dictSize: content.len(),
+            dictContentOriginal: core::ptr::null(),
+            dictSizeOriginal: content.len(),
+            dictID,
+            entropyPresent: 0,
+        };
+        ddict.dictContent = if ddict.dictBuffer.is_empty() {
+            core::ptr::null()
+        } else {
+            ddict.dictBuffer.as_ptr()
+        };
+        ddict.dictContentOriginal = ddict.dictContent;
+        ddict
+    }
 }
 
 /// Port of `ZSTD_DDict_dictContent`.
 #[inline]
 pub fn ZSTD_DDict_dictContent(ddict: &ZSTD_DDict) -> &[u8] {
+    ZSTD_DDict_rawContent(ddict)
+}
+
+#[inline]
+pub(crate) fn ZSTD_DDict_rawContent(ddict: &ZSTD_DDict) -> &[u8] {
     if ddict.dictSize == 0 {
         &[]
     } else {
@@ -56,6 +114,20 @@ pub fn ZSTD_DDict_dictSize(ddict: &ZSTD_DDict) -> usize {
 #[inline]
 pub fn ZSTD_getDictID_fromDDict(ddict: &ZSTD_DDict) -> u32 {
     ddict.dictID
+}
+
+#[inline]
+pub(crate) fn ZSTD_DDict_entropyPresent(ddict: &ZSTD_DDict) -> u32 {
+    ddict.entropyPresent
+}
+
+#[inline]
+pub(crate) fn ZSTD_DDict_originalContent(ddict: &ZSTD_DDict) -> &[u8] {
+    if ddict.dictSizeOriginal == 0 {
+        &[]
+    } else {
+        unsafe { core::slice::from_raw_parts(ddict.dictContentOriginal, ddict.dictSizeOriginal) }
+    }
 }
 
 /// Port of `ZSTD_getDictID_fromDict`. Reads the 4-byte dictID from a
@@ -100,8 +172,7 @@ pub fn ZSTD_sizeof_DDict(ddict: Option<&ZSTD_DDict>) -> usize {
 /// Port of `ZSTD_loadEntropy_intoDDict`.
 /// Returns 0 on success or an error code. Magic-tagged zstd-format
 /// dictionaries are parsed with the shared decoder entropy loader so
-/// the DDict exposes only the raw content bytes after the entropy
-/// tables, matching upstream's `dictContent` pointer adjustment.
+/// the DDict keeps its public content pointer after the entropy tables.
 pub(crate) fn ZSTD_loadEntropy_intoDDict(
     ddict: &mut ZSTD_DDict,
     dictContentType: ZSTD_dictContentType_e,
@@ -125,38 +196,39 @@ pub(crate) fn ZSTD_loadEntropy_intoDDict(
         }
         return 0; // pure content mode
     }
-    let magic = MEM_readLE32(&ddict.dictBuffer[..4]);
-    if magic != ZSTD_MAGIC_DICTIONARY {
-        if dictContentType == ZSTD_dictContentType_e::ZSTD_dct_fullDict {
-            return ERROR(ErrorCode::DictionaryCorrupted);
+    let (dictID, entropy_size) = {
+        let dict = ZSTD_DDict_dictContent(ddict);
+        let magic = MEM_readLE32(&dict[..4]);
+        if magic != ZSTD_MAGIC_DICTIONARY {
+            if dictContentType == ZSTD_dictContentType_e::ZSTD_dct_fullDict {
+                return ERROR(ErrorCode::DictionaryCorrupted);
+            }
+            return 0;
         }
-        return 0;
-    }
 
-    ddict.dictID = MEM_readLE32(&ddict.dictBuffer[ZSTD_FRAMEIDSIZE..ZSTD_FRAMEIDSIZE + 4]);
-    let mut tmp_dctx = ZSTD_DCtx::new();
-    let mut rep = [0u32; 3];
-    let entropy_size = ZSTD_loadDEntropy(&mut tmp_dctx, &mut rep, &ddict.dictBuffer);
+        let dictID = MEM_readLE32(&dict[ZSTD_FRAMEIDSIZE..ZSTD_FRAMEIDSIZE + 4]);
+        let mut tmp_dctx = ZSTD_DCtx::new();
+        let mut rep = [0u32; 3];
+        let entropy_size = ZSTD_loadDEntropy(&mut tmp_dctx, &mut rep, dict);
+        (dictID, entropy_size)
+    };
     if ERR_isError(entropy_size) {
-        if dictContentType == ZSTD_dictContentType_e::ZSTD_dct_fullDict {
-            return ERROR(ErrorCode::DictionaryCorrupted);
-        }
-        // `ZSTD_dct_auto` is permissive: recognize dictID but keep
-        // treating the bytes as raw content when the magic-prefixed
-        // buffer doesn't contain a complete serialized entropy prefix.
+        ddict.dictID = 0;
         ddict.entropyPresent = 0;
-        return 0;
+        return ERROR(ErrorCode::DictionaryCorrupted);
     }
 
+    ddict.dictID = dictID;
     ddict.entropyPresent = 1;
-    ddict.dictContent = unsafe { ddict.dictBuffer.as_ptr().add(entropy_size) };
-    ddict.dictSize = ddict.dictBuffer.len() - entropy_size;
+    ddict.dictContent = unsafe { ddict.dictContent.add(entropy_size) };
+    ddict.dictSize -= entropy_size;
     0
 }
 
 /// Port of `ZSTD_initDDict_internal`. Initializes an already-allocated
-/// DDict from caller bytes. The Rust port still owns a `Vec<u8>` for
-/// both load methods, but preserves the same parse / error behavior.
+/// DDict from caller bytes. The Rust port owns a `Vec<u8>` for both
+/// load methods because `ZSTD_DDict` itself is not lifetime-parameterized,
+/// but preserves the same parse / error behavior.
 pub(crate) fn ZSTD_initDDict_internal(
     ddict: &mut ZSTD_DDict,
     dict: &[u8],
@@ -170,25 +242,20 @@ pub(crate) fn ZSTD_initDDict_internal(
         ddict.dictBuffer.as_ptr()
     };
     ddict.dictSize = dict.len();
+    ddict.dictContentOriginal = ddict.dictContent;
+    ddict.dictSizeOriginal = dict.len();
     ddict.dictID = 0;
     ddict.entropyPresent = 0;
     ZSTD_loadEntropy_intoDDict(ddict, dictContentType)
 }
 
-/// Port of `ZSTD_createDDict_advanced`. Always copies the dict bytes
-/// for now.
+/// Port of `ZSTD_createDDict_advanced`. Always copies the dict bytes.
 pub fn ZSTD_createDDict_advanced(
     dict: &[u8],
     dictLoadMethod: ZSTD_dictLoadMethod_e,
     dictContentType: ZSTD_dictContentType_e,
 ) -> Option<Box<ZSTD_DDict>> {
-    let mut ddict = Box::new(ZSTD_DDict {
-        dictBuffer: Vec::new(),
-        dictContent: core::ptr::null(),
-        dictSize: 0,
-        dictID: 0,
-        entropyPresent: 0,
-    });
+    let mut ddict = Box::new(ZSTD_DDict::empty());
     let rc = ZSTD_initDDict_internal(&mut ddict, dict, dictLoadMethod, dictContentType);
     if crate::common::error::ERR_isError(rc) {
         return None;
@@ -205,9 +272,12 @@ pub fn ZSTD_createDDict(dictBuffer: &[u8]) -> Option<Box<ZSTD_DDict>> {
     )
 }
 
-/// Port of `ZSTD_createDDict_byReference`. In the Rust port we still
-/// take a copy (the lifetime plumbing for a true by-reference variant
-/// lands with streaming dict support).
+/// Rust-safe variant of upstream `ZSTD_createDDict_byReference`.
+///
+/// The upstream C API stores a caller-owned pointer. This Rust port's
+/// `ZSTD_DDict` type has no lifetime parameter, so returning a borrowed
+/// heap DDict would be unsound. It therefore copies the bytes, matching
+/// `ZSTD_createDDict` ownership while preserving parse behavior.
 pub fn ZSTD_createDDict_byReference(dictBuffer: &[u8]) -> Option<Box<ZSTD_DDict>> {
     ZSTD_createDDict_advanced(
         dictBuffer,
@@ -226,9 +296,8 @@ pub fn ZSTD_freeDDict(_ddict: Option<Box<ZSTD_DDict>>) -> usize {
 /// with a DDict's parameters. Upstream sets the prefix/virtualStart/
 /// dictEnd/previousDstEnd pointers that it uses to resolve back-refs
 /// into the dict; v0.1's decoder works by materializing the dict into
-/// `stream_dict` and re-scanning, so we copy the content there and
-/// reparse the DDict's original bytes when serialized entropy is
-/// present.
+/// `stream_dict`, so we copy the exposed content there and reparse the
+/// DDict's original bytes when serialized entropy is present.
 pub fn ZSTD_copyDDictParameters(
     dctx: &mut crate::decompress::zstd_decompress_block::ZSTD_DCtx,
     ddict: &ZSTD_DDict,
@@ -236,7 +305,7 @@ pub fn ZSTD_copyDDictParameters(
     use crate::common::error::ERR_isError;
     use crate::decompress::zstd_decompress::ZSTD_loadDEntropy;
 
-    dctx.stream_dict = ZSTD_DDict_dictContent(ddict).to_vec();
+    dctx.stream_dict = ZSTD_DDict_rawContent(ddict).to_vec();
     // Upstream (zstd_ddict.c:63-84) also copies dictID and flips
     // `fseEntropy` alongside `litEntropy` when the DDict has
     // pre-digested entropy tables. Our port was only copying
@@ -245,7 +314,7 @@ pub fn ZSTD_copyDDictParameters(
     dctx.dictID = ddict.dictID;
     if ddict.entropyPresent != 0 {
         let mut rep = [0u32; 3];
-        let rc = ZSTD_loadDEntropy(dctx, &mut rep, &ddict.dictBuffer);
+        let rc = ZSTD_loadDEntropy(dctx, &mut rep, ZSTD_DDict_originalContent(ddict));
         if !ERR_isError(rc) {
             dctx.ddict_rep = rep;
         }
@@ -268,14 +337,8 @@ mod byref_tests {
         // `litEntropy` AND `fseEntropy` from `ddict.entropyPresent`.
         // Previously our port only wrote `stream_dict` + `litEntropy`.
         use crate::decompress::zstd_decompress_block::ZSTD_DCtx;
-        let mut ddict = ZSTD_DDict {
-            dictBuffer: b"copy-params-dict".to_vec(),
-            dictContent: core::ptr::null(),
-            dictSize: 16,
-            dictID: 0xDEAD_BEEF,
-            entropyPresent: 1,
-        };
-        ddict.dictContent = ddict.dictBuffer.as_ptr();
+        let mut ddict = ZSTD_DDict::raw_with_dict_id(0xDEAD_BEEF, b"copy-params-dict");
+        ddict.entropyPresent = 1;
         let mut dctx = ZSTD_DCtx::new();
         ZSTD_copyDDictParameters(&mut dctx, &ddict);
         assert_eq!(dctx.dictID, 0xDEAD_BEEF);
@@ -294,9 +357,6 @@ mod byref_tests {
 
     #[test]
     fn createDDict_byReference_matches_regular_creator_content() {
-        // byReference is currently implemented as a by-copy load in
-        // the Rust port; the exposed content must nonetheless equal
-        // the plain `createDDict` output for the same buffer.
         let dict = b"byref-equivalence-test-dict ".repeat(4);
         let by_copy = ZSTD_createDDict(&dict).expect("by-copy");
         let by_ref = ZSTD_createDDict_byReference(&dict).expect("by-ref");
@@ -305,6 +365,18 @@ mod byref_tests {
             ZSTD_DDict_dictContent(&by_ref)
         );
         assert_eq!(ZSTD_DDict_dictSize(&by_copy), ZSTD_DDict_dictSize(&by_ref));
+    }
+
+    #[test]
+    fn createDDict_byReference_copies_caller_bytes() {
+        let mut dict = b"byref-copy-contract-test-dict ".repeat(4);
+        let expected = dict.clone();
+        let ddict = ZSTD_createDDict_byReference(&dict).expect("by-ref");
+
+        dict.fill(b'X');
+
+        assert_eq!(ZSTD_DDict_dictContent(&ddict), expected.as_slice());
+        assert_ne!(ZSTD_DDict_dictContent(&ddict), dict.as_slice());
     }
 
     #[test]
@@ -441,13 +513,7 @@ mod tests {
     fn initDDict_internal_reinitializes_existing_ddict() {
         let first = b"first-ddict-content";
         let second = b"second-ddict-content";
-        let mut ddict = ZSTD_DDict {
-            dictBuffer: Vec::new(),
-            dictContent: core::ptr::null(),
-            dictSize: 0,
-            dictID: 0,
-            entropyPresent: 0,
-        };
+        let mut ddict = ZSTD_DDict::empty();
 
         assert_eq!(
             ZSTD_initDDict_internal(
@@ -491,7 +557,7 @@ mod tests {
     }
 
     #[test]
-    fn create_magic_prefix_dict_reads_dict_id_in_auto() {
+    fn create_magic_prefix_dict_rejects_malformed_entropy_in_auto() {
         use crate::common::mem::MEM_writeLE32;
         use crate::decompress::zstd_decompress::{ZSTD_FRAMEIDSIZE, ZSTD_MAGIC_DICTIONARY};
 
@@ -501,11 +567,7 @@ mod tests {
             &mut dict[ZSTD_FRAMEIDSIZE..ZSTD_FRAMEIDSIZE + 4],
             0xCAFEBABE,
         );
-        // In auto mode, full-entropy loading is not yet wired so
-        // `ZSTD_dct_auto` falls back to raw while still recognizing
-        // the dictID.
-        let ddict = ZSTD_createDDict(&dict).expect("auto-mode magic dict");
-        assert_eq!(ZSTD_getDictID_fromDDict(&ddict), 0xCAFEBABE);
+        assert!(ZSTD_createDDict(&dict).is_none());
     }
 
     #[test]
@@ -524,6 +586,9 @@ mod tests {
         assert_eq!(ZSTD_getDictID_fromDDict(&ddict), 0xA5A5_1234);
         assert_eq!(ddict.entropyPresent, 1);
         assert_eq!(ZSTD_DDict_dictContent(&ddict), content.as_slice());
+        assert_eq!(ZSTD_DDict_dictSize(&ddict), content.len());
+        assert_eq!(ZSTD_DDict_originalContent(&ddict), dict.as_slice());
+        assert_eq!(ZSTD_DDict_rawContent(&ddict), content.as_slice());
 
         let mut dctx = ZSTD_DCtx::new();
         ZSTD_copyDDictParameters(&mut dctx, &ddict);

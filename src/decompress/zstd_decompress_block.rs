@@ -1412,9 +1412,18 @@ pub struct ZSTD_DCtx {
     /// `ZSTD_BLOCKSIZE_MAX` before a frame header has been parsed).
     /// Reset on frame boundaries and on `ZSTD_decompressBegin`.
     pub historyBuffer: Vec<u8>,
-    /// `ZSTD_d_windowLogMax`: upper bound on the window size the
-    /// decoder will accept. Set via `ZSTD_DCtx_setParameter`.
+    /// `ZSTD_d_windowLogMax`: public log-form upper bound on the
+    /// window size the decoder will accept. Set via
+    /// `ZSTD_DCtx_setParameter`.
     pub d_windowLogMax: u32,
+    /// Byte-form max window size used for streaming enforcement.
+    /// `ZSTD_DCtx_setMaxWindowSize()` accepts byte sizes that are not
+    /// powers of two, so the effective cap must not be reconstructed
+    /// from `d_windowLogMax`.
+    pub d_maxWindowSize: u64,
+    /// Tracks whether the max-window cap came from an explicit public
+    /// setter rather than the fresh-DCtx default.
+    pub d_maxWindowSizeSet: bool,
 
     /// Upstream `dctx->format`. Selected decoder format — zstd1 (with
     /// magic) or zstd1_magicless (for embedded / streaming contexts
@@ -1575,6 +1584,9 @@ impl Default for ZSTD_DCtx {
             stream_dict: Vec::new(),
             historyBuffer: Vec::new(),
             d_windowLogMax: crate::decompress::zstd_decompress::ZSTD_WINDOWLOG_LIMIT_DEFAULT,
+            d_maxWindowSize: 1u64
+                << crate::decompress::zstd_decompress::ZSTD_WINDOWLOG_LIMIT_DEFAULT,
+            d_maxWindowSizeSet: false,
             format: crate::decompress::zstd_decompress::ZSTD_format_e::ZSTD_f_zstd1,
             expected: crate::decompress::zstd_decompress::ZSTD_startingInputLength(
                 crate::decompress::zstd_decompress::ZSTD_format_e::ZSTD_f_zstd1,

@@ -92,6 +92,12 @@ pub struct ZSTD_CCtx {
     /// non-empty; magic-prefixed zstd-format dictionaries also retain
     /// their parsed `dictID`.
     pub stream_dict: Vec<u8>,
+    /// Original dictionary bytes provided by the caller. For full
+    /// dictionaries, `stream_dict` stores only parsed content while
+    /// this keeps the magic-prefixed bytes for later session init.
+    pub stream_dict_original: Vec<u8>,
+    /// Caller-selected interpretation for `stream_dict_original`.
+    pub stream_dict_content_type: crate::decompress::zstd_ddict::ZSTD_dictContentType_e,
     /// Referenced CDict installed via `ZSTD_CCtx_refCDict`. When set,
     /// stream/session init routes through the CDict-backed begin path
     /// instead of degrading to a raw dictionary.
@@ -107,6 +113,12 @@ pub struct ZSTD_CCtx {
     /// Pending input bytes staged by `ZSTD_compressStream`, awaiting
     /// `ZSTD_endStream` to be compressed in a single frame.
     pub stream_in_buffer: Vec<u8>,
+    /// Effective parameter snapshot captured when this buffered
+    /// stream first accepts input. Since this port doesn't yet emit
+    /// blocks before `endStream`, the final one-shot compression must
+    /// not observe later CCtx parameter edits for already accepted
+    /// bytes.
+    pub stream_params_snapshot: Option<ZSTD_streamParamsSnapshot>,
     /// Compressed payload produced by `ZSTD_endStream`, awaiting drain
     /// through successive `endStream` calls.
     pub stream_out_buffer: Vec<u8>,
@@ -121,6 +133,10 @@ pub struct ZSTD_CCtx {
     pub buffer_expectations_set: bool,
     /// Flag: `endStream` has produced output (frame is final).
     pub stream_closed: bool,
+    /// The previous streaming frame fully drained and no new input has
+    /// started yet. Used to make repeated `endStream()` calls no-op while
+    /// still allowing init-stage setters.
+    pub stream_frame_completed: bool,
     /// cParams requested via `ZSTD_CCtx_setCParams`. Stored so API
     /// getters can round-trip and so `ZSTD_getBlockSize` can fall
     /// back to the requested `windowLog` before the CCtx has been
@@ -211,11 +227,15 @@ impl Default for ZSTD_CCtx {
             stream_level: None,
             pledged_src_size: None,
             stream_dict: Vec::new(),
+            stream_dict_original: Vec::new(),
+            stream_dict_content_type:
+                crate::decompress::zstd_ddict::ZSTD_dictContentType_e::ZSTD_dct_auto,
             stream_cdict: None,
             param_checksum: false,
             param_contentSize: true, // upstream default
             param_dictID: true,      // upstream default
             stream_in_buffer: Vec::new(),
+            stream_params_snapshot: None,
             stream_out_buffer: Vec::new(),
             stream_out_drained: 0,
             expected_in_src: 0,
@@ -224,6 +244,7 @@ impl Default for ZSTD_CCtx {
             expected_out_buffer_size: 0,
             buffer_expectations_set: false,
             stream_closed: false,
+            stream_frame_completed: false,
             requested_cParams: None,
             requestedParams: ZSTD_CCtx_params::default(),
             appliedParams: ZSTD_CCtx_params::default(),
@@ -1022,6 +1043,16 @@ pub fn ZSTD_cParam_withinBounds(cParam: ZSTD_cParameter, value: i32) -> bool {
 /// type alias matches.
 pub type ZSTD_CStream = ZSTD_CCtx;
 
+#[derive(Debug, Clone, Copy)]
+pub struct ZSTD_streamParamsSnapshot {
+    pub requestedParams: ZSTD_CCtx_params,
+    pub stream_level: i32,
+    pub param_checksum: bool,
+    pub param_contentSize: bool,
+    pub param_dictID: bool,
+    pub format: crate::decompress::zstd_decompress::ZSTD_format_e,
+}
+
 /// Port of `ZSTD_createCStream`. Alias for `ZSTD_createCCtx`.
 pub fn ZSTD_createCStream() -> Option<Box<ZSTD_CStream>> {
     ZSTD_createCCtx()
@@ -1041,6 +1072,31 @@ fn cctx_is_in_init_stage(cctx: &ZSTD_CCtx) -> bool {
     cctx.stream_in_buffer.is_empty() && cctx.stream_out_buffer.is_empty() && !cctx.stream_closed
 }
 
+fn cctx_mark_stream_frame_completed(cctx: &mut ZSTD_CCtx) {
+    cctx.stream_in_buffer.clear();
+    cctx.stream_params_snapshot = None;
+    cctx.stream_out_buffer.clear();
+    cctx.stream_out_drained = 0;
+    cctx.stream_closed = false;
+    cctx.stream_frame_completed = true;
+    cctx.pledgedSrcSizePlusOne = 0;
+    cctx.pledged_src_size = None;
+    cctx.consumedSrcSize = 0;
+    cctx.initialized = false;
+}
+
+#[inline]
+fn zstd_snapshot_stream_params(cctx: &ZSTD_CCtx) -> ZSTD_streamParamsSnapshot {
+    ZSTD_streamParamsSnapshot {
+        requestedParams: cctx.requestedParams,
+        stream_level: cctx.stream_level.unwrap_or(ZSTD_CLEVEL_DEFAULT),
+        param_checksum: cctx.param_checksum,
+        param_contentSize: cctx.param_contentSize,
+        param_dictID: cctx.param_dictID,
+        format: cctx.format,
+    }
+}
+
 /// Port of `ZSTD_CCtx_loadDictionary`. Stashes the dict on the CCtx
 /// so subsequent streaming / one-shot compressions use it. Upstream
 /// also supports pre-digested dicts via `ZSTD_CCtx_refCDict`; this
@@ -1052,23 +1108,12 @@ fn cctx_is_in_init_stage(cctx: &ZSTD_CCtx) -> bool {
 /// `compressStream` calls would leave the already-buffered bytes
 /// compressed against the wrong back-reference substrate.
 pub fn ZSTD_CCtx_loadDictionary(cctx: &mut ZSTD_CCtx, dict: &[u8]) -> usize {
-    if !cctx_is_in_init_stage(cctx) {
-        return ERROR(ErrorCode::StageWrong);
-    }
-    // Upstream (zstd_compress.c:1308): `clearAllDicts` first, then
-    // install only when there's actual content. Empty-dict calls
-    // become a pure clear — matches the `refPrefix(&[])` path too.
-    ZSTD_clearAllDicts(cctx);
-    if !dict.is_empty() {
-        cctx.stream_dict = dict.to_vec();
-        // Upstream's dictID tracking — parse the dict's embedded ID
-        // if it starts with the magic prefix; otherwise 0 (raw).
-        cctx.dictID = crate::decompress::zstd_ddict::ZSTD_getDictID_fromDict(dict);
-        cctx.dictContentSize = dict.len();
-        // loadDictionary attaches persistently — the single-use
-        // flag stays at the `clearAllDicts` default (`false`).
-    }
-    0
+    ZSTD_CCtx_loadDictionary_advanced(
+        cctx,
+        dict,
+        crate::decompress::zstd_ddict::ZSTD_dictLoadMethod_e::ZSTD_dlm_byCopy,
+        crate::decompress::zstd_ddict::ZSTD_dictContentType_e::ZSTD_dct_auto,
+    )
 }
 
 /// Port of `ZSTD_CCtx_refPrefix`. Stores `prefix` as raw-content dict
@@ -1090,6 +1135,9 @@ pub fn ZSTD_CCtx_refPrefix(cctx: &mut ZSTD_CCtx, prefix: &[u8]) -> usize {
     ZSTD_clearAllDicts(cctx);
     if !prefix.is_empty() {
         cctx.stream_dict = prefix.to_vec();
+        cctx.stream_dict_original = prefix.to_vec();
+        cctx.stream_dict_content_type =
+            crate::decompress::zstd_ddict::ZSTD_dictContentType_e::ZSTD_dct_rawContent;
         cctx.dictContentSize = prefix.len();
         // Prefixes are treated as raw content — `dictID` was just
         // zeroed by `clearAllDicts` so no explicit re-write needed.
@@ -2190,6 +2238,8 @@ pub fn ZSTD_compress_insertDictionary(
             }
         }
         cctx.stream_dict = dict.to_vec();
+        cctx.stream_dict_original = dict.to_vec();
+        cctx.stream_dict_content_type = ZSTD_dictContentType_e::ZSTD_dct_rawContent;
         cctx.dictContentSize = dict.len();
         cctx.dictID = 0;
         return 0;
@@ -2215,6 +2265,8 @@ pub fn ZSTD_compress_insertDictionary(
             }
         }
         cctx.stream_dict = dict.to_vec();
+        cctx.stream_dict_original = dict.to_vec();
+        cctx.stream_dict_content_type = dictContentType;
         cctx.dictContentSize = dict.len();
         cctx.dictID = 0;
         return 0;
@@ -2248,6 +2300,8 @@ pub fn ZSTD_compress_insertDictionary(
     }
     cctx.dictID = dictID as u32;
     cctx.stream_dict = dict[eSize..].to_vec();
+    cctx.stream_dict_original = dict.to_vec();
+    cctx.stream_dict_content_type = dictContentType;
     cctx.dictContentSize = dict.len();
     dictID
 }
@@ -2302,6 +2356,9 @@ pub fn ZSTD_compressBegin_internal(
     }
 
     cctx.stream_dict.clear();
+    cctx.stream_dict_original.clear();
+    cctx.stream_dict_content_type =
+        crate::decompress::zstd_ddict::ZSTD_dictContentType_e::ZSTD_dct_auto;
     cctx.prefix_is_single_use = false;
     cctx.dictID = dictID as u32;
     cctx.dictContentSize = dict.len();
@@ -2395,6 +2452,7 @@ pub fn ZSTD_compressBegin_usingCDict_deprecated(cctx: &mut ZSTD_CCtx, cdict: &ZS
 
 /// Port of `ZSTD_CCtx_refThreadPool`. Wires an external thread pool
 /// into the compressor.
+#[cfg(feature = "std")]
 #[inline]
 pub fn ZSTD_CCtx_refThreadPool(
     cctx: &mut ZSTD_CCtx,
@@ -2468,8 +2526,9 @@ pub fn ZSTD_CCtx_refPrefix_advanced(
 
 /// Port of `ZSTD_CCtx_loadDictionary_advanced`. Upstream takes
 /// `dictLoadMethod` and `dictContentType`. The Rust port still ignores
-/// `dictLoadMethod`, but now honors `dictContentType` via the shared
-/// `ZSTD_compress_insertDictionary()` path.
+/// `dictLoadMethod`, but matches upstream's lazy load behavior: stash
+/// the dictionary bytes and parse them when the next compression session
+/// is initialized.
 pub fn ZSTD_CCtx_loadDictionary_advanced(
     cctx: &mut ZSTD_CCtx,
     dict: &[u8],
@@ -2483,8 +2542,12 @@ pub fn ZSTD_CCtx_loadDictionary_advanced(
     if dict.is_empty() {
         return 0;
     }
-    let params = cctx.requestedParams;
-    ZSTD_compress_insertDictionary(cctx, &params, dict, dictContentType)
+    cctx.stream_dict = dict.to_vec();
+    cctx.stream_dict_original = dict.to_vec();
+    cctx.stream_dict_content_type = dictContentType;
+    cctx.dictContentSize = dict.len();
+    cctx.dictID = 0;
+    0
 }
 
 /// Port of `ZSTD_CCtx_loadDictionary_byReference`. Forwards to the
@@ -2804,7 +2867,21 @@ fn is_update_authorized(param: ZSTD_cParameter) -> bool {
     matches!(
         param,
         ZSTD_cParameter::ZSTD_c_compressionLevel
-            | ZSTD_cParameter::ZSTD_c_windowLog
+            | ZSTD_cParameter::ZSTD_c_hashLog
+            | ZSTD_cParameter::ZSTD_c_chainLog
+            | ZSTD_cParameter::ZSTD_c_searchLog
+            | ZSTD_cParameter::ZSTD_c_minMatch
+            | ZSTD_cParameter::ZSTD_c_targetLength
+            | ZSTD_cParameter::ZSTD_c_strategy
+            | ZSTD_cParameter::ZSTD_c_blockSplitterLevel
+    )
+}
+
+#[inline]
+fn ZSTD_cParam_acceptsDefaultZero(param: ZSTD_cParameter) -> bool {
+    matches!(
+        param,
+        ZSTD_cParameter::ZSTD_c_windowLog
             | ZSTD_cParameter::ZSTD_c_hashLog
             | ZSTD_cParameter::ZSTD_c_chainLog
             | ZSTD_cParameter::ZSTD_c_searchLog
@@ -2814,17 +2891,30 @@ fn is_update_authorized(param: ZSTD_cParameter) -> bool {
     )
 }
 
+#[inline]
+fn ZSTD_validateCParamSetterValue(param: ZSTD_cParameter, value: i32) -> usize {
+    if value == 0 && ZSTD_cParam_acceptsDefaultZero(param) {
+        return 0;
+    }
+    let bounds = ZSTD_cParam_getBounds(param);
+    if ERR_isError(bounds.error) {
+        return bounds.error;
+    }
+    if value < bounds.lowerBound || value > bounds.upperBound {
+        return ERROR(ErrorCode::ParameterOutOfBound);
+    }
+    0
+}
+
 /// Port of `ZSTD_CCtx_setParameter`. Stashes the value on the CCtx
 /// for subsequent calls. For `compressionLevel`, behavior matches
 /// `ZSTD_initCStream(level)`. For the frame flags, the next
 /// compression call honors them.
 pub fn ZSTD_CCtx_setParameter(cctx: &mut ZSTD_CCtx, param: ZSTD_cParameter, value: i32) -> usize {
     // Upstream (zstd_compress.c:727) stage-gates mid-session param
-    // updates: only the `ZSTD_isUpdateAuthorized` subset (currently
-    // `ZSTD_c_compressionLevel` and cParams-family knobs we haven't
-    // surfaced yet) can change once input has been staged. Everything
-    // else — format, frame flags, nbWorkers — rejects with
-    // `StageWrong`.
+    // updates: only the `ZSTD_isUpdateAuthorized` subset can change
+    // once input has been staged. Everything else — format, frame
+    // flags, nbWorkers — rejects with `StageWrong`.
     if !cctx_is_in_init_stage(cctx) && !is_update_authorized(param) {
         return ERROR(ErrorCode::StageWrong);
     }
@@ -2857,9 +2947,9 @@ pub fn ZSTD_CCtx_setParameter(cctx: &mut ZSTD_CCtx, param: ZSTD_cParameter, valu
         | ZSTD_cParameter::ZSTD_c_minMatch
         | ZSTD_cParameter::ZSTD_c_targetLength
         | ZSTD_cParameter::ZSTD_c_strategy => {
-            let bounds = ZSTD_cParam_getBounds(param);
-            if value < bounds.lowerBound || value > bounds.upperBound {
-                return ERROR(ErrorCode::ParameterOutOfBound);
+            let rc = ZSTD_validateCParamSetterValue(param, value);
+            if ERR_isError(rc) {
+                return rc;
             }
             let mut cParams = cctx.requestedParams.cParams;
             match param {
@@ -2919,31 +3009,27 @@ pub fn ZSTD_CCtx_setParameter(cctx: &mut ZSTD_CCtx, param: ZSTD_cParameter, valu
             0
         }
         ZSTD_cParameter::ZSTD_c_checksumFlag => {
-            // Upstream bounds-checks each 0/1 flag — out-of-range (e.g.
-            // -1 or 2) returns `ParameterOutOfBound`, not a silent
-            // clamp. Previously we cast `value as u32` which turned
-            // -1 into `0xFFFFFFFF` on the header write path.
-            let bounds = ZSTD_cParam_getBounds(ZSTD_cParameter::ZSTD_c_checksumFlag);
-            if value < bounds.lowerBound || value > bounds.upperBound {
-                return ERROR(ErrorCode::ParameterOutOfBound);
+            let rc = ZSTD_validateCParamSetterValue(param, value);
+            if ERR_isError(rc) {
+                return rc;
             }
             cctx.param_checksum = value != 0;
             cctx.requestedParams.fParams.checksumFlag = value as u32;
             0
         }
         ZSTD_cParameter::ZSTD_c_contentSizeFlag => {
-            let bounds = ZSTD_cParam_getBounds(ZSTD_cParameter::ZSTD_c_contentSizeFlag);
-            if value < bounds.lowerBound || value > bounds.upperBound {
-                return ERROR(ErrorCode::ParameterOutOfBound);
+            let rc = ZSTD_validateCParamSetterValue(param, value);
+            if ERR_isError(rc) {
+                return rc;
             }
             cctx.param_contentSize = value != 0;
             cctx.requestedParams.fParams.contentSizeFlag = value as u32;
             0
         }
         ZSTD_cParameter::ZSTD_c_dictIDFlag => {
-            let bounds = ZSTD_cParam_getBounds(ZSTD_cParameter::ZSTD_c_dictIDFlag);
-            if value < bounds.lowerBound || value > bounds.upperBound {
-                return ERROR(ErrorCode::ParameterOutOfBound);
+            let rc = ZSTD_validateCParamSetterValue(param, value);
+            if ERR_isError(rc) {
+                return rc;
             }
             cctx.param_dictID = value != 0;
             // Upstream `noDictIDFlag = !dictIDFlag`.
@@ -3062,6 +3148,7 @@ pub fn ZSTD_CCtx_reset(cctx: &mut ZSTD_CCtx, reset: ZSTD_ResetDirective) -> usiz
     }
     if clear_session {
         cctx.stream_in_buffer.clear();
+        cctx.stream_params_snapshot = None;
         cctx.stream_out_buffer.clear();
         cctx.stream_out_drained = 0;
         cctx.expected_in_src = 0;
@@ -3070,6 +3157,7 @@ pub fn ZSTD_CCtx_reset(cctx: &mut ZSTD_CCtx, reset: ZSTD_ResetDirective) -> usiz
         cctx.expected_out_buffer_size = 0;
         cctx.buffer_expectations_set = false;
         cctx.stream_closed = false;
+        cctx.stream_frame_completed = false;
         cctx.pledged_src_size = None;
         cctx.externalMatchStore = None;
         // Restore the repcode history + entropy repeatModes to
@@ -4993,6 +5081,7 @@ pub fn ZSTD_resetCCtx_internal(
     };
     zc.externalMatchStore = None;
     zc.stream_in_buffer.clear();
+    zc.stream_params_snapshot = None;
     zc.stream_out_buffer.clear();
     zc.stream_out_drained = 0;
     zc.expected_in_src = 0;
@@ -5001,6 +5090,7 @@ pub fn ZSTD_resetCCtx_internal(
     zc.expected_out_buffer_size = 0;
     zc.buffer_expectations_set = false;
     zc.stream_closed = false;
+    zc.stream_frame_completed = false;
     if zc.stream_in_buffer.capacity() < buffInSize {
         zc.stream_in_buffer
             .reserve(buffInSize - zc.stream_in_buffer.capacity());
@@ -5063,6 +5153,9 @@ pub fn ZSTD_resetCCtx_byAttachingCDict(
         ms.loadedDictEnd = cdict.dictContent.len() as u32;
     }
     cctx.stream_dict.clear();
+    cctx.stream_dict_original.clear();
+    cctx.stream_dict_content_type =
+        crate::decompress::zstd_ddict::ZSTD_dictContentType_e::ZSTD_dct_auto;
     cctx.stream_level = Some(cdict.compressionLevel);
     cctx.dictID = cdict.dictID;
     cctx.dictContentSize = cdict.dictContent.len();
@@ -5104,6 +5197,9 @@ pub fn ZSTD_resetCCtx_byCopyingCDict(
         ms.loadedDictEnd = cdict.dictContent.len() as u32;
     }
     cctx.stream_dict = cdict.dictContent.clone();
+    cctx.stream_dict_original = cdict.dictContent.clone();
+    cctx.stream_dict_content_type =
+        crate::decompress::zstd_ddict::ZSTD_dictContentType_e::ZSTD_dct_rawContent;
     cctx.stream_level = Some(cdict.compressionLevel);
     cctx.dictID = cdict.dictID;
     cctx.dictContentSize = cdict.dictContent.len();
@@ -7693,6 +7789,7 @@ pub fn ZSTD_freeCCtxContent(cctx: &mut ZSTD_CCtx) {
     cctx.ms = None;
     cctx.seqStore = None;
     cctx.stream_in_buffer.clear();
+    cctx.stream_params_snapshot = None;
     cctx.stream_out_buffer.clear();
     cctx.stream_out_drained = 0;
 }
@@ -7955,7 +8052,7 @@ pub fn ZSTD_convertBlockSequences(
     repcodeResolution: bool,
 ) -> usize {
     use crate::compress::seq_store::{
-        Repcodes_t, ZSTD_longLengthType_e, ZSTD_storeSeqOnly, ZSTD_updateRep,
+        Repcodes_t, ZSTD_longLengthType_e, ZSTD_storeSeqOnly, ZSTD_updateRep, MINMATCH,
     };
 
     let nbSequences = inSeqs.len();
@@ -7981,6 +8078,15 @@ pub fn ZSTD_convertBlockSequences(
     }
 
     let mut updatedRepcodes = Repcodes_t { rep: cctx.prev_rep };
+
+    for seq in &inSeqs[..nbSequences - 1] {
+        if seq.matchLength != 0 && seq.offset == 0 {
+            return ERROR(ErrorCode::ExternalSequencesInvalid);
+        }
+        if seq.matchLength != 0 && seq.matchLength < MINMATCH {
+            return ERROR(ErrorCode::ExternalSequencesInvalid);
+        }
+    }
 
     if !repcodeResolution {
         seqStore.sequences.resize(
@@ -8051,7 +8157,8 @@ fn ZSTD_transferSequences_wBlockDelim(
     externalRepSearch: crate::compress::zstd_ldm::ZSTD_ParamSwitch_e,
 ) -> usize {
     use crate::compress::seq_store::{
-        Repcodes_t, ZSTD_storeLastLiterals, ZSTD_storeSeq, ZSTD_updateRep, OFFSET_TO_OFFBASE,
+        Repcodes_t, ZSTD_storeLastLiterals, ZSTD_storeSeq, ZSTD_updateRep, MINMATCH,
+        OFFSET_TO_OFFBASE,
     };
     use crate::compress::zstd_ldm::ZSTD_ParamSwitch_e;
 
@@ -8068,6 +8175,12 @@ fn ZSTD_transferSequences_wBlockDelim(
     while idx < inSeqs.len() && (inSeqs[idx].matchLength != 0 || inSeqs[idx].offset != 0) {
         let litLength = inSeqs[idx].litLength as usize;
         let matchLength = inSeqs[idx].matchLength as usize;
+        if matchLength != 0 && inSeqs[idx].offset == 0 {
+            return ERROR(ErrorCode::ExternalSequencesInvalid);
+        }
+        if matchLength != 0 && matchLength < MINMATCH as usize {
+            return ERROR(ErrorCode::ExternalSequencesInvalid);
+        }
         let offBase = if externalRepSearch == ZSTD_ParamSwitch_e::ZSTD_ps_disable {
             OFFSET_TO_OFFBASE(inSeqs[idx].offset)
         } else {
@@ -8078,12 +8191,12 @@ fn ZSTD_transferSequences_wBlockDelim(
         };
 
         if cctx.appliedParams.validateSequences != 0 {
-            seqPos.posInSrc += litLength + matchLength;
+            let matchStartPos = seqPos.posInSrc + litLength;
             let rc = ZSTD_validateSequence(
-                offBase,
+                crate::compress::seq_store::OFFSET_TO_OFFBASE(inSeqs[idx].offset),
                 matchLength as u32,
                 cctx.appliedParams.cParams.minMatch,
-                seqPos.posInSrc,
+                matchStartPos,
                 cctx.appliedParams.cParams.windowLog,
                 dictSize,
                 ZSTD_hasExtSeqProd(&cctx.appliedParams),
@@ -8100,6 +8213,7 @@ fn ZSTD_transferSequences_wBlockDelim(
         }
         ZSTD_storeSeq(seqStore, litLength, &src[ip..], offBase, matchLength);
         ip += litLength + matchLength;
+        seqPos.posInSrc += litLength + matchLength;
         idx += 1;
     }
 
@@ -8156,7 +8270,7 @@ fn ZSTD_transferSequences_noDelim(
     _externalRepSearch: crate::compress::zstd_ldm::ZSTD_ParamSwitch_e,
 ) -> usize {
     use crate::compress::seq_store::{
-        Repcodes_t, ZSTD_storeLastLiterals, ZSTD_storeSeq, ZSTD_updateRep,
+        Repcodes_t, ZSTD_storeLastLiterals, ZSTD_storeSeq, ZSTD_updateRep, MINMATCH,
     };
 
     let mut idx = seqPos.idx as usize;
@@ -8226,16 +8340,25 @@ fn ZSTD_transferSequences_noDelim(
             break;
         }
 
+        if matchLength != 0 && rawOffset == 0 {
+            return ERROR(ErrorCode::ExternalSequencesInvalid);
+        }
+        if matchLength == 0 {
+            return ERROR(ErrorCode::ExternalSequencesInvalid);
+        }
+        if matchLength < MINMATCH {
+            return ERROR(ErrorCode::ExternalSequencesInvalid);
+        }
         let ll0 = (litLength == 0) as u32;
         let offBase = ZSTD_finalizeOffBase(rawOffset, &updatedRepcodes.rep, ll0);
         ZSTD_updateRep(&mut updatedRepcodes.rep, offBase, ll0);
         if cctx.appliedParams.validateSequences != 0 {
-            seqPos.posInSrc += litLength as usize + matchLength as usize;
+            let matchStartPos = seqPos.posInSrc + litLength as usize;
             let rc = ZSTD_validateSequence(
-                offBase,
+                crate::compress::seq_store::OFFSET_TO_OFFBASE(rawOffset),
                 matchLength,
                 cctx.appliedParams.cParams.minMatch,
-                seqPos.posInSrc,
+                matchStartPos,
                 cctx.appliedParams.cParams.windowLog,
                 dictSize,
                 ZSTD_hasExtSeqProd(&cctx.appliedParams),
@@ -8255,6 +8378,7 @@ fn ZSTD_transferSequences_noDelim(
         }
         ZSTD_storeSeq(seqStore, litLengthU, &src[ip..], offBase, matchLengthU);
         ip += litLengthU + matchLengthU;
+        seqPos.posInSrc += litLengthU + matchLengthU;
         if !finalMatchSplit {
             idx += 1;
         }
@@ -8620,7 +8744,11 @@ pub fn ZSTD_generateSequences(
         zc.isFirstBlock = 0;
     }
 
-    seqCollector.seqIndex
+    if zc.appliedParams.blockDelimiters == ZSTD_SequenceFormat_e::ZSTD_sf_noBlockDelimiters {
+        ZSTD_mergeBlockDelimiters(&mut outSeqs[..seqCollector.seqIndex])
+    } else {
+        seqCollector.seqIndex
+    }
 }
 
 /// Port of `ZSTD_clearAllDicts`. Drops any cached dict state from
@@ -8630,6 +8758,9 @@ pub fn ZSTD_generateSequences(
 pub fn ZSTD_clearAllDicts(cctx: &mut ZSTD_CCtx) {
     cctx.stream_cdict = None;
     cctx.stream_dict.clear();
+    cctx.stream_dict_original.clear();
+    cctx.stream_dict_content_type =
+        crate::decompress::zstd_ddict::ZSTD_dictContentType_e::ZSTD_dct_auto;
     cctx.dictID = 0;
     cctx.dictContentSize = 0;
     if let Some(ms) = cctx.ms.as_mut() {
@@ -8754,6 +8885,9 @@ pub fn ZSTD_validateSequence(
     } else {
         4
     };
+    if offBase == 0 || offsetBound == 0 {
+        return ERROR(ErrorCode::ExternalSequencesInvalid);
+    }
     if offBase > OFFSET_TO_OFFBASE(offsetBound as u32) {
         return ERROR(ErrorCode::ExternalSequencesInvalid);
     }
@@ -9194,9 +9328,9 @@ pub fn ZSTD_CCtxParams_setParameter(
         | ZSTD_cParameter::ZSTD_c_minMatch
         | ZSTD_cParameter::ZSTD_c_targetLength
         | ZSTD_cParameter::ZSTD_c_strategy => {
-            let bounds = ZSTD_cParam_getBounds(param);
-            if value < bounds.lowerBound || value > bounds.upperBound {
-                return ERROR(ErrorCode::ParameterOutOfBound);
+            let rc = ZSTD_validateCParamSetterValue(param, value);
+            if ERR_isError(rc) {
+                return rc;
             }
             match param {
                 ZSTD_cParameter::ZSTD_c_windowLog => params.cParams.windowLog = value as u32,
@@ -9251,28 +9385,25 @@ pub fn ZSTD_CCtxParams_setParameter(
             0
         }
         ZSTD_cParameter::ZSTD_c_checksumFlag => {
-            // Upstream: bounds-checked against `[0, 1]`. Out-of-range
-            // returns `ParameterOutOfBound`. We mirror so params-
-            // level callers see the same rejection as CCtx-level ones.
-            let bounds = ZSTD_cParam_getBounds(ZSTD_cParameter::ZSTD_c_checksumFlag);
-            if value < bounds.lowerBound || value > bounds.upperBound {
-                return ERROR(ErrorCode::ParameterOutOfBound);
+            let rc = ZSTD_validateCParamSetterValue(param, value);
+            if ERR_isError(rc) {
+                return rc;
             }
             params.fParams.checksumFlag = value as u32;
             0
         }
         ZSTD_cParameter::ZSTD_c_contentSizeFlag => {
-            let bounds = ZSTD_cParam_getBounds(ZSTD_cParameter::ZSTD_c_contentSizeFlag);
-            if value < bounds.lowerBound || value > bounds.upperBound {
-                return ERROR(ErrorCode::ParameterOutOfBound);
+            let rc = ZSTD_validateCParamSetterValue(param, value);
+            if ERR_isError(rc) {
+                return rc;
             }
             params.fParams.contentSizeFlag = value as u32;
             0
         }
         ZSTD_cParameter::ZSTD_c_dictIDFlag => {
-            let bounds = ZSTD_cParam_getBounds(ZSTD_cParameter::ZSTD_c_dictIDFlag);
-            if value < bounds.lowerBound || value > bounds.upperBound {
-                return ERROR(ErrorCode::ParameterOutOfBound);
+            let rc = ZSTD_validateCParamSetterValue(param, value);
+            if ERR_isError(rc) {
+                return rc;
             }
             // Upstream stores noDictIDFlag, inverted — we mirror.
             params.fParams.noDictIDFlag = if value != 0 { 0 } else { 1 };
@@ -9914,9 +10045,11 @@ pub fn ZSTD_initCStream(zcs: &mut ZSTD_CCtx, compressionLevel: i32) -> usize {
     // returning 0 (upstream returns 3).
     zcs.pledged_src_size = None;
     zcs.stream_in_buffer.clear();
+    zcs.stream_params_snapshot = None;
     zcs.stream_out_buffer.clear();
     zcs.stream_out_drained = 0;
     zcs.stream_closed = false;
+    zcs.stream_frame_completed = false;
     ZSTD_clearAllDicts(zcs);
     ZSTD_CCtx_setParameter(
         zcs,
@@ -10247,16 +10380,14 @@ pub fn ZSTD_CCtx_setCParams(
     cctx: &mut ZSTD_CCtx,
     cParams: crate::compress::match_state::ZSTD_compressionParameters,
 ) -> usize {
-    // Upstream (zstd_compress.c:1211) rejects with `StageWrong` when
-    // not in init stage. Applying fresh cParams mid-session would
-    // desync the applied match-state from buffered input.
-    if !cctx_is_in_init_stage(cctx) {
-        return ERROR(ErrorCode::StageWrong);
-    }
     let rc = ZSTD_checkCParams(cParams);
     if ERR_isError(rc) {
         return rc;
     }
+    // Authorized cParam updates are allowed mid-stream. The buffered
+    // stream path snapshots parameters when input is first staged, so
+    // this only affects future work and doesn't retarget already-
+    // buffered input.
     cctx.requested_cParams = Some(cParams);
     cctx.requestedParams.cParams = cParams;
     0
@@ -10308,6 +10439,9 @@ pub fn ZSTD_CCtx_setParametersUsingCCtxParams(
     // replacement mid-session — that would desync appliedParams
     // from buffered input. Gate matches the dict-family setters.
     if !cctx_is_in_init_stage(cctx) {
+        return ERROR(ErrorCode::StageWrong);
+    }
+    if cctx.stream_cdict.is_some() {
         return ERROR(ErrorCode::StageWrong);
     }
     cctx.stream_level = Some(params.compressionLevel);
@@ -10570,6 +10704,12 @@ pub fn ZSTD_compressStream(
     input: &[u8],
     input_pos: &mut usize,
 ) -> usize {
+    if *output_pos > output.len() {
+        return ERROR(ErrorCode::DstSizeTooSmall);
+    }
+    if *input_pos > input.len() {
+        return ERROR(ErrorCode::SrcSizeWrong);
+    }
     if zcs.stream_level.is_none() {
         return ERROR(ErrorCode::InitMissing);
     }
@@ -10580,7 +10720,14 @@ pub fn ZSTD_compressStream(
     }
     // Stage new input.
     if !zcs.stream_closed {
-        zcs.stream_in_buffer.extend_from_slice(&input[*input_pos..]);
+        let new_input = &input[*input_pos..];
+        if !new_input.is_empty() {
+            zcs.stream_frame_completed = false;
+            if zcs.stream_in_buffer.is_empty() && zcs.stream_params_snapshot.is_none() {
+                zcs.stream_params_snapshot = Some(zstd_snapshot_stream_params(zcs));
+            }
+        }
+        zcs.stream_in_buffer.extend_from_slice(new_input);
         *input_pos = input.len();
     }
     // Hint: any value > 0 means "more input expected". Return 1 when
@@ -10596,6 +10743,9 @@ pub fn ZSTD_compressStream(
 /// Drain as much of `zcs.stream_out_buffer[stream_out_drained..]` as
 /// fits into `output[output_pos..]`. Returns 0 on success or error.
 fn stream_drain(zcs: &mut ZSTD_CCtx, output: &mut [u8], output_pos: &mut usize) -> usize {
+    if *output_pos > output.len() {
+        return ERROR(ErrorCode::DstSizeTooSmall);
+    }
     let avail = output.len() - *output_pos;
     let pending = zcs.stream_out_buffer.len() - zcs.stream_out_drained;
     let n = avail.min(pending);
@@ -10609,13 +10759,23 @@ fn stream_drain(zcs: &mut ZSTD_CCtx, output: &mut [u8], output_pos: &mut usize) 
     0
 }
 
-/// Port of `ZSTD_flushStream`. In our buffer-until-end implementation
-/// this is a no-op beyond draining any already-produced output.
+/// Port of `ZSTD_flushStream`. This buffered implementation doesn't
+/// produce partial frames, so flush only drains already pending output
+/// and otherwise returns a non-zero hint until `endStream` finalizes.
 pub fn ZSTD_flushStream(zcs: &mut ZSTD_CCtx, output: &mut [u8], output_pos: &mut usize) -> usize {
-    stream_drain(zcs, output, output_pos);
-    // Remaining bytes in stream_out_buffer → caller needs to keep
-    // calling. Return 0 when fully drained (upstream convention).
-    zcs.stream_out_buffer.len() - zcs.stream_out_drained
+    let rc = stream_drain(zcs, output, output_pos);
+    if ERR_isError(rc) {
+        return rc;
+    }
+    let remaining = zcs.stream_out_buffer.len() - zcs.stream_out_drained;
+    if remaining != 0 {
+        return remaining;
+    }
+    if zcs.stream_closed && zcs.stream_frame_completed {
+        0
+    } else {
+        1
+    }
 }
 
 /// Rust-only helper: extracts the raw pointer address of the input
@@ -10742,10 +10902,18 @@ fn zstd_endStream_buffered(
     output: &mut [u8],
     output_pos: &mut usize,
 ) -> usize {
-    let level = match zcs.stream_level {
-        Some(l) => l,
-        None => return ERROR(ErrorCode::InitMissing),
-    };
+    if zcs.stream_frame_completed
+        && zcs.stream_in_buffer.is_empty()
+        && zcs.stream_out_buffer.is_empty()
+    {
+        return 0;
+    }
+    if zcs.stream_level.is_none() {
+        return ERROR(ErrorCode::InitMissing);
+    }
+    let stream_params = zcs
+        .stream_params_snapshot
+        .unwrap_or_else(|| zstd_snapshot_stream_params(zcs));
     // First endStream call on this frame: compress the staged input
     // into stream_out_buffer.
     if !zcs.stream_closed {
@@ -10768,31 +10936,44 @@ fn zstd_endStream_buffered(
         // Mirror by snapshotting the dict + flag, then wiping the
         // cctx-side single-use state. The compress below consumes
         // the snapshot; success-or-failure the flag is already gone.
-        let prefix_snapshot: Option<Vec<u8>> = if zcs.prefix_is_single_use {
-            let snap = std::mem::take(&mut zcs.stream_dict);
+        let prefix_snapshot: Option<(
+            Vec<u8>,
+            Vec<u8>,
+            crate::decompress::zstd_ddict::ZSTD_dictContentType_e,
+        )> = if zcs.prefix_is_single_use {
+            let content = std::mem::take(&mut zcs.stream_dict);
+            let original = std::mem::take(&mut zcs.stream_dict_original);
+            let content_type = zcs.stream_dict_content_type;
+            zcs.stream_dict_content_type =
+                crate::decompress::zstd_ddict::ZSTD_dictContentType_e::ZSTD_dct_auto;
             zcs.dictID = 0;
             zcs.dictContentSize = 0;
             zcs.prefix_is_single_use = false;
-            Some(snap)
+            Some((content, original, content_type))
         } else {
             None
         };
         #[cfg(feature = "mt")]
-        let maybe_mt = if zcs.requestedParams.nbWorkers > 0 {
+        let maybe_mt = if stream_params.requestedParams.nbWorkers > 0 {
             let effective_prefix: &[u8] = prefix_snapshot
-                .as_deref()
+                .as_ref()
+                .map(|(content, _, _)| content.as_slice())
                 .unwrap_or(zcs.stream_dict.as_slice());
             let fp = ZSTD_FrameParameters {
-                contentSizeFlag: if zcs.param_contentSize { 1 } else { 0 },
-                checksumFlag: if zcs.param_checksum { 1 } else { 0 },
-                noDictIDFlag: if zcs.param_dictID { 0 } else { 1 },
+                contentSizeFlag: if stream_params.param_contentSize {
+                    1
+                } else {
+                    0
+                },
+                checksumFlag: if stream_params.param_checksum { 1 } else { 0 },
+                noDictIDFlag: if stream_params.param_dictID { 0 } else { 1 },
             };
             Some(zstd_endstream_mt_compress(
-                zcs.requestedParams,
-                zcs.format,
+                stream_params.requestedParams,
+                stream_params.format,
                 zcs.threadPoolRef,
                 zcs.rayonThreadPoolRef,
-                level,
+                stream_params.stream_level,
                 &src,
                 effective_prefix,
                 fp,
@@ -10815,11 +10996,13 @@ fn zstd_endStream_buffered(
                 ZSTD_resolveExternalRepcodeSearch, ZSTD_resolveExternalSequenceValidation,
                 ZSTD_resolveMaxBlockSize, ZSTD_resolveRowMatchFinderMode,
             };
-            use crate::decompress::zstd_ddict::{ZSTD_dictContentType_e, ZSTD_getDictID_fromDict};
+            use crate::decompress::zstd_ddict::ZSTD_dictContentType_e;
 
             let persistent_raw_dict = if prefix_snapshot.is_none() && zcs.stream_cdict.is_none() {
                 Some((
                     zcs.stream_dict.clone(),
+                    zcs.stream_dict_original.clone(),
+                    zcs.stream_dict_content_type,
                     zcs.dictID,
                     zcs.dictContentSize,
                     zcs.prefix_is_single_use,
@@ -10828,34 +11011,61 @@ fn zstd_endStream_buffered(
                 None
             };
 
-            if let Some(prefix) = prefix_snapshot {
-                zcs.stream_dict = prefix;
-                zcs.dictContentSize = zcs.stream_dict.len();
+            if let Some((prefix_content, prefix_original, prefix_content_type)) = prefix_snapshot {
+                zcs.stream_dict = prefix_content;
+                zcs.stream_dict_original = prefix_original;
+                zcs.stream_dict_content_type = prefix_content_type;
+                zcs.dictContentSize = if zcs.stream_dict_original.is_empty() {
+                    zcs.stream_dict.len()
+                } else {
+                    zcs.stream_dict_original.len()
+                };
             }
 
             let pledged = zcs.pledged_src_size.unwrap_or(src.len() as u64);
             let cdict_snapshot = zcs.stream_cdict.clone();
             let cdict = cdict_snapshot.as_ref();
-            let raw_dict_snapshot = if cdict.is_none() {
-                Some(zcs.stream_dict.clone())
+            let raw_dict_snapshot = if cdict.is_none() && !zcs.stream_dict.is_empty() {
+                let original = if zcs.stream_dict_original.is_empty() {
+                    zcs.stream_dict.clone()
+                } else {
+                    zcs.stream_dict_original.clone()
+                };
+                Some((original, zcs.stream_dict_content_type))
             } else {
                 None
             };
-            let dict = raw_dict_snapshot.as_deref().unwrap_or(&[]);
+            let (dict, dict_content_type) = raw_dict_snapshot
+                .as_ref()
+                .map(|(dict, content_type)| (dict.as_slice(), *content_type))
+                .unwrap_or((&[][..], ZSTD_dictContentType_e::ZSTD_dct_auto));
             let raw_cdict_compat = cdict.is_some();
-            let dictSize = cdict.map_or(dict.len(), |cd| cd.dictContent.len());
+            let dictSize = cdict.map_or_else(
+                || {
+                    if zcs.dictContentSize != 0 {
+                        zcs.dictContentSize
+                    } else {
+                        dict.len()
+                    }
+                },
+                |cd| cd.dictContent.len(),
+            );
             let mode = ZSTD_getCParamMode(
                 if raw_cdict_compat { None } else { cdict },
-                &zcs.requestedParams,
+                &stream_params.requestedParams,
                 pledged,
             );
-            let mut params = zcs.requestedParams;
-            params.compressionLevel = level;
-            params.format = zcs.format;
+            let mut params = stream_params.requestedParams;
+            params.compressionLevel = stream_params.stream_level;
+            params.format = stream_params.format;
             params.fParams = ZSTD_FrameParameters {
-                contentSizeFlag: if zcs.param_contentSize { 1 } else { 0 },
-                checksumFlag: if zcs.param_checksum { 1 } else { 0 },
-                noDictIDFlag: if zcs.param_dictID { 0 } else { 1 },
+                contentSizeFlag: if stream_params.param_contentSize {
+                    1
+                } else {
+                    0
+                },
+                checksumFlag: if stream_params.param_checksum { 1 } else { 0 },
+                noDictIDFlag: if stream_params.param_dictID { 0 } else { 1 },
             };
             params.cParams = ZSTD_getCParamsFromCCtxParams(&params, pledged, dictSize, mode);
             params.postBlockSplitter =
@@ -10871,6 +11081,9 @@ fn zstd_endStream_buffered(
                 params.compressionLevel,
             );
 
+            let future_requestedParams = zcs.requestedParams;
+            let future_requested_cParams = zcs.requested_cParams;
+            let future_stream_level = zcs.stream_level;
             zcs.requestedParams = params;
             let n = if let Some(cd) = cdict {
                 let init = ZSTD_compressBegin_usingCDict_internal(zcs, cd, params.fParams, pledged);
@@ -10880,11 +11093,10 @@ fn zstd_endStream_buffered(
                     ZSTD_compressEnd_public(zcs, &mut compressed, &src)
                 }
             } else if !dict.is_empty() {
-                let dictID = ZSTD_getDictID_fromDict(dict);
                 let init = ZSTD_compressBegin_internal(
                     zcs,
                     dict,
-                    ZSTD_dictContentType_e::ZSTD_dct_rawContent,
+                    dict_content_type,
                     None,
                     &params,
                     pledged,
@@ -10893,25 +11105,36 @@ fn zstd_endStream_buffered(
                 if ERR_isError(init) {
                     init
                 } else {
-                    zcs.dictID = dictID;
-                    zcs.dictContentSize = dict.len();
                     ZSTD_compressEnd_public(zcs, &mut compressed, &src)
                 }
             } else {
                 ZSTD_compress_advanced_internal(zcs, &mut compressed, &src, dict, &params)
             };
-            if let Some((stream_dict, dictID, dictContentSize, prefix_is_single_use)) =
-                persistent_raw_dict.as_ref()
+            if let Some((
+                stream_dict,
+                stream_dict_original,
+                stream_dict_content_type,
+                dictID,
+                dictContentSize,
+                prefix_is_single_use,
+            )) = persistent_raw_dict.as_ref()
             {
                 zcs.stream_dict = stream_dict.clone();
+                zcs.stream_dict_original = stream_dict_original.clone();
+                zcs.stream_dict_content_type = *stream_dict_content_type;
                 zcs.dictID = *dictID;
                 zcs.dictContentSize = *dictContentSize;
                 zcs.prefix_is_single_use = *prefix_is_single_use;
             } else if cdict.is_none() {
                 zcs.stream_dict.clear();
+                zcs.stream_dict_original.clear();
+                zcs.stream_dict_content_type = ZSTD_dictContentType_e::ZSTD_dct_auto;
                 zcs.dictID = 0;
                 zcs.dictContentSize = 0;
             }
+            zcs.requestedParams = future_requestedParams;
+            zcs.requested_cParams = future_requested_cParams;
+            zcs.stream_level = future_stream_level;
             if ERR_isError(n) {
                 return n;
             }
@@ -10922,7 +11145,11 @@ fn zstd_endStream_buffered(
         zcs.stream_closed = true;
     }
     stream_drain(zcs, output, output_pos);
-    zcs.stream_out_buffer.len() - zcs.stream_out_drained
+    let remaining = zcs.stream_out_buffer.len() - zcs.stream_out_drained;
+    if remaining == 0 {
+        cctx_mark_stream_frame_completed(zcs);
+    }
+    remaining
 }
 
 /// Port of `ZSTD_endStream`. Upstream reaches the end-of-frame logic
@@ -10931,6 +11158,9 @@ fn zstd_endStream_buffered(
 /// stability/expectation handling here, while keeping the current
 /// buffered finalization backend.
 pub fn ZSTD_endStream(zcs: &mut ZSTD_CCtx, output: &mut [u8], output_pos: &mut usize) -> usize {
+    if *output_pos > output.len() {
+        return ERROR(ErrorCode::DstSizeTooSmall);
+    }
     let mut output_buffer = ZSTD_outBuffer {
         dst: None,
         size: output.len(),
@@ -11066,7 +11296,36 @@ pub fn ZSTD_CCtx_init_compressStream2(
     let pledged = ZSTD_getPledgedSrcSize(cctx);
     let cdict_snapshot = cctx.stream_cdict.clone();
     let cdict = cdict_snapshot.as_ref();
-    let dictSize = cdict.map_or(cctx.stream_dict.len(), |cd| cd.dictContent.len());
+    let dict_snapshot = if cdict.is_none() && !cctx.stream_dict.is_empty() {
+        let dict = if cctx.stream_dict_original.is_empty() {
+            cctx.stream_dict.clone()
+        } else {
+            cctx.stream_dict_original.clone()
+        };
+        Some((
+            dict,
+            cctx.stream_dict_content_type,
+            cctx.dictContentSize,
+            !cctx.prefix_is_single_use,
+        ))
+    } else {
+        None
+    };
+    let dictSize = cdict.map_or_else(
+        || {
+            dict_snapshot
+                .as_ref()
+                .map(|(dict, _, content_size, _)| {
+                    if *content_size != 0 {
+                        *content_size
+                    } else {
+                        dict.len()
+                    }
+                })
+                .unwrap_or(0)
+        },
+        |cd| cd.dictContent.len(),
+    );
     let mode = ZSTD_getCParamMode(cdict, &params, pledged);
     params.cParams = ZSTD_getCParamsFromCCtxParams(&params, pledged, dictSize, mode);
     params.postBlockSplitter =
@@ -11081,10 +11340,15 @@ pub fn ZSTD_CCtx_init_compressStream2(
         params.compressionLevel,
     );
 
+    let (dict, dict_content_type) = dict_snapshot
+        .as_ref()
+        .map(|(dict, content_type, _, _)| (dict.as_slice(), *content_type))
+        .unwrap_or((&[][..], ZSTD_dictContentType_e::ZSTD_dct_auto));
+
     let rc = ZSTD_compressBegin_internal(
         cctx,
-        &[],
-        ZSTD_dictContentType_e::ZSTD_dct_auto,
+        dict,
+        dict_content_type,
         cdict,
         &params,
         pledged,
@@ -11092,6 +11356,25 @@ pub fn ZSTD_CCtx_init_compressStream2(
     );
     if ERR_isError(rc) {
         return rc;
+    }
+    if let Some((dict, content_type, content_size, persistent)) = dict_snapshot {
+        if persistent {
+            cctx.stream_dict = dict.clone();
+            cctx.stream_dict_original = dict;
+            cctx.stream_dict_content_type = content_type;
+            cctx.dictContentSize = if content_size != 0 {
+                content_size
+            } else {
+                cctx.stream_dict.len()
+            };
+        } else {
+            cctx.stream_dict.clear();
+            cctx.stream_dict_original.clear();
+            cctx.stream_dict_content_type = ZSTD_dictContentType_e::ZSTD_dct_auto;
+            cctx.dictID = 0;
+            cctx.dictContentSize = 0;
+            cctx.prefix_is_single_use = false;
+        }
     }
     cctx.requestedParams = params;
     cctx.blockSizeMax = if params.maxBlockSize != 0 {
@@ -11226,8 +11509,8 @@ fn ZSTD_compressSequencesAndLiterals_internal(
 /// Compresses an externally-prepared `(inSeqs, literals)` pair into a
 /// complete zstd frame. Requires explicit block delimiters and disables
 /// sequence validation; rejects with an error otherwise. The literals
-/// buffer must be at least 8 bytes larger than `litSize` to allow safe
-/// over-read by the entropy coder.
+/// capacity must cover `literals.len() + 8`, matching the upstream C API
+/// contract for literal over-read slack.
 pub fn ZSTD_compressSequencesAndLiterals(
     cctx: &mut ZSTD_CCtx,
     dst: &mut [u8],
@@ -11239,7 +11522,7 @@ pub fn ZSTD_compressSequencesAndLiterals(
     let mut op = 0usize;
     let mut cSize = 0usize;
 
-    if litCapacity < literals.len() {
+    if litCapacity < literals.len().saturating_add(8) {
         return ERROR(ErrorCode::WorkSpaceTooSmall);
     }
     let rc = ZSTD_CCtx_init_compressStream2(cctx, ZSTD_EndDirective::ZSTD_e_end, decompressedSize);

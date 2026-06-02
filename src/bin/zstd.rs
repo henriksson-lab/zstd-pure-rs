@@ -1,33 +1,37 @@
 //! `zstd` CLI binary — pure-Rust port of a subset of upstream's
 //! `zstd/programs/zstdcli.c`. Supports compression + decompression
 //! of `.zst` files end-to-end, raw-content dictionaries via `-D`,
-//! XXH64 checksum trailers via `--check`, verbose ratio reporting
-//! via `-v`, and stdin/stdout streaming via `-`.
+//! XXH64 checksum trailers via `--check` / `--no-check`, verbose
+//! ratio reporting via `-v`, and buffered stdin/stdout via `-`.
 
 use clap::Parser;
+use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use zstd_pure_rs::common::error::{ERR_getErrorName, ERR_isError};
+use zstd_pure_rs::common::xxhash::XXH64_state_t;
 use zstd_pure_rs::compress::zstd_compress::{
     ZSTD_CCtx_setFormat, ZSTD_FrameParameters, ZSTD_compressBound, ZSTD_compress_advanced,
     ZSTD_createCCtx, ZSTD_getCParams, ZSTD_parameters,
 };
 use zstd_pure_rs::decompress::zstd_decompress::{
-    ZSTD_DCtx_setFormat, ZSTD_decompress, ZSTD_decompressStream, ZSTD_decompress_usingDict,
-    ZSTD_findDecompressedSize, ZSTD_findFrameSizeInfo, ZSTD_format_e, ZSTD_CONTENTSIZE_ERROR,
-    ZSTD_CONTENTSIZE_UNKNOWN,
+    ZSTD_DCtx_setFormat, ZSTD_decompress, ZSTD_decompressDCtx, ZSTD_decompress_usingDict,
+    ZSTD_findFrameSizeInfo, ZSTD_format_e, ZSTD_CONTENTSIZE_ERROR, ZSTD_MAGICNUMBER,
+    ZSTD_MAGIC_SKIPPABLE_MASK, ZSTD_MAGIC_SKIPPABLE_START,
 };
-use zstd_pure_rs::decompress::zstd_decompress_block::ZSTD_DCtx;
+use zstd_pure_rs::decompress::zstd_decompress_block::{
+    ZSTD_DCtx, ZSTD_buildDefaultSeqTables, ZSTD_decoder_entropy_rep,
+};
 
 /// Mirror of the most-used `zstd` flags. The subset is kept small on
 /// purpose — we add flags as the matching features land.
 #[derive(Parser, Debug)]
 #[command(
     name = "zstd",
-    about = "Pure-Rust port of the zstd CLI — compression, decompression, dict support, and streaming",
+    about = "Pure-Rust port of the zstd CLI — compression, decompression, dict support, and buffered stdin/stdout",
     version,
     long_version = concat!(
         env!("CARGO_PKG_VERSION"),
@@ -62,7 +66,7 @@ struct Cli {
     #[arg(short = 'o', long = "output-file")]
     output_file: Option<PathBuf>,
 
-    /// Compression level (1..=22). Default is 3.
+    /// Compression level; -L is a local alias, while upstream-style -N forms are also accepted. Out-of-range values are clamped. Default is 3.
     #[arg(long = "level", short = 'L', default_value_t = 3)]
     level: i32,
 
@@ -71,14 +75,13 @@ struct Cli {
     #[arg(short = 'D', long = "dict")]
     dict: Option<PathBuf>,
 
-    /// Add / require an XXH64 content checksum trailer on compression.
-    /// This is the upstream CLI default; decompression validates when
-    /// present regardless of this flag.
+    /// Add an XXH64 content checksum trailer on compression, and validate it on decompression when present.
+    /// This is the upstream CLI default.
     #[arg(long = "check")]
     check: bool,
 
     /// Disable the default XXH64 content checksum trailer.
-    #[arg(long = "no-check", conflicts_with = "check")]
+    #[arg(long = "no-check")]
     no_check: bool,
 
     /// Emit / expect magicless-format frames (`ZSTD_f_zstd1_magicless`):
@@ -90,6 +93,143 @@ struct Cli {
 
     /// Input files. Use `-` for stdin.
     files: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputDirective {
+    Stdout,
+    File,
+}
+
+fn normalize_level_short_args<I>(args: I) -> Vec<OsString>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let mut options_done = false;
+    let mut normalized = Vec::new();
+    for arg in args {
+        let mut emit_original = true;
+        if options_done {
+            normalized.push(arg);
+            continue;
+        }
+        if let Some(s) = arg.to_str() {
+            if s == "--" {
+                options_done = true;
+            } else if s.len() > 1 && s.starts_with('-') && !s.starts_with("--") {
+                let shorts = &s[1..];
+                if !matches!(shorts.chars().next(), Some('D' | 'L' | 'o')) {
+                    let mut replacements = Vec::new();
+                    let mut chunk = String::new();
+                    let mut digits = String::new();
+                    let mut saw_digits = false;
+                    for c in shorts.chars() {
+                        if c.is_ascii_digit() {
+                            if !chunk.is_empty() {
+                                replacements.push(OsString::from(format!("-{chunk}")));
+                                chunk.clear();
+                            }
+                            digits.push(c);
+                            saw_digits = true;
+                        } else {
+                            if !digits.is_empty() {
+                                replacements.push(OsString::from(format!("--level={digits}")));
+                                digits.clear();
+                            }
+                            chunk.push(c);
+                        }
+                    }
+                    if !digits.is_empty() {
+                        replacements.push(OsString::from(format!("--level={digits}")));
+                    }
+                    if !chunk.is_empty() {
+                        replacements.push(OsString::from(format!("-{chunk}")));
+                    }
+                    if saw_digits {
+                        normalized.extend(replacements);
+                        emit_original = false;
+                    }
+                }
+            }
+        }
+        if emit_original {
+            normalized.push(arg);
+        }
+    }
+    normalized
+}
+
+fn last_checksum_directive(args: &[OsString]) -> Option<bool> {
+    let mut last = None;
+    for arg in args.iter().skip(1) {
+        let Some(arg) = arg.to_str() else {
+            continue;
+        };
+        if arg == "--" {
+            break;
+        }
+        if arg == "--check" {
+            last = Some(true);
+        } else if arg == "--no-check" {
+            last = Some(false);
+        }
+    }
+    last
+}
+
+fn reject_attached_dict_arg(args: &[OsString]) -> Result<(), String> {
+    for arg in args.iter().skip(1) {
+        let Some(arg) = arg.to_str() else {
+            continue;
+        };
+        if arg == "--" {
+            break;
+        }
+        if arg.starts_with("-D") && arg != "-D" {
+            return Err(format!(
+                "{arg}: dictionary path must be passed as a separate argument after -D"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn last_output_directive(args: &[OsString]) -> Option<OutputDirective> {
+    let mut last = None;
+    let mut i = 1usize;
+    while i < args.len() {
+        let Some(arg) = args[i].to_str() else {
+            i += 1;
+            continue;
+        };
+        if arg == "--" {
+            break;
+        }
+        if arg == "--stdout" || arg == "-c" {
+            last = Some(OutputDirective::Stdout);
+        } else if arg == "--output-file" || arg == "-o" {
+            last = Some(OutputDirective::File);
+            i += 1;
+        } else if arg.starts_with("--output-file=") {
+            last = Some(OutputDirective::File);
+        } else if let Some(shorts) = arg.strip_prefix('-') {
+            if !shorts.starts_with('-') && !shorts.chars().all(|c| c.is_ascii_digit()) {
+                for c in shorts.chars() {
+                    match c {
+                        'c' => last = Some(OutputDirective::Stdout),
+                        'o' => {
+                            last = Some(OutputDirective::File);
+                            break;
+                        }
+                        'D' | 'L' => break,
+                        _ => {}
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    last
 }
 
 fn read_input(path: &Path) -> io::Result<Vec<u8>> {
@@ -117,6 +257,26 @@ fn infer_output_path(input: &Path, decompress: bool) -> Option<PathBuf> {
     }
 }
 
+fn output_path_for_input(
+    input: &Path,
+    cli: &Cli,
+    effective_output_file: Option<&PathBuf>,
+) -> Result<Option<PathBuf>, String> {
+    if let Some(output_file) = effective_output_file {
+        return Ok(Some(output_file.clone()));
+    }
+    if cli.stdout || input == Path::new("-") {
+        return Ok(None);
+    }
+    match infer_output_path(input, cli.decompress) {
+        Some(path) => Ok(Some(path)),
+        None => Err(format!(
+            "{}: unknown suffix -- expected .zst or .zstd; use -c or -o to select output",
+            input.display()
+        )),
+    }
+}
+
 fn write_output(path: Option<&Path>, force: bool, data: &[u8]) -> io::Result<()> {
     match path {
         None => io::stdout().write_all(data),
@@ -132,53 +292,92 @@ fn write_output(path: Option<&Path>, force: bool, data: &[u8]) -> io::Result<()>
     }
 }
 
-fn decompress_bytes(src: &[u8], dict: Option<&[u8]>, magicless: bool) -> Result<Vec<u8>, String> {
-    // Size the output buffer from frame metadata:
-    //   1. `ZSTD_findDecompressedSize` sums declared FCS across frames
-    //      when present — exact.
-    //   2. Otherwise, walk frames via `ZSTD_findFrameSizeInfo` to get
-    //      `decompressedBound = nbBlocks * blockSizeMax` — a tight
-    //      upper bound per frame.
-    //   3. Fall back to a 32× src estimate only if no bound is
-    //      available (shouldn't happen for well-formed zstd streams).
+fn decompressed_bound_for_format(src: &[u8], format: ZSTD_format_e) -> Result<usize, String> {
+    let mut bound: u64 = 0;
+    let mut cursor = src;
+    while !cursor.is_empty() {
+        let info = ZSTD_findFrameSizeInfo(cursor, format);
+        if ERR_isError(info.compressedSize) || info.decompressedBound == ZSTD_CONTENTSIZE_ERROR {
+            return Err(format!(
+                "frame walk failed: {}",
+                ERR_getErrorName(info.compressedSize)
+            ));
+        }
+        bound = bound.saturating_add(info.decompressedBound);
+        cursor = &cursor[info.compressedSize..];
+    }
+    usize::try_from(bound).map_err(|_| "decompressed bound exceeds addressable memory".to_string())
+}
+
+fn strip_decode_checksums(src: &[u8], format: ZSTD_format_e) -> Result<Vec<u8>, String> {
+    let mut stripped = Vec::with_capacity(src.len());
+    let mut cursor = src;
+    while !cursor.is_empty() {
+        let info = ZSTD_findFrameSizeInfo(cursor, format);
+        if ERR_isError(info.compressedSize) || info.decompressedBound == ZSTD_CONTENTSIZE_ERROR {
+            return Err(format!(
+                "frame walk failed: {}",
+                ERR_getErrorName(info.compressedSize)
+            ));
+        }
+        let frame = &cursor[..info.compressedSize];
+        let is_skippable = format == ZSTD_format_e::ZSTD_f_zstd1
+            && frame.len() >= 4
+            && (u32::from_le_bytes([frame[0], frame[1], frame[2], frame[3]])
+                & ZSTD_MAGIC_SKIPPABLE_MASK)
+                == ZSTD_MAGIC_SKIPPABLE_START;
+        if is_skippable {
+            stripped.extend_from_slice(frame);
+        } else {
+            let fhd_index = if format == ZSTD_format_e::ZSTD_f_zstd1 {
+                4
+            } else {
+                0
+            };
+            if frame.len() <= fhd_index {
+                return Err("frame walk failed: Src size is incorrect".to_string());
+            }
+            let has_checksum = frame[fhd_index] & 0b0000_0100 != 0;
+            if has_checksum {
+                if frame.len() < 4 {
+                    return Err("frame walk failed: Src size is incorrect".to_string());
+                }
+                let frame_start = stripped.len();
+                stripped.extend_from_slice(&frame[..frame.len() - 4]);
+                stripped[frame_start + fhd_index] &= !0b0000_0100;
+            } else {
+                stripped.extend_from_slice(frame);
+            }
+        }
+        cursor = &cursor[info.compressedSize..];
+    }
+    Ok(stripped)
+}
+
+fn decompress_bytes(
+    src: &[u8],
+    dict: Option<&[u8]>,
+    magicless: bool,
+    ignore_checksum: bool,
+) -> Result<Vec<u8>, String> {
+    // Size the output buffer from format-aware frame metadata. When a
+    // frame declares FCS the walker returns the exact size; otherwise
+    // it returns nbBlocks * blockSizeMax for that frame. This matters
+    // for magicless frames because the default `ZSTD_findDecompressedSize`
+    // path assumes a 4-byte zstd1 magic prefix.
     let format = if magicless {
         ZSTD_format_e::ZSTD_f_zstd1_magicless
     } else {
         ZSTD_format_e::ZSTD_f_zstd1
     };
-    // Magicless frames don't have a content-size probe-friendly path
-    // via the plain `ZSTD_findDecompressedSize` helper (it hardcodes
-    // zstd1 format). Fall back to a size-hint estimate in that case.
-    let dst_size = if magicless {
-        src.len().saturating_mul(32)
+    let decoded_src;
+    let src = if ignore_checksum {
+        decoded_src = strip_decode_checksums(src, format)?;
+        decoded_src.as_slice()
     } else {
-        let declared = ZSTD_findDecompressedSize(src);
-        if declared == ZSTD_CONTENTSIZE_ERROR {
-            return Err(format!(
-                "invalid input: {}",
-                ERR_getErrorName(declared as usize)
-            ));
-        }
-        if declared != ZSTD_CONTENTSIZE_UNKNOWN {
-            declared as usize
-        } else {
-            // Walk frames and sum decompressedBound.
-            let mut bound: u64 = 0;
-            let mut cursor = src;
-            while !cursor.is_empty() {
-                let info = ZSTD_findFrameSizeInfo(cursor, ZSTD_format_e::ZSTD_f_zstd1);
-                if ERR_isError(info.compressedSize) {
-                    return Err(format!(
-                        "frame walk failed: {}",
-                        ERR_getErrorName(info.compressedSize)
-                    ));
-                }
-                bound = bound.saturating_add(info.decompressedBound);
-                cursor = &cursor[info.compressedSize..];
-            }
-            bound as usize
-        }
+        src
     };
+    let dst_size = decompressed_bound_for_format(src, format)?;
 
     let mut dst = vec![0u8; dst_size.max(1)];
     let out = if magicless {
@@ -188,19 +387,10 @@ fn decompress_bytes(src: &[u8], dict: Option<&[u8]>, magicless: bool) -> Result<
         if let Some(d) = dict {
             ZSTD_decompress_usingDict(&mut dctx, &mut dst, src, d)
         } else {
-            // Single-frame streaming decode threads dctx.format.
-            let mut in_pos = 0usize;
-            let mut out_pos = 0usize;
-            let mut hint =
-                ZSTD_decompressStream(&mut dctx, &mut dst, &mut out_pos, src, &mut in_pos);
-            while hint != 0 && !ERR_isError(hint) {
-                hint = ZSTD_decompressStream(&mut dctx, &mut dst, &mut out_pos, &[], &mut 0usize);
-            }
-            if ERR_isError(hint) {
-                hint
-            } else {
-                out_pos
-            }
+            ZSTD_buildDefaultSeqTables(&mut dctx);
+            let mut rep = ZSTD_decoder_entropy_rep::default();
+            let mut xxh = XXH64_state_t::default();
+            ZSTD_decompressDCtx(&mut dctx, &mut rep, &mut xxh, &mut dst, src)
         }
     } else if let Some(d) = dict {
         let mut dctx = ZSTD_DCtx::new();
@@ -213,6 +403,17 @@ fn decompress_bytes(src: &[u8], dict: Option<&[u8]>, magicless: bool) -> Result<
     }
     dst.truncate(out);
     Ok(dst)
+}
+
+fn looks_like_zstd_input(src: &[u8], magicless: bool) -> bool {
+    if magicless {
+        return true;
+    }
+    if src.len() < 4 {
+        return false;
+    }
+    let magic = u32::from_le_bytes([src[0], src[1], src[2], src[3]]);
+    magic == ZSTD_MAGICNUMBER || (magic & ZSTD_MAGIC_SKIPPABLE_MASK) == ZSTD_MAGIC_SKIPPABLE_START
 }
 
 fn compress_bytes(
@@ -278,13 +479,26 @@ fn compress_bytes(
 }
 
 fn run() -> Result<(), String> {
-    let cli = Cli::parse();
+    let raw_args: Vec<OsString> = std::env::args_os().collect();
+    reject_attached_dict_arg(&raw_args)?;
+    let output_directive = last_output_directive(&raw_args);
+    let checksum_directive = last_checksum_directive(&raw_args);
+    let cli = Cli::parse_from(normalize_level_short_args(raw_args));
 
     let inputs = if cli.files.is_empty() {
         vec![PathBuf::from("-")]
     } else {
         cli.files.clone()
     };
+
+    let effective_output_file = match output_directive {
+        Some(OutputDirective::Stdout) => None,
+        Some(OutputDirective::File) | None => cli.output_file.clone(),
+    };
+
+    if effective_output_file.is_some() && inputs.len() > 1 {
+        return Err("--output-file/-o can only be used with a single input".to_string());
+    }
 
     // Load the dict once (if provided) — used by every file.
     let dict_bytes: Option<Vec<u8>> = cli
@@ -295,19 +509,25 @@ fn run() -> Result<(), String> {
     let dict_ref = dict_bytes.as_deref();
 
     for input in &inputs {
+        let out_path = output_path_for_input(input, &cli, effective_output_file.as_ref())?;
         let src = read_input(input).map_err(|e| format!("{}: {e}", input.display()))?;
+        let output_is_stdout = effective_output_file.is_none()
+            && (matches!(output_directive, Some(OutputDirective::Stdout))
+                || input == Path::new("-"));
         let dst = if cli.decompress {
-            decompress_bytes(&src, dict_ref, cli.magicless)?
+            if cli.force && output_is_stdout && !looks_like_zstd_input(&src, cli.magicless) {
+                src.clone()
+            } else {
+                decompress_bytes(
+                    &src,
+                    dict_ref,
+                    cli.magicless,
+                    checksum_directive == Some(false),
+                )?
+            }
         } else {
-            let checksum = cli.check || !cli.no_check;
+            let checksum = checksum_directive.unwrap_or(true);
             compress_bytes(&src, cli.level, dict_ref, checksum, cli.magicless)?
-        };
-        let out_path: Option<PathBuf> = if cli.stdout || input == Path::new("-") {
-            cli.output_file.clone()
-        } else {
-            cli.output_file
-                .clone()
-                .or_else(|| infer_output_path(input, cli.decompress))
         };
         let out_label = out_path
             .as_ref()

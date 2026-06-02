@@ -2,7 +2,7 @@
 
 A pure-Rust port of the [Zstandard (`zstd`)](https://github.com/facebook/zstd) compression library
 
-* 2026-04-27: Tested, speed on par with original. But be vigilant to bugs!
+* 2026-04-27: Tested locally for core compression/decompression behavior. Treat performance and parity notes as status snapshots, not guarantees.
 * Some features out of scope. Contact if you need them
 
 ## This is an LLM-mediated faithful (hopefully) translation, not the original code! 
@@ -22,7 +22,7 @@ But:
 
 * **This approach should still be considered experimental**. The LLM technology is immature and has sharp corners. But there are opportunities to reap, and the genie is not going back into the bottle. This translation is as much aimed to learn how to improve the technology and get feedback on the results.
 * Translations are not endorsed by the original authors unless otherwise noted. **Do not send bug reports to the original developers**. Use our Github issues page instead.
-* **Do not trust the benchmarks on this page**. They are used to help evaluate the translation. If you want improved performance, you generally have to use this code as a library, and use the additional tricks it offers. We generally accept performance losses in order to reduce our dependency issues
+* **Do not treat README status notes as performance guarantees**. Local benchmarks are used to help evaluate the translation, but reproducibility and dependency reduction take priority over speed claims here
 * **Check the original Github pages for information about the package**. This README is kept sparse on purpose. It is not meant to be the primary source of information
 * **If you are the author of the original code and wish to move to Rust, you can obtain ownership of this repository and crate**. Until then, our commitment is to offer an as-faithful-as-possible translation of a snapshot of your code. If we find serious bugs, we will report them to you. Otherwise we will just replicate them, to ensure comparability across studies that claim to use package XYZ v.666. Think of this like a fancy Ubuntu .deb-package of your software - that is how we treat it
 
@@ -31,48 +31,23 @@ This blurb might be out of date. Go to [this page](https://github.com/henriksson
 
 ## Status
 
-Fully usable for compression and decompression. Per-level compression ratio on the 182 KB `zstd_h.txt` fixture is at parity with upstream `zstd` 1.5.7 across all tested levels (1.00× / 1.05× / 0.98× / 1.01× / 0.99× / 1.01× / 1.05× / 1.05× at levels 1/3/5/7/10/15/19/22 — we beat upstream at 5 and 10). All 22 positive compression levels produce spec-compliant output that upstream `zstd -d` accepts byte-exact.
+Usable for core compression and decompression, with ongoing CLI/API parity work. Focused local tests exercise all positive compression levels, and the CLI integration suite checks representative upstream `zstd -d` compatibility when `zstd` is available on `PATH`; this is compatibility evidence, not a performance guarantee.
 
 Features working:
 
 - One-shot compression: `ZSTD_compress(level)`, `ZSTD_compressCCtx`, `ZSTD_compressBound`.
 - One-shot decompression: `ZSTD_decompress`, `ZSTD_decompressDCtx`, `ZSTD_findFrameCompressedSize`, `ZSTD_getFrameContentSize`.
 - Raw-content dictionaries: `ZSTD_compress_usingDict` / `ZSTD_decompress_usingDict` + CDict/DDict wrappers.
-- Streaming API: `ZSTD_initCStream` / `ZSTD_compressStream` / `ZSTD_endStream`, unified `ZSTD_compressStream2` + `ZSTD_EndDirective`, symmetric decompression, `ZSTD_CCtx_setPledgedSrcSize`, dict variants (`ZSTD_initCStream_usingDict` + `ZSTD_initDStream_usingDict`).
+- Buffered streaming compatibility wrappers: `ZSTD_initCStream` / `ZSTD_compressStream` / `ZSTD_endStream`, unified `ZSTD_compressStream2` + `ZSTD_EndDirective`, symmetric decompression, `ZSTD_CCtx_setPledgedSrcSize`, dict variants (`ZSTD_initCStream_usingDict` + `ZSTD_initDStream_usingDict`). Compression buffers input until `endStream`; block-by-block flush semantics are not yet equivalent to upstream.
 - Parametric API: `ZSTD_cParameter` / `ZSTD_dParameter` + `ZSTD_CCtx_setParameter` / `ZSTD_DCtx_setParameter`, reset directives, parameter-bounds queries (`ZSTD_cParam_getBounds` / `ZSTD_dParam_getBounds`).
 - Memory estimation: `ZSTD_estimateCCtxSize{,_usingCParams}`, `ZSTD_estimateDCtxSize`, `ZSTD_estimateDStreamSize{,_fromFrame}`, `ZSTD_sizeof_CCtx` / `ZSTD_sizeof_DCtx`.
 - Frame parameters: content-size flag, XXH64 checksum trailer, multi-block frames crossing the 128 KB boundary.
 - Strategies 1–9 (fast, dfast, greedy, lazy, lazy2, btlazy2, btopt, btultra, btultra2), including no-dict, ext-dict, dict-match-state, row-hash, and LDM-assisted optimal-parser paths.
-- CLI (`cargo build --release --features cli`) with `-d/-c/-f/-q/-v/-o/-L/-D/--check/--no-check/--magicless` flags, stdin/stdout support, file-argument handling with `.zst` extension inference.
+- CLI (`cargo build --release --features cli`) with `-d/-c/-f/-q/-v/-o/-D/--check/--no-check/--magicless` flags, upstream-style level flags such as `-1` and `-19`, local `-L/--level` level selection, buffered stdin/stdout support, file-argument handling with `.zst`/`.zstd` extension inference and unknown-suffix rejection unless `-c`/`-o` is explicit, last-wins `-c`/`-o` and `--check`/`--no-check` handling, decode-side checksum validation when present, decode-side `--no-check`, `-d -c -f` stdout pass-through for unrecognized input, and multi-input `-o` rejection.
 
-The full v1.6 public API from `zstd.h` (stable + experimental) is surfaced — every upstream entry point has a Rust counterpart reachable through `zstd_pure_rs::prelude::*`. The current C→Rust function-name coverage backlog is closed for both compression and decompression under `code-complexity-comparator`; remaining gaps are mostly verification breadth, performance/shape differences from safe scalar factoring, and CLI flag completeness rather than missing library entry points. Magic-prefix dictionary entropy **decode** is live via `ZSTD_DCtx_loadDictionary` / `ZSTD_decompress_insertDictionary` / `ZSTD_loadDEntropy`, and DDict full-dictionary entropy is copied into DCtx state when attached. Progress is tracked in `TODO.md`; the full C → Rust function mapping lives in `FUNCTIONS.md`.
+The main v1.6 `zstd.h` `ZSTD_` entry points and many experimental helpers, including translated helpers such as `ZSTD_compressSequencesAndLiterals`, are surfaced through `zstd_pure_rs::prelude::*`, but lower-level `HUF_` and `FSE_` helpers remain in their module namespaces unless explicitly re-exported there. Some parameter IDs and edge APIs remain intentionally unsupported and return the matching error codes. The current C→Rust function-name coverage backlog is closed for both compression and decompression under `code-complexity-comparator`; remaining gaps are mostly verification breadth, performance/shape differences from safe scalar factoring, unsupported parameter variants, and CLI flag completeness. Magic-prefix dictionary entropy **decode** is live via `ZSTD_DCtx_loadDictionary` / `ZSTD_decompress_insertDictionary` / `ZSTD_loadDEntropy`, and DDict full-dictionary entropy is copied into DCtx state when attached. Focused follow-up notes live in `TODO.md`; the full C → Rust function mapping lives in `FUNCTIONS.md`.
 
-Test suite: 816 library unit tests without MT and 834 with `--features mt` as of the latest local run, plus CLI/integration/fixture/doc tests in the full suite. Coverage includes cross-compatibility tests that pipe our output through upstream `zstd` when the binary is on `$PATH`, a public-API sentinel that touches every exposed entry point, a boundary-size sweep around block/tail boundaries, a regression gate for a past multi-block repcode bug, end-to-end `--magicless` CLI roundtrips, and `refPrefix` one-shot auto-clear gates proving single-use dict semantics match upstream for both compressor and decompressor sides.
-
-Release throughput on `tests/fixtures/zstd_h.txt` (182 KB), comparing the current working tree against clean `HEAD` built separately from the same repository snapshot:
-
-| Level | Previous MB/s | Current MB/s | Change |
-|------:|--------------:|-------------:|-------:|
-| 1 | 163.1 | 158.4 | -2.9% |
-| 3 | 137.4 | 139.7 | +1.7% |
-| 5 | 50.6 | 53.4 | +5.5% |
-| 10 | 15.7 | 20.3 | +29.3% |
-
-Decompression spot check on the same fixture:
-
-| Level | Previous MB/s | Current MB/s | Change |
-|------:|--------------:|-------------:|-------:|
-| 1 | 477.7 | 519.0 | +8.6% |
-| 10 | 494.3 | 536.8 | +8.6% |
-
-Commands used:
-
-```sh
-cargo build --release
-target/release/bench tests/fixtures/zstd_h.txt <level> <iters>
-```
-
-These are local microbenchmarks on a small fixture, not general performance claims. Compressed sizes were identical in the comparison above; the decompression differences should be treated as noise unless repeated dedicated decompression benchmarks confirm them.
+Test suite status as of the latest local CLI audit run: `cargo test --features cli --test cli_roundtrip` passes the focused CLI integration suite. That CLI suite covers file/stdin/stdout behavior, cross-compatibility cases that run only when upstream `zstd` is on `PATH`, boundary-size and multi-block regressions, end-to-end `--magicless` roundtrips, last-wins `-c`/`-o` and `--check`/`--no-check`, `-N` and clustered level flags, decode-side `--no-check`, no-suffix output rejection before decode, attached `-Ddict` rejection, `-d -c -f` stdout pass-through for unrecognized input, and multi-input `-o` rejection. Broader library/API coverage lives in the regular unit and integration tests, not only this CLI audit suite.
 
 ## Goals
 

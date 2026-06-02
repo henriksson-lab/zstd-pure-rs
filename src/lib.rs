@@ -112,9 +112,11 @@
 //! assert_eq!(&out[..d], &src[..]);
 //! ```
 //!
-//! See upstream's `zstd.h` for the full API — the same function names
-//! are available here (prefixed with `ZSTD_` / `HUF_` / `FSE_` as in
-//! upstream) under the `zstd_pure_rs::prelude` re-exports.
+//! See upstream's `zstd.h` for API semantics. The main public `ZSTD_`
+//! entry points are available under the `zstd_pure_rs::prelude`
+//! re-exports. Lower-level `HUF_` and `FSE_` helpers remain in their
+//! module namespaces unless explicitly re-exported there; unsupported
+//! experimental parameters return the corresponding error codes.
 
 #![allow(non_snake_case)]
 #![allow(non_camel_case_types)]
@@ -163,15 +165,17 @@ pub mod prelude {
     // One-shot compression.
     #[cfg(feature = "mt")]
     pub use crate::compress::zstd_compress::ZSTD_CCtx_refRayonThreadPool;
+    #[cfg(feature = "std")]
+    pub use crate::compress::zstd_compress::ZSTD_CCtx_refThreadPool;
     pub use crate::compress::zstd_compress::{
         ZSTD_CCtx, ZSTD_CCtx_loadDictionary, ZSTD_CCtx_loadDictionary_advanced,
         ZSTD_CCtx_loadDictionary_byReference, ZSTD_CCtx_refCDict, ZSTD_CCtx_refPrefix,
-        ZSTD_CCtx_refPrefix_advanced, ZSTD_CCtx_refThreadPool, ZSTD_CDict, ZSTD_Sequence,
-        ZSTD_SequenceFormat_e, ZSTD_SequencePosition, ZSTD_compress, ZSTD_compress2,
-        ZSTD_compressBegin, ZSTD_compressBegin_usingCDict, ZSTD_compressBegin_usingDict,
-        ZSTD_compressBound, ZSTD_compressCCtx, ZSTD_compressSequences, ZSTD_compress_usingCDict,
-        ZSTD_compress_usingCDict_advanced, ZSTD_compress_usingDict, ZSTD_createCCtx,
-        ZSTD_createCCtx_advanced, ZSTD_createCDict, ZSTD_createCDict_advanced,
+        ZSTD_CCtx_refPrefix_advanced, ZSTD_CDict, ZSTD_Sequence, ZSTD_SequenceFormat_e,
+        ZSTD_SequencePosition, ZSTD_compress, ZSTD_compress2, ZSTD_compressBegin,
+        ZSTD_compressBegin_usingCDict, ZSTD_compressBegin_usingDict, ZSTD_compressBound,
+        ZSTD_compressCCtx, ZSTD_compressSequences, ZSTD_compressSequencesAndLiterals,
+        ZSTD_compress_usingCDict, ZSTD_compress_usingCDict_advanced, ZSTD_compress_usingDict,
+        ZSTD_createCCtx, ZSTD_createCCtx_advanced, ZSTD_createCDict, ZSTD_createCDict_advanced,
         ZSTD_createCDict_advanced2, ZSTD_createCDict_byReference, ZSTD_customMem,
         ZSTD_frameProgression, ZSTD_freeCCtx, ZSTD_freeCDict, ZSTD_generateSequences,
         ZSTD_getDictID_fromCDict, ZSTD_getFrameProgression, ZSTD_mergeBlockDelimiters,
@@ -200,8 +204,8 @@ pub mod prelude {
         ZSTD_ResetDirective, ZSTD_adjustCParams, ZSTD_bounds, ZSTD_cParam_clampBounds,
         ZSTD_cParam_getBounds, ZSTD_cParam_withinBounds, ZSTD_cParameter, ZSTD_checkCParams,
         ZSTD_compressFrame_fast_advanced, ZSTD_compressFrame_fast_with_prefix_advanced,
-        ZSTD_createCCtxParams, ZSTD_defaultCLevel, ZSTD_freeCCtxParams, ZSTD_getCParams,
-        ZSTD_getParams, ZSTD_maxCLevel, ZSTD_minCLevel, ZSTD_parameters,
+        ZSTD_createCCtxParams, ZSTD_defaultCLevel, ZSTD_forceIgnoreChecksum_e, ZSTD_freeCCtxParams,
+        ZSTD_getCParams, ZSTD_getParams, ZSTD_maxCLevel, ZSTD_minCLevel, ZSTD_parameters,
         ZSTD_writeFrameHeader_advanced, ZSTD_CHAINLOG_MAX_32, ZSTD_CHAINLOG_MAX_64,
         ZSTD_CHAINLOG_MIN, ZSTD_CLEVEL_DEFAULT, ZSTD_FRAMEHEADERSIZE_MAX, ZSTD_MAX_CLEVEL,
         ZSTD_MINMATCH_MAX, ZSTD_MINMATCH_MIN, ZSTD_NO_CLEVEL, ZSTD_SEARCHLOG_MIN,
@@ -272,6 +276,7 @@ pub mod prelude {
     // Error handling.
     pub use crate::common::error::{ERR_getErrorName, ERR_isError, ErrorCode, ZstdError};
     // Thread pool API.
+    #[cfg(feature = "std")]
     pub use crate::common::pool::{POOL_ctx, ZSTD_createThreadPool, ZSTD_freeThreadPool};
     // Version + determinism helpers.
     pub use crate::common::zstd_common::{
@@ -330,6 +335,7 @@ mod prelude_tests {
         let _: Option<ZSTD_frameProgression> = None;
         let _: Option<ZSTD_Sequence> = None;
         let _: Option<ZSTD_customMem> = None;
+        let _: Option<ZSTD_forceIgnoreChecksum_e> = None;
         let _: Option<ErrorCode> = None;
     }
 
@@ -351,6 +357,14 @@ mod prelude_tests {
         let _ = ZSTD_decompressionMargin(&dst);
         let _ = ZSTD_getDecompressedSize(&dst);
         let _ = ZSTD_sequenceBound(1024);
+        let _compress_sequences_and_literals: fn(
+            &mut ZSTD_CCtx,
+            &mut [u8],
+            &[ZSTD_Sequence],
+            &[u8],
+            usize,
+            usize,
+        ) -> usize = ZSTD_compressSequencesAndLiterals;
 
         // Skippable frames
         let mut skip = vec![0u8; 16];

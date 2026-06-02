@@ -7,6 +7,7 @@
 
 #![cfg(feature = "cli")]
 
+use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -230,7 +231,7 @@ fn cli_compression_ratio_within_reasonable_factor_of_upstream() {
     let payload = std::fs::read("tests/fixtures/zstd_h.txt").expect("read fixture");
 
     fn compress_via(bin: &std::path::Path, payload: &[u8], level: i32) -> Vec<u8> {
-        // Our CLI takes `--level N`; upstream takes the `-N` short form.
+        // Use the local long level form and upstream's `-N` short form.
         let is_ours = bin == bin_path();
         let lvl_str = level.to_string();
         let neg_flag = format!("-{level}");
@@ -647,6 +648,85 @@ fn cli_file_to_file_compress_then_decompress_roundtrip() {
 }
 
 #[test]
+fn cli_decompress_file_with_unknown_suffix_requires_explicit_output() {
+    let tmp = std::env::temp_dir().join(format!("zstd_pure_unknown_suffix_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&tmp);
+    fs::create_dir_all(&tmp).unwrap();
+
+    let suffixed = tmp.join("payload.zst");
+    let no_suffix = tmp.join("payload-copy");
+    fs::write(&suffixed, make_raw_frame(b"unknown suffix payload")).unwrap();
+    fs::copy(&suffixed, &no_suffix).unwrap();
+
+    let out = Command::new(bin_path())
+        .args(["-d", "-q"])
+        .arg(&no_suffix)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+
+    assert!(
+        !out.status.success(),
+        "unknown-suffix decompression should fail"
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "unknown-suffix decompression must not write stdout"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("unknown suffix"),
+        "unknown-suffix decompression reported the wrong error: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let entry_count = fs::read_dir(&tmp).unwrap().count();
+    assert_eq!(
+        entry_count, 2,
+        "unknown-suffix decompression created an unexpected output file"
+    );
+
+    let _ = fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn cli_decompress_malformed_file_with_unknown_suffix_rejects_before_decode() {
+    let tmp = std::env::temp_dir().join(format!(
+        "zstd_pure_unknown_suffix_malformed_{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&tmp);
+    fs::create_dir_all(&tmp).unwrap();
+
+    let no_suffix = tmp.join("payload-copy");
+    fs::write(&no_suffix, b"not a zstd frame").unwrap();
+
+    let out = Command::new(bin_path())
+        .args(["-d", "-q"])
+        .arg(&no_suffix)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "malformed no-suffix input should fail"
+    );
+    assert!(
+        stderr.contains("unknown suffix"),
+        "expected suffix diagnostic, got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("frame walk failed") && !stderr.contains("Src size"),
+        "no-suffix rejection should happen before decode, got: {stderr}"
+    );
+    assert!(out.stdout.is_empty(), "rejection must not write stdout");
+
+    let _ = fs::remove_dir_all(&tmp);
+}
+
+#[test]
 fn cli_help_advertises_compression_support() {
     let out = Command::new(bin_path()).arg("--help").output().unwrap();
     assert!(out.status.success());
@@ -687,6 +767,10 @@ fn cli_help_mentions_every_supported_flag() {
             "--help missed short flag {needle}: {help}"
         );
     }
+    assert!(
+        help.contains("Out-of-range values are clamped"),
+        "--help did not describe level clamping: {help}"
+    );
 }
 
 #[test]
@@ -746,11 +830,156 @@ fn cli_refuses_to_overwrite_existing_output_without_force() {
 }
 
 #[test]
+fn cli_accepts_stdout_and_output_file_for_single_input() {
+    use std::fs;
+    let tmp = std::env::temp_dir();
+    let pid = std::process::id();
+    let output_path = tmp.join(format!("zstd_pure_stdout_plus_o_{pid}.zst"));
+    let _ = fs::remove_file(&output_path);
+    let payload = b"single input -c -o writes to file, not stdout".repeat(8);
+
+    let mut child = Command::new(bin_path())
+        .args(["-c", "-q", "-o"])
+        .arg(&output_path)
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.as_mut().unwrap().write_all(&payload).unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "single-input -c -o should succeed, stderr: {}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "-c -o should write to file and leave stdout empty",
+    );
+    assert!(
+        output_path.exists(),
+        "-c -o should create {}",
+        output_path.display(),
+    );
+
+    let dec = Command::new(bin_path())
+        .args(["-d", "-c", "-q"])
+        .arg(&output_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let dec_out = dec.wait_with_output().unwrap();
+    assert!(
+        dec_out.status.success(),
+        "decompress stderr: {}",
+        String::from_utf8_lossy(&dec_out.stderr),
+    );
+    assert_eq!(dec_out.stdout, payload);
+
+    let _ = fs::remove_file(&output_path);
+}
+
+#[test]
+fn cli_stdout_output_order_is_last_wins() {
+    use std::fs;
+    let tmp = std::env::temp_dir();
+    let pid = std::process::id();
+    let output_path = tmp.join(format!("zstd_pure_o_before_c_{pid}.zst"));
+    let _ = fs::remove_file(&output_path);
+    let payload = b"single input -o file -c writes to stdout".repeat(8);
+
+    let mut child = Command::new(bin_path())
+        .args(["-q", "-o"])
+        .arg(&output_path)
+        .args(["-c", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.as_mut().unwrap().write_all(&payload).unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "-o ... -c should succeed, stderr: {}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(
+        !out.stdout.is_empty(),
+        "-o ... -c should write compressed bytes to stdout",
+    );
+    assert!(
+        !output_path.exists(),
+        "-o ... -c should not create {}",
+        output_path.display(),
+    );
+
+    let mut dec = Command::new(bin_path())
+        .args(["-d", "-c", "-q", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    dec.stdin.as_mut().unwrap().write_all(&out.stdout).unwrap();
+    let dec_out = dec.wait_with_output().unwrap();
+    assert!(
+        dec_out.status.success(),
+        "decompress stderr: {}",
+        String::from_utf8_lossy(&dec_out.stderr),
+    );
+    assert_eq!(dec_out.stdout, payload);
+}
+
+#[test]
+fn cli_rejects_single_output_file_for_multiple_inputs() {
+    use std::fs;
+    let tmp = std::env::temp_dir();
+    let pid = std::process::id();
+    let input_a = tmp.join(format!("zstd_pure_multi_o_a_{pid}.txt"));
+    let input_b = tmp.join(format!("zstd_pure_multi_o_b_{pid}.txt"));
+    let output_path = tmp.join(format!("zstd_pure_multi_o_{pid}.zst"));
+    let _ = fs::remove_file(&output_path);
+
+    fs::write(&input_a, b"first input").unwrap();
+    fs::write(&input_b, b"second input").unwrap();
+
+    let out = Command::new(bin_path())
+        .args(["-q", "-o"])
+        .arg(&output_path)
+        .arg(&input_a)
+        .arg(&input_b)
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "one -o for multiple inputs should fail, stderr: {}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("single input"),
+        "unexpected stderr: {}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(
+        !output_path.exists(),
+        "multi-input -o rejection should not create {}",
+        output_path.display(),
+    );
+
+    let _ = fs::remove_file(&input_a);
+    let _ = fs::remove_file(&input_b);
+}
+
+#[test]
 fn cli_accepts_out_of_range_level_and_clamps_silently() {
-    // Upstream silently clamps `-L 99` to MAX (22) and `-L -999999`
-    // to MIN. Our CLI inherits this — compression must succeed and
-    // the output must roundtrip. Prevents a regression that makes
-    // a typo / user-error crash the CLI instead of DWIM'ing.
+    // `-L` is a project-local alias for `--level`; out-of-range
+    // values are clamped to zstd's supported bounds. Compression must
+    // succeed and the output must roundtrip.
     let payload: Vec<u8> = b"clamped-level test "
         .iter()
         .cycle()
@@ -801,6 +1030,57 @@ fn cli_accepts_out_of_range_level_and_clamps_silently() {
 }
 
 #[test]
+fn cli_accepts_upstream_short_level_syntax() {
+    let payload: Vec<u8> = b"short level syntax payload "
+        .iter()
+        .cycle()
+        .take(600)
+        .copied()
+        .collect();
+
+    fn compress(args: &[&str], payload: &[u8]) -> Vec<u8> {
+        let mut child = Command::new(bin_path())
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.as_mut().unwrap().write_all(payload).unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "compress {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr),
+        );
+        out.stdout
+    }
+
+    let short = compress(&["-c", "-q", "-1", "-"], &payload);
+    let long = compress(&["-c", "-q", "-L", "1", "-"], &payload);
+    assert_eq!(short, long, "-1 should behave like -L 1");
+
+    for args in [
+        ["-q", "-1c", "-"],
+        ["-q", "-c1", "-"],
+        ["-q", "-19c", "-"],
+        ["-q", "-c19", "-"],
+        ["-c", "-1q", "-"],
+        ["-c", "-19q", "-"],
+        ["-c", "-q1", "-"],
+    ] {
+        let clustered = compress(&args, &payload);
+        let level = if args[1].contains("19") { "19" } else { "1" };
+        let canonical = compress(&["-c", "-q", "-L", level, "-"], &payload);
+        assert_eq!(
+            clustered, canonical,
+            "{:?} should behave like -c -L {level}",
+            args,
+        );
+    }
+}
+
+#[test]
 fn cli_rejects_nonexistent_dict_path_with_nonzero_exit() {
     // Safety gate: `-D` pointing at a missing file must produce a
     // clean error message + non-zero exit, not a panic.
@@ -821,7 +1101,7 @@ fn cli_rejects_nonexistent_dict_path_with_nonzero_exit() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    child.stdin.as_mut().unwrap().write_all(b"payload").unwrap();
+    let _ = child.stdin.as_mut().unwrap().write_all(b"payload");
     let out = child.wait_with_output().unwrap();
     assert!(
         !out.status.success(),
@@ -833,6 +1113,45 @@ fn cli_rejects_nonexistent_dict_path_with_nonzero_exit() {
         stderr.contains(&missing_dict.display().to_string()) || stderr.contains("dict"),
         "error message didn't reference the missing dict: {stderr}",
     );
+}
+
+#[test]
+fn cli_rejects_attached_short_dict_value() {
+    let tmp = std::env::temp_dir().join(format!("zstd_pure_attached_dict_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&tmp);
+    fs::create_dir_all(&tmp).unwrap();
+
+    let dict_path = tmp.join("dict-with-c-byte.bin");
+    fs::write(&dict_path, b"dictionary content with c in the path").unwrap();
+    let attached_dict = format!("-D{}", dict_path.display());
+
+    let mut child = Command::new(bin_path())
+        .args(["-c", "-q"])
+        .arg(attached_dict)
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let _ = child.stdin.as_mut().unwrap().write_all(b"payload");
+    let out = child.wait_with_output().unwrap();
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "attached -D value should be rejected"
+    );
+    assert!(
+        stderr.contains("separate argument"),
+        "unexpected attached -D diagnostic: {stderr}"
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "rejected attached -D value must not emit compressed data"
+    );
+
+    let _ = fs::remove_dir_all(&tmp);
 }
 
 #[test]
@@ -861,6 +1180,75 @@ fn cli_rejects_decompressing_non_zstd_garbage_with_nonzero_exit() {
         !out.stderr.is_empty(),
         "expected an error message on stderr"
     );
+}
+
+#[test]
+fn cli_force_decompress_stdout_passes_through_unrecognized_input() {
+    let garbage = b"this is not compressed but should pass through with -d -c -f";
+    let mut child = Command::new(bin_path())
+        .args(["-d", "-c", "-f", "-q", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.as_mut().unwrap().write_all(garbage).unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "pass-through should succeed, stderr: {}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert_eq!(out.stdout, garbage);
+}
+
+#[test]
+fn cli_force_decompress_file_output_rejects_unrecognized_input() {
+    use std::fs;
+    let tmp = std::env::temp_dir();
+    let pid = std::process::id();
+    let input_path = tmp.join(format!("zstd_pure_passthrough_bad_{pid}.zst"));
+    let inferred_path = tmp.join(format!("zstd_pure_passthrough_bad_{pid}"));
+    let explicit_path = tmp.join(format!("zstd_pure_passthrough_bad_{pid}.out"));
+    let garbage = b"malformed file input must not be copied to output";
+
+    let _ = fs::remove_file(&input_path);
+    let _ = fs::remove_file(&inferred_path);
+    let _ = fs::remove_file(&explicit_path);
+    fs::write(&input_path, garbage).unwrap();
+
+    let inferred = Command::new(bin_path())
+        .args(["-d", "-f", "-q"])
+        .arg(&input_path)
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(
+        !inferred.status.success(),
+        "inferred file output should reject malformed input",
+    );
+    assert!(
+        !inferred_path.exists(),
+        "malformed input was copied to inferred output"
+    );
+
+    let explicit = Command::new(bin_path())
+        .args(["-d", "-f", "-q", "-o"])
+        .arg(&explicit_path)
+        .arg(&input_path)
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(
+        !explicit.status.success(),
+        "explicit file output should reject malformed input",
+    );
+    assert!(
+        !explicit_path.exists(),
+        "malformed input was copied to explicit output"
+    );
+
+    let _ = fs::remove_file(&input_path);
 }
 
 #[test]
@@ -1047,6 +1435,8 @@ fn cli_no_check_suppresses_checksum_flag_and_trailer() {
     let plain = compress(&["-c", "-q", "-"], &payload);
     let no_check = compress(&["-c", "-q", "--no-check", "-"], &payload);
     let explicit_check = compress(&["-c", "-q", "--check", "-"], &payload);
+    let check_then_no_check = compress(&["-c", "-q", "--check", "--no-check", "-"], &payload);
+    let no_check_then_check = compress(&["-c", "-q", "--no-check", "--check", "-"], &payload);
     assert_eq!(
         plain, explicit_check,
         "default output should match explicit --check"
@@ -1061,6 +1451,172 @@ fn cli_no_check_suppresses_checksum_flag_and_trailer() {
         0,
         "--no-check unexpectedly set checksumFlag"
     );
+    assert_eq!(
+        check_then_no_check[4] & 0b0000_0100,
+        0,
+        "--check --no-check should use the last checksum directive"
+    );
+    assert_eq!(
+        no_check_then_check[4] & 0b0000_0100,
+        0b0000_0100,
+        "--no-check --check should use the last checksum directive"
+    );
+}
+
+#[test]
+fn cli_check_decodes_frame_without_checksum_trailer() {
+    // `--check` validates a checksum when the frame carries one; it
+    // must not reject valid frames that were encoded without a trailer.
+    let payload: Vec<u8> = b"check accepts no-check frame "
+        .iter()
+        .cycle()
+        .take(900)
+        .copied()
+        .collect();
+
+    let mut comp = Command::new(bin_path())
+        .args(["-c", "-q", "--no-check", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    comp.stdin.as_mut().unwrap().write_all(&payload).unwrap();
+    let comp_out = comp.wait_with_output().unwrap();
+    assert!(
+        comp_out.status.success(),
+        "no-check compression failed: {}",
+        String::from_utf8_lossy(&comp_out.stderr)
+    );
+
+    let mut dec = Command::new(bin_path())
+        .args(["-d", "-c", "-q", "--check", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    dec.stdin
+        .as_mut()
+        .unwrap()
+        .write_all(&comp_out.stdout)
+        .unwrap();
+    let dec_out = dec.wait_with_output().unwrap();
+    assert!(
+        dec_out.status.success(),
+        "--check should decode a no-check frame: {}",
+        String::from_utf8_lossy(&dec_out.stderr)
+    );
+    assert_eq!(dec_out.stdout, payload);
+}
+
+#[test]
+fn cli_no_check_skips_checksum_validation_on_decode() {
+    let payload: Vec<u8> = b"decode no-check payload "
+        .iter()
+        .cycle()
+        .take(900)
+        .copied()
+        .collect();
+
+    let mut comp = Command::new(bin_path())
+        .args(["-c", "-q", "--check", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    comp.stdin.as_mut().unwrap().write_all(&payload).unwrap();
+    let comp_out = comp.wait_with_output().unwrap();
+    assert!(
+        comp_out.status.success(),
+        "compress stderr: {}",
+        String::from_utf8_lossy(&comp_out.stderr),
+    );
+
+    let mut corrupted = comp_out.stdout;
+    let last = corrupted.last_mut().expect("checksum trailer byte");
+    *last ^= 0x5a;
+
+    let mut strict = Command::new(bin_path())
+        .args(["-d", "-c", "-q", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    strict
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(&corrupted)
+        .unwrap();
+    let strict_out = strict.wait_with_output().unwrap();
+    assert!(
+        !strict_out.status.success(),
+        "strict decode should reject checksum corruption",
+    );
+
+    let mut relaxed = Command::new(bin_path())
+        .args(["-d", "-c", "-q", "--no-check", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    relaxed
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(&corrupted)
+        .unwrap();
+    let relaxed_out = relaxed.wait_with_output().unwrap();
+    assert!(
+        relaxed_out.status.success(),
+        "--no-check decode should skip checksum validation, stderr: {}",
+        String::from_utf8_lossy(&relaxed_out.stderr),
+    );
+    assert_eq!(relaxed_out.stdout, payload);
+
+    let mut last_check = Command::new(bin_path())
+        .args(["-d", "-c", "-q", "--no-check", "--check", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    last_check
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(&corrupted)
+        .unwrap();
+    let last_check_out = last_check.wait_with_output().unwrap();
+    assert!(
+        !last_check_out.status.success(),
+        "--no-check --check should validate checksum corruption",
+    );
+
+    let mut last_no_check = Command::new(bin_path())
+        .args(["-d", "-c", "-q", "--check", "--no-check", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    last_no_check
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(&corrupted)
+        .unwrap();
+    let last_no_check_out = last_no_check.wait_with_output().unwrap();
+    assert!(
+        last_no_check_out.status.success(),
+        "--check --no-check should skip checksum validation, stderr: {}",
+        String::from_utf8_lossy(&last_no_check_out.stderr),
+    );
+    assert_eq!(last_no_check_out.stdout, payload);
 }
 
 #[test]
@@ -1524,6 +2080,40 @@ fn cli_magicless_plus_check_roundtrip_through_self() {
         String::from_utf8_lossy(&dec_out.stderr),
     );
     assert_eq!(dec_out.stdout, payload, "roundtrip mismatch");
+}
+
+#[test]
+fn cli_magicless_decompresses_frame_with_absent_fcs() {
+    // Magicless frame with no frame content size:
+    // FHD=0x00 (fcsID=0, singleSegment=0), wlByte=0x40, then an RLE
+    // last block. The decoded size is intentionally larger than
+    // compressed_len * 32, so the CLI must use the format-aware frame
+    // walker bound rather than the old magicless heuristic.
+    let mut frame = Vec::new();
+    frame.push(0x00);
+    frame.push(0x40);
+    let decoded_len = 1024u32;
+    let bh = (decoded_len << 3) | (1 << 1) | 1;
+    frame.push((bh & 0xFF) as u8);
+    frame.push(((bh >> 8) & 0xFF) as u8);
+    frame.push(((bh >> 16) & 0xFF) as u8);
+    frame.push(b'Z');
+
+    let mut dec = Command::new(bin_path())
+        .args(["-d", "-c", "-q", "--magicless", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn decompressor");
+    dec.stdin.as_mut().unwrap().write_all(&frame).unwrap();
+    let dec_out = dec.wait_with_output().expect("wait");
+    assert!(
+        dec_out.status.success(),
+        "decompress stderr: {}",
+        String::from_utf8_lossy(&dec_out.stderr),
+    );
+    assert_eq!(dec_out.stdout, vec![b'Z'; decoded_len as usize]);
 }
 
 #[test]

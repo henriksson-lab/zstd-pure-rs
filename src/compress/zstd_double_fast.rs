@@ -240,7 +240,7 @@ fn ZSTD_compressBlock_doubleFast_noDict_generic_mls<const MLS: u32>(
         }
     }
 
-    let kStepIncr = 1usize << (kSearchStrength - 1);
+    let kStepIncr = 1usize << kSearchStrength;
     let dummy = [0x12u8, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0, 0xe2, 0xb4];
 
     'outer: loop {
@@ -548,9 +548,10 @@ pub fn ZSTD_compressBlock_doubleFast_dictMatchState_generic(
     let dictHBitsL = dms.cParams.hashLog + ZSTD_SHORT_CACHE_TAG_BITS;
     let dictHBitsS = dms.cParams.chainLog + ZSTD_SHORT_CACHE_TAG_BITS;
     let parseStart = 0usize;
-    let prefixLength = parseStart.saturating_sub(prefixLowest) as u32;
-    let dictAndPrefixLength =
-        prefixLength.wrapping_add(dictEndIndex.saturating_sub(dictStartIndex));
+    let istartIndex = base_off.wrapping_add(parseStart as u32);
+    let dictAndPrefixLength = istartIndex
+        .saturating_sub(prefixLowestIndex)
+        .wrapping_add(dictEndIndex.saturating_sub(dictStartIndex));
     let maxDistance = if cParams.windowLog >= 31 {
         u32::MAX
     } else {
@@ -569,11 +570,12 @@ pub fn ZSTD_compressBlock_doubleFast_dictMatchState_generic(
     if dictAndPrefixLength == 0 {
         return ZSTD_compressBlock_doubleFast_noDict_generic(ms, seqStore, rep, src, 0, mls);
     }
-    if rep[0] > dictAndPrefixLength {
-        rep[0] = dictAndPrefixLength;
-    }
-    if rep[1] > dictAndPrefixLength {
-        rep[1] = dictAndPrefixLength;
+    if rep[0] > dictAndPrefixLength || rep[1] > dictAndPrefixLength {
+        debug_assert!(
+            rep[0] <= dictAndPrefixLength && rep[1] <= dictAndPrefixLength,
+            "dictMatchState repcodes must be within current prefix plus dictionary"
+        );
+        return src.len();
     }
     debug_assert!(prefixLowestIndex <= endIndex);
     if ms.prefetchCDictTables {
@@ -1535,9 +1537,10 @@ mod tests {
     }
 
     #[test]
-    fn double_fast_dict_match_state_clamps_repcodes_to_current_prefix_and_dict() {
+    fn double_fast_dict_match_state_accepts_repcodes_in_current_prefix_and_dict() {
         let dict: Vec<u8> = (0..64u8).collect();
         let src: Vec<u8> = (128..152u8).collect();
+        let prefix_len = 32u32;
 
         let cp = ZSTD_compressionParameters {
             windowLog: 17,
@@ -1559,20 +1562,22 @@ mod tests {
 
         let mut ms = ZSTD_MatchState_t::new(cp);
         ms.dictMatchState = Some(Box::new(dms));
-        ms.window.base_offset =
-            crate::compress::match_state::ZSTD_WINDOW_START_INDEX.wrapping_add(dict.len() as u32);
-        ms.window.dictLimit = ms.window.base_offset;
-        ms.window.lowLimit = ms.window.base_offset;
+        ms.window.base_offset = crate::compress::match_state::ZSTD_WINDOW_START_INDEX
+            .wrapping_add(dict.len() as u32)
+            .wrapping_add(prefix_len);
+        ms.window.dictLimit = ms.window.base_offset.wrapping_sub(prefix_len);
+        ms.window.lowLimit = ms.window.dictLimit;
         ms.nextToUpdate = ms.window.base_offset;
         ms.loadedDictEnd = dict.len() as u32;
 
         let mut seq = SeqStore_t::with_capacity(16, 1024);
-        let mut rep = [u32::MAX, u32::MAX - 1, 8];
+        let dict_and_prefix_len = dict.len() as u32 + prefix_len;
+        let mut rep = [dict_and_prefix_len, dict.len() as u32 + 1, 8];
         let _last_lits =
             ZSTD_compressBlock_doubleFast_dictMatchState(&mut ms, &mut seq, &mut rep, &src);
 
-        assert_eq!(rep[0], dict.len() as u32);
-        assert_eq!(rep[1], dict.len() as u32);
+        assert_eq!(rep[0], dict_and_prefix_len);
+        assert_eq!(rep[1], dict.len() as u32 + 1);
     }
 
     #[test]

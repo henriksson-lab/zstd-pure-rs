@@ -531,19 +531,21 @@ pub fn ZSTD_window_canOverflowCorrect(
 ) -> bool {
     let cycleSize = 1u32 << cycleLog;
     let curr = src_abs;
-    let minIndexToOverflowCorrect = cycleSize + maxDist.max(cycleSize) + ZSTD_WINDOW_START_INDEX;
+    let minIndexToOverflowCorrect = cycleSize
+        .wrapping_add(maxDist.max(cycleSize))
+        .wrapping_add(ZSTD_WINDOW_START_INDEX);
 
-    // Wraparound is intentional — upstream relies on saturation via
-    // u32 overflow to keep the threshold at at least the base value.
+    // Wraparound is intentional: upstream multiplies in U32 and clamps
+    // the wrapped result back up to the minimum threshold.
     let adjustment = window.nbOverflowCorrections + 1;
     let adjustedIndex = minIndexToOverflowCorrect
-        .saturating_mul(adjustment)
+        .wrapping_mul(adjustment)
         .max(minIndexToOverflowCorrect);
     let indexLargeEnough = curr > adjustedIndex;
 
     // Only worth correcting early if the dictionary is already
     // invalidated, so we don't lose useful history.
-    let dictionaryInvalidated = curr > maxDist.saturating_add(loadedDictEnd);
+    let dictionaryInvalidated = curr > maxDist.wrapping_add(loadedDictEnd);
 
     indexLargeEnough && dictionaryInvalidated
 }
@@ -645,8 +647,8 @@ pub fn ZSTD_window_enforceMaxDist(
     let blockEndIdx = blockEnd_abs;
     let loadedEnd = *loadedDictEnd;
 
-    if blockEndIdx > maxDist + loadedEnd {
-        let newLowLimit = blockEndIdx - maxDist;
+    if blockEndIdx > maxDist.wrapping_add(loadedEnd) {
+        let newLowLimit = blockEndIdx.wrapping_sub(maxDist);
         if window.lowLimit < newLowLimit {
             window.lowLimit = newLowLimit;
         }
@@ -692,7 +694,7 @@ pub fn ZSTD_checkDictValidity(
     // Rust absolute-index model, so `loadedDictEnd` may be greater than
     // `blockEnd_abs`. Release behavior already preserves the dictionary
     // in that case; don't make debug builds stricter than runtime.
-    if blockEnd_abs > loadedEnd + maxDist || loadedEnd != window.dictLimit {
+    if blockEnd_abs > loadedEnd.wrapping_add(maxDist) || loadedEnd != window.dictLimit {
         *loadedDictEnd = 0;
         return true;
     }
@@ -1125,6 +1127,32 @@ mod tests {
     }
 
     #[test]
+    fn canOverflowCorrect_wraps_backoff_multiply_then_clamps() {
+        let cycleLog = 10;
+        let cycleSize = 1u32 << cycleLog;
+        let maxDist = 1u32 << 20;
+        let minIdx = cycleSize
+            .wrapping_add(maxDist.max(cycleSize))
+            .wrapping_add(ZSTD_WINDOW_START_INDEX);
+        let adjustment = u32::MAX / minIdx + 1;
+        let wrappedAdjusted = minIdx.wrapping_mul(adjustment);
+        assert!(wrappedAdjusted < minIdx);
+
+        let w = ZSTD_window_t {
+            nbOverflowCorrections: adjustment - 1,
+            ..Default::default()
+        };
+
+        assert!(ZSTD_window_canOverflowCorrect(
+            &w,
+            cycleLog,
+            maxDist,
+            0,
+            minIdx + 1
+        ));
+    }
+
+    #[test]
     fn needOverflowCorrection_tracks_ZSTD_CURRENT_MAX() {
         let w = ZSTD_window_t::default();
         assert!(!ZSTD_window_needOverflowCorrection(
@@ -1259,6 +1287,25 @@ mod tests {
     }
 
     #[test]
+    fn enforceMaxDist_uses_wrapping_loaded_end_distance() {
+        let mut w = ZSTD_window_t::default();
+        w.lowLimit = 5;
+        w.dictLimit = 10;
+        let maxDist = 100;
+        let mut dictEnd = u32::MAX - 50;
+
+        assert!(ZSTD_window_enforceMaxDist(
+            &mut w,
+            60,
+            maxDist,
+            &mut dictEnd
+        ));
+        assert_eq!(w.lowLimit, 60u32.wrapping_sub(maxDist));
+        assert_eq!(w.dictLimit, w.lowLimit);
+        assert_eq!(dictEnd, 0);
+    }
+
+    #[test]
     fn matchState_enforceMaxDist_clears_dictMatchState() {
         let cp = ZSTD_compressionParameters::default();
         let mut ms = ZSTD_MatchState_t::new(cp);
@@ -1282,6 +1329,19 @@ mod tests {
         let mut dictEnd = 100u32;
         // blockEnd = 500, maxDist = 100, loaded = 100 → 500 > 200 → invalidate.
         assert!(ZSTD_checkDictValidity(&w, 500, 100, &mut dictEnd));
+        assert_eq!(dictEnd, 0);
+    }
+
+    #[test]
+    fn checkDictValidity_uses_wrapping_loaded_end_distance() {
+        let loadedEnd = u32::MAX - 50;
+        let w = ZSTD_window_t {
+            dictLimit: loadedEnd,
+            ..Default::default()
+        };
+        let mut dictEnd = loadedEnd;
+
+        assert!(ZSTD_checkDictValidity(&w, 60, 100, &mut dictEnd));
         assert_eq!(dictEnd, 0);
     }
 

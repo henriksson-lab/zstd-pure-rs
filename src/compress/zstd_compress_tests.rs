@@ -679,12 +679,10 @@ fn compressSequencesAndLiterals_rejects_sub_minmatch_with_validation_disabled() 
 }
 
 #[test]
-fn compressSequencesAndLiterals_requires_literal_capacity_with_slack() {
-    use crate::common::error::ERR_getErrorCode;
-
+fn compressSequencesAndLiterals_accepts_exact_upstream_literal_capacity() {
     let mut cctx = ZSTD_createCCtx().unwrap();
     cctx.requestedParams.blockDelimiters = ZSTD_SequenceFormat_e::ZSTD_sf_explicitBlockDelimiters;
-    let literals = b"literal slack".to_vec();
+    let literals = b"literal capacity".to_vec();
     let seqs = [ZSTD_Sequence {
         offset: 0,
         litLength: literals.len() as u32,
@@ -697,11 +695,13 @@ fn compressSequencesAndLiterals_requires_literal_capacity_with_slack() {
         &mut dst,
         &seqs,
         &literals,
-        literals.len() + 7,
+        literals.len(),
         literals.len(),
     );
-    assert!(ERR_isError(rc));
-    assert_eq!(ERR_getErrorCode(rc), ErrorCode::WorkSpaceTooSmall);
+    assert!(
+        !ERR_isError(rc),
+        "upstream only requires litCapacity >= litSize, rc={rc:#x}"
+    );
 }
 
 #[test]
@@ -1524,13 +1524,13 @@ fn CCtx_magicless_endStream_roundtrips_through_magicless_dctx() {
 }
 
 #[test]
-fn compress_usingDict_honors_cctx_format() {
-    // Raw-dict one-shot path: `ZSTD_compress_usingDict(cctx, dst,
-    // src, dict, level)` must honor the cctx's format slot.
-    // Previously the cctx arg was dropped (`_cctx`), so setFormat
-    // had no effect on this entry point.
+fn compress_usingDict_uses_zstd1_format_despite_cctx_format() {
+    // Upstream deprecated/simple one-shot entry points build their
+    // params from the level-only API, so they don't inherit a
+    // caller-staged cctx.format. Magicless still requires the
+    // parametric path.
     use crate::decompress::zstd_decompress::{
-        ZSTD_DCtx_setFormat, ZSTD_decompress_usingDict, ZSTD_format_e, ZSTD_MAGICNUMBER,
+        ZSTD_decompress_usingDict, ZSTD_format_e, ZSTD_MAGICNUMBER,
     };
     use crate::decompress::zstd_decompress_block::ZSTD_DCtx;
 
@@ -1546,17 +1546,13 @@ fn compress_usingDict_honors_cctx_format() {
     let n = ZSTD_compress_usingDict(&mut cctx, &mut dst, &src, &dict, 3);
     assert!(!ERR_isError(n));
     dst.truncate(n);
-    assert_ne!(
+    assert_eq!(
         crate::common::mem::MEM_readLE32(&dst[..4]),
         ZSTD_MAGICNUMBER,
-        "usingDict leaked magic after setFormat(magicless)",
+        "usingDict should keep zstd1 format despite setFormat(magicless)",
     );
 
     let mut dctx = ZSTD_DCtx::new();
-    assert_eq!(
-        ZSTD_DCtx_setFormat(&mut dctx, ZSTD_format_e::ZSTD_f_zstd1_magicless),
-        0,
-    );
     let mut out = vec![0u8; src.len() + 128];
     let d = ZSTD_decompress_usingDict(&mut dctx, &mut out, &dst, &dict);
     assert!(!ERR_isError(d), "decode err: {d:#x}");
@@ -1564,15 +1560,12 @@ fn compress_usingDict_honors_cctx_format() {
 }
 
 #[test]
-fn compress_usingCDict_advanced_honors_cctx_format() {
-    // CDict one-shot path parity gate: when the caller flipped
-    // magicless on the cctx, the emitted frame must be magicless
-    // and the matching dctx + dict must decode it back to the
-    // original payload. Previously the cctx argument was
-    // ignored entirely (`_cctx`) so the cctx-scoped format slot
-    // couldn't influence the output.
+fn compress_usingCDict_advanced_uses_zstd1_format_despite_cctx_format() {
+    // Like the other deprecated/simple one-shot APIs, this entry
+    // point takes frame params but no format field. Upstream doesn't
+    // inherit a previously staged cctx.format here.
     use crate::decompress::zstd_decompress::{
-        ZSTD_DCtx_setFormat, ZSTD_decompress_usingDict, ZSTD_format_e, ZSTD_MAGICNUMBER,
+        ZSTD_decompress_usingDict, ZSTD_format_e, ZSTD_MAGICNUMBER,
     };
     use crate::decompress::zstd_decompress_block::ZSTD_DCtx;
 
@@ -1593,17 +1586,13 @@ fn compress_usingCDict_advanced_honors_cctx_format() {
     let n = ZSTD_compress_usingCDict_advanced(&mut cctx, &mut dst, &src, &cdict, fp);
     assert!(!ERR_isError(n));
     dst.truncate(n);
-    assert_ne!(
+    assert_eq!(
         crate::common::mem::MEM_readLE32(&dst[..4]),
         ZSTD_MAGICNUMBER,
-        "usingCDict_advanced leaked magic after setFormat(magicless)",
+        "usingCDict_advanced should keep zstd1 format despite setFormat(magicless)",
     );
 
     let mut dctx = ZSTD_DCtx::new();
-    assert_eq!(
-        ZSTD_DCtx_setFormat(&mut dctx, ZSTD_format_e::ZSTD_f_zstd1_magicless),
-        0,
-    );
     let mut out = vec![0u8; src.len() + 128];
     let d = ZSTD_decompress_usingDict(&mut dctx, &mut out, &dst, &dict);
     assert!(!ERR_isError(d), "decode err: {d:#x}");
@@ -1611,16 +1600,11 @@ fn compress_usingCDict_advanced_honors_cctx_format() {
 }
 
 #[test]
-fn compressCCtx_honors_cctx_format() {
-    // `ZSTD_compressCCtx` takes a level directly but must still
-    // honor the cctx's format slot. Without this, a caller who
-    // set `c_format = magicless` would see a zstd1 frame come
-    // out of the level-driven one-shot — silent divergence from
-    // the parametric API contract.
-    use crate::decompress::zstd_decompress::{
-        ZSTD_DCtx_setFormat, ZSTD_decompressStream, ZSTD_format_e, ZSTD_MAGICNUMBER,
-    };
-    use crate::decompress::zstd_decompress_block::ZSTD_DCtx;
+fn compressCCtx_uses_zstd1_format_despite_cctx_format() {
+    // `ZSTD_compressCCtx` takes a level directly. Upstream's
+    // level-only path doesn't inherit cctx.format, so a staged
+    // magicless value must not affect this deprecated/simple API.
+    use crate::decompress::zstd_decompress::{ZSTD_decompress, ZSTD_format_e, ZSTD_MAGICNUMBER};
 
     let src = b"compressCCtx-magicless-level-path ".repeat(4);
     let mut cctx = ZSTD_createCCtx().unwrap();
@@ -1632,33 +1616,21 @@ fn compressCCtx_honors_cctx_format() {
     let n = ZSTD_compressCCtx(&mut cctx, &mut dst, &src, 3);
     assert!(!ERR_isError(n));
     dst.truncate(n);
-    assert_ne!(
+    assert_eq!(
         crate::common::mem::MEM_readLE32(&dst[..4]),
         ZSTD_MAGICNUMBER,
-        "compressCCtx leaked magic after setFormat(magicless)",
+        "compressCCtx should keep zstd1 format despite setFormat(magicless)",
     );
 
-    let mut dctx = ZSTD_DCtx::new();
-    assert_eq!(
-        ZSTD_DCtx_setFormat(&mut dctx, ZSTD_format_e::ZSTD_f_zstd1_magicless),
-        0,
-    );
     let mut out = vec![0u8; src.len() + 64];
-    let mut in_pos = 0usize;
-    let mut out_pos = 0usize;
-    let _ = ZSTD_decompressStream(&mut dctx, &mut out, &mut out_pos, &dst, &mut in_pos);
-    for _ in 0..8 {
-        if out_pos >= src.len() {
-            break;
-        }
-        let _ = ZSTD_decompressStream(&mut dctx, &mut out, &mut out_pos, &[], &mut 0usize);
-    }
-    assert_eq!(&out[..out_pos], &src[..]);
+    let d = ZSTD_decompress(&mut out, &dst);
+    assert!(!ERR_isError(d), "decode err: {d:#x}");
+    assert_eq!(&out[..d], &src[..]);
 }
 
 #[test]
 fn compress_advanced_internal_propagates_params_format_onto_cctx() {
-    // Sibling of `compress_advanced_honors_cctx_format`: when
+    // Sibling of `compress_advanced_uses_zstd1_format_despite_cctx_format`: when
     // the caller configures format on a `ZSTD_CCtx_params`
     // (the upstream-canonical slot), `compress_advanced_internal`
     // must push that onto the cctx so the emitter path reads it.
@@ -1702,16 +1674,11 @@ fn compress_advanced_internal_propagates_params_format_onto_cctx() {
 }
 
 #[test]
-fn compress_advanced_honors_cctx_format() {
-    // `ZSTD_compress_advanced` takes a `ZSTD_parameters` (no
-    // format field) alongside a `&mut cctx`. The format must come
-    // from the cctx's slot — otherwise a caller who flipped
-    // magicless via `c_format` would be surprised to get a zstd1
-    // frame back.
-    use crate::decompress::zstd_decompress::{
-        ZSTD_DCtx_setFormat, ZSTD_decompressStream, ZSTD_format_e, ZSTD_MAGICNUMBER,
-    };
-    use crate::decompress::zstd_decompress_block::ZSTD_DCtx;
+fn compress_advanced_uses_zstd1_format_despite_cctx_format() {
+    // `ZSTD_compress_advanced` takes a `ZSTD_parameters` with no
+    // format field. Upstream treats this as a legacy/simple path
+    // and doesn't inherit a staged cctx.format.
+    use crate::decompress::zstd_decompress::{ZSTD_decompress, ZSTD_format_e, ZSTD_MAGICNUMBER};
 
     let src = b"compress_advanced-magicless-honors-cctx ".repeat(5);
     let mut cctx = ZSTD_createCCtx().unwrap();
@@ -1732,30 +1699,16 @@ fn compress_advanced_honors_cctx_format() {
     assert!(!ERR_isError(n));
     dst.truncate(n);
 
-    // No magic prefix.
-    assert_ne!(
+    assert_eq!(
         crate::common::mem::MEM_readLE32(&dst[..4]),
         ZSTD_MAGICNUMBER,
-        "compress_advanced leaked magic prefix",
+        "compress_advanced should keep zstd1 format despite setFormat(magicless)",
     );
 
-    // Magicless dctx round-trips.
-    let mut dctx = ZSTD_DCtx::new();
-    assert_eq!(
-        ZSTD_DCtx_setFormat(&mut dctx, ZSTD_format_e::ZSTD_f_zstd1_magicless),
-        0,
-    );
     let mut out = vec![0u8; src.len() + 64];
-    let mut in_pos = 0usize;
-    let mut out_pos = 0usize;
-    let _ = ZSTD_decompressStream(&mut dctx, &mut out, &mut out_pos, &dst, &mut in_pos);
-    for _ in 0..8 {
-        if out_pos >= src.len() {
-            break;
-        }
-        let _ = ZSTD_decompressStream(&mut dctx, &mut out, &mut out_pos, &[], &mut 0usize);
-    }
-    assert_eq!(&out[..out_pos], &src[..]);
+    let d = ZSTD_decompress(&mut out, &dst);
+    assert!(!ERR_isError(d), "decode err: {d:#x}");
+    assert_eq!(&out[..d], &src[..]);
 }
 
 #[test]
@@ -4561,12 +4514,9 @@ fn ZSTD_CParamMode_e_discriminants_match_upstream() {
 
 #[test]
 fn getBlockSize_reverts_to_BLOCKSIZE_MAX_after_reset_parameters() {
-    // After `ZSTD_CCtx_reset(parameters)`, `requested_cParams` is
-    // cleared — `getBlockSize` should revert from the small-window
-    // value back to `BLOCKSIZE_MAX`. Guards against stale cparam
-    // state surviving a reset.
+    // `ZSTD_getBlockSize` wraps deprecated applied-params state. A
+    // requested cParam update alone does not change the applied value.
     use crate::compress::match_state::ZSTD_compressionParameters;
-    use crate::decompress::zstd_decompress_block::ZSTD_BLOCKSIZE_MAX;
     let mut cctx = ZSTD_createCCtx().unwrap();
     let small_cp = ZSTD_compressionParameters {
         windowLog: 10,
@@ -4578,27 +4528,20 @@ fn getBlockSize_reverts_to_BLOCKSIZE_MAX_after_reset_parameters() {
         strategy: 1,
     };
     ZSTD_CCtx_setCParams(&mut cctx, small_cp);
-    assert_eq!(ZSTD_getBlockSize(&cctx), 1024);
+    assert_eq!(ZSTD_getBlockSize(&cctx), 0);
     ZSTD_CCtx_reset(&mut cctx, ZSTD_ResetDirective::ZSTD_reset_parameters);
-    assert_eq!(ZSTD_getBlockSize(&cctx), ZSTD_BLOCKSIZE_MAX);
+    assert_eq!(ZSTD_getBlockSize(&cctx), 0);
 }
 
 #[test]
-fn getBlockSize_honors_requested_windowLog_min_with_BLOCKSIZE_MAX() {
-    // Upstream `ZSTD_getBlockSize(cctx)` returns
-    // `min(BLOCKSIZE_MAX, 1 << cParams.windowLog)`. Previously our
-    // port returned `BLOCKSIZE_MAX` regardless of windowLog, over-
-    // reporting for small-window configs. Pin both regimes:
-    //   - small windowLog (10) → 1 << 10 = 1024
-    //   - default / unconfigured → BLOCKSIZE_MAX (128 KB)
+fn getBlockSize_wraps_deprecated_applied_params_behavior() {
+    // Upstream `ZSTD_getBlockSize(cctx)` directly wraps the deprecated
+    // helper, which reads appliedParams rather than requested params.
     use crate::compress::match_state::ZSTD_compressionParameters;
-    use crate::decompress::zstd_decompress_block::ZSTD_BLOCKSIZE_MAX;
 
-    // Fresh CCtx (no requested_cParams): returns BLOCKSIZE_MAX.
     let cctx_fresh = ZSTD_createCCtx().unwrap();
-    assert_eq!(ZSTD_getBlockSize(&cctx_fresh), ZSTD_BLOCKSIZE_MAX);
+    assert_eq!(ZSTD_getBlockSize(&cctx_fresh), 0);
 
-    // Configured with windowLog=10: returns 1024.
     let mut cctx_small = ZSTD_createCCtx().unwrap();
     let small_cp = ZSTD_compressionParameters {
         windowLog: 10,
@@ -4610,22 +4553,11 @@ fn getBlockSize_honors_requested_windowLog_min_with_BLOCKSIZE_MAX() {
         strategy: 1,
     };
     assert_eq!(ZSTD_CCtx_setCParams(&mut cctx_small, small_cp), 0);
-    assert_eq!(ZSTD_getBlockSize(&cctx_small), 1024);
+    assert_eq!(ZSTD_getBlockSize(&cctx_small), 0);
 
-    // Configured with windowLog=17 (== log2(BLOCKSIZE_MAX)): returns
-    // BLOCKSIZE_MAX.
-    let mut cctx_edge = ZSTD_createCCtx().unwrap();
-    let edge_cp = ZSTD_compressionParameters {
-        windowLog: 17,
-        chainLog: 17,
-        hashLog: 17,
-        searchLog: 4,
-        minMatch: 4,
-        targetLength: 32,
-        strategy: 3,
-    };
-    assert_eq!(ZSTD_CCtx_setCParams(&mut cctx_edge, edge_cp), 0);
-    assert_eq!(ZSTD_getBlockSize(&cctx_edge), ZSTD_BLOCKSIZE_MAX);
+    cctx_small.appliedParams.cParams = small_cp;
+    cctx_small.appliedParams.maxBlockSize = 4096;
+    assert_eq!(ZSTD_getBlockSize(&cctx_small), 1024);
 }
 
 #[test]
@@ -5699,9 +5631,8 @@ fn zstd_extended_api_surface_sentinel() {
 
 #[test]
 fn initStaticCCtx_accepts_header_sized_workspace_but_compression_can_fail() {
-    // Upstream accepts an aligned workspace large enough to hold the
-    // CCtx header at init time. The later compression setup is where
-    // an undersized static workspace is allowed to fail.
+    // Upstream requires room for the CCtx header plus its reserved
+    // static workspace before returning a context.
     let cctx_size = core::mem::size_of::<ZSTD_CCtx>();
     let mut buf = vec![0u64; (cctx_size + 1).div_ceil(core::mem::size_of::<u64>())];
     let bytes = unsafe {
@@ -5713,16 +5644,7 @@ fn initStaticCCtx_accepts_header_sized_workspace_but_compression_can_fail() {
     assert!(bytes.len() > cctx_size);
     assert!(bytes.len() < ZSTD_estimateCCtxSize(ZSTD_CLEVEL_DEFAULT));
 
-    let cctx = ZSTD_initStaticCCtx(bytes).expect("header-sized static cctx");
-    assert_eq!(cctx.stage, ZSTD_compressionStage_e::ZSTDcs_created);
-
-    let src = b"small-static-cctx workspace probe";
-    let mut dst = vec![0u8; ZSTD_compressBound(src.len())];
-    let n = ZSTD_compressCCtx(cctx, &mut dst, src, 1);
-    assert!(
-        ERR_isError(n),
-        "undersized static workspace should fail during compression setup, got {n}"
-    );
+    assert!(ZSTD_initStaticCCtx(bytes).is_none());
 }
 
 /// Sentinel test: touch every public one-shot compress function
@@ -6291,14 +6213,13 @@ fn zstd_public_api_surface_touches_every_entry_point() {
         assert!(crate::common::error::ERR_isError(rc));
     }
 
-    // Compress-side ZSTD_getBlockSize: default CCtx hands back
-    // ZSTD_BLOCKSIZE_MAX. Explicit module path avoids the glob-
+    // Compress-side ZSTD_getBlockSize directly wraps deprecated
+    // applied-params behavior. Explicit module path avoids the glob-
     // imported decompress-side variant that's also in scope here.
     {
-        use crate::decompress::zstd_decompress_block::ZSTD_BLOCKSIZE_MAX;
         assert_eq!(
             crate::compress::zstd_compress::ZSTD_getBlockSize(&cctx_fresh),
-            ZSTD_BLOCKSIZE_MAX,
+            0,
         );
     }
 

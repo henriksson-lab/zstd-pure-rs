@@ -17,6 +17,16 @@ use crate::decompress::zstd_decompress_block::SymbolEncodingType_e;
 
 const BYTESCALE: usize = 256;
 
+/// Upstream `STREAM_ACCUMULATOR_MIN` — 57 on 64-bit targets, 25 on 32-bit.
+#[inline]
+const fn STREAM_ACCUMULATOR_MIN() -> u32 {
+    if crate::common::mem::MEM_32bits() != 0 {
+        25
+    } else {
+        57
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct EstimatedBlockSize {
     pub estLitSize: usize,
@@ -153,7 +163,7 @@ pub fn ZSTD_compressSubBlock_sequences(
     use crate::compress::zstd_compress_sequences::ZSTD_encodeSequences;
     use crate::decompress::zstd_decompress_block::LONGNBSEQ;
 
-    let longOffsets = (cctxParams.cParams.windowLog > 25) as i32;
+    let longOffsets = (cctxParams.cParams.windowLog > STREAM_ACCUMULATOR_MIN()) as i32;
     let mut op = 0usize;
 
     *entropyWritten = 0;
@@ -575,11 +585,15 @@ pub fn ZSTD_estimateSubBlockSize_sequences(
         return SEQUENCES_SECTION_HEADER_SIZE;
     }
 
+    let ofCodeTable = &ofCodeTable[..ofCodeTable.len().min(nbSeq)];
+    let llCodeTable = &llCodeTable[..llCodeTable.len().min(nbSeq)];
+    let mlCodeTable = &mlCodeTable[..mlCodeTable.len().min(nbSeq)];
+
     let mut cSeqSizeEstimate = 0usize;
     cSeqSizeEstimate += ZSTD_estimateBlockSize_symbolType(
         fseMetadata.ofType,
         ofCodeTable,
-        MaxOff,
+        DefaultMaxOff,
         &fseTables.offcodeCTable,
         None,
         &OF_defaultNorm,
@@ -606,7 +620,7 @@ pub fn ZSTD_estimateSubBlockSize_sequences(
         ML_defaultNormLog,
         workspace,
     );
-    let _ = DefaultMaxOff;
+    let _ = MaxOff;
     if writeEntropy {
         cSeqSizeEstimate += fseMetadata.fseTablesSize;
     }
@@ -925,6 +939,43 @@ mod tests {
             ZSTD_estimateBlockSize_sequences(&[], &[], &[], 0, &fse, &meta, &mut wksp, false),
             2
         );
+    }
+
+    #[test]
+    fn estimate_subblock_sequences_uses_only_nbseq_codes() {
+        let fse = crate::compress::zstd_compress::ZSTD_fseCTables_t::default();
+        let meta = ZSTD_fseCTablesMetadata_t::default();
+        let of_codes = [1, 2, 28, 31];
+        let ll_codes = [0, 1, 2, 35];
+        let ml_codes = [0, 1, 2, 52];
+        let mut wksp = vec![0u32; crate::compress::hist::HIST_WKSP_SIZE_U32];
+
+        let with_tail = ZSTD_estimateSubBlockSize_sequences(
+            &of_codes, &ll_codes, &ml_codes, 3, &fse, &meta, &mut wksp, false,
+        );
+        let trimmed = ZSTD_estimateSubBlockSize_sequences(
+            &of_codes[..3],
+            &ll_codes[..3],
+            &ml_codes[..3],
+            3,
+            &fse,
+            &meta,
+            &mut wksp,
+            false,
+        );
+
+        assert_eq!(with_tail, trimmed);
+    }
+
+    #[test]
+    fn stream_accumulator_min_matches_upstream_word_size() {
+        let expected = if core::mem::size_of::<usize>() == 4 {
+            25
+        } else {
+            57
+        };
+
+        assert_eq!(STREAM_ACCUMULATOR_MIN(), expected);
     }
 
     #[test]

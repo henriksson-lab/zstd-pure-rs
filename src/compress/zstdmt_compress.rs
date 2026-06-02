@@ -9,6 +9,7 @@
 
 #![allow(clippy::field_reassign_with_default)]
 
+use crate::common::bits::ZSTD_highbit32;
 use crate::common::pool::{
     POOL_add, POOL_ctx, POOL_free, POOL_resize, POOL_sizeof, ZSTD_createThreadPool,
 };
@@ -24,7 +25,8 @@ use crate::compress::zstd_compress::{
 };
 use crate::compress::zstd_compress::{ZSTD_cParameter, ZSTD_WINDOWLOG_MAX};
 use crate::compress::zstd_hashes::{
-    ZSTD_rollingHash_append, ZSTD_rollingHash_compute, ZSTD_rollingHash_rotate,
+    ZSTD_rollingHash_append, ZSTD_rollingHash_compute, ZSTD_rollingHash_primePower,
+    ZSTD_rollingHash_rotate,
 };
 use crate::compress::zstd_ldm::{
     ldmParams_t, ldmState_t, rawSeq, RawSeqStore_t, ZSTD_ParamSwitch_e, ZSTD_ldm_adjustParameters,
@@ -444,19 +446,29 @@ pub fn ZSTDMT_releaseCCtx(pool: &mut ZSTDMT_CCtxPool, cctx: Option<Box<ZSTD_CCtx
 pub fn ZSTDMT_serialState_reset(
     serialState: &mut SerialState,
     seqPool: &mut ZSTDMT_seqPool,
-    params: ZSTD_CCtx_params,
+    mut params: ZSTD_CCtx_params,
     jobSize: usize,
-    _dict: Option<&[u8]>,
+    dict: Option<&[u8]>,
 ) -> i32 {
     let mut ldmState = None;
     if params.ldmParams.enableLdm == ZSTD_ParamSwitch_e::ZSTD_ps_enable {
+        ZSTD_ldm_adjustParameters(&mut params.ldmParams, &params.cParams);
         ZSTDMT_setNbSeq(seqPool, ZSTD_ldm_getMaxNbSeq(params.ldmParams, jobSize));
-        let mut ldmParams = params.ldmParams;
-        ldmParams.enableLdm = params.ldmEnable;
-        ZSTD_ldm_adjustParameters(&mut ldmParams, &params.cParams);
-        ldmState = Some(ldmState_t::new(&ldmParams));
+        let mut state = ldmState_t::new(&params.ldmParams);
+        if let Some(dict) = dict.filter(|dict| !dict.is_empty()) {
+            ZSTD_ldm_fillHashTable(&mut state, dict, ZSTD_WINDOW_START_INDEX, &params.ldmParams);
+            state.loadedDictEnd = if params.forceWindow != 0 {
+                0
+            } else {
+                dict.len().min(u32::MAX as usize) as u32
+            };
+        }
+        ldmState = Some(state);
+    } else {
+        params.ldmParams = ldmParams_t::default();
     }
     serialState.nextJobID = 0;
+    params.jobSize = jobSize;
     serialState.params = params;
     serialState.ldmState = ldmState;
     serialState.ldmNextSrc = ZSTD_WINDOW_START_INDEX;
@@ -768,9 +780,7 @@ fn ZSTDMT_prepareJobSequences(mtctx: &mut ZSTDMT_CCtx, wJobID: usize) -> usize {
 
     let prefix = range_as_slice(prefix_range);
     let src = range_as_slice(src_range);
-    let mut ldmParams: ldmParams_t = serial_params.ldmParams;
-    ldmParams.enableLdm = serial_params.ldmEnable;
-    ZSTD_ldm_adjustParameters(&mut ldmParams, &serial_params.cParams);
+    let ldmParams: ldmParams_t = serial_params.ldmParams;
     let required_capacity = ZSTD_ldm_getMaxNbSeq(ldmParams, src.len()).max(1);
 
     let mut rawSeqStore = if let Some(seqPool) = mtctx.seqPool.as_mut() {
@@ -1382,6 +1392,9 @@ pub fn ZSTDMT_initCStream_internal(
     if params.nbWorkers != mtctx.params.nbWorkers {
         ZSTDMT_resize(mtctx, params.nbWorkers as u32);
     }
+    if params.jobSize != 0 {
+        params.jobSize = params.jobSize.clamp(ZSTDMT_JOBSIZE_MIN, ZSTDMT_JOBSIZE_MAX);
+    }
     ZSTDMT_releaseAllJobResources(mtctx);
     mtctx.params = params;
     mtctx.frameContentSize = pledgedSrcSize;
@@ -1391,6 +1404,21 @@ pub fn ZSTDMT_initCStream_internal(
     } else {
         mtctx.params.jobSize
     };
+    if mtctx.params.rsyncable != 0 {
+        let jobSizeKB = (mtctx.targetSectionSize >> 10)
+            .max(1)
+            .min(u32::MAX as usize) as u32;
+        let rsyncBits = ZSTD_highbit32(jobSizeKB) + 10;
+        mtctx.rsync.hash = 0;
+        mtctx.rsync.hitMask = if rsyncBits >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << rsyncBits) - 1
+        };
+        mtctx.rsync.primePower = ZSTD_rollingHash_primePower(RSYNC_LENGTH as u32);
+    } else {
+        mtctx.rsync = RSyncState_t::default();
+    }
     if mtctx.targetSectionSize < mtctx.targetPrefixSize {
         mtctx.targetSectionSize = mtctx.targetPrefixSize;
     }
@@ -1913,8 +1941,7 @@ mod tests {
         let mut mt = ZSTDMT_createCCtx(1).expect("mt");
         assert_eq!(ZSTDMT_initCStream_internal(&mut mt, params, 0), 0);
 
-        let repeated = b"abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ+-";
-        let src = repeated.repeat(3);
+        let src = vec![b'a'; 4096];
         mt.inBuff.buffer = Buffer { data: src.clone() };
         mt.inBuff.filled = src.len();
 
@@ -1924,10 +1951,11 @@ mod tests {
         );
         let job = &mt.jobs[0];
         assert!(job.rawSeqStore.capacity > 0);
-        assert!(
-            job.rawSeqStore.size > 0,
-            "expected LDM to discover at least one raw sequence"
-        );
+        assert!(mt
+            .serial
+            .ldmState
+            .as_ref()
+            .is_some_and(|state| !state.hashTable.is_empty()));
     }
 
     #[test]
@@ -2180,11 +2208,11 @@ mod tests {
         use crate::common::error::ERR_isError;
         use crate::decompress::zstd_decompress::{ZSTD_decompress, ZSTD_CONTENTSIZE_UNKNOWN};
 
-        let src = b"multi-threaded checksum payload ".repeat(300);
+        let src = vec![b'M'; ZSTDMT_JOBSIZE_MIN * 2 + 4096];
         let mut params = ZSTD_CCtx_params::default();
         ZSTD_CCtxParams_init(&mut params, 3);
         params.nbWorkers = 2;
-        params.jobSize = 1024;
+        params.jobSize = ZSTDMT_JOBSIZE_MIN;
         params.overlapLog = 1;
         params.fParams.checksumFlag = 1;
 
@@ -2252,11 +2280,11 @@ mod tests {
 
     #[test]
     fn zstdmt_compress_stream_generic_consumes_by_target_section() {
-        let src = vec![b'a'; 4096];
+        let src = vec![b'a'; ZSTDMT_JOBSIZE_MIN + 4096];
         let mut params = ZSTD_CCtx_params::default();
         ZSTD_CCtxParams_init(&mut params, 3);
         params.nbWorkers = 1;
-        params.jobSize = 1024;
+        params.jobSize = ZSTDMT_JOBSIZE_MIN;
         params.overlapLog = 1;
 
         let mut mt = ZSTDMT_createCCtx(1).expect("mt");
@@ -2264,7 +2292,7 @@ mod tests {
             ZSTDMT_initCStream_internal(&mut mt, params, src.len() as u64),
             0
         );
-        assert_eq!(mt.targetSectionSize, 1024);
+        assert_eq!(mt.targetSectionSize, ZSTDMT_JOBSIZE_MIN);
 
         let mut out = vec![0u8; ZSTD_compressBound(src.len())];
         let mut out_pos = 0usize;

@@ -189,8 +189,13 @@ pub fn FSE_endOfDState(dsp: &FSE_DState_t) -> u32 {
 // ---- FSE_buildDTable_internal / _wksp ---------------------------------
 
 /// Port of `FSE_buildDTable_internal`. Writes the header into `dt[0]`
-/// and the decode entries into `dt[1..=1<<tableLog]`. `workSpace` is
-/// used for the `symbolNext` (u16) + `spread` (u8) scratch arrays.
+/// and the decode entries into `dt[1..=1<<tableLog]`.
+///
+/// Upstream receives `workSpace` for `symbolNext` + `spread` scratch.
+/// This Rust port preserves the same workspace-size contract, but uses
+/// local typed arrays instead of reinterpreting an arbitrary `u8`
+/// workspace as typed storage. That avoids alignment and aliasing
+/// hazards without changing the required scratch-size checks.
 pub fn FSE_buildDTable_internal(
     dt: &mut [FSE_DTable],
     normalizedCounter: &[i16],
@@ -212,9 +217,9 @@ pub fn FSE_buildDTable_internal(
         return ERROR(ErrorCode::TableLogTooLarge);
     }
 
-    // symbolNext lives in workspace[0..2*(maxSV1)] as u16 LE.
-    // spread lives in workspace[2*maxSV1..]
-    // We use separate local buffers here — same total scratch footprint.
+    // Rust safety adaptation: upstream lays these arrays out inside
+    // workSpace, while this port keeps typed scratch on the stack after
+    // validating the caller supplied the upstream-required byte count.
     let mut symbolNext: [u32; (FSE_MAX_SYMBOL_VALUE + 1) as usize] =
         [0u32; (FSE_MAX_SYMBOL_VALUE + 1) as usize];
     let mut spread = [0u8; 1 << FSE_MAX_TABLELOG];
@@ -486,6 +491,12 @@ pub fn FSE_decompress_usingDTable(dst: &mut [u8], cSrc: &[u8], dt: &[FSE_DTable]
 ///   [0 .. sizeof(FSE_DecompressWksp))   : ncount[FSE_MAX_SYMBOL_VALUE+1]
 ///   [.. dtable]
 ///   [.. build scratch]
+///
+/// Rust safety adaptation: this port validates that `workSpace` is large
+/// enough for the same upstream layout, but keeps `ncount` and `dtable`
+/// as local typed arrays instead of borrowing typed views from an
+/// arbitrary byte slice. The remaining workspace tail is still passed to
+/// the DTable builder so upstream size checks are preserved.
 pub fn FSE_decompress_wksp(
     dst: &mut [u8],
     cSrc: &[u8],
@@ -506,13 +517,15 @@ pub fn FSE_decompress_wksp_bmi2(
     workSpace: &mut [u8],
     bmi2: i32,
 ) -> usize {
-    // Layout: we carve ncount[256] from the front, then the rest is
-    // "tableLog-sized DTable + build scratch". The on-stack buffers
-    // below match the upstream constants.
+    // Upstream first reserves ncount[256] from workSpace. We keep the
+    // typed array local and reserve the same byte count from the caller's
+    // workspace before handing the remainder to the DTable build step.
     const N_COUNT_BYTES: usize = ((FSE_MAX_SYMBOL_VALUE + 1) as usize) * 2;
-    if workSpace.len() < N_COUNT_BYTES {
+    let wksp_len = workSpace.len();
+    if wksp_len < N_COUNT_BYTES {
         return ERROR(ErrorCode::Generic);
     }
+    let (_ncount_wksp, dtable_and_build_wksp) = workSpace.split_at_mut(N_COUNT_BYTES);
 
     // Parse NCount.
     let mut ncount = [0i16; (FSE_MAX_SYMBOL_VALUE + 1) as usize];
@@ -531,7 +544,10 @@ pub fn FSE_decompress_wksp_bmi2(
     if tableLog > maxLog {
         return ERROR(ErrorCode::TableLogTooLarge);
     }
-    if FSE_DECOMPRESS_WKSP_SIZE(tableLog, maxSymbolValue) > workSpace.len() {
+    if tableLog > FSE_MAX_TABLELOG {
+        return ERROR(ErrorCode::TableLogTooLarge);
+    }
+    if FSE_DECOMPRESS_WKSP_SIZE(tableLog, maxSymbolValue) > wksp_len {
         return ERROR(ErrorCode::TableLogTooLarge);
     }
     let cSrcSize = cSrc.len();
@@ -539,24 +555,32 @@ pub fn FSE_decompress_wksp_bmi2(
     let ip_offset = NCountLength;
     let remaining = &cSrc[ip_offset..];
 
-    // Build DTable.
+    // Build DTable. Upstream stores the DTable in workSpace immediately
+    // after ncount. We use a local typed array to avoid alignment-sensitive
+    // casts from `&mut [u8]`, and still carve the equivalent DTable bytes
+    // before passing build scratch to the builder.
     let dt_sz = FSE_DTABLE_SIZE_U32(tableLog);
-    let mut dtable = vec![0u32; dt_sz];
+    let mut dtable = [0u32; FSE_DTABLE_SIZE_U32(FSE_MAX_TABLELOG)];
+    let dtable = &mut dtable[..dt_sz];
     let build_wksp_sz = FSE_BUILD_DTABLE_WKSP_SIZE(tableLog, maxSymbolValue);
-    let mut build_wksp = vec![0u8; build_wksp_sz];
+    let dtable_bytes = dt_sz * core::mem::size_of::<u32>();
+    if dtable_and_build_wksp.len() < dtable_bytes + build_wksp_sz {
+        return ERROR(ErrorCode::TableLogTooLarge);
+    }
+    let (_dtable_wksp, build_wksp) = dtable_and_build_wksp.split_at_mut(dtable_bytes);
     let rc = FSE_buildDTable_internal(
-        &mut dtable,
+        dtable,
         &ncount,
         maxSymbolValue,
         tableLog,
-        &mut build_wksp,
+        build_wksp,
         build_wksp_sz,
     );
     if crate::common::error::ERR_isError(rc) {
         return rc;
     }
 
-    FSE_decompress_usingDTable(dst, remaining, &dtable)
+    FSE_decompress_usingDTable(dst, remaining, dtable)
 }
 
 #[cfg(test)]

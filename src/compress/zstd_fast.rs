@@ -175,7 +175,7 @@ pub fn ZSTD_fillHashTableForCDict(
     let iend = src_end - HASH_READ_SIZE;
 
     let mut ip = ms.nextToUpdate.saturating_sub(ms.window.base_offset) as usize;
-    while ip + fastHashFillStep as usize + 1 < iend + 2 {
+    while ip + (fastHashFillStep as usize) < iend + 2 {
         let curr = ms.window.base_offset.wrapping_add(ip as u32);
         let hash0 = ZSTD_hashPtr(&src[ip..], hBits, mls);
         ZSTD_writeTaggedIndex(&mut ms.hashTable, hash0, curr);
@@ -193,11 +193,11 @@ pub fn ZSTD_fillHashTableForCDict(
 }
 
 /// Port of `ZSTD_fillHashTableForCCtx`. Called for a fresh compression
-/// context; always uses `ZSTD_dtlm_fast`.
+/// context.
 pub fn ZSTD_fillHashTableForCCtx(
     ms: &mut ZSTD_MatchState_t,
     src: &[u8],
-    _dtlm: ZSTD_dictTableLoadMethod_e,
+    dtlm: ZSTD_dictTableLoadMethod_e,
 ) {
     let hBits = ms.cParams.hashLog;
     let mls = ms.cParams.minMatch;
@@ -210,11 +210,18 @@ pub fn ZSTD_fillHashTableForCCtx(
     let iend = src_end - HASH_READ_SIZE;
 
     let mut ip = ms.nextToUpdate.saturating_sub(ms.window.base_offset) as usize;
-    while ip + fastHashFillStep as usize + 1 < iend + 2 {
+    while ip + (fastHashFillStep as usize) < iend + 2 {
         let curr = ms.window.base_offset.wrapping_add(ip as u32);
         let hash0 = ZSTD_hashPtr(&src[ip..], hBits, mls);
         ms.hashTable[hash0] = curr;
-        // Fast variant: no extra-slot fill.
+        if dtlm != ZSTD_dictTableLoadMethod_e::ZSTD_dtlm_fast {
+            for p in 1..fastHashFillStep as usize {
+                let hash = ZSTD_hashPtr(&src[ip + p..], hBits, mls);
+                if ms.hashTable[hash] == 0 {
+                    ms.hashTable[hash] = curr.wrapping_add(p as u32);
+                }
+            }
+        }
         ip += fastHashFillStep as usize;
     }
 }
@@ -659,15 +666,9 @@ pub fn ZSTD_compressBlock_fast_dictMatchState_generic(
     if src.len() < HASH_READ_SIZE || stepSize == 0 {
         return src.len();
     }
-    if dictAndPrefixLength == 0 {
-        return ZSTD_compressBlock_fast_noDict_generic(ms, seqStore, rep, src, 0, mls);
-    }
-    if rep[0] > dictAndPrefixLength {
-        rep[0] = dictAndPrefixLength;
-    }
-    if rep[1] > dictAndPrefixLength {
-        rep[1] = dictAndPrefixLength;
-    }
+    debug_assert!(dictAndPrefixLength > 0);
+    debug_assert!(rep[0] <= dictAndPrefixLength);
+    debug_assert!(rep[1] <= dictAndPrefixLength);
 
     if ms.prefetchCDictTables {
         crate::common::zstd_internal::ZSTD_prefetchArea(&dms.hashTable);
@@ -677,8 +678,16 @@ pub fn ZSTD_compressBlock_fast_dictMatchState_generic(
     let base_off = ms.window.base_offset;
     let iend = src.len();
     let ilimit = iend.saturating_sub(HASH_READ_SIZE);
-    let mut offset_1 = rep[0];
-    let mut offset_2 = rep[1];
+    let mut offset_1 = if rep[0] <= dictAndPrefixLength {
+        rep[0]
+    } else {
+        0
+    };
+    let mut offset_2 = if rep[1] <= dictAndPrefixLength {
+        rep[1]
+    } else {
+        0
+    };
     let mut anchor = 0usize;
     let mut ip0 = usize::from(dictAndPrefixLength == 0);
     let mut ip1 = ip0 + stepSize as usize;
@@ -1662,7 +1671,7 @@ mod tests {
     }
 
     #[test]
-    fn fast_dict_match_state_rep_bounds_exclude_future_source_bytes() {
+    fn fast_dict_match_state_preserves_valid_repcodes() {
         let cp = ZSTD_compressionParameters {
             windowLog: 17,
             hashLog: 12,
@@ -1687,12 +1696,55 @@ mod tests {
 
         let src: Vec<u8> = (0..96u8).map(|v| v.wrapping_mul(37)).collect();
         let mut seq = SeqStore_t::with_capacity(128, 4096);
-        let mut rep = [40u32, 45, 8];
+        let mut rep = [12u32, 16, 8];
 
         let _ = ZSTD_compressBlock_fast_dictMatchState(&mut ms, &mut seq, &mut rep, &src);
 
-        assert_eq!(rep[0], dict.len() as u32);
-        assert_eq!(rep[1], dict.len() as u32);
+        assert_eq!(rep[0], 12);
+        assert_eq!(rep[1], 16);
+    }
+
+    #[test]
+    fn fill_hash_table_cctx_uses_upstream_loop_bound() {
+        let mut ms = test_state();
+        let src: Vec<u8> = (0..13u8).collect();
+
+        ZSTD_fillHashTableForCCtx(&mut ms, &src, ZSTD_dictTableLoadMethod_e::ZSTD_dtlm_fast);
+
+        let hash = ZSTD_hashPtr(&src[3..], ms.cParams.hashLog, ms.cParams.minMatch);
+        assert_eq!(ms.hashTable[hash], ms.window.base_offset + 3);
+    }
+
+    #[test]
+    fn fill_hash_table_cdict_uses_upstream_loop_bound() {
+        let mut ms = test_state();
+        let src: Vec<u8> = (0..13u8).collect();
+
+        ZSTD_fillHashTableForCDict(&mut ms, &src, ZSTD_dictTableLoadMethod_e::ZSTD_dtlm_fast);
+
+        let hash_and_tag = ZSTD_hashPtr(
+            &src[3..],
+            ms.cParams.hashLog + ZSTD_SHORT_CACHE_TAG_BITS,
+            ms.cParams.minMatch,
+        );
+        let slot = hash_and_tag >> ZSTD_SHORT_CACHE_TAG_BITS;
+        let expected = ((ms.window.base_offset + 3) << ZSTD_SHORT_CACHE_TAG_BITS)
+            | (hash_and_tag as u32 & ((1u32 << ZSTD_SHORT_CACHE_TAG_BITS) - 1));
+
+        assert_eq!(ms.hashTable[slot], expected);
+    }
+
+    #[test]
+    fn fill_hash_table_cctx_full_fills_extra_empty_slots() {
+        let mut ms = test_state();
+        let src: Vec<u8> = (0..11u8).collect();
+
+        ZSTD_fillHashTableForCCtx(&mut ms, &src, ZSTD_dictTableLoadMethod_e::ZSTD_dtlm_full);
+
+        for p in 1..3 {
+            let hash = ZSTD_hashPtr(&src[p..], ms.cParams.hashLog, ms.cParams.minMatch);
+            assert_eq!(ms.hashTable[hash], ms.window.base_offset + p as u32);
+        }
     }
 
     #[test]

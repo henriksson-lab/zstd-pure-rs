@@ -1086,6 +1086,7 @@ pub fn ZSTD_insertAndFindFirstIndex_internal(
     src: &[u8],
     ip: usize,
     mls: u32,
+    lazySkipping: u32,
 ) -> u32 {
     let hashLog = ms.cParams.hashLog;
     let chainMask = (1u32 << ms.cParams.chainLog) - 1;
@@ -1107,6 +1108,9 @@ pub fn ZSTD_insertAndFindFirstIndex_internal(
         ms.chainTable[slot] = ms.hashTable[h];
         ms.hashTable[h] = idx;
         idx += 1;
+        if lazySkipping != 0 {
+            break;
+        }
     }
     ms.nextToUpdate = target;
     // Lookup hash at ip itself.
@@ -1150,7 +1154,7 @@ pub fn ZSTD_HcFindBestMatch_noDict(
     let mut ml: usize = 3; // upstream: 4-1 (seeded below minMatch so any ≥ 4 wins)
 
     // Insert + find head.
-    let mut matchIndex = ZSTD_insertAndFindFirstIndex_internal(ms, src, ip, mls);
+    let mut matchIndex = ZSTD_insertAndFindFirstIndex_internal(ms, src, ip, mls, ms.lazySkipping);
 
     while matchIndex >= lowLimit && matchIndex < curr && nbAttempts > 0 {
         nbAttempts -= 1;
@@ -1200,11 +1204,7 @@ pub fn ZSTD_HcFindBestMatch_noDict(
         }
         matchIndex = next;
     }
-    if ml >= 4 {
-        ml
-    } else {
-        0
-    }
+    ml
 }
 
 /// Port of `ZSTD_HcFindBestMatch`. Hash-chain match finder covering
@@ -1261,7 +1261,7 @@ pub fn ZSTD_HcFindBestMatch(
         0usize
     };
 
-    let mut matchIndex = ZSTD_insertAndFindFirstIndex_internal(ms, src, ip, mls);
+    let mut matchIndex = ZSTD_insertAndFindFirstIndex_internal(ms, src, ip, mls, ms.lazySkipping);
 
     while matchIndex >= lowLimit && nbAttempts > 0 {
         nbAttempts -= 1;
@@ -2534,6 +2534,56 @@ pub fn ZSTD_compressBlock_lazy_generic_with_istart(
                 anchor = ip;
             }
         }
+
+        if dictMode == ZSTD_dictMode_e::ZSTD_extDict {
+            while ip <= ilimit {
+                let repCurrent = base_off.wrapping_add(ip as u32);
+                let windowLow = ZSTD_getLowestMatchIndex(ms, repCurrent, ms.cParams.windowLog);
+                let repIndex = repCurrent.wrapping_sub(offset_2);
+                let repInDict = repIndex < prefixLowestIndex;
+                let repMatch = if repInDict {
+                    repIndex.saturating_sub(extDictBaseOffset) as usize
+                } else {
+                    repIndex.saturating_sub(base_off) as usize
+                };
+                if !ZSTD_index_overlap_check(prefixLowestIndex, repIndex)
+                    || offset_2 > repCurrent.wrapping_sub(windowLow)
+                {
+                    break;
+                }
+                let matches = if repInDict {
+                    repMatch + 4 <= extDict.len()
+                        && MEM_read32(&extDict[repMatch..]) == MEM_read32(&src[ip..])
+                } else {
+                    repMatch + 4 <= src.len()
+                        && MEM_read32(&src[repMatch..]) == MEM_read32(&src[ip..])
+                };
+                if !matches {
+                    break;
+                }
+                matchLength = ZSTD_count_2segments(
+                    src,
+                    ip + 4,
+                    iend,
+                    prefixLowest,
+                    if repInDict { extDict.as_slice() } else { src },
+                    repMatch + 4,
+                    if repInDict { extDict.len() } else { iend },
+                ) + 4;
+                offBase = offset_2;
+                offset_2 = offset_1;
+                offset_1 = offBase;
+                ZSTD_storeSeq(
+                    seqStore,
+                    0,
+                    &src[anchor..anchor],
+                    REPCODE_TO_OFFBASE(1),
+                    matchLength,
+                );
+                ip += matchLength;
+                anchor = ip;
+            }
+        }
     }
 
     offsetSaved2 = if offsetSaved1 != 0 && offset_1 != 0 {
@@ -2561,7 +2611,15 @@ pub fn ZSTD_compressBlock_greedy(
     rep: &mut [u32; ZSTD_REP_NUM],
     src: &[u8],
 ) -> usize {
-    ZSTD_compressBlock_lazy_noDict_generic(ms, seqStore, rep, src, 0, 0)
+    ZSTD_compressBlock_lazy_generic(
+        ms,
+        seqStore,
+        rep,
+        src,
+        searchMethod_e::search_hashChain,
+        0,
+        ZSTD_dictMode_e::ZSTD_noDict,
+    )
 }
 
 /// Public entry for strategy=lazy (4): depth=1.
@@ -2571,7 +2629,15 @@ pub fn ZSTD_compressBlock_lazy(
     rep: &mut [u32; ZSTD_REP_NUM],
     src: &[u8],
 ) -> usize {
-    ZSTD_compressBlock_lazy_noDict_generic(ms, seqStore, rep, src, 0, 1)
+    ZSTD_compressBlock_lazy_generic(
+        ms,
+        seqStore,
+        rep,
+        src,
+        searchMethod_e::search_hashChain,
+        1,
+        ZSTD_dictMode_e::ZSTD_noDict,
+    )
 }
 
 /// Public entry for strategy=lazy2 (5): depth=2.
@@ -2581,7 +2647,15 @@ pub fn ZSTD_compressBlock_lazy2(
     rep: &mut [u32; ZSTD_REP_NUM],
     src: &[u8],
 ) -> usize {
-    ZSTD_compressBlock_lazy_noDict_generic(ms, seqStore, rep, src, 0, 2)
+    ZSTD_compressBlock_lazy_generic(
+        ms,
+        seqStore,
+        rep,
+        src,
+        searchMethod_e::search_hashChain,
+        2,
+        ZSTD_dictMode_e::ZSTD_noDict,
+    )
 }
 
 /// Port of `ZSTD_compressBlock_greedy_row`. Public entry: row-hash
@@ -3035,7 +3109,20 @@ pub fn ZSTD_compressBlock_lazy_extDict_generic(
     depth: u32,
 ) -> usize {
     if !crate::compress::match_state::ZSTD_window_hasExtDict(&ms.window) {
-        return ZSTD_compressBlock_lazy_noDict_generic(ms, seqStore, rep, src, 0, depth);
+        let saved_rep = *rep;
+        let last = ZSTD_compressBlock_lazy_generic(
+            ms,
+            seqStore,
+            rep,
+            src,
+            searchMethod,
+            depth,
+            ZSTD_dictMode_e::ZSTD_extDict,
+        );
+        if seqStore.sequences.is_empty() {
+            *rep = saved_rep;
+        }
+        return last;
     }
     if ms.dictMatchState.is_some() && ms.loadedDictEnd != 0 {
         return match depth {
@@ -3416,7 +3503,16 @@ pub fn ZSTD_compressBlock_lazy_with_history(
             ZSTD_dictMode_e::ZSTD_noDict,
         );
     }
-    ZSTD_compressBlock_lazy_noDict_generic(ms, seqStore, rep, src, istart, depth)
+    ZSTD_compressBlock_lazy_generic_with_istart(
+        ms,
+        seqStore,
+        rep,
+        src,
+        istart,
+        searchMethod_e::search_hashChain,
+        depth,
+        ZSTD_dictMode_e::ZSTD_noDict,
+    )
 }
 
 /// Port of `ZSTD_compressBlock_btlazy2`. Binary-tree search at depth=2,
@@ -3646,7 +3742,7 @@ pub fn ZSTD_insertDUBT1(
 /// Public wrapper of `ZSTD_insertAndFindFirstIndex`.
 pub fn ZSTD_insertAndFindFirstIndex(ms: &mut ZSTD_MatchState_t, src: &[u8], ip: usize) -> u32 {
     let mls = ms.cParams.minMatch;
-    ZSTD_insertAndFindFirstIndex_internal(ms, src, ip, mls)
+    ZSTD_insertAndFindFirstIndex_internal(ms, src, ip, mls, 0)
 }
 
 #[cfg(test)]
@@ -3972,7 +4068,7 @@ mod tests {
             dms.window.nextSrc = dms.window.base_offset.wrapping_add(dict.len() as u32);
             dms.chainTable.resize(1 << dms.cParams.chainLog, 0);
             for pos in 0..dict.len().saturating_sub(4) {
-                let _ = ZSTD_insertAndFindFirstIndex_internal(&mut dms, &dict, pos, dms_mls);
+                let _ = ZSTD_insertAndFindFirstIndex_internal(&mut dms, &dict, pos, dms_mls, 0);
             }
             ms.dictMatchState = Some(Box::new(dms));
             ms.window.base_offset = crate::compress::match_state::ZSTD_WINDOW_START_INDEX
@@ -4008,7 +4104,7 @@ mod tests {
             ms.window.base_offset = crate::compress::match_state::ZSTD_WINDOW_START_INDEX;
             ms.nextToUpdate = ms.window.base_offset;
             for pos in 0..dict.len().saturating_sub(4) {
-                let _ = ZSTD_insertAndFindFirstIndex_internal(&mut ms, &dict, pos, ms_mls);
+                let _ = ZSTD_insertAndFindFirstIndex_internal(&mut ms, &dict, pos, ms_mls, 0);
             }
             ms.window.dictBase_offset = crate::compress::match_state::ZSTD_WINDOW_START_INDEX;
             ms.window.lowLimit = crate::compress::match_state::ZSTD_WINDOW_START_INDEX;
@@ -4049,6 +4145,76 @@ mod tests {
         assert_eq!(ms.nextToUpdate, ms.window.base_offset.wrapping_add(30));
         // head must be either 0 (no collision) or a valid prior position.
         assert!(head < ms.window.base_offset.wrapping_add(30));
+    }
+
+    #[test]
+    fn insert_and_find_first_index_lazy_skipping_inserts_one_position() {
+        let mut ms = ZSTD_MatchState_t::new(ZSTD_compressionParameters {
+            hashLog: 10,
+            chainLog: 10,
+            minMatch: 4,
+            ..Default::default()
+        });
+        ms.chainTable.resize(1 << 10, 0);
+        let src: Vec<u8> = (0..128u8).collect();
+        ms.nextToUpdate = ms.window.base_offset.wrapping_add(10);
+
+        let _ = ZSTD_insertAndFindFirstIndex_internal(&mut ms, &src, 30, 4, 1);
+
+        assert_eq!(ms.nextToUpdate, ms.window.base_offset.wrapping_add(30));
+        let inserted_hash = ZSTD_hashPtr(&src[10..], ms.cParams.hashLog, 4);
+        let skipped_hash = ZSTD_hashPtr(&src[11..], ms.cParams.hashLog, 4);
+        assert_eq!(ms.hashTable[inserted_hash], ms.window.base_offset + 10);
+        assert_ne!(ms.hashTable[skipped_hash], ms.window.base_offset + 11);
+    }
+
+    #[test]
+    fn hc_find_best_match_no_dict_returns_seeded_len_without_match() {
+        let mut ms = ZSTD_MatchState_t::new(ZSTD_compressionParameters {
+            windowLog: 17,
+            hashLog: 12,
+            chainLog: 12,
+            searchLog: 4,
+            minMatch: 4,
+            ..Default::default()
+        });
+        ms.chainTable.resize(1 << ms.cParams.chainLog, 0);
+        let src: Vec<u8> = (0..96u8).collect();
+        let mut offbase = 0xDEAD_BEEFu32;
+
+        let ml = ZSTD_HcFindBestMatch_noDict(&mut ms, &src, 32, src.len(), &mut offbase, 4);
+
+        assert_eq!(ml, 3);
+        assert_eq!(offbase, 0xDEAD_BEEF);
+    }
+
+    #[test]
+    fn extdict_generic_without_extdict_preserves_rep_offsets() {
+        let mut ms = ZSTD_MatchState_t::new(ZSTD_compressionParameters {
+            windowLog: 17,
+            hashLog: 12,
+            chainLog: 12,
+            searchLog: 2,
+            minMatch: 4,
+            strategy: 4,
+            ..Default::default()
+        });
+        let src: Vec<u8> = (0..96u8).collect();
+        let mut seq = SeqStore_t::with_capacity(1024, 131072);
+        let mut rep = [1 << 20, 1 << 19, 8];
+
+        let last = ZSTD_compressBlock_lazy_extDict_generic(
+            &mut ms,
+            &mut seq,
+            &mut rep,
+            &src,
+            searchMethod_e::search_hashChain,
+            1,
+        );
+
+        assert!(last <= src.len());
+        assert_eq!(rep[0], 1 << 20);
+        assert_eq!(rep[1], 1 << 19);
     }
 
     #[test]

@@ -1946,10 +1946,13 @@ pub fn ZSTD_compressBlock(cctx: &mut ZSTD_CCtx, dst: &mut [u8], src: &[u8]) -> u
 }
 
 /// Port of `ZSTD_getBlockSize_deprecated` (`zstd_compress.c:4893`).
-/// Legacy alias of `ZSTD_getBlockSize`.
 #[inline]
 pub fn ZSTD_getBlockSize_deprecated(cctx: &ZSTD_CCtx) -> usize {
-    ZSTD_getBlockSize(cctx)
+    cctx.appliedParams.maxBlockSize.min(
+        1usize
+            .checked_shl(cctx.appliedParams.cParams.windowLog)
+            .unwrap_or(usize::MAX),
+    )
 }
 
 /// Port of `ZSTD_compressBegin_usingCDict`. Legacy begin/end
@@ -3294,6 +3297,46 @@ fn ZSTD_estimateCCtxSize_usingCCtxParams_internal(
         0
     };
     cctxSpace + blockStateSpace + matchStateSize + tokenSpace + bufferSpace + externalSeqSpace
+}
+
+const ZSTD_COMPRESS_SEQUENCES_WORKSPACE_SIZE: usize =
+    core::mem::size_of::<u32>() * (MaxSeq as usize + 2);
+const ZSTD_ENTROPY_WORKSPACE_SIZE: usize =
+    crate::compress::huf_compress::HUF_WORKSPACE_SIZE + ZSTD_COMPRESS_SEQUENCES_WORKSPACE_SIZE;
+const ZSTD_SLIPBLOCK_WORKSPACESIZE: usize = 8208;
+const ZSTD_TMP_WORKSPACE_SIZE: usize = if ZSTD_ENTROPY_WORKSPACE_SIZE > ZSTD_SLIPBLOCK_WORKSPACESIZE
+{
+    ZSTD_ENTROPY_WORKSPACE_SIZE
+} else {
+    ZSTD_SLIPBLOCK_WORKSPACESIZE
+};
+
+#[inline]
+fn ZSTD_static_compressedBlockState_size() -> usize {
+    fn align_up(size: usize, align: usize) -> usize {
+        (size + align - 1) & !(align - 1)
+    }
+
+    let huf_size = align_up(
+        257 * core::mem::size_of::<HUF_CElt>() + core::mem::size_of::<u32>(),
+        core::mem::align_of::<usize>(),
+    );
+    let fse_size = (FSE_CTABLE_SIZE_U32(OffFSELog, MaxOff)
+        + FSE_CTABLE_SIZE_U32(MLFSELog, MaxML)
+        + FSE_CTABLE_SIZE_U32(LLFSELog, MaxLL))
+        * core::mem::size_of::<FSE_CTable>()
+        + 3 * core::mem::size_of::<u32>();
+    align_up(
+        huf_size + fse_size + 3 * core::mem::size_of::<u32>(),
+        core::mem::align_of::<usize>(),
+    )
+}
+
+#[inline]
+fn ZSTD_minStaticCCtxSize() -> usize {
+    core::mem::size_of::<ZSTD_CCtx>()
+        + ZSTD_TMP_WORKSPACE_SIZE
+        + 2 * ZSTD_static_compressedBlockState_size()
 }
 
 /// Port of `ZSTD_estimateCCtxSize_usingCParams` (`zstd_compress.c:1789`).
@@ -5775,11 +5818,16 @@ pub fn ZSTD_compress_usingCDict_internal(
     cdict: &ZSTD_CDict,
     fParams: ZSTD_FrameParameters,
 ) -> usize {
+    let saved_format = cctx.format;
+    cctx.format = crate::decompress::zstd_decompress::ZSTD_format_e::ZSTD_f_zstd1;
     let rc = ZSTD_compressBegin_usingCDict_internal(cctx, cdict, fParams, src.len() as u64);
     if ERR_isError(rc) {
+        cctx.format = saved_format;
         return rc;
     }
-    ZSTD_compressEnd_public(cctx, dst, src)
+    let result = ZSTD_compressEnd_public(cctx, dst, src);
+    cctx.format = saved_format;
+    result
 }
 
 /// Port of `ZSTD_compress_usingCDict_advanced`. Compress with a
@@ -5826,7 +5874,6 @@ pub fn ZSTD_compress_usingDict(
     };
     let mut cctx_params = ZSTD_CCtx_params::default();
     ZSTD_CCtxParams_init_internal(&mut cctx_params, &params, effective_level);
-    cctx_params.format = cctx.format;
     ZSTD_compress_advanced_internal(cctx, dst, src, dict, &cctx_params)
 }
 
@@ -5848,7 +5895,6 @@ pub fn ZSTD_compress_advanced(
     }
     let mut cctxParams = ZSTD_CCtx_params::default();
     ZSTD_CCtxParams_init_internal(&mut cctxParams, &params, ZSTD_NO_CLEVEL);
-    cctxParams.format = cctx.format;
     ZSTD_compress_advanced_internal(cctx, dst, src, dict, &cctxParams)
 }
 
@@ -8011,27 +8057,10 @@ pub fn ZSTD_getFrameProgression(cctx: &ZSTD_CCtx) -> ZSTD_frameProgression {
 }
 
 /// Port of `ZSTD_getBlockSize` (compressor side, `zstd_compress.c:4901`).
-/// Returns `min(appliedParams.maxBlockSize, 1 << windowLog)`. When
-/// `appliedParams.maxBlockSize == 0` (unset), treat as
-/// `ZSTD_BLOCKSIZE_MAX`. For callers that never set params, falls
-/// back to `requested_cParams.windowLog` when present, else to the
-/// hard `ZSTD_BLOCKSIZE_MAX`.
+/// Upstream keeps this as a direct wrapper over the deprecated helper.
 #[inline]
 pub fn ZSTD_getBlockSize(cctx: &ZSTD_CCtx) -> usize {
-    use crate::decompress::zstd_decompress_block::ZSTD_BLOCKSIZE_MAX;
-    let maxBlockSize = if cctx.appliedParams.maxBlockSize != 0 {
-        cctx.appliedParams.maxBlockSize
-    } else {
-        ZSTD_BLOCKSIZE_MAX
-    };
-    let windowLog = if cctx.appliedParams.cParams.windowLog != 0 {
-        cctx.appliedParams.cParams.windowLog
-    } else if let Some(cp) = cctx.requested_cParams {
-        cp.windowLog
-    } else {
-        return maxBlockSize;
-    };
-    maxBlockSize.min(1usize << windowLog)
+    ZSTD_getBlockSize_deprecated(cctx)
 }
 
 /// Port of `ZSTD_writeSkippableFrame`. Writes a skippable frame header
@@ -10368,13 +10397,13 @@ pub fn ZSTD_createCStream_advanced(customMem: ZSTD_customMem) -> Option<Box<ZSTD
 /// Port of `ZSTD_initStaticCCtx`. Places a `ZSTD_CCtx` header inside
 /// the caller's workspace when alignment and size allow it.
 pub fn ZSTD_initStaticCCtx(workspace: &mut [u8]) -> Option<&mut ZSTD_CCtx> {
-    use core::mem::{align_of, size_of};
+    use core::mem::align_of;
     use core::ptr;
 
     if (workspace.as_mut_ptr() as usize) & (align_of::<u64>() - 1) != 0 {
         return None;
     }
-    if workspace.len() <= size_of::<ZSTD_CCtx>() {
+    if workspace.len() < ZSTD_minStaticCCtxSize() {
         return None;
     }
 
@@ -11527,6 +11556,10 @@ pub fn ZSTD_CCtx_init_compressStream2(
         params.searchForExternalRepcodes,
         params.compressionLevel,
     );
+    #[cfg(feature = "mt")]
+    if params.extSeqProdFunc.is_some() && params.nbWorkers >= 1 {
+        return ERROR(ErrorCode::ParameterCombinationUnsupported);
+    }
 
     let (dict, dict_content_type) = dict_snapshot
         .as_ref()
@@ -11615,6 +11648,9 @@ fn ZSTD_compressSequencesAndLiterals_internal(
         if block.litSize > lits.len() {
             return ERROR(ErrorCode::ExternalSequencesInvalid);
         }
+        if block.blockSize > remaining {
+            return ERROR(ErrorCode::ExternalSequencesInvalid);
+        }
         let block_literals = &lits[..block.litSize];
         let seqStore = cctx.seqStore.get_or_insert_with(|| {
             SeqStore_t::with_capacity(ZSTD_BLOCKSIZE_MAX / 3, ZSTD_BLOCKSIZE_MAX)
@@ -11628,7 +11664,7 @@ fn ZSTD_compressSequencesAndLiterals_internal(
         }
         seqs = &seqs[block.nbSequences..];
         lits = &lits[block_literals.len()..];
-        remaining = remaining.saturating_sub(block.blockSize);
+        remaining -= block.blockSize;
 
         if dst.len() - op < ZSTD_blockHeaderSize {
             return ERROR(ErrorCode::DstSizeTooSmall);
@@ -11697,8 +11733,8 @@ fn ZSTD_compressSequencesAndLiterals_internal(
 /// Compresses an externally-prepared `(inSeqs, literals)` pair into a
 /// complete zstd frame. Requires explicit block delimiters and disables
 /// sequence validation; rejects with an error otherwise. The literals
-/// capacity must cover `literals.len() + 8`, matching the upstream C API
-/// contract for literal over-read slack.
+/// capacity must cover `literals.len()`, matching the upstream C API
+/// check.
 pub fn ZSTD_compressSequencesAndLiterals(
     cctx: &mut ZSTD_CCtx,
     dst: &mut [u8],
@@ -11710,7 +11746,7 @@ pub fn ZSTD_compressSequencesAndLiterals(
     let mut op = 0usize;
     let mut cSize = 0usize;
 
-    if litCapacity < literals.len().saturating_add(8) {
+    if litCapacity < literals.len() {
         return ERROR(ErrorCode::WorkSpaceTooSmall);
     }
     let rc = ZSTD_CCtx_init_compressStream2(cctx, ZSTD_EndDirective::ZSTD_e_end, decompressedSize);
@@ -11793,10 +11829,10 @@ mod local_streaming_static_tests {
     }
 
     #[test]
-    fn init_static_cctx_accepts_workspace_above_struct_size_below_estimate() {
+    fn init_static_cctx_rejects_workspace_below_static_header_reserve() {
         let cctx_size = core::mem::size_of::<ZSTD_CCtx>();
-        let estimate = ZSTD_estimateCCtxSize(ZSTD_CLEVEL_DEFAULT);
-        let workspace_len = cctx_size + 1;
+        let min_static = ZSTD_minStaticCCtxSize();
+        let workspace_len = min_static - 1;
         let mut workspace = vec![0u64; workspace_len.div_ceil(core::mem::size_of::<u64>())];
         let bytes_len = workspace.len() * core::mem::size_of::<u64>();
         let bytes_all = unsafe {
@@ -11805,22 +11841,79 @@ mod local_streaming_static_tests {
         let bytes = &mut bytes_all[..workspace_len];
 
         assert!(bytes.len() > cctx_size);
-        assert!(bytes.len() < estimate);
-        let cctx = ZSTD_initStaticCCtx(bytes).expect("static cctx above struct size");
+        assert!(bytes.len() < min_static);
+        assert!(ZSTD_initStaticCCtx(bytes).is_none());
+    }
+
+    #[test]
+    fn init_static_cctx_accepts_workspace_with_static_header_reserve() {
+        let workspace_len = ZSTD_minStaticCCtxSize();
+        let mut workspace = vec![0u64; workspace_len.div_ceil(core::mem::size_of::<u64>())];
+        let bytes_len = workspace.len() * core::mem::size_of::<u64>();
+        let bytes_all = unsafe {
+            core::slice::from_raw_parts_mut(workspace.as_mut_ptr() as *mut u8, bytes_len)
+        };
+        let bytes = &mut bytes_all[..workspace_len];
+
+        let cctx = ZSTD_initStaticCCtx(bytes).expect("static cctx with static reserve");
         assert_eq!(cctx.staticSize, workspace_len);
     }
 
     #[test]
     fn init_static_cctx_rejects_bad_alignment() {
-        let cctx_size = core::mem::size_of::<ZSTD_CCtx>();
-        let mut workspace = vec![0u8; cctx_size + 16];
+        let min_static = ZSTD_minStaticCCtxSize();
+        let mut workspace = vec![0u8; min_static + 16];
         let base = workspace.as_mut_ptr() as usize;
         let aligned_offset = (8 - (base & 7)) & 7;
         let misaligned_offset = if aligned_offset == 0 { 1 } else { 0 };
-        let misaligned = &mut workspace[misaligned_offset..misaligned_offset + cctx_size + 1];
+        let misaligned = &mut workspace[misaligned_offset..misaligned_offset + min_static];
 
         assert_ne!((misaligned.as_mut_ptr() as usize) & 7, 0);
         assert!(ZSTD_initStaticCCtx(misaligned).is_none());
+    }
+
+    #[test]
+    fn compress_sequences_and_literals_accepts_exact_literal_capacity_check() {
+        let mut cctx = ZSTD_CCtx::default();
+        cctx.requestedParams.blockDelimiters =
+            ZSTD_SequenceFormat_e::ZSTD_sf_explicitBlockDelimiters;
+        let seqs = [ZSTD_Sequence {
+            offset: 0,
+            litLength: 1,
+            matchLength: 0,
+            rep: 0,
+        }];
+        let literals = b"x";
+        let mut dst = vec![0u8; 128];
+
+        let rc = ZSTD_compressSequencesAndLiterals(
+            &mut cctx,
+            &mut dst,
+            &seqs,
+            literals,
+            literals.len(),
+            literals.len(),
+        );
+
+        assert_ne!(rc, ERROR(ErrorCode::WorkSpaceTooSmall));
+    }
+
+    #[test]
+    fn compress_sequences_and_literals_internal_rejects_overlong_block_total() {
+        let mut cctx = ZSTD_CCtx::default();
+        let seqs = [ZSTD_Sequence {
+            offset: 0,
+            litLength: 2,
+            matchLength: 0,
+            rep: 0,
+        }];
+        let literals = b"xx";
+        let mut dst = vec![0u8; 128];
+
+        let rc =
+            ZSTD_compressSequencesAndLiterals_internal(&mut cctx, &mut dst, &seqs, literals, 1);
+
+        assert_eq!(rc, ERROR(ErrorCode::ExternalSequencesInvalid));
     }
 
     #[test]

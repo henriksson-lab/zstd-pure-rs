@@ -61,6 +61,8 @@ pub const ZSTD_REP_NUM: usize = 3;
 pub const MIN_CBLOCK_SIZE: usize = 2;
 pub use crate::common::zstd_internal::{WILDCOPY_OVERLENGTH, WILDCOPY_VECLEN};
 pub const ZSTD_LITBUFFEREXTRASIZE: usize = 65536; // BLOCKSIZE_MAX / 2
+const STREAM_ACCUMULATOR_MIN_32: u32 = 25;
+const LONG_OFFSETS_MAX_EXTRA_BITS_32: u32 = 5;
 
 /// Port of `ZSTD_longOffset_e` (`zstd_decompress_block.c:1227`). Tells
 /// the sequence-decode inner loop whether to take the long-offset
@@ -363,13 +365,14 @@ pub struct seqState_t<'a> {
     pub prevOffset: [usize; ZSTD_REP_NUM],
 }
 
-/// Port of `ZSTD_decodeSequence` (portable path — no 32-bit long-offset
-/// reloads, no aarch64-specific local copy). Decodes one sequence
-/// triplet (litLength, matchLength, offset), updates repcodes, and
-/// (when not the last sequence) advances the FSE states.
+/// Port of `ZSTD_decodeSequence` (portable path — no aarch64-specific
+/// local copy). Decodes one sequence triplet (litLength, matchLength,
+/// offset), updates repcodes, and (when not the last sequence) advances
+/// the FSE states.
 #[inline]
 pub fn ZSTD_decodeSequence(
     seqState: &mut seqState_t,
+    longOffsets: ZSTD_longOffset_e,
     LLTable: &[ZSTD_seqSymbol],
     OFTable: &[ZSTD_seqSymbol],
     MLTable: &[ZSTD_seqSymbol],
@@ -403,9 +406,23 @@ pub fn ZSTD_decodeSequence(
     let mut prev0 = seqState.prevOffset[0];
     let mut prev1 = seqState.prevOffset[1];
     let mut prev2 = seqState.prevOffset[2];
-    let offset;
+    let mut offset;
     if ofBits > 1 {
-        offset = ofBase + BIT_readBitsFast(&mut seqState.DStream, ofBits as u32);
+        if crate::common::mem::MEM_32bits() != 0
+            && longOffsets == ZSTD_longOffset_e::ZSTD_lo_isLongOffset
+            && (ofBits as u32) >= STREAM_ACCUMULATOR_MIN_32
+        {
+            let extraBits = LONG_OFFSETS_MAX_EXTRA_BITS_32;
+            offset = ofBase
+                + (BIT_readBitsFast(&mut seqState.DStream, ofBits as u32 - extraBits) << extraBits);
+            BIT_reloadDStream(&mut seqState.DStream);
+            offset += BIT_readBitsFast(&mut seqState.DStream, extraBits);
+        } else {
+            offset = ofBase + BIT_readBitsFast(&mut seqState.DStream, ofBits as u32);
+            if crate::common::mem::MEM_32bits() != 0 {
+                BIT_reloadDStream(&mut seqState.DStream);
+            }
+        }
         prev2 = prev1;
         prev1 = prev0;
         prev0 = offset;
@@ -442,8 +459,16 @@ pub fn ZSTD_decodeSequence(
         seq.matchLength += BIT_readBitsFast(&mut seqState.DStream, mlBits as u32);
     }
 
-    if totalBits
-        >= crate::common::bitstream::BIT_DStream_unfinished + 57 - (LLFSELog + MLFSELog + OffFSELog)
+    if crate::common::mem::MEM_32bits() != 0
+        && mlBits as u32 + llBits as u32
+            >= STREAM_ACCUMULATOR_MIN_32 - LONG_OFFSETS_MAX_EXTRA_BITS_32
+    {
+        BIT_reloadDStream(&mut seqState.DStream);
+    }
+    if crate::common::mem::MEM_64bits() != 0
+        && totalBits
+            >= crate::common::bitstream::BIT_DStream_unfinished + 57
+                - (LLFSELog + MLFSELog + OffFSELog)
     {
         // Upstream reloads when the remaining bit budget gets tight.
         // Condition is a static macro; the portable-path check below
@@ -453,6 +478,9 @@ pub fn ZSTD_decodeSequence(
 
     if llBits > 0 {
         seq.litLength += BIT_readBitsFast(&mut seqState.DStream, llBits as u32);
+    }
+    if crate::common::mem::MEM_32bits() != 0 {
+        BIT_reloadDStream(&mut seqState.DStream);
     }
 
     if !isLastSeq {
@@ -468,6 +496,9 @@ pub fn ZSTD_decodeSequence(
             mlDInfo.nextState,
             mlDInfo.nbBits as u32,
         );
+        if crate::common::mem::MEM_32bits() != 0 {
+            BIT_reloadDStream(&mut seqState.DStream);
+        }
         ZSTD_updateFseStateWithDInfo(
             &mut seqState.stateOffb,
             &mut seqState.DStream,
@@ -489,6 +520,7 @@ pub fn ZSTD_decodeSequence(
 #[target_feature(enable = "bmi1,bmi2,lzcnt")]
 unsafe fn ZSTD_decodeSequence_bmi2(
     seqState: &mut seqState_t,
+    longOffsets: ZSTD_longOffset_e,
     LLTable: &[ZSTD_seqSymbol],
     OFTable: &[ZSTD_seqSymbol],
     MLTable: &[ZSTD_seqSymbol],
@@ -521,9 +553,24 @@ unsafe fn ZSTD_decodeSequence_bmi2(
     let mut prev0 = seqState.prevOffset[0];
     let mut prev1 = seqState.prevOffset[1];
     let mut prev2 = seqState.prevOffset[2];
-    let offset;
+    let mut offset;
     if ofBits > 1 {
-        offset = ofBase + BIT_readBitsFast_bmi2(&mut seqState.DStream, ofBits as u32);
+        if crate::common::mem::MEM_32bits() != 0
+            && longOffsets == ZSTD_longOffset_e::ZSTD_lo_isLongOffset
+            && (ofBits as u32) >= STREAM_ACCUMULATOR_MIN_32
+        {
+            let extraBits = LONG_OFFSETS_MAX_EXTRA_BITS_32;
+            offset = ofBase
+                + (BIT_readBitsFast_bmi2(&mut seqState.DStream, ofBits as u32 - extraBits)
+                    << extraBits);
+            BIT_reloadDStream(&mut seqState.DStream);
+            offset += BIT_readBitsFast_bmi2(&mut seqState.DStream, extraBits);
+        } else {
+            offset = ofBase + BIT_readBitsFast_bmi2(&mut seqState.DStream, ofBits as u32);
+            if crate::common::mem::MEM_32bits() != 0 {
+                BIT_reloadDStream(&mut seqState.DStream);
+            }
+        }
         prev2 = prev1;
         prev1 = prev0;
         prev0 = offset;
@@ -560,14 +607,25 @@ unsafe fn ZSTD_decodeSequence_bmi2(
         seq.matchLength += BIT_readBitsFast_bmi2(&mut seqState.DStream, mlBits as u32);
     }
 
-    if totalBits
-        >= crate::common::bitstream::BIT_DStream_unfinished + 57 - (LLFSELog + MLFSELog + OffFSELog)
+    if crate::common::mem::MEM_32bits() != 0
+        && mlBits as u32 + llBits as u32
+            >= STREAM_ACCUMULATOR_MIN_32 - LONG_OFFSETS_MAX_EXTRA_BITS_32
+    {
+        BIT_reloadDStream(&mut seqState.DStream);
+    }
+    if crate::common::mem::MEM_64bits() != 0
+        && totalBits
+            >= crate::common::bitstream::BIT_DStream_unfinished + 57
+                - (LLFSELog + MLFSELog + OffFSELog)
     {
         BIT_reloadDStream(&mut seqState.DStream);
     }
 
     if llBits > 0 {
         seq.litLength += BIT_readBitsFast_bmi2(&mut seqState.DStream, llBits as u32);
+    }
+    if crate::common::mem::MEM_32bits() != 0 {
+        BIT_reloadDStream(&mut seqState.DStream);
     }
 
     if !isLastSeq {
@@ -583,6 +641,9 @@ unsafe fn ZSTD_decodeSequence_bmi2(
             mlDInfo.nextState,
             mlDInfo.nbBits as u32,
         );
+        if crate::common::mem::MEM_32bits() != 0 {
+            BIT_reloadDStream(&mut seqState.DStream);
+        }
         ZSTD_updateFseStateWithDInfo_bmi2(
             &mut seqState.stateOffb,
             &mut seqState.DStream,
@@ -611,6 +672,7 @@ macro_rules! ZSTD_decodeSequence_bmi2_inline {
         $LLTablePtr:expr,
         $OFTablePtr:expr,
         $MLTablePtr:expr,
+        $longOffsets:expr,
         $isLastSeq:expr
     ) => {{
         use crate::common::bitstream::BIT_reloadDStream;
@@ -637,9 +699,24 @@ macro_rules! ZSTD_decodeSequence_bmi2_inline {
         let mut litLength = llDInfo.baseValue as usize;
         let mut matchLength = mlDInfo.baseValue as usize;
 
-        let offset;
+        let mut offset;
         if ofBits > 1 {
-            offset = ofBase + BIT_readBitsFast_bmi2(&mut $DStream, ofBits as u32);
+            if crate::common::mem::MEM_32bits() != 0
+                && $longOffsets == ZSTD_longOffset_e::ZSTD_lo_isLongOffset
+                && (ofBits as u32) >= STREAM_ACCUMULATOR_MIN_32
+            {
+                let extraBits = LONG_OFFSETS_MAX_EXTRA_BITS_32;
+                offset = ofBase
+                    + (BIT_readBitsFast_bmi2(&mut $DStream, ofBits as u32 - extraBits)
+                        << extraBits);
+                BIT_reloadDStream(&mut $DStream);
+                offset += BIT_readBitsFast_bmi2(&mut $DStream, extraBits);
+            } else {
+                offset = ofBase + BIT_readBitsFast_bmi2(&mut $DStream, ofBits as u32);
+                if crate::common::mem::MEM_32bits() != 0 {
+                    BIT_reloadDStream(&mut $DStream);
+                }
+            }
             $prev2 = $prev1;
             $prev1 = $prev0;
             $prev0 = offset;
@@ -674,9 +751,16 @@ macro_rules! ZSTD_decodeSequence_bmi2_inline {
             matchLength += BIT_readBitsFast_bmi2(&mut $DStream, mlBits as u32);
         }
 
-        if totalBits
-            >= crate::common::bitstream::BIT_DStream_unfinished + 57
-                - (LLFSELog + MLFSELog + OffFSELog)
+        if crate::common::mem::MEM_32bits() != 0
+            && mlBits as u32 + llBits as u32
+                >= STREAM_ACCUMULATOR_MIN_32 - LONG_OFFSETS_MAX_EXTRA_BITS_32
+        {
+            BIT_reloadDStream(&mut $DStream);
+        }
+        if crate::common::mem::MEM_64bits() != 0
+            && totalBits
+                >= crate::common::bitstream::BIT_DStream_unfinished + 57
+                    - (LLFSELog + MLFSELog + OffFSELog)
         {
             BIT_reloadDStream(&mut $DStream);
         }
@@ -684,10 +768,16 @@ macro_rules! ZSTD_decodeSequence_bmi2_inline {
         if llBits > 0 {
             litLength += BIT_readBitsFast_bmi2(&mut $DStream, llBits as u32);
         }
+        if crate::common::mem::MEM_32bits() != 0 {
+            BIT_reloadDStream(&mut $DStream);
+        }
 
         if !$isLastSeq {
             update_fse_state!($stateLL, llDInfo);
             update_fse_state!($stateML, mlDInfo);
+            if crate::common::mem::MEM_32bits() != 0 {
+                BIT_reloadDStream(&mut $DStream);
+            }
             update_fse_state!($stateOffb, ofDInfo);
             BIT_reloadDStream(&mut $DStream);
         }
@@ -1712,6 +1802,7 @@ pub fn ZSTD_decompressSequences_body(
             nbSeq,
             litBuf.as_ptr(),
             litSize,
+            ZSTD_longOffset_e::ZSTD_lo_isRegularOffset,
             LLTable,
             OFTable,
             MLTable,
@@ -1731,6 +1822,7 @@ unsafe fn ZSTD_decompressSequences_body_rawLit(
     nbSeq: i32,
     lit_base: *const u8,
     litSize: usize,
+    isLongOffset: ZSTD_longOffset_e,
     LLTable: &[ZSTD_seqSymbol],
     OFTable: &[ZSTD_seqSymbol],
     MLTable: &[ZSTD_seqSymbol],
@@ -1772,8 +1864,14 @@ unsafe fn ZSTD_decompressSequences_body_rawLit(
 
         let mut remaining = nbSeq;
         while remaining > 0 {
-            let sequence =
-                ZSTD_decodeSequence(&mut seqState, LLTable, OFTable, MLTable, remaining == 1);
+            let sequence = ZSTD_decodeSequence(
+                &mut seqState,
+                isLongOffset,
+                LLTable,
+                OFTable,
+                MLTable,
+                remaining == 1,
+            );
             let oneSeqSize = ZSTD_execSequence_rawLit(
                 dst,
                 op,
@@ -1830,6 +1928,7 @@ unsafe fn ZSTD_decompressSequences_bodySplitLitBuffer_raw_impl<const BMI2: bool>
     lit_dst_len: usize,
     lit_extra: &[u8],
     litSize: usize,
+    isLongOffset: ZSTD_longOffset_e,
     LLTable: &[ZSTD_seqSymbol],
     OFTable: &[ZSTD_seqSymbol],
     MLTable: &[ZSTD_seqSymbol],
@@ -1871,6 +1970,7 @@ unsafe fn ZSTD_decompressSequences_bodySplitLitBuffer_raw_impl<const BMI2: bool>
                 {
                     ZSTD_decodeSequence_bmi2(
                         &mut seqState,
+                        isLongOffset,
                         LLTable,
                         OFTable,
                         MLTable,
@@ -1882,7 +1982,14 @@ unsafe fn ZSTD_decompressSequences_bodySplitLitBuffer_raw_impl<const BMI2: bool>
                     unreachable!("BMI2 split decoder is x86_64-only")
                 }
             } else {
-                ZSTD_decodeSequence(&mut seqState, LLTable, OFTable, MLTable, remaining == 1)
+                ZSTD_decodeSequence(
+                    &mut seqState,
+                    isLongOffset,
+                    LLTable,
+                    OFTable,
+                    MLTable,
+                    remaining == 1,
+                )
             };
             if !using_extra && litPtr + sequence.litLength > lit_dst_len {
                 let leftover = lit_dst_len.saturating_sub(litPtr);
@@ -2047,6 +2154,7 @@ unsafe fn ZSTD_decompressSequences_bodySplitLitBuffer_raw(
     lit_dst_len: usize,
     lit_extra: &[u8],
     litSize: usize,
+    isLongOffset: ZSTD_longOffset_e,
     LLTable: &[ZSTD_seqSymbol],
     OFTable: &[ZSTD_seqSymbol],
     MLTable: &[ZSTD_seqSymbol],
@@ -2063,6 +2171,7 @@ unsafe fn ZSTD_decompressSequences_bodySplitLitBuffer_raw(
         lit_dst_len,
         lit_extra,
         litSize,
+        isLongOffset,
         LLTable,
         OFTable,
         MLTable,
@@ -2085,6 +2194,7 @@ unsafe fn ZSTD_decompressSequences_bodySplitLitBuffer_bmi2_raw(
     lit_dst_len: usize,
     lit_extra: &[u8],
     litSize: usize,
+    isLongOffset: ZSTD_longOffset_e,
     LLTable: &[ZSTD_seqSymbol],
     OFTable: &[ZSTD_seqSymbol],
     MLTable: &[ZSTD_seqSymbol],
@@ -2101,6 +2211,7 @@ unsafe fn ZSTD_decompressSequences_bodySplitLitBuffer_bmi2_raw(
         lit_dst_len,
         lit_extra,
         litSize,
+        isLongOffset,
         LLTable,
         OFTable,
         MLTable,
@@ -2120,6 +2231,7 @@ unsafe fn ZSTD_decompressSequences_body_bmi2_impl(
     nbSeq: i32,
     litBuf: &[u8],
     litSize: usize,
+    isLongOffset: ZSTD_longOffset_e,
     LLTable: &[ZSTD_seqSymbol],
     OFTable: &[ZSTD_seqSymbol],
     MLTable: &[ZSTD_seqSymbol],
@@ -2133,6 +2245,7 @@ unsafe fn ZSTD_decompressSequences_body_bmi2_impl(
         nbSeq,
         litBuf.as_ptr(),
         litSize,
+        isLongOffset,
         LLTable,
         OFTable,
         MLTable,
@@ -2153,6 +2266,7 @@ unsafe fn ZSTD_decompressSequences_body_bmi2_rawLit(
     nbSeq: i32,
     lit_base: *const u8,
     litSize: usize,
+    isLongOffset: ZSTD_longOffset_e,
     LLTable: &[ZSTD_seqSymbol],
     OFTable: &[ZSTD_seqSymbol],
     MLTable: &[ZSTD_seqSymbol],
@@ -2169,6 +2283,7 @@ unsafe fn ZSTD_decompressSequences_body_bmi2_rawLit(
             LLTable.as_ptr(),
             OFTable.as_ptr(),
             MLTable.as_ptr(),
+            isLongOffset,
             entropy_rep,
         );
     }
@@ -2219,6 +2334,7 @@ unsafe fn ZSTD_decompressSequences_body_bmi2_rawLit(
                 LLTable.as_ptr(),
                 OFTable.as_ptr(),
                 MLTable.as_ptr(),
+                isLongOffset,
                 remaining == 1
             );
             let oLitEnd = op + litLength;
@@ -2299,6 +2415,7 @@ unsafe fn ZSTD_decompressSequences_body_bmi2_noExt_rawLit(
     LLTable: *const ZSTD_seqSymbol,
     OFTable: *const ZSTD_seqSymbol,
     MLTable: *const ZSTD_seqSymbol,
+    isLongOffset: ZSTD_longOffset_e,
     entropy_rep: &mut ZSTD_decoder_entropy_rep,
 ) -> usize {
     use crate::common::bitstream::{BIT_DStream_t, BIT_endOfDStream, BIT_initDStream};
@@ -2360,6 +2477,7 @@ unsafe fn ZSTD_decompressSequences_body_bmi2_noExt_rawLit(
                 LLTable,
                 OFTable,
                 MLTable,
+                isLongOffset,
                 remaining == 1
             );
             let oLitEnd = op + litLength;
@@ -2435,6 +2553,7 @@ fn ZSTD_decompressSequences_body_bmi2(
     nbSeq: i32,
     litBuf: &[u8],
     litSize: usize,
+    isLongOffset: ZSTD_longOffset_e,
     LLTable: &[ZSTD_seqSymbol],
     OFTable: &[ZSTD_seqSymbol],
     MLTable: &[ZSTD_seqSymbol],
@@ -2455,6 +2574,7 @@ fn ZSTD_decompressSequences_body_bmi2(
                     nbSeq,
                     litBuf,
                     litSize,
+                    isLongOffset,
                     LLTable,
                     OFTable,
                     MLTable,
@@ -2464,7 +2584,71 @@ fn ZSTD_decompressSequences_body_bmi2(
         }
     }
 
-    ZSTD_decompressSequences_body(
+    unsafe {
+        ZSTD_decompressSequences_body_rawLit(
+            dst,
+            op_start,
+            ext_history,
+            seqSrc,
+            nbSeq,
+            litBuf.as_ptr(),
+            litSize,
+            isLongOffset,
+            LLTable,
+            OFTable,
+            MLTable,
+            entropy_rep,
+        )
+    }
+}
+
+fn ZSTD_decompressSequences_body_withLongOffset(
+    dst: &mut [u8],
+    op_start: usize,
+    ext_history: &[u8],
+    seqSrc: &[u8],
+    nbSeq: i32,
+    litBuf: &[u8],
+    litSize: usize,
+    isLongOffset: ZSTD_longOffset_e,
+    LLTable: &[ZSTD_seqSymbol],
+    OFTable: &[ZSTD_seqSymbol],
+    MLTable: &[ZSTD_seqSymbol],
+    entropy_rep: &mut ZSTD_decoder_entropy_rep,
+) -> usize {
+    unsafe {
+        ZSTD_decompressSequences_body_rawLit(
+            dst,
+            op_start,
+            ext_history,
+            seqSrc,
+            nbSeq,
+            litBuf.as_ptr(),
+            litSize,
+            isLongOffset,
+            LLTable,
+            OFTable,
+            MLTable,
+            entropy_rep,
+        )
+    }
+}
+
+fn ZSTD_decompressSequences_body_bmi2_withLongOffset(
+    dst: &mut [u8],
+    op_start: usize,
+    ext_history: &[u8],
+    seqSrc: &[u8],
+    nbSeq: i32,
+    litBuf: &[u8],
+    litSize: usize,
+    isLongOffset: ZSTD_longOffset_e,
+    LLTable: &[ZSTD_seqSymbol],
+    OFTable: &[ZSTD_seqSymbol],
+    MLTable: &[ZSTD_seqSymbol],
+    entropy_rep: &mut ZSTD_decoder_entropy_rep,
+) -> usize {
+    ZSTD_decompressSequences_body_bmi2(
         dst,
         op_start,
         ext_history,
@@ -2472,6 +2656,7 @@ fn ZSTD_decompressSequences_body_bmi2(
         nbSeq,
         litBuf,
         litSize,
+        isLongOffset,
         LLTable,
         OFTable,
         MLTable,
@@ -2603,6 +2788,7 @@ fn ZSTD_decompressSequencesLong_body_impl<const BMI2: bool>(
     nbSeq: i32,
     litBuf: &[u8],
     litSize: usize,
+    isLongOffset: ZSTD_longOffset_e,
     LLTable: &[ZSTD_seqSymbol],
     OFTable: &[ZSTD_seqSymbol],
     MLTable: &[ZSTD_seqSymbol],
@@ -2650,6 +2836,7 @@ fn ZSTD_decompressSequencesLong_body_impl<const BMI2: bool>(
                 unsafe {
                     ZSTD_decodeSequence_bmi2(
                         &mut seqState,
+                        isLongOffset,
                         LLTable,
                         OFTable,
                         MLTable,
@@ -2661,7 +2848,14 @@ fn ZSTD_decompressSequencesLong_body_impl<const BMI2: bool>(
                     unreachable!("BMI2 long decoder is x86_64-only")
                 }
             } else {
-                ZSTD_decodeSequence(&mut seqState, LLTable, OFTable, MLTable, seqNb + 1 == total)
+                ZSTD_decodeSequence(
+                    &mut seqState,
+                    isLongOffset,
+                    LLTable,
+                    OFTable,
+                    MLTable,
+                    seqNb + 1 == total,
+                )
             };
             prefetchPos = ZSTD_prefetchMatch_rust(prefetchPos, sequence, dst, ext_history);
             sequences[seqNb] = sequence;
@@ -2674,6 +2868,7 @@ fn ZSTD_decompressSequencesLong_body_impl<const BMI2: bool>(
                 unsafe {
                     ZSTD_decodeSequence_bmi2(
                         &mut seqState,
+                        isLongOffset,
                         LLTable,
                         OFTable,
                         MLTable,
@@ -2685,7 +2880,14 @@ fn ZSTD_decompressSequencesLong_body_impl<const BMI2: bool>(
                     unreachable!("BMI2 long decoder is x86_64-only")
                 }
             } else {
-                ZSTD_decodeSequence(&mut seqState, LLTable, OFTable, MLTable, seqNb + 1 == total)
+                ZSTD_decodeSequence(
+                    &mut seqState,
+                    isLongOffset,
+                    LLTable,
+                    OFTable,
+                    MLTable,
+                    seqNb + 1 == total,
+                )
             };
             let execute_idx = (seqNb - STORED_SEQS) & STORED_SEQS_MASK;
             let oneSeqSize = ZSTD_execSequence(
@@ -2768,6 +2970,7 @@ pub fn ZSTD_decompressSequencesLong_body(
         nbSeq,
         litBuf,
         litSize,
+        ZSTD_longOffset_e::ZSTD_lo_isRegularOffset,
         LLTable,
         OFTable,
         MLTable,
@@ -2790,6 +2993,7 @@ fn ZSTD_decompressSequencesLong_bodySplitLitBuffer_impl<const BMI2: bool>(
     lit_dst_len: usize,
     lit_extra: &[u8],
     litSize: usize,
+    isLongOffset: ZSTD_longOffset_e,
     LLTable: &[ZSTD_seqSymbol],
     OFTable: &[ZSTD_seqSymbol],
     MLTable: &[ZSTD_seqSymbol],
@@ -2837,6 +3041,7 @@ fn ZSTD_decompressSequencesLong_bodySplitLitBuffer_impl<const BMI2: bool>(
                 unsafe {
                     ZSTD_decodeSequence_bmi2(
                         &mut seqState,
+                        isLongOffset,
                         LLTable,
                         OFTable,
                         MLTable,
@@ -2848,7 +3053,14 @@ fn ZSTD_decompressSequencesLong_bodySplitLitBuffer_impl<const BMI2: bool>(
                     unreachable!("BMI2 long split decoder is x86_64-only")
                 }
             } else {
-                ZSTD_decodeSequence(&mut seqState, LLTable, OFTable, MLTable, seqNb + 1 == total)
+                ZSTD_decodeSequence(
+                    &mut seqState,
+                    isLongOffset,
+                    LLTable,
+                    OFTable,
+                    MLTable,
+                    seqNb + 1 == total,
+                )
             };
             prefetchPos = ZSTD_prefetchMatch_rust(prefetchPos, sequence, dst, ext_history);
             sequences[seqNb] = sequence;
@@ -2861,6 +3073,7 @@ fn ZSTD_decompressSequencesLong_bodySplitLitBuffer_impl<const BMI2: bool>(
                 unsafe {
                     ZSTD_decodeSequence_bmi2(
                         &mut seqState,
+                        isLongOffset,
                         LLTable,
                         OFTable,
                         MLTable,
@@ -2872,7 +3085,14 @@ fn ZSTD_decompressSequencesLong_bodySplitLitBuffer_impl<const BMI2: bool>(
                     unreachable!("BMI2 long split decoder is x86_64-only")
                 }
             } else {
-                ZSTD_decodeSequence(&mut seqState, LLTable, OFTable, MLTable, seqNb + 1 == total)
+                ZSTD_decodeSequence(
+                    &mut seqState,
+                    isLongOffset,
+                    LLTable,
+                    OFTable,
+                    MLTable,
+                    seqNb + 1 == total,
+                )
             };
             let execute_idx = (seqNb - STORED_SEQS) & STORED_SEQS_MASK;
             let mut queued = sequences[execute_idx];
@@ -2987,6 +3207,7 @@ unsafe fn ZSTD_decompressSequencesLong_body_bmi2_impl(
         nbSeq,
         litBuf,
         litSize,
+        ZSTD_longOffset_e::ZSTD_lo_isRegularOffset,
         LLTable,
         OFTable,
         MLTable,
@@ -3047,6 +3268,7 @@ pub fn ZSTD_decompressSequences_bmi2(
         nbSeq,
         litBuf,
         litSize,
+        ZSTD_longOffset_e::ZSTD_lo_isRegularOffset,
         LLTable,
         OFTable,
         MLTable,
@@ -3078,6 +3300,7 @@ pub fn ZSTD_decompressSequencesSplitLitBuffer_bmi2(
         nbSeq,
         litBuf,
         litSize,
+        ZSTD_longOffset_e::ZSTD_lo_isRegularOffset,
         LLTable,
         OFTable,
         MLTable,
@@ -3318,13 +3541,33 @@ pub fn ZSTD_decompressBlock_internal(
     let blockSizeMax = dstCapacity.min(ZSTD_blockSizeMax(dctx));
     let totalHistorySize =
         dctx.stream_dict.len() + dctx.historyBuffer.len() + op_start + blockSizeMax;
+    let mut isLongOffset =
+        if crate::common::mem::MEM_32bits() != 0 && totalHistorySize > ZSTD_maxShortOffset() {
+            ZSTD_longOffset_e::ZSTD_lo_isLongOffset
+        } else {
+            ZSTD_longOffset_e::ZSTD_lo_isRegularOffset
+        };
     let mut usePrefetchDecoder = dctx.ddictIsCold != 0;
-    if !usePrefetchDecoder && totalHistorySize > (1usize << 24) && nbSeq > 8 {
+    if isLongOffset == ZSTD_longOffset_e::ZSTD_lo_isLongOffset
+        || (!usePrefetchDecoder && totalHistorySize > (1usize << 24) && nbSeq > 8)
+    {
         let info = ZSTD_getOffsetInfo(
             active_of_table_from(&dctx.OFTable, dctx.of_default_active),
             nbSeq,
         );
-        usePrefetchDecoder = info.longOffsetShare >= 7;
+        if isLongOffset == ZSTD_longOffset_e::ZSTD_lo_isLongOffset
+            && info.maxNbAdditionalBits <= STREAM_ACCUMULATOR_MIN_32
+        {
+            isLongOffset = ZSTD_longOffset_e::ZSTD_lo_isRegularOffset;
+        }
+        if !usePrefetchDecoder {
+            let minShare = if crate::common::mem::MEM_64bits() != 0 {
+                7
+            } else {
+                20
+            };
+            usePrefetchDecoder = info.longOffsetShare >= minShare;
+        }
     }
     dctx.ddictIsCold = 0;
 
@@ -3390,6 +3633,7 @@ pub fn ZSTD_decompressBlock_internal(
                     lit_dst_len,
                     &dctx.litExtraBuffer[..ZSTD_LITBUFFEREXTRASIZE],
                     litSize,
+                    isLongOffset,
                     LL,
                     OF,
                     ML,
@@ -3407,6 +3651,7 @@ pub fn ZSTD_decompressBlock_internal(
                 lit_dst_len,
                 &dctx.litExtraBuffer[..ZSTD_LITBUFFEREXTRASIZE],
                 litSize,
+                isLongOffset,
                 LL,
                 OF,
                 ML,
@@ -3432,6 +3677,7 @@ pub fn ZSTD_decompressBlock_internal(
                     lit_dst_len,
                     &dctx.litExtraBuffer[..ZSTD_LITBUFFEREXTRASIZE],
                     litSize,
+                    isLongOffset,
                     LL,
                     OF,
                     ML,
@@ -3451,6 +3697,7 @@ pub fn ZSTD_decompressBlock_internal(
                 lit_dst_len,
                 &dctx.litExtraBuffer[..ZSTD_LITBUFFEREXTRASIZE],
                 litSize,
+                isLongOffset,
                 LL,
                 OF,
                 ML,
@@ -3487,6 +3734,7 @@ pub fn ZSTD_decompressBlock_internal(
                     nbSeq,
                     lit_base,
                     litSize,
+                    isLongOffset,
                     LL,
                     OF,
                     ML,
@@ -3503,6 +3751,7 @@ pub fn ZSTD_decompressBlock_internal(
                 nbSeq,
                 lit_base,
                 litSize,
+                isLongOffset,
                 LL,
                 OF,
                 ML,
@@ -3512,19 +3761,60 @@ pub fn ZSTD_decompressBlock_internal(
     }
 
     let lit_snapshot = lit_snapshot.expect("non-dst literal buffer must be available");
-    let decompress_sequences = if usePrefetchDecoder {
-        if ZSTD_DCtx_get_bmi2(dctx) != 0 {
-            ZSTD_decompressSequencesLong_bmi2
-        } else {
-            ZSTD_decompressSequencesLong_default
+    if usePrefetchDecoder {
+        #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+        if ZSTD_DCtx_get_bmi2(dctx) != 0
+            && std::is_x86_feature_detected!("bmi1")
+            && std::is_x86_feature_detected!("bmi2")
+            && std::is_x86_feature_detected!("lzcnt")
+        {
+            return ZSTD_decompressSequencesLong_body_impl::<true>(
+                dst,
+                op_start,
+                &ext_history,
+                &src[ip..ip + srcSize],
+                nbSeq,
+                lit_snapshot,
+                litSize,
+                isLongOffset,
+                LL,
+                OF,
+                ML,
+                entropy_rep,
+            );
         }
-    } else if ZSTD_DCtx_get_bmi2(dctx) != 0 {
-        ZSTD_decompressSequences_bmi2
-    } else {
-        ZSTD_decompressSequences_default
-    };
-
-    decompress_sequences(
+        return ZSTD_decompressSequencesLong_body_impl::<false>(
+            dst,
+            op_start,
+            &ext_history,
+            &src[ip..ip + srcSize],
+            nbSeq,
+            lit_snapshot,
+            litSize,
+            isLongOffset,
+            LL,
+            OF,
+            ML,
+            entropy_rep,
+        );
+    }
+    if ZSTD_DCtx_get_bmi2(dctx) != 0 {
+        return ZSTD_decompressSequences_body_bmi2_withLongOffset(
+            dst,
+            op_start,
+            &ext_history,
+            &src[ip..ip + srcSize],
+            nbSeq,
+            lit_snapshot,
+            litSize,
+            isLongOffset,
+            LL,
+            OF,
+            ML,
+            entropy_rep,
+        );
+    }
+    ZSTD_decompressSequences_body_withLongOffset(
         dst,
         op_start,
         &ext_history,
@@ -3532,6 +3822,7 @@ pub fn ZSTD_decompressBlock_internal(
         nbSeq,
         lit_snapshot,
         litSize,
+        isLongOffset,
         LL,
         OF,
         ML,
@@ -3626,6 +3917,9 @@ pub fn ZSTD_decodeLiteralsBlock(
         SymbolEncodingType_e::set_repeat | SymbolEncodingType_e::set_compressed => {
             if litEncType == SymbolEncodingType_e::set_repeat && dctx.litEntropy == 0 {
                 return ERROR(ErrorCode::DictionaryCorrupted);
+            }
+            if srcSize < 5 {
+                return ERROR(ErrorCode::CorruptionDetected);
             }
 
             let lhlCode = (src[0] >> 2) & 3;
@@ -4772,6 +5066,8 @@ mod tests {
         assert_eq!(MIN_CBLOCK_SIZE, 2);
         assert_eq!(WILDCOPY_OVERLENGTH, 32);
         assert_eq!(WILDCOPY_VECLEN, 16);
+        assert_eq!(STREAM_ACCUMULATOR_MIN_32, 25);
+        assert_eq!(LONG_OFFSETS_MAX_EXTRA_BITS_32, 5);
     }
 
     #[test]
@@ -5149,11 +5445,10 @@ mod tests {
     }
 
     #[test]
-    fn decode_literals_block_compressed_three_byte_header_is_not_rejected_as_too_short() {
+    fn decode_literals_block_compressed_short_header_matches_upstream_1_5_7() {
         // set_compressed, lhlCode=0 uses a 3-byte header:
-        // litSize=20, litCSize=0. A one-byte dst should fail with
-        // DstSizeTooSmall after parsing the header, not with the old
-        // unconditional srcSize < 5 corruption check.
+        // litSize=20, litCSize=0. Upstream 1.5.7 still requires
+        // srcSize >= 5 before parsing compressed/repeat literal headers.
         let lhc = (20u32 << 4) | 2;
         let src = [
             (lhc & 0xFF) as u8,
@@ -5170,7 +5465,7 @@ mod tests {
             streaming_operation::not_streaming,
         );
 
-        assert_eq!(rc, ERROR(ErrorCode::DstSizeTooSmall));
+        assert_eq!(rc, ERROR(ErrorCode::CorruptionDetected));
     }
 
     #[test]
@@ -5200,7 +5495,14 @@ mod tests {
         }];
         let ml_table = [ZSTD_seqSymbol::default()];
 
-        let seq = ZSTD_decodeSequence(&mut seq_state, &ll_table, &of_table, &ml_table, true);
+        let seq = ZSTD_decodeSequence(
+            &mut seq_state,
+            ZSTD_longOffset_e::ZSTD_lo_isRegularOffset,
+            &ll_table,
+            &of_table,
+            &ml_table,
+            true,
+        );
 
         assert_eq!(seq.offset, usize::MAX);
         assert_eq!(seq_state.prevOffset[0], usize::MAX);

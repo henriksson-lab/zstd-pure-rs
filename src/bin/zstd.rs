@@ -14,8 +14,8 @@ use std::process::ExitCode;
 use zstd_pure_rs::common::error::{ERR_getErrorName, ERR_isError};
 use zstd_pure_rs::common::xxhash::XXH64_state_t;
 use zstd_pure_rs::compress::zstd_compress::{
-    ZSTD_CCtx_setFormat, ZSTD_FrameParameters, ZSTD_compressBound, ZSTD_compress_advanced,
-    ZSTD_createCCtx, ZSTD_getCParams, ZSTD_parameters,
+    ZSTD_CCtx_loadDictionary, ZSTD_CCtx_setParameter, ZSTD_cParameter, ZSTD_compress2,
+    ZSTD_compressBound, ZSTD_createCCtx,
 };
 use zstd_pure_rs::decompress::zstd_decompress::{
     ZSTD_DCtx_setFormat, ZSTD_decompress, ZSTD_decompressDCtx, ZSTD_decompress_usingDict,
@@ -433,44 +433,32 @@ fn compress_bytes(
     } else {
         ZSTD_format_e::ZSTD_f_zstd1
     };
-    let n = if let Some(d) = dict {
-        // Dict path: route through `ZSTD_compress_advanced` so that
-        // `--check` threads through as `fParams.checksumFlag` and the
-        // final frame carries the XXH64 trailer alongside the dict-
-        // back-refs. The cctx.format slot picks up magicless.
-        let mut cctx = ZSTD_createCCtx().ok_or("cctx alloc failed")?;
-        if magicless {
-            let _ = ZSTD_CCtx_setFormat(&mut cctx, ZSTD_format_e::ZSTD_f_zstd1_magicless);
+    let mut cctx = ZSTD_createCCtx().ok_or("cctx alloc failed")?;
+    for (param, value) in [
+        (ZSTD_cParameter::ZSTD_c_compressionLevel, level),
+        (ZSTD_cParameter::ZSTD_c_contentSizeFlag, 1),
+        (
+            ZSTD_cParameter::ZSTD_c_checksumFlag,
+            if checksum { 1 } else { 0 },
+        ),
+        (
+            ZSTD_cParameter::ZSTD_c_dictIDFlag,
+            if dict.is_some() { 1 } else { 0 },
+        ),
+        (ZSTD_cParameter::ZSTD_c_format, format as i32),
+    ] {
+        let rc = ZSTD_CCtx_setParameter(&mut cctx, param, value);
+        if ERR_isError(rc) {
+            return Err(ERR_getErrorName(rc).to_string());
         }
-        let cp = ZSTD_getCParams(level, src.len() as u64, d.len());
-        let params = ZSTD_parameters {
-            cParams: cp,
-            fParams: ZSTD_FrameParameters {
-                contentSizeFlag: 1,
-                checksumFlag: if checksum { 1 } else { 0 },
-                noDictIDFlag: 0,
-            },
-        };
-        ZSTD_compress_advanced(&mut cctx, &mut dst, src, d, params)
-    } else {
-        // Route through the same CCtx-based public API path as the
-        // dict case so CLI behavior stays aligned with the translated
-        // `ZSTD_compress_advanced()` orchestration.
-        let mut cctx = ZSTD_createCCtx().ok_or("cctx alloc failed")?;
-        if magicless {
-            let _ = ZSTD_CCtx_setFormat(&mut cctx, format);
+    }
+    if let Some(d) = dict {
+        let rc = ZSTD_CCtx_loadDictionary(&mut cctx, d);
+        if ERR_isError(rc) {
+            return Err(ERR_getErrorName(rc).to_string());
         }
-        let cp = ZSTD_getCParams(level, src.len() as u64, 0);
-        let params = ZSTD_parameters {
-            cParams: cp,
-            fParams: ZSTD_FrameParameters {
-                contentSizeFlag: 1,
-                checksumFlag: if checksum { 1 } else { 0 },
-                noDictIDFlag: 1,
-            },
-        };
-        ZSTD_compress_advanced(&mut cctx, &mut dst, src, &[], params)
-    };
+    }
+    let n = ZSTD_compress2(&mut cctx, &mut dst, src);
     if ERR_isError(n) {
         return Err(ERR_getErrorName(n).to_string());
     }

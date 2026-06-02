@@ -232,12 +232,10 @@ pub fn ZSTD_ldm_adjustParameters(params: &mut ldmParams_t, cParams: &ZSTD_compre
         }
     }
     if params.hashLog == 0 {
-        if params.windowLog <= params.hashRateLog {
-            params.hashLog = ZSTD_HASHLOG_MIN;
-        } else {
-            params.hashLog =
-                (params.windowLog - params.hashRateLog).clamp(ZSTD_HASHLOG_MIN, ZSTD_HASHLOG_MAX);
-        }
+        params.hashLog = params
+            .windowLog
+            .wrapping_sub(params.hashRateLog)
+            .clamp(ZSTD_HASHLOG_MIN, ZSTD_HASHLOG_MAX);
     }
     if params.minMatchLength == 0 {
         params.minMatchLength = LDM_MIN_MATCH_LENGTH;
@@ -259,10 +257,21 @@ pub fn ZSTD_ldm_adjustParameters(params: &mut ldmParams_t, cParams: &ZSTD_compre
 /// required for the LDM state's hash + bucket tables (0 when LDM is
 /// disabled).
 ///
-/// Rust signature note: upstream uses `ZSTD_cwksp_alloc_size` for
-/// cache-line rounding. The Rust port drops that alignment fudge — it
-/// returns the raw byte count; callers that need alignment pad their
-/// own allocation.
+#[inline]
+fn ZSTD_ldm_cwksp_alloc_size(size: usize) -> usize {
+    if size == 0 {
+        0
+    } else {
+        crate::compress::zstd_cwksp::ZSTD_cwksp_align(
+            size,
+            crate::compress::zstd_cwksp::ZSTD_CWKSP_ALIGNMENT_BYTES,
+        )
+    }
+}
+
+/// Rust signature note: upstream sizes each table allocation through
+/// `ZSTD_cwksp_alloc_size`; mirror that per-allocation workspace
+/// rounding before summing the tables.
 pub fn ZSTD_ldm_getTableSize(params: ldmParams_t) -> usize {
     if params.enableLdm != ZSTD_ParamSwitch_e::ZSTD_ps_enable {
         return 0;
@@ -270,7 +279,8 @@ pub fn ZSTD_ldm_getTableSize(params: ldmParams_t) -> usize {
     let ldmHSize = 1usize << params.hashLog;
     let ldmBucketSizeLog = params.bucketSizeLog.min(params.hashLog);
     let ldmBucketSize = 1usize << (params.hashLog - ldmBucketSizeLog);
-    ldmBucketSize + ldmHSize * core::mem::size_of::<ldmEntry_t>()
+    ZSTD_ldm_cwksp_alloc_size(ldmBucketSize)
+        + ZSTD_ldm_cwksp_alloc_size(ldmHSize * core::mem::size_of::<ldmEntry_t>())
 }
 
 /// Port of `ZSTD_ldm_getMaxNbSeq`. Returns the upper bound on the
@@ -418,7 +428,7 @@ pub fn ZSTD_ldm_gear_reset(state: &mut ldmRollingHashState_t, data: &[u8], minMa
         hash = (hash << 1).wrapping_add(ZSTD_ldm_gearTab[data[n] as usize]);
         n += 1;
     }
-    state.rolling = hash;
+    let _ = hash;
 }
 
 /// Port of `ZSTD_ldm_gear_feed`. Rolls through `data[..size]`
@@ -675,10 +685,11 @@ pub fn ZSTD_ldm_generateSequences_internal(
     };
 
     let istart = ip_pos;
-    if iend_pos - istart < minMatchLength {
-        return iend_pos - istart;
+    let srcSize = iend_pos - istart;
+    if srcSize < minMatchLength {
+        return srcSize;
     }
-    let ilimit = iend_pos - HASH_READ_SIZE;
+    let ilimit = iend_pos.saturating_sub(HASH_READ_SIZE);
 
     let mut anchor = istart;
     let mut ip = istart;
@@ -1159,9 +1170,22 @@ mod tests {
     fn adjust_parameters_clamps_hashLog_to_range() {
         let mut lp = ldmParams_t::default();
         let mut cp = base_cparams(9);
-        cp.windowLog = 8; // smaller than hashRateLog
+        cp.windowLog = 6;
+        lp.hashRateLog = 6;
         ZSTD_ldm_adjustParameters(&mut lp, &cp);
         assert_eq!(lp.hashLog, ZSTD_HASHLOG_MIN);
+    }
+
+    #[test]
+    fn adjust_parameters_wraps_excessive_hashRateLog_to_hashLog_max() {
+        let mut lp = ldmParams_t {
+            hashRateLog: 40,
+            ..Default::default()
+        };
+        let mut cp = base_cparams(3);
+        cp.windowLog = 23;
+        ZSTD_ldm_adjustParameters(&mut lp, &cp);
+        assert_eq!(lp.hashLog, ZSTD_HASHLOG_MAX);
     }
 
     #[test]
@@ -1185,6 +1209,24 @@ mod tests {
         };
         let sz = ZSTD_ldm_getTableSize(lp);
         assert!(sz > 0);
+    }
+
+    #[test]
+    fn get_table_size_rounds_each_workspace_allocation() {
+        let lp = ldmParams_t {
+            enableLdm: ZSTD_ParamSwitch_e::ZSTD_ps_enable,
+            hashLog: 6,
+            bucketSizeLog: 4,
+            ..Default::default()
+        };
+        let raw_bucket = 1usize << (lp.hashLog - lp.bucketSizeLog);
+        let raw_hash = (1usize << lp.hashLog) * core::mem::size_of::<ldmEntry_t>();
+        assert_eq!(raw_bucket, 4);
+        assert_eq!(
+            ZSTD_ldm_getTableSize(lp),
+            ZSTD_ldm_cwksp_alloc_size(raw_bucket) + ZSTD_ldm_cwksp_alloc_size(raw_hash)
+        );
+        assert_eq!(ZSTD_ldm_getTableSize(lp), 64 + 512);
     }
 
     #[test]
@@ -1234,7 +1276,7 @@ mod tests {
     }
 
     #[test]
-    fn gear_hash_reset_seeds_state_without_recording_splits() {
+    fn gear_hash_reset_warms_local_hash_without_storing_it() {
         let params = ldmParams_t {
             enableLdm: ZSTD_ParamSwitch_e::ZSTD_ps_enable,
             minMatchLength: 64,
@@ -1249,10 +1291,7 @@ mod tests {
         let initial = s.rolling;
         let warmup = [0x42u8; 64];
         ZSTD_ldm_gear_reset(&mut s, &warmup, 64);
-        assert_ne!(
-            s.rolling, initial,
-            "rolling should have mutated during reset"
-        );
+        assert_eq!(s.rolling, initial);
     }
 
     fn ldm_params_for(strategy: u32) -> ldmParams_t {
@@ -1262,6 +1301,17 @@ mod tests {
         };
         ZSTD_ldm_adjustParameters(&mut lp, &base_cparams(strategy));
         lp
+    }
+
+    fn dense_ldm_params() -> ldmParams_t {
+        ldmParams_t {
+            enableLdm: ZSTD_ParamSwitch_e::ZSTD_ps_enable,
+            hashLog: 16,
+            bucketSizeLog: LDM_BUCKET_SIZE_LOG,
+            minMatchLength: LDM_MIN_MATCH_LENGTH,
+            hashRateLog: 1,
+            windowLog: 23,
+        }
     }
 
     #[test]
@@ -1481,7 +1531,7 @@ mod tests {
         let repeat_start = buf.len();
         buf.extend_from_slice(&block);
 
-        let lp = ldm_params_for(3);
+        let lp = dense_ldm_params();
         let mut st = ldmState_t::new(&lp);
         let mut store = RawSeqStore_t::with_capacity(1024);
 
@@ -1522,7 +1572,7 @@ mod tests {
         buf.extend_from_slice(&filler);
         buf.extend_from_slice(&block);
 
-        let lp = ldm_params_for(3);
+        let lp = dense_ldm_params();
         let mut st = ldmState_t::new(&lp);
         let mut store = RawSeqStore_t::with_capacity(0);
         let rc =
@@ -1558,6 +1608,36 @@ mod tests {
                 + leftover as u64,
             buf.len() as u64,
         );
+    }
+
+    #[test]
+    fn generateSequences_internal_short_sources_at_hash_read_size_boundary_do_not_underflow() {
+        for src_size in HASH_READ_SIZE / 2..HASH_READ_SIZE {
+            let lp = ldmParams_t {
+                enableLdm: ZSTD_ParamSwitch_e::ZSTD_ps_enable,
+                hashLog: ZSTD_HASHLOG_MIN,
+                bucketSizeLog: LDM_BUCKET_SIZE_LOG,
+                minMatchLength: 4,
+                hashRateLog: 4,
+                windowLog: 23,
+            };
+            let mut st = ldmState_t::new(&lp);
+            let mut store = RawSeqStore_t::with_capacity(4);
+            let buf: Vec<u8> = (0..src_size as u8).collect();
+
+            let leftover = ZSTD_ldm_generateSequences_internal(
+                &mut st,
+                &mut store,
+                &lp,
+                &buf,
+                0,
+                buf.len(),
+                0,
+            );
+
+            assert_eq!(leftover, src_size);
+            assert_eq!(store.size, 0);
+        }
     }
 
     #[test]
@@ -1633,7 +1713,7 @@ mod tests {
         let src = [b"noise-".as_slice(), &dict[..96], b"-tail".as_slice()].concat();
         let buf = [dict.clone(), src.clone()].concat();
 
-        let lp = ldm_params_for(3);
+        let lp = dense_ldm_params();
         let mut st = ldmState_t::new(&lp);
         st.window.dictBase_offset = 0;
         st.window.lowLimit = 0;
@@ -1833,7 +1913,7 @@ mod tests {
         let repeat_pos = buf.len();
         buf.extend_from_slice(&block);
 
-        let lp = ldm_params_for(3);
+        let lp = dense_ldm_params();
         let mut st = ldmState_t::new(&lp);
         let mut store = RawSeqStore_t::with_capacity(4096);
 

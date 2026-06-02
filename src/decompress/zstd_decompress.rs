@@ -1501,7 +1501,7 @@ mod tests {
 
     #[test]
     fn decompressStream_unknown_fcs_uses_caller_capacity_not_frame_bound() {
-        use crate::common::error::{ERR_getErrorCode, ERR_isError};
+        use crate::common::error::ERR_isError;
 
         let payload = b"unknown-fcs";
         let bh = ((payload.len() as u32) << 3) | 1; // lastBlock=1, bt_raw=0
@@ -1513,9 +1513,14 @@ mod tests {
         let mut out_pos = 0usize;
         let mut in_pos = 0usize;
         let rc = ZSTD_decompressStream(&mut dctx, &mut tiny, &mut out_pos, &frame, &mut in_pos);
-        assert!(ERR_isError(rc));
-        assert_eq!(ERR_getErrorCode(rc), ErrorCode::DstSizeTooSmall);
+        assert!(
+            !ERR_isError(rc),
+            "err: {}",
+            crate::common::error::ERR_getErrorName(rc)
+        );
         assert_eq!(in_pos, frame.len());
+        assert_eq!(out_pos, tiny.len());
+        assert_eq!(&tiny, &payload[..tiny.len()]);
 
         let mut out = [0u8; 32];
         let mut out_pos = 0usize;
@@ -1526,7 +1531,7 @@ mod tests {
             "err: {}",
             crate::common::error::ERR_getErrorName(rc)
         );
-        assert_eq!(&out[..out_pos], payload);
+        assert_eq!(&out[..out_pos], &payload[tiny.len()..]);
     }
 
     #[test]
@@ -8058,11 +8063,10 @@ pub fn ZSTD_decompressStream(
         // Determine decoded size.
         let declared = zfh.frameContentSize;
         let out_size = if declared == ZSTD_CONTENTSIZE_UNKNOWN {
-            let cap = output.len() - *output_pos;
-            if cap == 0 {
-                return ERROR(ErrorCode::DstSizeTooSmall);
+            match usize::try_from(frame_info.decompressedBound) {
+                Ok(size) if size != usize::MAX => size,
+                _ => return ERROR(ErrorCode::DstSizeTooSmall),
             }
-            cap
         } else {
             match usize::try_from(declared) {
                 Ok(size) => size,

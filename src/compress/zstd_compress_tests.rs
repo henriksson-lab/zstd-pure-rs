@@ -174,8 +174,8 @@ fn streaming_flush_with_buffered_input_does_not_finalize_frame() {
 
     assert!(!ERR_isError(rc));
     assert_eq!(src_pos, first.len());
-    assert_eq!(dst_pos, 0, "flush must not complete the frame");
-    assert_ne!(rc, 0, "flush should hint that endStream is still needed");
+    assert_eq!(rc, 0, "flush should complete all currently staged input");
+    assert_ne!(dst_pos, 0, "flush must emit a non-final frame prefix");
 
     src_pos = 0;
     let rc = ZSTD_compressStream2(
@@ -3055,7 +3055,11 @@ fn zstd_cctx_lifecycle_create_compress_free() {
     // Verify roundtrip.
     let mut out = vec![0u8; src.len() + 64];
     let d = ZSTD_decompress(&mut out, &dst);
-    assert!(!crate::common::error::ERR_isError(d));
+    assert!(
+        !crate::common::error::ERR_isError(d),
+        "decompress: {}",
+        crate::common::error::ERR_getErrorName(d)
+    );
     assert_eq!(&out[..d], &src[..]);
 
     // Free returns 0.
@@ -3096,7 +3100,11 @@ fn zstd_stream_init_compress_end_roundtrips() {
 
     let mut decoded = vec![0u8; src.len() + 64];
     let d = ZSTD_decompress(&mut decoded, &staged);
-    assert!(!crate::common::error::ERR_isError(d));
+    assert!(
+        !crate::common::error::ERR_isError(d),
+        "decompress: {}",
+        crate::common::error::ERR_getErrorName(d)
+    );
     assert_eq!(&decoded[..d], &src[..]);
 }
 
@@ -3364,7 +3372,11 @@ fn zstd_cdict_ddict_symmetric_roundtrip() {
     let mut dctx = ZSTD_DCtx::new();
     let mut decoded = vec![0u8; src.len() + 64];
     let d = ZSTD_decompress_usingDDict(&mut dctx, &mut decoded, &compressed, &ddict);
-    assert!(!crate::common::error::ERR_isError(d));
+    assert!(
+        !crate::common::error::ERR_isError(d),
+        "ddict decompress: {}",
+        crate::common::error::ERR_getErrorName(d)
+    );
     assert_eq!(&decoded[..d], &src[..]);
 }
 
@@ -3397,7 +3409,11 @@ fn zstd_cdict_create_compress_reuse_across_payloads() {
         let mut dctx = ZSTD_DCtx::new();
         let mut decoded = vec![0u8; payload.len() + 64];
         let d = ZSTD_decompress_usingDict(&mut dctx, &mut decoded, &compressed, &dict);
-        assert!(!crate::common::error::ERR_isError(d));
+        assert!(
+            !crate::common::error::ERR_isError(d),
+            "[iter {i}] dict decompress: {}",
+            crate::common::error::ERR_getErrorName(d)
+        );
         assert_eq!(&decoded[..d], &payload[..], "[iter {i}] roundtrip");
     }
 
@@ -3595,8 +3611,8 @@ fn compressStream2_flush_directive_roundtrips() {
     );
     assert!(!ERR_isError(rc));
     assert_eq!(sp, first.len());
-    assert_eq!(dp, 0, "flush must not emit a completed frame");
-    assert_ne!(rc, 0, "flush should hint that end is still pending");
+    assert_eq!(rc, 0, "flush should complete all currently staged input");
+    assert_ne!(dp, 0, "flush must emit a non-final frame prefix");
 
     sp = 0;
     let rc = ZSTD_compressStream2(
@@ -4426,7 +4442,7 @@ fn CCtxParams_setParameter_flag_values_reject_out_of_range() {
 }
 
 #[test]
-fn flushStream_does_not_enforce_pledged_size_before_endStream() {
+fn flushStream_emits_staged_input_without_finishing_pledged_frame() {
     use crate::decompress::zstd_decompress::ZSTD_decompress;
 
     let first = b"pledged flush split part one ".repeat(9);
@@ -4449,8 +4465,8 @@ fn flushStream_does_not_enforce_pledged_size_before_endStream() {
         !ERR_isError(rc),
         "flushStream errored before full pledge: {rc:#x}"
     );
-    assert_ne!(rc, 0);
-    assert_eq!(dp, 0, "flushStream must not complete the pledged frame");
+    assert_eq!(rc, 0);
+    assert_ne!(dp, 0, "flushStream should emit the staged non-final block");
 
     sp = 0;
     let rc = ZSTD_compressStream(&mut cctx, &mut dst, &mut dp, &second, &mut sp);
@@ -5681,6 +5697,34 @@ fn zstd_extended_api_surface_sentinel() {
     assert_eq!(ZSTD_toFlushNow(&cctx2), 0);
 }
 
+#[test]
+fn initStaticCCtx_accepts_header_sized_workspace_but_compression_can_fail() {
+    // Upstream accepts an aligned workspace large enough to hold the
+    // CCtx header at init time. The later compression setup is where
+    // an undersized static workspace is allowed to fail.
+    let cctx_size = core::mem::size_of::<ZSTD_CCtx>();
+    let mut buf = vec![0u64; (cctx_size + 1).div_ceil(core::mem::size_of::<u64>())];
+    let bytes = unsafe {
+        core::slice::from_raw_parts_mut(
+            buf.as_mut_ptr() as *mut u8,
+            buf.len() * core::mem::size_of::<u64>(),
+        )
+    };
+    assert!(bytes.len() > cctx_size);
+    assert!(bytes.len() < ZSTD_estimateCCtxSize(ZSTD_CLEVEL_DEFAULT));
+
+    let cctx = ZSTD_initStaticCCtx(bytes).expect("header-sized static cctx");
+    assert_eq!(cctx.stage, ZSTD_compressionStage_e::ZSTDcs_created);
+
+    let src = b"small-static-cctx workspace probe";
+    let mut dst = vec![0u8; ZSTD_compressBound(src.len())];
+    let n = ZSTD_compressCCtx(cctx, &mut dst, src, 1);
+    assert!(
+        ERR_isError(n),
+        "undersized static workspace should fail during compression setup, got {n}"
+    );
+}
+
 /// Sentinel test: touch every public one-shot compress function
 /// with a trivial input to ensure none of them panic.
 #[test]
@@ -5827,7 +5871,8 @@ fn zstd_public_api_surface_touches_every_entry_point() {
     // initStatic*: construct headers inside caller workspace when
     // alignment and size permit it.
     {
-        let mut buf = vec![0u64; (1 << 20) / core::mem::size_of::<u64>()];
+        let bytes_needed = ZSTD_estimateCCtxSize(ZSTD_CLEVEL_DEFAULT).max(1 << 20);
+        let mut buf = vec![0u64; bytes_needed.div_ceil(core::mem::size_of::<u64>())];
         let bytes = unsafe {
             core::slice::from_raw_parts_mut(
                 buf.as_mut_ptr() as *mut u8,
@@ -5844,7 +5889,6 @@ fn zstd_public_api_surface_touches_every_entry_point() {
         assert_eq!(cdict.cParams.strategy as u32, cp.strategy as u32);
         assert_eq!(cdict.cParams.windowLog, cp.windowLog);
     }
-
     // estimateCCtxSize_usingCCtxParams + CStream variant.
     {
         let mut p = ZSTD_createCCtxParams().unwrap();
@@ -6969,12 +7013,12 @@ fn initCStream_srcSize_with_UNKNOWN_clears_pledge() {
 
 #[test]
 fn resetCStream_with_zero_pledge_accepts_zero_bytes_and_produces_empty_frame() {
-    // `ZSTD_resetCStream(0)` is a distinct path from
-    // `setPledgedSrcSize(0)` (the first sets per-frame state
-    // AND the pledge, the second only the pledge). Verify that
-    // feeding 0 bytes after resetCStream(0) + endStream produces
-    // a valid empty frame whose FCS is 0.
-    use crate::decompress::zstd_decompress::{ZSTD_decompress, ZSTD_getFrameContentSize};
+    // Deprecated `ZSTD_resetCStream(0)` maps the pledge to
+    // ZSTD_CONTENTSIZE_UNKNOWN upstream. The exact zero-size pledge
+    // path is covered by `setPledgedSrcSize_zero_with_empty_input_roundtrips`.
+    use crate::decompress::zstd_decompress::{
+        ZSTD_decompress, ZSTD_getFrameContentSize, ZSTD_CONTENTSIZE_UNKNOWN,
+    };
     let mut cctx = ZSTD_createCCtx().unwrap();
     ZSTD_initCStream(&mut cctx, 1);
     ZSTD_resetCStream(&mut cctx, 0);
@@ -6989,7 +7033,7 @@ fn resetCStream_with_zero_pledge_accepts_zero_bytes_and_produces_empty_frame() {
         }
     }
     dst.truncate(dp);
-    assert_eq!(ZSTD_getFrameContentSize(&dst), 0);
+    assert_eq!(ZSTD_getFrameContentSize(&dst), ZSTD_CONTENTSIZE_UNKNOWN);
     let mut out = vec![0u8; 32];
     let d = ZSTD_decompress(&mut out, &dst);
     assert_eq!(d, 0);
@@ -8006,7 +8050,8 @@ fn resetCCtx_byAttachingCDict_attaches_live_dict_match_state() {
     assert!(cctx.stream_dict.is_empty());
     assert!(ms.dictContent.is_empty());
     assert!(ms.dictMatchState.is_some());
-    assert_eq!(ms.loadedDictEnd, dict.len() as u32);
+    assert_eq!(ms.loadedDictEnd, ms.window.dictLimit);
+    assert_eq!(ms.window.dictLimit, cdict.matchState.window.nextSrc);
     assert_eq!(
         ZSTD_matchState_dictMode(ms),
         crate::compress::match_state::ZSTD_dictMode_e::ZSTD_dictMatchState

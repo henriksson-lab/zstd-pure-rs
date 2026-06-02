@@ -3,8 +3,7 @@
 //! Superblock compression splits a single block into multiple small
 //! sub-blocks with independent entropy tables to better adapt to
 //! local statistics. Used when `cctx.appliedParams.targetCBlockSize`
-//! is set. Not yet ported — current v0.1 always emits single blocks
-//! per `ZSTD_BLOCKSIZE_MAX` stride.
+//! is set.
 
 #![allow(clippy::field_reassign_with_default)]
 
@@ -62,7 +61,14 @@ pub fn ZSTD_compressSubBlock_literal(
         return ZSTD_compressRleLiteralsBlock(dst, literals);
     }
 
+    if dst.len() < op {
+        return 0;
+    }
+
     if writeEntropy && hufMetadata.hType == SymbolEncodingType_e::set_compressed {
+        if hufMetadata.hufDesSize > dst.len() - op {
+            return 0;
+        }
         dst[op..op + hufMetadata.hufDesSize]
             .copy_from_slice(&hufMetadata.hufDesBuffer[..hufMetadata.hufDesSize]);
         op += hufMetadata.hufDesSize;
@@ -239,6 +245,9 @@ pub fn ZSTD_compressSubBlock(
     use crate::common::mem::MEM_writeLE24;
     use crate::decompress::zstd_decompress_block::{blockType_e, ZSTD_blockHeaderSize};
 
+    if dst.len() < ZSTD_blockHeaderSize {
+        return 0;
+    }
     let mut op = ZSTD_blockHeaderSize;
     let cLitSize = ZSTD_compressSubBlock_literal(
         &entropy.huf.CTable,
@@ -974,6 +983,28 @@ mod tests {
     }
 
     #[test]
+    fn compress_subblock_literal_compressed_tiny_dst_returns_zero() {
+        let huf = ZSTD_hufCTables_t::default();
+        let mut meta = ZSTD_hufCTablesMetadata_t::default();
+        meta.hType = SymbolEncodingType_e::set_repeat;
+        let mut dst = [0u8; 2];
+        let mut entropy_written = -1;
+
+        let n = ZSTD_compressSubBlock_literal(
+            &huf.CTable,
+            &meta,
+            b"hello",
+            &mut dst,
+            0,
+            false,
+            &mut entropy_written,
+        );
+
+        assert_eq!(n, 0);
+        assert_eq!(entropy_written, 0);
+    }
+
+    #[test]
     fn compress_subblock_sequences_zero_seq_writes_count_only() {
         let fse = crate::compress::zstd_compress::ZSTD_fseCTables_t::default();
         let meta = ZSTD_fseCTablesMetadata_t::default();
@@ -1033,6 +1064,37 @@ mod tests {
         assert_eq!(lit_entropy_written, 0);
         assert_eq!(seq_entropy_written, 0);
         assert_eq!(dst[0] & 1, 1);
+    }
+
+    #[test]
+    fn compress_subblock_tiny_dst_returns_zero() {
+        let entropy = ZSTD_entropyCTables_t::default();
+        let meta = ZSTD_entropyCTablesMetadata_t::default();
+        let params = ZSTD_CCtx_params::default();
+        let mut dst = [0u8; 2];
+        let mut lit_entropy_written = -1;
+        let mut seq_entropy_written = -1;
+
+        let n = ZSTD_compressSubBlock(
+            &entropy,
+            &meta,
+            &[],
+            0,
+            b"abc",
+            &[],
+            &[],
+            &[],
+            &params,
+            &mut dst,
+            0,
+            false,
+            false,
+            &mut lit_entropy_written,
+            &mut seq_entropy_written,
+            1,
+        );
+
+        assert_eq!(n, 0);
     }
 
     #[test]

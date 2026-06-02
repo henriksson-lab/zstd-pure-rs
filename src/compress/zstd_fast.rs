@@ -638,10 +638,11 @@ pub fn ZSTD_compressBlock_fast_dictMatchState_generic(
     let dictBaseOffset = dms.window.base_offset;
     let dict = &dms.dictContent;
     let dictStart = dictStartIndex.saturating_sub(dictBaseOffset) as usize;
-    let dictSize = dictEndIndex.saturating_sub(dictBaseOffset);
-    let dictIndexDelta = prefixStartIndex.saturating_sub(dictSize);
-    let dictAndPrefixLength =
-        (src.len() as u32).wrapping_add(dictEndIndex.saturating_sub(dictStartIndex));
+    let dictIndexDelta = prefixStartIndex.saturating_sub(dictEndIndex);
+    let istartIndex = ms.window.base_offset;
+    let dictAndPrefixLength = istartIndex
+        .saturating_sub(prefixStartIndex)
+        .wrapping_add(dictEndIndex.saturating_sub(dictStartIndex));
     let dictHBits = dms.cParams.hashLog + ZSTD_SHORT_CACHE_TAG_BITS;
     let maxDistance = if cParams.windowLog >= 31 {
         u32::MAX
@@ -1658,6 +1659,40 @@ mod tests {
                 "variant {idx} regressed into a dead wrapper"
             );
         }
+    }
+
+    #[test]
+    fn fast_dict_match_state_rep_bounds_exclude_future_source_bytes() {
+        let cp = ZSTD_compressionParameters {
+            windowLog: 17,
+            hashLog: 12,
+            minMatch: 4,
+            ..Default::default()
+        };
+        let dict = b"0123456789abcdef".to_vec();
+
+        let mut dms = ZSTD_MatchState_t::new(cp);
+        dms.dictContent = dict.clone();
+        dms.window.base_offset = ZSTD_WINDOW_START_INDEX;
+        dms.window.dictLimit = ZSTD_WINDOW_START_INDEX;
+        dms.window.lowLimit = ZSTD_WINDOW_START_INDEX;
+        dms.window.nextSrc = ZSTD_WINDOW_START_INDEX.wrapping_add(dict.len() as u32);
+
+        let mut ms = ZSTD_MatchState_t::new(cp);
+        ms.window.base_offset = 100;
+        ms.window.dictLimit = 104;
+        ms.window.lowLimit = 104;
+        ms.window.nextSrc = ms.window.base_offset.wrapping_add(96);
+        ms.dictMatchState = Some(Box::new(dms));
+
+        let src: Vec<u8> = (0..96u8).map(|v| v.wrapping_mul(37)).collect();
+        let mut seq = SeqStore_t::with_capacity(128, 4096);
+        let mut rep = [40u32, 45, 8];
+
+        let _ = ZSTD_compressBlock_fast_dictMatchState(&mut ms, &mut seq, &mut rep, &src);
+
+        assert_eq!(rep[0], dict.len() as u32);
+        assert_eq!(rep[1], dict.len() as u32);
     }
 
     #[test]

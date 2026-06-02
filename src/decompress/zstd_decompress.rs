@@ -653,11 +653,84 @@ mod tests {
             let body = &frame
                 [body_start + ZSTD_blockHeaderSize..body_start + ZSTD_blockHeaderSize + body_size];
             let mut dctx = ZSTD_DCtx::new();
+            dctx.isFrameDecompression = 1;
             let mut out = vec![0u8; src.len() + 64];
             let d = ZSTD_decompressBlock(&mut dctx, &mut out, body);
             assert!(!crate::common::error::ERR_isError(d));
             assert_eq!(&out[..d], &src[..]);
+            assert_eq!(dctx.isFrameDecompression, 0);
+            assert_eq!(dctx.prefixStart, Some(out.as_ptr() as usize));
+            assert_eq!(dctx.previousDstEnd, Some(out.as_ptr() as usize + d));
         }
+    }
+
+    #[test]
+    fn decompressBlock_rotates_continuity_between_dst_buffers() {
+        use crate::decompress::zstd_decompress_block::{
+            blockProperties_t, blockType_e, ZSTD_DCtx, ZSTD_blockHeaderSize, ZSTD_getcBlockSize,
+        };
+
+        let src: Vec<u8> = b"standalone block continuity "
+            .iter()
+            .cycle()
+            .take(256)
+            .copied()
+            .collect();
+        let mut frame = vec![0u8; 1024];
+        let n = crate::compress::zstd_compress::ZSTD_compress(&mut frame, &src, 1);
+        assert!(!crate::common::error::ERR_isError(n));
+        frame.truncate(n);
+
+        let mut zfh = super::ZSTD_FrameHeader::default();
+        assert_eq!(super::ZSTD_getFrameHeader(&mut zfh, &frame), 0);
+        let body_start = zfh.headerSize as usize;
+        let mut bp = blockProperties_t {
+            blockType: blockType_e::bt_raw,
+            lastBlock: 0,
+            origSize: 0,
+        };
+        let body_size = ZSTD_getcBlockSize(&frame[body_start..], &mut bp);
+        assert_eq!(bp.blockType, blockType_e::bt_compressed);
+        let body = &frame
+            [body_start + ZSTD_blockHeaderSize..body_start + ZSTD_blockHeaderSize + body_size];
+
+        let mut dctx = ZSTD_DCtx::new();
+        let mut first = vec![0u8; src.len() + 64];
+        let decoded = ZSTD_decompressBlock(&mut dctx, &mut first, body);
+        assert!(!crate::common::error::ERR_isError(decoded));
+        let first_end = first.as_ptr() as usize + decoded;
+        assert_eq!(dctx.previousDstEnd, Some(first_end));
+
+        let mut second = vec![0u8; src.len() + 64];
+        let decoded = ZSTD_decompressBlock(&mut dctx, &mut second, body);
+        assert!(!crate::common::error::ERR_isError(decoded));
+        assert_eq!(dctx.dictEnd, Some(first_end));
+        assert_eq!(dctx.prefixStart, Some(second.as_ptr() as usize));
+        assert_eq!(
+            dctx.previousDstEnd,
+            Some(second.as_ptr() as usize + decoded)
+        );
+    }
+
+    #[test]
+    fn decompressBlock_updates_previous_dst_end_after_zero_output() {
+        use crate::decompress::zstd_decompress_block::ZSTD_DCtx;
+
+        let mut dctx = ZSTD_DCtx::new();
+        let previous = vec![0u8; 8];
+        dctx.prefixStart = Some(previous.as_ptr() as usize);
+        dctx.previousDstEnd = Some(previous.as_ptr() as usize + previous.len());
+
+        let mut dst = vec![0u8; 16];
+        let decoded = ZSTD_decompressBlock(&mut dctx, &mut dst, &[0, 0]);
+        assert!(
+            !crate::common::error::ERR_isError(decoded),
+            "decompressBlock failed: {}",
+            crate::common::error::ERR_getErrorName(decoded)
+        );
+        assert_eq!(decoded, 0);
+        assert_eq!(dctx.prefixStart, Some(dst.as_ptr() as usize));
+        assert_eq!(dctx.previousDstEnd, Some(dst.as_ptr() as usize));
     }
 
     #[test]
@@ -2524,6 +2597,38 @@ mod tests {
         assert_eq!(ERR_getErrorCode(rc), ErrorCode::SrcSizeWrong);
     }
 
+    #[test]
+    fn decompressContinue_wrong_chunk_size_preserves_continuity_state() {
+        let mut dctx = ZSTD_DCtx::default();
+        let prefix = vec![0u8; 8];
+        dctx.prefixStart = Some(prefix.as_ptr() as usize);
+        dctx.previousDstEnd = Some(prefix.as_ptr() as usize + prefix.len());
+        dctx.dictEnd = Some(prefix.as_ptr() as usize);
+        dctx.virtualStart = Some(prefix.as_ptr() as usize);
+
+        let before = (
+            dctx.prefixStart,
+            dctx.previousDstEnd,
+            dctx.dictEnd,
+            dctx.virtualStart,
+        );
+        let mut dst = [0u8; 64];
+        let rc = ZSTD_decompressContinue(&mut dctx, &mut dst, b"wrong-size");
+
+        assert!(crate::common::error::ERR_isError(rc));
+        use crate::common::error::ERR_getErrorCode;
+        assert_eq!(ERR_getErrorCode(rc), ErrorCode::SrcSizeWrong);
+        assert_eq!(
+            (
+                dctx.prefixStart,
+                dctx.previousDstEnd,
+                dctx.dictEnd,
+                dctx.virtualStart,
+            ),
+            before
+        );
+    }
+
     fn raw_block_frame_for_continue(payload: &[u8], checksum: bool) -> Vec<u8> {
         use crate::common::mem::{MEM_writeLE24, MEM_writeLE32};
         use crate::common::xxhash::{XXH64_digest, XXH64_reset, XXH64_state_t, XXH64_update};
@@ -2558,6 +2663,38 @@ mod tests {
             frame.extend_from_slice(&check);
         }
         frame
+    }
+
+    #[test]
+    fn decompressContinue_updates_previous_dst_end_after_zero_output_block() {
+        let frame = no_fcs_rle_frame(0, 0x42);
+        let mut dctx = ZSTD_DCtx::default();
+        let mut out = vec![0u8; 16];
+        let mut empty = [];
+        let mut ip = 0usize;
+
+        while ip < frame.len() {
+            let chunk = ZSTD_nextSrcSizeToDecompress(&dctx);
+            assert!(chunk > 0);
+            let input_type = ZSTD_nextInputType(&dctx);
+            let produced = if matches!(
+                input_type,
+                ZSTD_nextInputType_e::ZSTDnit_block | ZSTD_nextInputType_e::ZSTDnit_lastBlock
+            ) {
+                ZSTD_decompressContinue(&mut dctx, &mut out, &frame[ip..ip + chunk])
+            } else {
+                ZSTD_decompressContinue(&mut dctx, &mut empty, &frame[ip..ip + chunk])
+            };
+            assert!(
+                !crate::common::error::ERR_isError(produced),
+                "decompressContinue failed at ip={ip}: {}",
+                crate::common::error::ERR_getErrorName(produced)
+            );
+            ip += chunk;
+        }
+
+        assert_eq!(ZSTD_nextSrcSizeToDecompress(&dctx), 0);
+        assert_eq!(dctx.previousDstEnd, Some(out.as_ptr() as usize));
     }
 
     fn drive_continue_frame(frame: &[u8], out_capacity: usize) -> (ZSTD_DCtx, Vec<u8>, usize) {
@@ -2595,6 +2732,7 @@ mod tests {
         assert_eq!(op, payload.len());
         assert_eq!(&out[..op], payload);
         assert_eq!(ZSTD_nextSrcSizeToDecompress(&dctx), 0);
+        assert_eq!(dctx.previousDstEnd, Some(out.as_ptr() as usize + op));
     }
 
     #[test]
@@ -2607,6 +2745,7 @@ mod tests {
         assert_eq!(&out[..op], payload);
         assert_eq!(ZSTD_nextSrcSizeToDecompress(&dctx), 0);
         assert_eq!(dctx.stage, ZSTD_dStage::ZSTDds_getFrameHeaderSize);
+        assert_eq!(dctx.previousDstEnd, Some(out.as_ptr() as usize + op));
     }
 
     #[test]
@@ -2644,6 +2783,10 @@ mod tests {
             crate::common::error::ERR_getErrorName(produced)
         );
         assert_eq!(produced, first);
+        assert_eq!(
+            dctx.previousDstEnd,
+            Some(out[op..].as_ptr() as usize + produced)
+        );
         ip += first;
         op += produced;
 
@@ -2664,6 +2807,7 @@ mod tests {
         assert_eq!(&out[..op], payload);
         assert_eq!(ZSTD_nextSrcSizeToDecompress(&dctx), 0);
         assert_eq!(dctx.stage, ZSTD_dStage::ZSTDds_getFrameHeaderSize);
+        assert_eq!(dctx.previousDstEnd, Some(out.as_ptr() as usize + op));
     }
 
     #[test]
@@ -3767,6 +3911,63 @@ mod tests {
         assert_eq!(dctx.dictEnd, Some(a.as_ptr() as usize + a.len()));
         assert_eq!(dctx.prefixStart, Some(b.as_ptr() as usize));
         assert_eq!(dctx.previousDstEnd, Some(b.as_ptr() as usize + b.len()));
+    }
+
+    #[test]
+    fn insertBlock_history_feeds_standalone_decompressBlock() {
+        use crate::compress::zstd_compress::{
+            ZSTD_compressBegin, ZSTD_compressBlock, ZSTD_createCCtx,
+        };
+        use crate::decompress::zstd_decompress_block::ZSTD_DCtx;
+
+        let first: Vec<u8> = b"insert-block-standalone-history-"
+            .iter()
+            .cycle()
+            .take(4096)
+            .copied()
+            .collect();
+        let second = first.clone();
+
+        let mut cctx = ZSTD_createCCtx().expect("cctx");
+        let rc = ZSTD_compressBegin(&mut cctx, 1);
+        assert!(!crate::common::error::ERR_isError(rc));
+
+        let mut first_body = vec![0u8; first.len()];
+        let first_csize = ZSTD_compressBlock(&mut cctx, &mut first_body, &first);
+        assert!(
+            !crate::common::error::ERR_isError(first_csize),
+            "first compressBlock failed: {}",
+            crate::common::error::ERR_getErrorName(first_csize)
+        );
+
+        let mut second_body = vec![0u8; second.len()];
+        let second_csize = ZSTD_compressBlock(&mut cctx, &mut second_body, &second);
+        assert!(
+            !crate::common::error::ERR_isError(second_csize),
+            "second compressBlock failed: {}",
+            crate::common::error::ERR_getErrorName(second_csize)
+        );
+        assert!(
+            second_csize > 0,
+            "second block was not emitted as a compressed standalone body"
+        );
+
+        let mut dctx = ZSTD_DCtx::new();
+        assert_eq!(ZSTD_insertBlock(&mut dctx, &first), first.len());
+        let inserted_end = first.as_ptr() as usize + first.len();
+
+        let mut out = vec![0u8; second.len() + 64];
+        let decoded = ZSTD_decompressBlock(&mut dctx, &mut out, &second_body[..second_csize]);
+        assert!(
+            !crate::common::error::ERR_isError(decoded),
+            "decompressBlock failed: {}",
+            crate::common::error::ERR_getErrorName(decoded)
+        );
+        assert_eq!(decoded, second.len());
+        assert_eq!(&out[..decoded], &second);
+        assert_eq!(dctx.dictEnd, Some(inserted_end));
+        assert_eq!(dctx.prefixStart, Some(out.as_ptr() as usize));
+        assert_eq!(dctx.previousDstEnd, Some(out.as_ptr() as usize + decoded));
     }
 
     #[test]
@@ -5018,6 +5219,29 @@ mod tests {
     }
 
     #[test]
+    fn decompressDCtx_reseeds_repcodes_for_each_concatenated_frame() {
+        use crate::common::xxhash::XXH64_state_t;
+        use crate::decompress::zstd_decompress_block::{
+            ZSTD_DCtx, ZSTD_buildDefaultSeqTables, ZSTD_decoder_entropy_rep,
+        };
+
+        let frame = frame_with_1152_byte_window_and_empty_block();
+        let mut concatenated = frame.clone();
+        concatenated.extend_from_slice(&frame);
+
+        let mut dctx = ZSTD_DCtx::new();
+        ZSTD_buildDefaultSeqTables(&mut dctx);
+        let mut rep = ZSTD_decoder_entropy_rep { rep: [33, 44, 55] };
+        let mut xxh = XXH64_state_t::default();
+        let mut dst = [];
+
+        let decoded = ZSTD_decompressDCtx(&mut dctx, &mut rep, &mut xxh, &mut dst, &concatenated);
+        assert_eq!(decoded, 0);
+        assert_eq!(rep.rep, [1, 4, 8]);
+        assert_eq!(dctx.ddict_rep, [1, 4, 8]);
+    }
+
+    #[test]
     fn streaming_decoder_still_rejects_window_above_default_cap() {
         use crate::common::error::{ERR_getErrorCode, ERR_isError};
 
@@ -5155,6 +5379,9 @@ pub fn ZSTD_decompressFrame_withOpStart(
     if validateChecksum {
         XXH64_reset(xxh, 0);
     }
+    if dctx.isFrameDecompression != 0 {
+        entropy_rep.rep = dctx.ddict_rep;
+    }
     ip += zfh.headerSize as usize;
     remaining -= zfh.headerSize as usize;
     loop {
@@ -5283,6 +5510,9 @@ pub fn ZSTD_decompressFrame(
     let validateChecksum = zfh.checksumFlag != 0;
     if validateChecksum {
         XXH64_reset(xxh, 0);
+    }
+    if dctx.isFrameDecompression != 0 {
+        entropy_rep.rep = dctx.ddict_rep;
     }
 
     ip += zfh.headerSize as usize;
@@ -6403,19 +6633,30 @@ pub fn ZSTD_insertBlock(dctx: &mut ZSTD_DCtx, block: &[u8]) -> usize {
 /// of decoded bytes written into `dst`, or an error code.
 pub fn ZSTD_decompressBlock(dctx: &mut ZSTD_DCtx, dst: &mut [u8], src: &[u8]) -> usize {
     use crate::decompress::zstd_decompress_block::{
-        streaming_operation, ZSTD_buildDefaultSeqTables, ZSTD_decoder_entropy_rep,
+        streaming_operation, ZSTD_checkContinuity, ZSTD_decoder_entropy_rep,
         ZSTD_decompressBlock_internal,
     };
-    ZSTD_buildDefaultSeqTables(dctx);
-    let mut entropy_rep = ZSTD_decoder_entropy_rep::default();
-    ZSTD_decompressBlock_internal(
+    dctx.isFrameDecompression = 0;
+    if dctx.ddict_rep == [0; 3] {
+        dctx.ddict_rep = [1, 4, 8];
+    }
+    ZSTD_checkContinuity(dctx, dst, dst.len());
+    let mut entropy_rep = ZSTD_decoder_entropy_rep {
+        rep: dctx.ddict_rep,
+    };
+    let decoded = ZSTD_decompressBlock_internal(
         dctx,
         &mut entropy_rep,
         dst,
         0,
         src,
         streaming_operation::not_streaming,
-    )
+    );
+    if !crate::common::error::ERR_isError(decoded) {
+        dctx.ddict_rep = entropy_rep.rep;
+        dctx.previousDstEnd = Some(dst.as_ptr() as usize + decoded);
+    }
+    decoded
 }
 
 /// Port of `ZSTD_decompressBlock_deprecated` (zstd_decompress_block.c:2291).
@@ -7335,7 +7576,8 @@ pub fn ZSTD_decompressContinue(dctx: &mut ZSTD_DCtx, dst: &mut [u8], src: &[u8])
     use crate::common::xxhash::{XXH64_digest, XXH64_update};
     use crate::decompress::zstd_decompress_block::{
         blockProperties_t, blockType_e, streaming_operation, ZSTD_blockHeaderSize,
-        ZSTD_decoder_entropy_rep, ZSTD_decompressBlock_internal, ZSTD_getcBlockSize,
+        ZSTD_checkContinuity, ZSTD_decoder_entropy_rep, ZSTD_decompressBlock_internal,
+        ZSTD_getcBlockSize,
     };
 
     let expected_src_size = if matches!(
@@ -7350,6 +7592,8 @@ pub fn ZSTD_decompressContinue(dctx: &mut ZSTD_DCtx, dst: &mut [u8], src: &[u8])
     if src.len() != expected_src_size {
         return ERROR(ErrorCode::SrcSizeWrong);
     }
+
+    ZSTD_checkContinuity(dctx, dst, dst.len());
 
     dctx.processedCSize = dctx.processedCSize.wrapping_add(src.len() as u64);
 
@@ -7464,6 +7708,7 @@ pub fn ZSTD_decompressContinue(dctx: &mut ZSTD_DCtx, dst: &mut [u8], src: &[u8])
             if rSize > dctx.fParams.blockSizeMax as usize {
                 return ERROR(ErrorCode::CorruptionDetected);
             }
+            dctx.previousDstEnd = Some(dst.as_ptr() as usize + rSize);
             dctx.ddict_rep = entropy_rep.rep;
             dctx.decodedSize = dctx.decodedSize.wrapping_add(rSize as u64);
             if dctx.validateChecksum != 0 && rSize > 0 {

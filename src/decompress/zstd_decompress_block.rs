@@ -423,12 +423,10 @@ pub fn ZSTD_decodeSequence(
             let raw = ofBase + ll0 + BIT_readBitsFast(&mut seqState.DStream, 1);
             let mut temp = match raw {
                 1 => prev1,
-                3 => prev0 - 1,
+                3 => prev0.wrapping_sub(1),
                 r if r >= 2 => prev2,
                 _ => prev0,
             };
-            // Zero is invalid; force underflow so ZSTD_execSequence
-            // rejects as corruption.
             if temp == 0 {
                 temp = temp.wrapping_sub(1);
             }
@@ -543,7 +541,7 @@ unsafe fn ZSTD_decodeSequence_bmi2(
             let raw = ofBase + ll0 + BIT_readBitsFast_bmi2(&mut seqState.DStream, 1);
             let mut temp = match raw {
                 1 => prev1,
-                3 => prev0 - 1,
+                3 => prev0.wrapping_sub(1),
                 r if r >= 2 => prev2,
                 _ => prev0,
             };
@@ -659,7 +657,7 @@ macro_rules! ZSTD_decodeSequence_bmi2_inline {
                 let raw = ofBase + ll0 + BIT_readBitsFast_bmi2(&mut $DStream, 1);
                 let mut temp = match raw {
                     1 => $prev1,
-                    3 => $prev0 - 1,
+                    3 => $prev0.wrapping_sub(1),
                     r if r >= 2 => $prev2,
                     _ => $prev0,
                 };
@@ -1624,13 +1622,9 @@ fn ZSTD_blockSizeMax(dctx: &ZSTD_DCtx) -> usize {
     }
 }
 
-/// Allocate the literals buffer. Rust port: always allocate inside
-/// `dctx.litExtraBuffer` (`ZSTD_not_in_dst`). The upstream
-/// optimization of spilling large literals into the tail of `dst`
-/// (`ZSTD_in_dst` / `ZSTD_split`) needs raw pointers into the
-/// caller's buffer and is skipped here — it's a perf-only win,
-/// correctness is unaffected since `ZSTD_execSequence` reads literals
-/// through `dctx.litPtr` regardless of where they live.
+/// Port of `ZSTD_allocateLiteralsBuffer`. Selects the same literal
+/// storage location as upstream: excess room after `dst`, the DCtx
+/// extra buffer, or a split between `dst` and the extra buffer.
 fn ZSTD_allocateLiteralsBuffer(
     dctx: &mut ZSTD_DCtx,
     _dst_len: usize,
@@ -3630,18 +3624,18 @@ pub fn ZSTD_decodeLiteralsBlock(
 
     match litEncType {
         SymbolEncodingType_e::set_repeat | SymbolEncodingType_e::set_compressed => {
-            if srcSize < 5 {
-                return ERROR(ErrorCode::CorruptionDetected);
-            }
             if litEncType == SymbolEncodingType_e::set_repeat && dctx.litEntropy == 0 {
                 return ERROR(ErrorCode::DictionaryCorrupted);
             }
 
             let lhlCode = (src[0] >> 2) & 3;
-            let lhc = MEM_readLE32(&src[..4]);
             let (lhSize, litSize, litCSize, singleStream) = match lhlCode {
                 0 | 1 => {
                     // 2 - 2 - 10 - 10
+                    if srcSize < 3 {
+                        return ERROR(ErrorCode::CorruptionDetected);
+                    }
+                    let lhc = MEM_readLE24(&src[..3]);
                     let singleStream = lhlCode == 0;
                     let lhSize = 3usize;
                     let litSize = ((lhc >> 4) & 0x3FF) as usize;
@@ -3650,6 +3644,10 @@ pub fn ZSTD_decodeLiteralsBlock(
                 }
                 2 => {
                     // 2 - 2 - 14 - 14
+                    if srcSize < 4 {
+                        return ERROR(ErrorCode::CorruptionDetected);
+                    }
+                    let lhc = MEM_readLE32(&src[..4]);
                     let lhSize = 4usize;
                     let litSize = ((lhc >> 4) & 0x3FFF) as usize;
                     let litCSize = (lhc >> 18) as usize;
@@ -3657,6 +3655,10 @@ pub fn ZSTD_decodeLiteralsBlock(
                 }
                 _ => {
                     // 3: 2 - 2 - 18 - 18
+                    if srcSize < 5 {
+                        return ERROR(ErrorCode::CorruptionDetected);
+                    }
+                    let lhc = MEM_readLE32(&src[..4]);
                     let lhSize = 5usize;
                     let litSize = ((lhc >> 4) & 0x3FFFF) as usize;
                     let litCSize = ((lhc >> 22) as usize) + ((src[4] as usize) << 10);
@@ -3854,6 +3856,9 @@ pub fn ZSTD_decodeLiteralsBlock(
             // litPtr = istart + lhSize. The Rust port copies into the
             // owned extraBuffer so downstream code doesn't need to
             // hold `src`'s borrow.
+            if dctx.litExtraBuffer.len() < litSize {
+                dctx.litExtraBuffer.resize(litSize, 0);
+            }
             dctx.litExtraBuffer[..litSize].copy_from_slice(&src[lhSize..lhSize + litSize]);
             dctx.litPtr_from_dst = false;
             dctx.litPtr_offset = 0;
@@ -5093,6 +5098,44 @@ mod tests {
     }
 
     #[test]
+    fn decode_literals_block_basic_large_direct_reference_resizes_copy_buffer() {
+        let lit_size = ZSTD_LITBUFFEREXTRASIZE + 1024;
+        let header = ((lit_size as u32) << 4) | (3 << 2);
+        let mut src = vec![
+            (header & 0xFF) as u8,
+            ((header >> 8) & 0xFF) as u8,
+            ((header >> 16) & 0xFF) as u8,
+        ];
+        src.extend((0..lit_size).map(|i| (i & 0xFF) as u8));
+        src.extend(std::iter::repeat(0).take(WILDCOPY_OVERLENGTH + 1));
+
+        let mut dst = vec![0u8; ZSTD_BLOCKSIZE_MAX + lit_size + WILDCOPY_OVERLENGTH * 2 + 1];
+        let mut dctx = ZSTD_DCtx::new();
+        let rc = ZSTD_decodeLiteralsBlock(
+            &mut dctx,
+            &src,
+            &mut dst,
+            streaming_operation::not_streaming,
+        );
+
+        assert!(
+            !crate::common::error::ERR_isError(rc),
+            "got error: {}",
+            crate::common::error::ERR_getErrorName(rc)
+        );
+        assert_eq!(rc, 3 + lit_size);
+        assert_eq!(dctx.litSize, lit_size);
+        assert_eq!(dctx.litBufferLocation, ZSTD_litLocation_e::ZSTD_not_in_dst);
+        assert!(!dctx.litPtr_from_dst);
+        assert_eq!(dctx.litExtraBuffer.len(), lit_size);
+        assert_eq!(&dctx.litExtraBuffer[..16], &src[3..19]);
+        assert_eq!(
+            &dctx.litExtraBuffer[lit_size - 16..lit_size],
+            &src[3 + lit_size - 16..3 + lit_size]
+        );
+    }
+
+    #[test]
     fn decode_literals_block_rejects_short_input() {
         let mut dctx = ZSTD_DCtx::new();
         let mut dst = [0u8; 16];
@@ -5103,6 +5146,66 @@ mod tests {
             streaming_operation::not_streaming,
         );
         assert!(crate::common::error::ERR_isError(rc));
+    }
+
+    #[test]
+    fn decode_literals_block_compressed_three_byte_header_is_not_rejected_as_too_short() {
+        // set_compressed, lhlCode=0 uses a 3-byte header:
+        // litSize=20, litCSize=0. A one-byte dst should fail with
+        // DstSizeTooSmall after parsing the header, not with the old
+        // unconditional srcSize < 5 corruption check.
+        let lhc = (20u32 << 4) | 2;
+        let src = [
+            (lhc & 0xFF) as u8,
+            ((lhc >> 8) & 0xFF) as u8,
+            ((lhc >> 16) & 0xFF) as u8,
+        ];
+        let mut dst = [0u8; 1];
+        let mut dctx = ZSTD_DCtx::new();
+
+        let rc = ZSTD_decodeLiteralsBlock(
+            &mut dctx,
+            &src,
+            &mut dst,
+            streaming_operation::not_streaming,
+        );
+
+        assert_eq!(rc, ERROR(ErrorCode::DstSizeTooSmall));
+    }
+
+    #[test]
+    fn decode_sequence_rep0_minus_one_zero_forces_invalid_offset() {
+        let mut seq_state = seqState_t {
+            DStream: crate::common::bitstream::BIT_DStream_t {
+                bitContainer: 1usize << (usize::BITS - 1),
+                bitsConsumed: 0,
+                ptr: 0,
+                start: 0,
+                limitPtr: 0,
+                src: &[],
+            },
+            stateLL: ZSTD_fseState::default(),
+            stateOffb: ZSTD_fseState::default(),
+            stateML: ZSTD_fseState::default(),
+            prevOffset: [1, 7, 9],
+        };
+        let ll_table = [ZSTD_seqSymbol {
+            baseValue: 0,
+            ..ZSTD_seqSymbol::default()
+        }];
+        let of_table = [ZSTD_seqSymbol {
+            baseValue: 1,
+            nbAdditionalBits: 1,
+            ..ZSTD_seqSymbol::default()
+        }];
+        let ml_table = [ZSTD_seqSymbol::default()];
+
+        let seq = ZSTD_decodeSequence(&mut seq_state, &ll_table, &of_table, &ml_table, true);
+
+        assert_eq!(seq.offset, usize::MAX);
+        assert_eq!(seq_state.prevOffset[0], usize::MAX);
+        assert_eq!(seq_state.prevOffset[1], 1);
+        assert_eq!(seq_state.prevOffset[2], 7);
     }
 
     #[test]

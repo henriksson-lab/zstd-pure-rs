@@ -544,12 +544,13 @@ pub fn ZSTD_compressBlock_doubleFast_dictMatchState_generic(
     let dictEndIndex = dms.window.nextSrc;
     let dictBaseOff = dms.window.base_offset;
     let dictStart = dictStartIndex.saturating_sub(dictBaseOff) as usize;
-    let dictSize = dictEndIndex.saturating_sub(dictBaseOff);
-    let dictIndexDelta = prefixLowestIndex.saturating_sub(dictSize);
+    let dictIndexDelta = prefixLowestIndex.saturating_sub(dictEndIndex);
     let dictHBitsL = dms.cParams.hashLog + ZSTD_SHORT_CACHE_TAG_BITS;
     let dictHBitsS = dms.cParams.chainLog + ZSTD_SHORT_CACHE_TAG_BITS;
+    let parseStart = 0usize;
+    let prefixLength = parseStart.saturating_sub(prefixLowest) as u32;
     let dictAndPrefixLength =
-        (src.len() as u32).wrapping_add(dictEndIndex.saturating_sub(dictStartIndex));
+        prefixLength.wrapping_add(dictEndIndex.saturating_sub(dictStartIndex));
     let maxDistance = if cParams.windowLog >= 31 {
         u32::MAX
     } else {
@@ -589,7 +590,7 @@ pub fn ZSTD_compressBlock_doubleFast_dictMatchState_generic(
     let ilimit = iend.saturating_sub(HASH_READ_SIZE);
     let mut offset_1 = rep[0];
     let mut offset_2 = rep[1];
-    let mut ip = usize::from(dictAndPrefixLength == 0);
+    let mut ip = parseStart + usize::from(dictAndPrefixLength == 0);
     let mut anchor = 0usize;
 
     while ip < ilimit {
@@ -1531,6 +1532,47 @@ mod tests {
             !seq.sequences.is_empty(),
             "dictMatchState path failed to emit any sequences"
         );
+    }
+
+    #[test]
+    fn double_fast_dict_match_state_clamps_repcodes_to_current_prefix_and_dict() {
+        let dict: Vec<u8> = (0..64u8).collect();
+        let src: Vec<u8> = (128..152u8).collect();
+
+        let cp = ZSTD_compressionParameters {
+            windowLog: 17,
+            hashLog: 12,
+            chainLog: 12,
+            minMatch: 4,
+            strategy: 2,
+            ..Default::default()
+        };
+
+        let mut dms = ZSTD_MatchState_t::new(cp);
+        dms.dictContent = dict.clone();
+        dms.window.nextSrc = dms.window.base_offset.wrapping_add(dict.len() as u32);
+        ZSTD_fillDoubleHashTableForCDict(
+            &mut dms,
+            &dict,
+            ZSTD_dictTableLoadMethod_e::ZSTD_dtlm_full,
+        );
+
+        let mut ms = ZSTD_MatchState_t::new(cp);
+        ms.dictMatchState = Some(Box::new(dms));
+        ms.window.base_offset =
+            crate::compress::match_state::ZSTD_WINDOW_START_INDEX.wrapping_add(dict.len() as u32);
+        ms.window.dictLimit = ms.window.base_offset;
+        ms.window.lowLimit = ms.window.base_offset;
+        ms.nextToUpdate = ms.window.base_offset;
+        ms.loadedDictEnd = dict.len() as u32;
+
+        let mut seq = SeqStore_t::with_capacity(16, 1024);
+        let mut rep = [u32::MAX, u32::MAX - 1, 8];
+        let _last_lits =
+            ZSTD_compressBlock_doubleFast_dictMatchState(&mut ms, &mut seq, &mut rep, &src);
+
+        assert_eq!(rep[0], dict.len() as u32);
+        assert_eq!(rep[1], dict.len() as u32);
     }
 
     #[test]

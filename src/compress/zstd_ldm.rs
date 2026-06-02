@@ -626,15 +626,12 @@ pub fn ZSTD_ldm_limitTableUpdate(ms: &mut ZSTD_MatchState_t, curr: u32) {
 
 /// Port of `ZSTD_ldm_generateSequences_internal`.
 ///
-/// Upstream takes `void const* src + size_t srcSize` and a window-base
-/// pointer; the port here takes a `window_buf` view of the whole
-/// window plus `ip_pos` / `iend_pos` offsets into it. `entry.offset`
-/// fields are buffer-relative indexes into `window_buf`, matching
-/// upstream's `split - window.base` semantics.
-///
-/// `lowestIndex` is the minimum valid buffer offset in the active
-/// search domain. When an ext-dict is attached, this is
-/// `ldmState.window.lowLimit`; otherwise it is `dictLimit`.
+/// Upstream takes `void const* src + size_t srcSize` plus the window
+/// base pointers. The port here takes a `window_buf` view plus
+/// `ip_pos` / `iend_pos` positions in that buffer. Hash-table
+/// `entry.offset` values remain upstream indexes (`ptr - base`), so
+/// this function converts through `window.base_offset` /
+/// `window.dictBase_offset` only when indexing `window_buf`.
 ///
 /// Returns the number of unconsumed literal bytes between the last
 /// emitted sequence's anchor and `iend_pos` (upstream's `iend - anchor`).
@@ -646,7 +643,7 @@ pub fn ZSTD_ldm_generateSequences_internal(
     window_buf: &[u8],
     ip_pos: usize,
     iend_pos: usize,
-    lowestIndex: u32,
+    _lowestIndex: u32,
 ) -> usize {
     let minMatchLength = params.minMatchLength as usize;
     let entsPerBucket = 1u32 << params.bucketSizeLog;
@@ -657,19 +654,22 @@ pub fn ZSTD_ldm_generateSequences_internal(
         (1u32 << hBits) - 1
     };
     let extDict = ZSTD_window_hasExtDict(&ldmState.window);
-    let dictLimit = ldmState.window.dictLimit as usize;
-    let lowestIndex = lowestIndex as usize;
-    let lowPrefixPtr = dictLimit;
+    let base_offset = ldmState.window.base_offset;
+    let dictBase_offset = ldmState.window.dictBase_offset;
+    let dictLimit = ldmState.window.dictLimit;
+    let lowestIndex = if extDict {
+        ldmState.window.lowLimit
+    } else {
+        dictLimit
+    };
+    let lowPrefixPtr = dictLimit.saturating_sub(base_offset) as usize;
     let dictStart = if extDict {
-        ldmState
-            .window
-            .lowLimit
-            .saturating_sub(ldmState.window.dictBase_offset) as usize
+        ldmState.window.lowLimit.saturating_sub(dictBase_offset) as usize
     } else {
         0
     };
     let dictEnd = if extDict {
-        dictLimit.saturating_sub(ldmState.window.dictBase_offset as usize)
+        dictLimit.saturating_sub(dictBase_offset) as usize
     } else {
         0
     };
@@ -712,12 +712,13 @@ pub fn ZSTD_ldm_generateSequences_internal(
         // &mut bucketOffsets + &candidates_scratch awkward.
         for &split in splits.iter().take(numSplits as usize) {
             let split_pos = ip + split - minMatchLength;
+            let split_index = base_offset.wrapping_add(split_pos as u32);
             let xxhash = XXH64(&window_buf[split_pos..split_pos + minMatchLength], 0);
             let hash = (xxhash as u32) & hashMask;
             let checksum = (xxhash >> 32) as u32;
 
             let newEntry = ldmEntry_t {
-                offset: split_pos as u32,
+                offset: split_index,
                 checksum,
             };
 
@@ -739,22 +740,18 @@ pub fn ZSTD_ldm_generateSequences_internal(
 
             for k in 0..entsPerBucket as usize {
                 let cur = ldmState.hashTable[bucket_base + k];
-                if cur.checksum != checksum || cur.offset as usize <= lowestIndex {
+                if cur.checksum != checksum || cur.offset <= lowestIndex {
                     continue;
                 }
                 let (cur_fwd, cur_bwd) = if extDict {
-                    let curMatchBase = if cur.offset < ldmState.window.dictLimit {
-                        0usize
+                    let match_in_dict = cur.offset < dictLimit;
+                    let pMatch = if match_in_dict {
+                        cur.offset.saturating_sub(dictBase_offset) as usize
                     } else {
-                        1usize
+                        cur.offset.saturating_sub(base_offset) as usize
                     };
-                    let pMatch = if curMatchBase == 0 {
-                        cur.offset.saturating_sub(ldmState.window.dictBase_offset) as usize
-                    } else {
-                        cur.offset.saturating_sub(ldmState.window.base_offset) as usize
-                    };
-                    let matchEnd = if curMatchBase == 0 { dictEnd } else { iend_pos };
-                    let lowMatchPtr = if curMatchBase == 0 {
+                    let matchEnd = if match_in_dict { dictEnd } else { iend_pos };
+                    let lowMatchPtr = if match_in_dict {
                         dictStart
                     } else {
                         lowPrefixPtr
@@ -784,7 +781,7 @@ pub fn ZSTD_ldm_generateSequences_internal(
                     );
                     (cur_fwd, cur_bwd)
                 } else {
-                    let pMatch = cur.offset as usize;
+                    let pMatch = cur.offset.saturating_sub(base_offset) as usize;
                     let cur_fwd = ZSTD_count(window_buf, split_pos, pMatch, iend_pos);
                     if cur_fwd < minMatchLength {
                         continue;
@@ -795,7 +792,7 @@ pub fn ZSTD_ldm_generateSequences_internal(
                         anchor,
                         window_buf,
                         pMatch,
-                        lowestIndex,
+                        lowPrefixPtr,
                     );
                     (cur_fwd, cur_bwd)
                 };
@@ -816,16 +813,14 @@ pub fn ZSTD_ldm_generateSequences_internal(
 
             // Emit sequence. Out of storage → error.
             if rawSeqStore.size == rawSeqStore.capacity {
-                // Signal by leaving unconsumed input; upstream returns
-                // dstSize_tooSmall, but we don't have a dst pointer —
-                // surface via caller detecting anchor < iend_pos and
-                // rawSeqStore.size == capacity.
-                return iend_pos - anchor;
+                return crate::common::error::ERROR(
+                    crate::common::error::ErrorCode::DstSizeTooSmall,
+                );
             }
             let seq = &mut rawSeqStore.seq[rawSeqStore.size];
             seq.litLength = (split_pos - backward_len - anchor) as u32;
             seq.matchLength = best_total as u32;
-            seq.offset = (split_pos as u32).wrapping_sub(matched_offset);
+            seq.offset = split_index.wrapping_sub(matched_offset);
             rawSeqStore.size += 1;
 
             // Insert only after reading the bucket — safe to do so
@@ -959,8 +954,9 @@ pub fn ZSTD_ldm_skipSequences(rawSeqStore: &mut RawSeqStore_t, mut srcSize: usiz
 /// emitted by the next.
 ///
 /// `window_buf` covers the full compressor window; `src_pos` /
-/// `src_end` are offsets into it. `lowestIndex` is the minimum valid
-/// buffer offset (upstream's `ldmState->window.dictLimit`).
+/// `src_end` are offsets into it. Window maintenance calls receive
+/// upstream indexes (`ptr - base`), computed from
+/// `ldmState.window.base_offset + buffer_pos`.
 #[allow(clippy::too_many_arguments)]
 pub fn ZSTD_ldm_generateSequences(
     ldmState: &mut ldmState_t,
@@ -977,10 +973,8 @@ pub fn ZSTD_ldm_generateSequences(
     let nbChunks = srcSize.div_ceil(K_MAX_CHUNK_SIZE).max(1);
     let mut leftoverSize: usize = 0;
 
-    for chunk in 0..nbChunks {
-        if sequences.size >= sequences.capacity {
-            break;
-        }
+    let mut chunk = 0;
+    while chunk < nbChunks && sequences.size < sequences.capacity {
         let chunkStart = src_pos + chunk * K_MAX_CHUNK_SIZE;
         if chunkStart >= src_end {
             break;
@@ -993,8 +987,8 @@ pub fn ZSTD_ldm_generateSequences(
         };
         let chunkSize = chunkEnd - chunkStart;
         let prevSize = sequences.size;
-        let chunkStartAbs = chunkStart as u32;
-        let chunkEndAbs = chunkEnd as u32;
+        let chunkStartAbs = ldmState.window.base_offset.wrapping_add(chunkStart as u32);
+        let mut chunkEndAbs = ldmState.window.base_offset.wrapping_add(chunkEnd as u32);
 
         if ZSTD_window_needOverflowCorrection(
             &ldmState.window,
@@ -1008,6 +1002,7 @@ pub fn ZSTD_ldm_generateSequences(
                 ZSTD_window_correctOverflow(&mut ldmState.window, 0, maxDist, chunkStartAbs);
             ZSTD_ldm_reduceTable(&mut ldmState.hashTable, correction);
             ldmState.loadedDictEnd = 0;
+            chunkEndAbs = ldmState.window.base_offset.wrapping_add(chunkEnd as u32);
         }
 
         ZSTD_window_enforceMaxDist(
@@ -1017,11 +1012,6 @@ pub fn ZSTD_ldm_generateSequences(
             &mut ldmState.loadedDictEnd,
         );
 
-        let chunkLowest = if ZSTD_window_hasExtDict(&ldmState.window) {
-            ldmState.window.lowLimit
-        } else {
-            lowestIndex
-        };
         let newLeftoverSize = ZSTD_ldm_generateSequences_internal(
             ldmState,
             sequences,
@@ -1029,8 +1019,11 @@ pub fn ZSTD_ldm_generateSequences(
             window_buf,
             chunkStart,
             chunkEnd,
-            chunkLowest,
+            lowestIndex,
         );
+        if crate::common::error::ERR_isError(newLeftoverSize) {
+            return newLeftoverSize;
+        }
 
         if prevSize < sequences.size {
             sequences.seq[prevSize].litLength = sequences.seq[prevSize]
@@ -1041,6 +1034,7 @@ pub fn ZSTD_ldm_generateSequences(
             debug_assert_eq!(newLeftoverSize, chunkSize);
             leftoverSize += chunkSize;
         }
+        chunk += 1;
     }
     0
 }
@@ -1059,6 +1053,7 @@ pub fn ZSTD_ldm_blockCompress(
     seqStore: &mut crate::compress::seq_store::SeqStore_t,
     rep: &mut [u32; 3],
     src: &[u8],
+    useRowMatchFinder: ZSTD_ParamSwitch_e,
 ) -> usize {
     use crate::compress::match_state::ZSTD_matchState_dictMode;
     use crate::compress::seq_store::{ZSTD_storeSeq, ZSTD_updateRep, OFFSET_TO_OFFBASE};
@@ -1068,7 +1063,7 @@ pub fn ZSTD_ldm_blockCompress(
     let minMatch = cParams.minMatch;
     let blockCompressor = ZSTD_selectBlockCompressor(
         cParams.strategy,
-        ZSTD_ParamSwitch_e::ZSTD_ps_disable,
+        useRowMatchFinder,
         ZSTD_matchState_dictMode(ms),
     );
     let istart = 0usize;
@@ -1086,6 +1081,7 @@ pub fn ZSTD_ldm_blockCompress(
     debug_assert!(rawSeqStore.pos <= rawSeqStore.size);
     debug_assert!(rawSeqStore.size <= rawSeqStore.capacity);
 
+    let block_base = ms.window.base_offset;
     while rawSeqStore.pos < rawSeqStore.size && ip < iend {
         let sequence = maybeSplitSequence(rawSeqStore, (iend - ip) as u32, minMatch);
         if sequence.offset == 0 {
@@ -1095,15 +1091,14 @@ pub fn ZSTD_ldm_blockCompress(
             return crate::common::error::ERROR(crate::common::error::ErrorCode::Generic);
         }
 
-        ZSTD_ldm_limitTableUpdate(ms, ip as u32);
-        ZSTD_ldm_fillFastTables(ms, &src[..ip + sequence.litLength as usize]);
+        ZSTD_ldm_limitTableUpdate(ms, block_base.wrapping_add(ip as u32));
+        ZSTD_ldm_fillFastTables(ms, &src[..ip]);
 
-        let newLitLength = blockCompressor(
-            ms,
-            seqStore,
-            rep,
-            &src[ip..ip + sequence.litLength as usize],
-        );
+        let literal_start = ip;
+        let literal_end = ip + sequence.litLength as usize;
+        ms.window.base_offset = block_base.wrapping_add(literal_start as u32);
+        let newLitLength = blockCompressor(ms, seqStore, rep, &src[literal_start..literal_end]);
+        ms.window.base_offset = block_base;
         if crate::common::error::ERR_isError(newLitLength) {
             return newLitLength;
         }
@@ -1119,9 +1114,12 @@ pub fn ZSTD_ldm_blockCompress(
         ip += sequence.matchLength as usize;
     }
 
-    ZSTD_ldm_limitTableUpdate(ms, ip as u32);
+    ZSTD_ldm_limitTableUpdate(ms, block_base.wrapping_add(ip as u32));
     ZSTD_ldm_fillFastTables(ms, &src[..ip]);
-    blockCompressor(ms, seqStore, rep, &src[ip..])
+    ms.window.base_offset = block_base.wrapping_add(ip as u32);
+    let lastLLSize = blockCompressor(ms, seqStore, rep, &src[ip..]);
+    ms.window.base_offset = block_base;
+    lastLLSize
 }
 
 #[cfg(test)]
@@ -1512,6 +1510,31 @@ mod tests {
     }
 
     #[test]
+    fn generateSequences_internal_errors_when_raw_seq_store_is_full() {
+        let block: Vec<u8> = (0..200u32)
+            .map(|i| ((i.wrapping_mul(2654435761)) >> 24) as u8)
+            .collect();
+        let filler: Vec<u8> = (0..70_000u32)
+            .map(|i| ((i.wrapping_mul(0xDEADBEEFu32).wrapping_add(1)) >> 16) as u8)
+            .collect();
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&block);
+        buf.extend_from_slice(&filler);
+        buf.extend_from_slice(&block);
+
+        let lp = ldm_params_for(3);
+        let mut st = ldmState_t::new(&lp);
+        let mut store = RawSeqStore_t::with_capacity(0);
+        let rc =
+            ZSTD_ldm_generateSequences_internal(&mut st, &mut store, &lp, &buf, 0, buf.len(), 0);
+
+        assert_eq!(
+            crate::common::error::ERR_getErrorCode(rc),
+            crate::common::error::ErrorCode::DstSizeTooSmall
+        );
+    }
+
+    #[test]
     fn generateSequences_prefixOnly_no_match_on_random() {
         // Random buffer — LDM shouldn't produce sequences with very
         // long match lengths (anything over minMatch is a spurious
@@ -1534,6 +1557,73 @@ mod tests {
                 .sum::<u64>()
                 + leftover as u64,
             buf.len() as u64,
+        );
+    }
+
+    #[test]
+    fn generateSequences_internal_uses_base_relative_offsets_with_nonzero_base() {
+        let block = b"abcdefghijklmnop".repeat(8);
+        let filler: Vec<u8> = (0..70_000u32)
+            .map(|i| ((i.wrapping_mul(0x9E3779B1).wrapping_add(17)) >> 16) as u8)
+            .collect();
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&block);
+        buf.extend_from_slice(&filler);
+        buf.extend_from_slice(&block);
+
+        let lp = ldm_params_for(3);
+        let mut st_zero = ldmState_t::new(&lp);
+        st_zero.window.base_offset = 0;
+        st_zero.window.dictLimit = 0;
+        st_zero.window.lowLimit = 0;
+        st_zero.window.nextSrc = buf.len() as u32;
+        let mut store_zero = RawSeqStore_t::with_capacity(1024);
+        let leftover_zero = ZSTD_ldm_generateSequences_internal(
+            &mut st_zero,
+            &mut store_zero,
+            &lp,
+            &buf,
+            0,
+            buf.len(),
+            0,
+        );
+
+        let mut st_shifted = ldmState_t::new(&lp);
+        st_shifted.window.base_offset = 10_000;
+        st_shifted.window.dictLimit = st_shifted.window.base_offset;
+        st_shifted.window.lowLimit = st_shifted.window.base_offset;
+        st_shifted.window.nextSrc = st_shifted.window.base_offset.wrapping_add(buf.len() as u32);
+        let mut store_shifted = RawSeqStore_t::with_capacity(1024);
+        let lowest = st_shifted.window.dictLimit;
+        let leftover_shifted = ZSTD_ldm_generateSequences_internal(
+            &mut st_shifted,
+            &mut store_shifted,
+            &lp,
+            &buf,
+            0,
+            buf.len(),
+            lowest,
+        );
+
+        assert_eq!(leftover_shifted, leftover_zero);
+        assert_eq!(store_shifted.size, store_zero.size);
+        for (shifted, zero) in store_shifted.seq[..store_shifted.size]
+            .iter()
+            .zip(store_zero.seq[..store_zero.size].iter())
+        {
+            assert_eq!(shifted.litLength, zero.litLength);
+            assert_eq!(shifted.matchLength, zero.matchLength);
+            assert_eq!(
+                shifted.offset, zero.offset,
+                "non-zero base should not change emitted raw sequence distances"
+            );
+        }
+        assert!(
+            st_shifted
+                .hashTable
+                .iter()
+                .any(|e| e.offset >= st_shifted.window.base_offset && e.checksum != 0),
+            "stored table offsets must stay in upstream base-relative coordinate space"
         );
     }
 
@@ -1762,6 +1852,59 @@ mod tests {
     }
 
     #[test]
+    fn generateSequences_outer_stops_when_full_at_chunk_boundary() {
+        const CHUNK_SIZE: usize = 1 << 20;
+
+        let block: Vec<u8> = (0..200u32)
+            .map(|i| ((i.wrapping_mul(2654435761)) >> 24) as u8)
+            .collect();
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&block);
+        let first_filler: Vec<u8> = (0..70_000u32)
+            .map(|i| ((i.wrapping_mul(0xDEADBEEFu32).wrapping_add(1)) >> 16) as u8)
+            .collect();
+        buf.extend_from_slice(&first_filler);
+        buf.extend_from_slice(&block);
+
+        let padding_len = CHUNK_SIZE - buf.len();
+        let padding: Vec<u8> = (0..padding_len as u32)
+            .map(|i| ((i.wrapping_mul(0x9E3779B1).wrapping_add(17)) >> 16) as u8)
+            .collect();
+        buf.extend_from_slice(&padding);
+
+        let second_filler: Vec<u8> = (0..70_000u32)
+            .map(|i| ((i.wrapping_mul(0xA511E9B3).wrapping_add(29)) >> 16) as u8)
+            .collect();
+        buf.extend_from_slice(&block);
+        buf.extend_from_slice(&second_filler);
+        buf.extend_from_slice(&block);
+
+        let lp = ldm_params_for(3);
+        let mut probe_st = ldmState_t::new(&lp);
+        let mut probe_store = RawSeqStore_t::with_capacity(4096);
+        let probe_rc = ZSTD_ldm_generateSequences(
+            &mut probe_st,
+            &mut probe_store,
+            &lp,
+            &buf,
+            0,
+            CHUNK_SIZE,
+            0,
+        );
+        assert_eq!(probe_rc, 0);
+        assert!(probe_store.size > 0);
+
+        let mut st = ldmState_t::new(&lp);
+        let mut store = RawSeqStore_t::with_capacity(probe_store.size);
+
+        let rc = ZSTD_ldm_generateSequences(&mut st, &mut store, &lp, &buf, 0, buf.len(), 0);
+
+        assert_eq!(store.size, store.capacity);
+        assert_eq!(rc, 0);
+    }
+
+    #[test]
     fn raw_seq_store_with_capacity_is_empty() {
         let s = RawSeqStore_t::with_capacity(128);
         assert_eq!(s.capacity, 128);
@@ -1829,7 +1972,14 @@ mod tests {
         });
         let mut seq = SeqStore_t::with_capacity(16, 256);
         let mut rep = [1u32, 4, 8];
-        let rc = ZSTD_ldm_blockCompress(&mut store, &mut ms, &mut seq, &mut rep, b"x");
+        let rc = ZSTD_ldm_blockCompress(
+            &mut store,
+            &mut ms,
+            &mut seq,
+            &mut rep,
+            b"x",
+            ZSTD_ParamSwitch_e::ZSTD_ps_disable,
+        );
         assert_eq!(rc, 1);
     }
 
@@ -1858,7 +2008,14 @@ mod tests {
         let mut rep = [1u32, 4, 8];
         let src = b"abcdEFGHIJKLMNOPQRST";
 
-        let trailing = ZSTD_ldm_blockCompress(&mut store, &mut ms, &mut seq, &mut rep, src);
+        let trailing = ZSTD_ldm_blockCompress(
+            &mut store,
+            &mut ms,
+            &mut seq,
+            &mut rep,
+            src,
+            ZSTD_ParamSwitch_e::ZSTD_ps_disable,
+        );
 
         assert!(
             store.pos >= store.size,
@@ -1872,6 +2029,55 @@ mod tests {
         let seq_len = ZSTD_getSequenceLength(&seq, ldm_idx);
         assert_eq!(seq_len.matchLength, 8);
         assert!(trailing <= src.len());
+    }
+
+    #[test]
+    fn blockCompress_restores_nonzero_base_after_ldm_subblocks() {
+        use crate::compress::match_state::{ZSTD_MatchState_t, ZSTD_compressionParameters};
+        use crate::compress::seq_store::{SeqStore_t, OFFSET_TO_OFFBASE};
+
+        let mut store = RawSeqStore_t::with_capacity(2);
+        store.seq[0] = rawSeq {
+            offset: 16,
+            litLength: 8,
+            matchLength: 16,
+        };
+        store.size = 1;
+
+        let mut ms = ZSTD_MatchState_t::new(ZSTD_compressionParameters {
+            windowLog: 20,
+            hashLog: 10,
+            chainLog: 10,
+            minMatch: 4,
+            strategy: ZSTD_fast,
+            ..Default::default()
+        });
+        ms.window.base_offset = 10_000;
+        ms.window.dictLimit = ms.window.base_offset;
+        ms.window.lowLimit = ms.window.base_offset;
+        ms.window.nextSrc = ms.window.base_offset + 64;
+        ms.nextToUpdate = ms.window.base_offset;
+        let mut seq = SeqStore_t::with_capacity(16, 256);
+        let mut rep = [1u32, 4, 8];
+        let src = b"abcdefghabcdefghabcdefghabcdefghabcdefghabcdefgh";
+
+        let trailing = ZSTD_ldm_blockCompress(
+            &mut store,
+            &mut ms,
+            &mut seq,
+            &mut rep,
+            src,
+            ZSTD_ParamSwitch_e::ZSTD_ps_disable,
+        );
+
+        assert_eq!(ms.window.base_offset, 10_000);
+        assert!(trailing <= src.len());
+        assert!(
+            seq.sequences
+                .iter()
+                .any(|s| s.offBase == OFFSET_TO_OFFBASE(16)),
+            "queued LDM sequence should still be emitted with shifted block coordinates"
+        );
     }
 
     #[test]
@@ -1909,7 +2115,14 @@ mod tests {
         let mut rep = [1u32, 4, 8];
         let src = b"abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 
-        let trailing = ZSTD_ldm_blockCompress(&mut store, &mut ms, &mut seq, &mut rep, src);
+        let trailing = ZSTD_ldm_blockCompress(
+            &mut store,
+            &mut ms,
+            &mut seq,
+            &mut rep,
+            src,
+            ZSTD_ParamSwitch_e::ZSTD_ps_disable,
+        );
 
         assert!(trailing < src.len(), "btopt should use the LDM candidate");
         assert!(

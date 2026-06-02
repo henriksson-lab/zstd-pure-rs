@@ -15,8 +15,8 @@
 
 use crate::common::bits::ZSTD_highbit32;
 use crate::common::bitstream::{
-    BIT_DStream_overflow, BIT_DStream_t, BIT_DStream_unfinished, BIT_endOfDStream, BIT_initDStream,
-    BIT_readBits, BIT_readBitsFast, BIT_reloadDStream,
+    BIT_DStream_overflow, BIT_DStream_t, BIT_DStream_unfinished, BIT_initDStream, BIT_readBits,
+    BIT_readBitsFast, BIT_reloadDStream,
 };
 use crate::common::error::{ErrorCode, ERROR};
 
@@ -47,6 +47,28 @@ pub const fn FSE_DTABLE_SIZE_U32(maxTableLog: u32) -> usize {
 #[inline(always)]
 pub const fn FSE_BUILD_DTABLE_WKSP_SIZE(maxTableLog: u32, maxSymbolValue: u32) -> usize {
     2 * (maxSymbolValue as usize + 1) + (1 << maxTableLog as usize) + 8
+}
+
+/// Upstream `FSE_BUILD_DTABLE_WKSP_SIZE_U32`.
+#[inline(always)]
+const fn FSE_BUILD_DTABLE_WKSP_SIZE_U32(maxTableLog: u32, maxSymbolValue: u32) -> usize {
+    FSE_BUILD_DTABLE_WKSP_SIZE(maxTableLog, maxSymbolValue).div_ceil(4)
+}
+
+/// Upstream `FSE_DECOMPRESS_WKSP_SIZE_U32`.
+#[inline(always)]
+const fn FSE_DECOMPRESS_WKSP_SIZE_U32(maxTableLog: u32, maxSymbolValue: u32) -> usize {
+    FSE_DTABLE_SIZE_U32(maxTableLog)
+        + 1
+        + FSE_BUILD_DTABLE_WKSP_SIZE_U32(maxTableLog, maxSymbolValue)
+        + ((FSE_MAX_SYMBOL_VALUE + 1) as usize) / 2
+        + 1
+}
+
+/// Upstream `FSE_DECOMPRESS_WKSP_SIZE`.
+#[inline(always)]
+const fn FSE_DECOMPRESS_WKSP_SIZE(maxTableLog: u32, maxSymbolValue: u32) -> usize {
+    FSE_DECOMPRESS_WKSP_SIZE_U32(maxTableLog, maxSymbolValue) * 4
 }
 
 pub type FSE_DTable = u32;
@@ -413,9 +435,14 @@ fn FSE_decompress_usingDTable_generic<const FAST: bool>(
         op += 4;
     }
 
+    #[inline(always)]
+    fn tail_has_room_for_two(op: usize, omax: usize) -> bool {
+        omax >= 2 && op <= omax - 2
+    }
+
     // Tail.
     loop {
-        if op > omax - 2 {
+        if !tail_has_room_for_two(op, omax) {
             return ERROR(ErrorCode::DstSizeTooSmall);
         }
         dst[op] = get::<FAST>(&mut s1, &mut bitD, dt);
@@ -425,7 +452,7 @@ fn FSE_decompress_usingDTable_generic<const FAST: bool>(
             op += 1;
             break;
         }
-        if op > omax - 2 {
+        if !tail_has_room_for_two(op, omax) {
             return ERROR(ErrorCode::DstSizeTooSmall);
         }
         dst[op] = get::<FAST>(&mut s2, &mut bitD, dt);
@@ -437,7 +464,6 @@ fn FSE_decompress_usingDTable_generic<const FAST: bool>(
         }
     }
 
-    let _ = BIT_endOfDStream; // keep the symbol referenced
     op
 }
 
@@ -503,6 +529,9 @@ pub fn FSE_decompress_wksp_bmi2(
         return NCountLength;
     }
     if tableLog > maxLog {
+        return ERROR(ErrorCode::TableLogTooLarge);
+    }
+    if FSE_DECOMPRESS_WKSP_SIZE(tableLog, maxSymbolValue) > workSpace.len() {
         return ERROR(ErrorCode::TableLogTooLarge);
     }
     let cSrcSize = cSrc.len();
@@ -590,5 +619,156 @@ mod tests {
             &mut dt_short,
             3
         )));
+    }
+
+    #[test]
+    fn build_dtable_workspace_size_u32_matches_upstream_boundaries() {
+        assert_eq!(FSE_BUILD_DTABLE_WKSP_SIZE(0, 0), 11);
+        assert_eq!(FSE_BUILD_DTABLE_WKSP_SIZE_U32(0, 0), 3);
+
+        assert_eq!(FSE_BUILD_DTABLE_WKSP_SIZE(0, 1), 13);
+        assert_eq!(FSE_BUILD_DTABLE_WKSP_SIZE_U32(0, 1), 4);
+
+        assert_eq!(
+            FSE_BUILD_DTABLE_WKSP_SIZE(FSE_MIN_TABLELOG, FSE_MAX_SYMBOL_VALUE),
+            552
+        );
+        assert_eq!(
+            FSE_BUILD_DTABLE_WKSP_SIZE_U32(FSE_MIN_TABLELOG, FSE_MAX_SYMBOL_VALUE),
+            138
+        );
+
+        assert_eq!(
+            FSE_BUILD_DTABLE_WKSP_SIZE(FSE_MAX_TABLELOG, FSE_MAX_SYMBOL_VALUE),
+            4616
+        );
+        assert_eq!(
+            FSE_BUILD_DTABLE_WKSP_SIZE_U32(FSE_MAX_TABLELOG, FSE_MAX_SYMBOL_VALUE),
+            1154
+        );
+
+        assert_eq!(
+            FSE_BUILD_DTABLE_WKSP_SIZE(FSE_TABLELOG_ABSOLUTE_MAX, FSE_MAX_SYMBOL_VALUE),
+            33288
+        );
+        assert_eq!(
+            FSE_BUILD_DTABLE_WKSP_SIZE_U32(FSE_TABLELOG_ABSOLUTE_MAX, FSE_MAX_SYMBOL_VALUE),
+            8322
+        );
+
+        assert_eq!(
+            FSE_BUILD_DTABLE_WKSP_SIZE(FSE_TABLELOG_ABSOLUTE_MAX, 0),
+            32778
+        );
+        assert_eq!(
+            FSE_BUILD_DTABLE_WKSP_SIZE_U32(FSE_TABLELOG_ABSOLUTE_MAX, 0),
+            8195
+        );
+    }
+
+    #[test]
+    fn decompress_workspace_size_uses_build_dtable_u32_size() {
+        assert_eq!(
+            FSE_DECOMPRESS_WKSP_SIZE_U32(FSE_MIN_TABLELOG, FSE_MAX_SYMBOL_VALUE),
+            301
+        );
+        assert_eq!(
+            FSE_DECOMPRESS_WKSP_SIZE(FSE_MIN_TABLELOG, FSE_MAX_SYMBOL_VALUE),
+            1204
+        );
+
+        assert_eq!(
+            FSE_DECOMPRESS_WKSP_SIZE_U32(FSE_MAX_TABLELOG, FSE_MAX_SYMBOL_VALUE),
+            5381
+        );
+        assert_eq!(
+            FSE_DECOMPRESS_WKSP_SIZE(FSE_MAX_TABLELOG, FSE_MAX_SYMBOL_VALUE),
+            21524
+        );
+
+        assert_eq!(
+            FSE_DECOMPRESS_WKSP_SIZE_U32(FSE_TABLELOG_ABSOLUTE_MAX, FSE_MAX_SYMBOL_VALUE),
+            41221
+        );
+        assert_eq!(
+            FSE_DECOMPRESS_WKSP_SIZE(FSE_TABLELOG_ABSOLUTE_MAX, FSE_MAX_SYMBOL_VALUE),
+            164884
+        );
+    }
+
+    #[test]
+    fn decompress_using_dtable_rejects_tiny_dst_without_underflow() {
+        let mut dt = vec![0u32; 2];
+        assert_eq!(FSE_buildDTable_rle(&mut dt, b'x'), 0);
+        let src = [1u8];
+
+        for cap in 0..2 {
+            let mut dst = vec![0u8; cap];
+            let rc = FSE_decompress_usingDTable(&mut dst, &src, &dt);
+            assert_eq!(
+                crate::common::error::ERR_getErrorCode(rc),
+                ErrorCode::DstSizeTooSmall
+            );
+        }
+    }
+
+    #[test]
+    fn decompress_wksp_rejects_workspace_after_ncount_but_before_heap_allocations() {
+        use crate::compress::fse_compress::{
+            FSE_NCountWriteBound, FSE_buildCTable_wksp, FSE_compressBound,
+            FSE_compress_usingCTable, FSE_normalizeCount, FSE_optimalTableLog, FSE_writeNCount,
+            FSE_CTABLE_SIZE_U32,
+        };
+        use crate::compress::hist::HIST_count_simple;
+
+        let src: Vec<u8> = b"ababcabcabaaaaabcbcbcbaaaa".to_vec();
+        let mut count = [0u32; 256];
+        let mut maxSymbolValue = 255;
+        assert!(HIST_count_simple(&mut count, &mut maxSymbolValue, &src) > 0);
+
+        let mut norm = [0i16; 256];
+        let tableLog = FSE_optimalTableLog(0, src.len(), maxSymbolValue);
+        assert_eq!(
+            FSE_normalizeCount(&mut norm, tableLog, &count, src.len(), maxSymbolValue, 0),
+            tableLog as usize
+        );
+
+        let mut ncount = vec![0u8; FSE_NCountWriteBound(maxSymbolValue, tableLog)];
+        let ncount_len = FSE_writeNCount(&mut ncount, &norm, maxSymbolValue, tableLog);
+        assert!(!crate::common::error::ERR_isError(ncount_len));
+        ncount.truncate(ncount_len);
+
+        let mut ctable = vec![0u32; FSE_CTABLE_SIZE_U32(tableLog, maxSymbolValue)];
+        let mut build_wksp =
+            vec![0u8; (maxSymbolValue as usize + 2) * 2 + (1usize << tableLog) + 8];
+        assert_eq!(
+            FSE_buildCTable_wksp(
+                &mut ctable,
+                &norm,
+                maxSymbolValue,
+                tableLog,
+                &mut build_wksp
+            ),
+            0
+        );
+
+        let mut payload = vec![0u8; FSE_compressBound(src.len())];
+        let payload_len = FSE_compress_usingCTable(&mut payload, &src, &ctable);
+        assert!(!crate::common::error::ERR_isError(payload_len));
+        payload.truncate(payload_len);
+
+        let mut stream = ncount;
+        stream.extend_from_slice(&payload);
+
+        let required = FSE_DECOMPRESS_WKSP_SIZE(tableLog, maxSymbolValue);
+        assert!(required > 512);
+        let mut workspace = vec![0u8; 512];
+        let mut dst = vec![0u8; src.len()];
+
+        let rc = FSE_decompress_wksp_bmi2(&mut dst, &stream, FSE_MAX_TABLELOG, &mut workspace, 0);
+        assert_eq!(
+            crate::common::error::ERR_getErrorCode(rc),
+            ErrorCode::TableLogTooLarge
+        );
     }
 }

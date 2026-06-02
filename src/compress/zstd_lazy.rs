@@ -118,6 +118,9 @@ pub fn ZSTD_row_fillHashCache(
 ) {
     let hashLog = ms.rowHashLog;
     let base_off = ms.window.base_offset;
+    if idx < base_off {
+        idx = base_off;
+    }
     let idx_slice = idx.saturating_sub(base_off) as usize;
     let maxElemsToPrefetch = if idx_slice > iLimit {
         0
@@ -202,6 +205,9 @@ pub fn ZSTD_row_update_internalImpl(
 ) {
     let hashLog = ms.rowHashLog;
     let base_off = ms.window.base_offset;
+    if updateStartIdx < base_off {
+        updateStartIdx = base_off;
+    }
     while updateStartIdx < updateEndIdx {
         let slice_off = updateStartIdx.wrapping_sub(base_off) as usize;
         let hash = if useCache {
@@ -1929,10 +1935,11 @@ pub fn ZSTD_compressBlock_lazy_generic_with_istart(
         let dictLowestIndex = dms.window.dictLimit;
         let dictEndIndex = dms.window.nextSrc;
         let dictBase = dms.dictContent.clone();
-        let dictSize = dictEndIndex.saturating_sub(dms.window.base_offset);
-        let dictIndexDelta = prefixLowestIndex.saturating_sub(dictSize);
-        let dictAndPrefixLength =
-            (src.len() as u32).wrapping_add(dictEndIndex.saturating_sub(dictLowestIndex));
+        let dictIndexDelta = prefixLowestIndex.saturating_sub(dictEndIndex);
+        let curr = base_off.wrapping_add(istart as u32);
+        let dictAndPrefixLength = curr
+            .saturating_sub(prefixLowestIndex)
+            .wrapping_add(dictEndIndex.saturating_sub(dictLowestIndex));
         (
             dictLowestIndex,
             dms.window.base_offset,
@@ -2453,14 +2460,7 @@ pub fn ZSTD_compressBlock_lazy_generic_with_istart(
 
         if ms.lazySkipping != 0 {
             if searchMethod == searchMethod_e::search_rowHash {
-                ZSTD_row_fillHashCache(
-                    ms,
-                    src,
-                    rowLog,
-                    mls,
-                    ms.nextToUpdate.saturating_sub(base_off),
-                    ilimit,
-                );
+                ZSTD_row_fillHashCache(ms, src, rowLog, mls, ms.nextToUpdate, ilimit);
             }
             ms.lazySkipping = 0;
         }

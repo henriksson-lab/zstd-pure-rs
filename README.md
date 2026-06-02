@@ -2,6 +2,7 @@
 
 A pure-Rust port of the [Zstandard (`zstd`)](https://github.com/facebook/zstd) compression library
 
+* 2026-06-02: Big audit
 * 2026-04-27: Tested locally for core compression/decompression behavior. Treat performance and parity notes as status snapshots, not guarantees.
 * Some features out of scope. Contact if you need them
 

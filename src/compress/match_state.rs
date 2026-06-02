@@ -76,14 +76,16 @@ pub enum ZSTD_dictMode_e {
 /// returns the mode the block compressor should use.
 ///
 pub fn ZSTD_matchState_dictMode(ms: &ZSTD_MatchState_t) -> ZSTD_dictMode_e {
-    if ms.dictMatchState.is_some() && ms.loadedDictEnd != 0 {
+    if ZSTD_window_hasExtDict(&ms.window) {
+        return ZSTD_dictMode_e::ZSTD_extDict;
+    }
+    if let Some(dict_ms) = ms.dictMatchState.as_ref() {
+        if dict_ms.dedicatedDictSearch != 0 {
+            return ZSTD_dictMode_e::ZSTD_dedicatedDictSearch;
+        }
         return ZSTD_dictMode_e::ZSTD_dictMatchState;
     }
-    if ZSTD_window_hasExtDict(&ms.window) {
-        ZSTD_dictMode_e::ZSTD_extDict
-    } else {
-        ZSTD_dictMode_e::ZSTD_noDict
-    }
+    ZSTD_dictMode_e::ZSTD_noDict
 }
 
 /// Upstream `ZSTD_CURRENT_MAX` (zstd_compress_internal.h:1031). Upper
@@ -581,11 +583,13 @@ pub fn ZSTD_window_correctOverflow(
     debug_assert_eq!(curr & cycleMask, newCurrent & cycleMask);
     debug_assert!(curr > newCurrent);
 
-    // base / dictBase would advance in upstream's pointer space; in
-    // our Rust encoding they're u32 offsets, so subtract the
-    // correction downward on the index-space side.
-    window.base_offset = window.base_offset.wrapping_add(correction);
-    window.dictBase_offset = window.dictBase_offset.wrapping_add(correction);
+    // Upstream advances `base` / `dictBase` pointers, so every
+    // `ptr - base` index decreases by `correction`. In the Rust
+    // encoding `base_offset + buffer_pos` is that index, so rebase the
+    // offsets downward in the same index space.
+    window.base_offset = window.base_offset.wrapping_sub(correction);
+    window.dictBase_offset = window.dictBase_offset.wrapping_sub(correction);
+    window.nextSrc = window.nextSrc.wrapping_sub(correction);
     window.lowLimit = if window.lowLimit < correction + ZSTD_WINDOW_START_INDEX {
         ZSTD_WINDOW_START_INDEX
     } else {
@@ -628,16 +632,16 @@ pub fn ZSTD_window_init(window: &mut ZSTD_window_t) {
 /// current block (upstream's `blockEnd - window.base`).
 ///
 /// `loadedDictEnd` is in/out: reset to 0 when the dictionary is
-/// invalidated. Pass `&mut 0` when no dictionary is in use.
+/// invalidated. Pass `&mut 0` when no dictionary is in use. Returns
+/// true when dictionary state was invalidated, so callers that carry
+/// a `dictMatchState` pointer can clear it in lockstep.
 ///
-/// The `dictMatchState**` parameter from upstream is dropped here —
-/// our Rust `ZSTD_MatchState_t` doesn't carry that linkage yet.
 pub fn ZSTD_window_enforceMaxDist(
     window: &mut ZSTD_window_t,
     blockEnd_abs: u32,
     maxDist: u32,
     loadedDictEnd: &mut u32,
-) {
+) -> bool {
     let blockEndIdx = blockEnd_abs;
     let loadedEnd = *loadedDictEnd;
 
@@ -650,7 +654,24 @@ pub fn ZSTD_window_enforceMaxDist(
             window.dictLimit = window.lowLimit;
         }
         *loadedDictEnd = 0;
+        return true;
     }
+    false
+}
+
+/// Match-state wrapper for `ZSTD_window_enforceMaxDist` which mirrors
+/// upstream's `dictMatchState**` invalidation.
+pub fn ZSTD_matchState_enforceMaxDist(
+    ms: &mut ZSTD_MatchState_t,
+    blockEnd_abs: u32,
+    maxDist: u32,
+) -> bool {
+    let invalidated =
+        ZSTD_window_enforceMaxDist(&mut ms.window, blockEnd_abs, maxDist, &mut ms.loadedDictEnd);
+    if invalidated {
+        ms.dictMatchState = None;
+    }
+    invalidated
 }
 
 /// Port of `ZSTD_checkDictValidity`. Invalidates `loadedDictEnd` once
@@ -658,14 +679,14 @@ pub fn ZSTD_window_enforceMaxDist(
 /// `loadedDictEnd + maxDist`, or after a non-contiguous jump flagged
 /// by `loadedDictEnd != window.dictLimit`.
 ///
-/// Upstream also nulls a `dictMatchState**`; we skip that since the
-/// Rust port's `ZSTD_MatchState_t` doesn't yet carry that linkage.
+/// Returns true when dictionary state was invalidated, so callers that
+/// carry a `dictMatchState` pointer can clear it in lockstep.
 pub fn ZSTD_checkDictValidity(
     window: &ZSTD_window_t,
     blockEnd_abs: u32,
     maxDist: u32,
     loadedDictEnd: &mut u32,
-) {
+) -> bool {
     let loadedEnd = *loadedDictEnd;
     // Prefix dictionaries can sit before the current tiny block in the
     // Rust absolute-index model, so `loadedDictEnd` may be greater than
@@ -673,7 +694,24 @@ pub fn ZSTD_checkDictValidity(
     // in that case; don't make debug builds stricter than runtime.
     if blockEnd_abs > loadedEnd + maxDist || loadedEnd != window.dictLimit {
         *loadedDictEnd = 0;
+        return true;
     }
+    false
+}
+
+/// Match-state wrapper for `ZSTD_checkDictValidity` which mirrors
+/// upstream's `dictMatchState**` invalidation.
+pub fn ZSTD_matchState_checkDictValidity(
+    ms: &mut ZSTD_MatchState_t,
+    blockEnd_abs: u32,
+    maxDist: u32,
+) -> bool {
+    let invalidated =
+        ZSTD_checkDictValidity(&ms.window, blockEnd_abs, maxDist, &mut ms.loadedDictEnd);
+    if invalidated {
+        ms.dictMatchState = None;
+    }
+    invalidated
 }
 
 /// Port of `ZSTD_window_needOverflowCorrection`. Returns true when
@@ -738,9 +776,9 @@ pub fn ZSTD_overflowCorrectIfNeeded(
         } else {
             ms.nextToUpdate -= correction;
         }
-        // Invalidate loaded dict on overflow correction — upstream
-        // also nulls `ms.dictMatchState`, which we don't yet track.
+        // Invalidate loaded dict on overflow correction.
         ms.loadedDictEnd = 0;
+        ms.dictMatchState = None;
     }
 }
 
@@ -765,6 +803,12 @@ pub struct ZSTD_MatchState_t {
     /// Upstream `dictMatchState`. When present, points at the loaded
     /// dictionary's match-state tables for DMS / DDSS search modes.
     pub dictMatchState: Option<Box<ZSTD_MatchState_t>>,
+
+    /// Upstream `dedicatedDictSearch`. Set on attached dictionary
+    /// match states whose tables use the dedicated-dictionary-search
+    /// layout.
+    pub dedicatedDictSearch: u32,
+
     /// Raw dictionary bytes associated with this match state. This is
     /// separate from `dictMatchState`: ext-dict modes dereference the
     /// local state's external dictionary bytes, while dictMatchState
@@ -854,6 +898,7 @@ impl ZSTD_MatchState_t {
             entropySeed: None,
             ldmSeqStore: None,
             dictMatchState: None,
+            dedicatedDictSearch: 0,
             dictContent: Vec::new(),
             loadedDictEnd: 0,
             forceNonContiguous: false,
@@ -887,6 +932,7 @@ impl ZSTD_MatchState_t {
         self.entropySeed = None;
         self.ldmSeqStore = None;
         self.dictMatchState = None;
+        self.dedicatedDictSearch = 0;
         self.dictContent.clear();
         self.loadedDictEnd = 0;
         self.forceNonContiguous = false;
@@ -1147,6 +1193,27 @@ mod tests {
     }
 
     #[test]
+    fn correctOverflow_rebases_offsets_downward() {
+        let src_abs: u32 = ZSTD_CURRENT_MAX + 4096;
+        let mut w = ZSTD_window_t {
+            base_offset: src_abs - 1024,
+            dictBase_offset: src_abs - 8192,
+            dictLimit: src_abs - 4096,
+            lowLimit: src_abs - (1 << 20),
+            nextSrc: src_abs,
+            nbOverflowCorrections: 0,
+        };
+        let old_base = w.base_offset;
+        let old_dict_base = w.dictBase_offset;
+        let old_next_src = w.nextSrc;
+        let correction = ZSTD_window_correctOverflow(&mut w, 16, 1u32 << 20, src_abs);
+
+        assert_eq!(w.base_offset, old_base.wrapping_sub(correction));
+        assert_eq!(w.dictBase_offset, old_dict_base.wrapping_sub(correction));
+        assert_eq!(w.nextSrc, old_next_src.wrapping_sub(correction));
+    }
+
+    #[test]
     fn window_init_sets_all_sentinels() {
         let mut w = ZSTD_window_t {
             nextSrc: 999,
@@ -1172,7 +1239,7 @@ mod tests {
         w.dictLimit = 10;
         let mut dictEnd = 0u32;
         // blockEnd 50, maxDist 100: still within range, no update.
-        ZSTD_window_enforceMaxDist(&mut w, 50, 100, &mut dictEnd);
+        assert!(!ZSTD_window_enforceMaxDist(&mut w, 50, 100, &mut dictEnd));
         assert_eq!(w.lowLimit, 5);
         assert_eq!(w.dictLimit, 10);
     }
@@ -1185,10 +1252,25 @@ mod tests {
         let mut dictEnd = 50u32;
         // blockEnd = 1200, maxDist = 100, loaded = 50 → 1200 > 150 → shift.
         // newLowLimit = 1100. dictLimit (10) < newLowLimit, so dictLimit = 1100.
-        ZSTD_window_enforceMaxDist(&mut w, 1200, 100, &mut dictEnd);
+        assert!(ZSTD_window_enforceMaxDist(&mut w, 1200, 100, &mut dictEnd));
         assert_eq!(w.lowLimit, 1100);
         assert_eq!(w.dictLimit, 1100);
         assert_eq!(dictEnd, 0);
+    }
+
+    #[test]
+    fn matchState_enforceMaxDist_clears_dictMatchState() {
+        let cp = ZSTD_compressionParameters::default();
+        let mut ms = ZSTD_MatchState_t::new(cp);
+        ms.window.lowLimit = 5;
+        ms.window.dictLimit = 10;
+        ms.loadedDictEnd = 50;
+        ms.dictMatchState = Some(Box::new(ZSTD_MatchState_t::new(cp)));
+
+        assert!(ZSTD_matchState_enforceMaxDist(&mut ms, 1200, 100));
+
+        assert_eq!(ms.loadedDictEnd, 0);
+        assert!(ms.dictMatchState.is_none());
     }
 
     #[test]
@@ -1199,7 +1281,7 @@ mod tests {
         };
         let mut dictEnd = 100u32;
         // blockEnd = 500, maxDist = 100, loaded = 100 → 500 > 200 → invalidate.
-        ZSTD_checkDictValidity(&w, 500, 100, &mut dictEnd);
+        assert!(ZSTD_checkDictValidity(&w, 500, 100, &mut dictEnd));
         assert_eq!(dictEnd, 0);
     }
 
@@ -1210,8 +1292,22 @@ mod tests {
             ..Default::default()
         };
         let mut dictEnd = 80u32; // != dictLimit
-        ZSTD_checkDictValidity(&w, 150, 1000, &mut dictEnd);
+        assert!(ZSTD_checkDictValidity(&w, 150, 1000, &mut dictEnd));
         assert_eq!(dictEnd, 0);
+    }
+
+    #[test]
+    fn matchState_checkDictValidity_clears_dictMatchState() {
+        let cp = ZSTD_compressionParameters::default();
+        let mut ms = ZSTD_MatchState_t::new(cp);
+        ms.window.dictLimit = 100;
+        ms.loadedDictEnd = 80;
+        ms.dictMatchState = Some(Box::new(ZSTD_MatchState_t::new(cp)));
+
+        assert!(ZSTD_matchState_checkDictValidity(&mut ms, 150, 1000));
+
+        assert_eq!(ms.loadedDictEnd, 0);
+        assert!(ms.dictMatchState.is_none());
     }
 
     #[test]
@@ -1504,17 +1600,53 @@ mod tests {
     }
 
     #[test]
-    fn matchState_dictMode_reports_dictMatchState_when_attached_and_live() {
+    fn matchState_dictMode_reports_dictMatchState_when_attached_with_zero_loadedDictEnd() {
+        let cp = ZSTD_compressionParameters::default();
+        let mut ms = ZSTD_MatchState_t::new(cp);
+        ms.dictMatchState = Some(Box::new(ZSTD_MatchState_t::new(cp)));
+        ms.loadedDictEnd = 0;
+        assert_eq!(
+            ZSTD_matchState_dictMode(&ms),
+            ZSTD_dictMode_e::ZSTD_dictMatchState
+        );
+    }
+
+    #[test]
+    fn matchState_dictMode_reports_dedicatedDictSearch_from_attached_state() {
+        let cp = ZSTD_compressionParameters::default();
+        let mut ms = ZSTD_MatchState_t::new(cp);
+        let mut dict_ms = ZSTD_MatchState_t::new(cp);
+        dict_ms.dedicatedDictSearch = 1;
+        ms.dictMatchState = Some(Box::new(dict_ms));
+
+        assert_eq!(
+            ZSTD_matchState_dictMode(&ms),
+            ZSTD_dictMode_e::ZSTD_dedicatedDictSearch
+        );
+    }
+
+    #[test]
+    fn matchState_dictMode_prioritizes_extDict_over_dictMatchState() {
         let cp = ZSTD_compressionParameters::default();
         let mut ms = ZSTD_MatchState_t::new(cp);
         ms.dictMatchState = Some(Box::new(ZSTD_MatchState_t::new(cp)));
         ms.loadedDictEnd = 32;
         ms.window.lowLimit = 5;
         ms.window.dictLimit = 10;
-        assert_eq!(
-            ZSTD_matchState_dictMode(&ms),
-            ZSTD_dictMode_e::ZSTD_dictMatchState
-        );
+        assert_eq!(ZSTD_matchState_dictMode(&ms), ZSTD_dictMode_e::ZSTD_extDict);
+    }
+
+    #[test]
+    fn matchState_dictMode_prioritizes_extDict_over_dedicatedDictSearch() {
+        let cp = ZSTD_compressionParameters::default();
+        let mut ms = ZSTD_MatchState_t::new(cp);
+        let mut dict_ms = ZSTD_MatchState_t::new(cp);
+        dict_ms.dedicatedDictSearch = 1;
+        ms.dictMatchState = Some(Box::new(dict_ms));
+        ms.window.lowLimit = 5;
+        ms.window.dictLimit = 10;
+
+        assert_eq!(ZSTD_matchState_dictMode(&ms), ZSTD_dictMode_e::ZSTD_extDict);
     }
 
     #[test]
@@ -1589,6 +1721,7 @@ mod tests {
         ms.window.lowLimit = 25;
         ms.nextToUpdate = 400;
         ms.loadedDictEnd = 99;
+        ms.dictMatchState = Some(Box::new(ZSTD_MatchState_t::new(cp)));
         ms.opt.litLengthSum = 77;
         ZSTD_invalidateMatchState(&mut ms);
         // window_clear collapses dictLimit/lowLimit to nextSrc = 500.
@@ -1596,7 +1729,39 @@ mod tests {
         assert_eq!(ms.window.lowLimit, 500);
         assert_eq!(ms.nextToUpdate, 500); // tracks dictLimit
         assert_eq!(ms.loadedDictEnd, 0);
+        assert!(ms.dictMatchState.is_none());
         assert_eq!(ms.opt.litLengthSum, 0);
+    }
+
+    #[test]
+    fn overflowCorrectIfNeeded_clears_dictMatchState() {
+        use crate::compress::zstd_ldm::ZSTD_ParamSwitch_e;
+
+        let cp = ZSTD_compressionParameters {
+            hashLog: 4,
+            windowLog: 20,
+            chainLog: 16,
+            strategy: 1,
+            ..Default::default()
+        };
+        let mut ms = ZSTD_MatchState_t::new(cp);
+        ms.loadedDictEnd = 99;
+        ms.dictMatchState = Some(Box::new(ZSTD_MatchState_t::new(cp)));
+        let src_abs = ZSTD_CURRENT_MAX + 4096;
+
+        ZSTD_overflowCorrectIfNeeded(
+            &mut ms,
+            ZSTD_ParamSwitch_e::ZSTD_ps_disable,
+            0,
+            cp.windowLog,
+            cp.chainLog,
+            cp.strategy,
+            src_abs,
+            src_abs,
+        );
+
+        assert_eq!(ms.loadedDictEnd, 0);
+        assert!(ms.dictMatchState.is_none());
     }
 
     #[test]

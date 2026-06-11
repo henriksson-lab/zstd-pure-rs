@@ -12,7 +12,7 @@ use crate::common::bits::{ZSTD_countTrailingZeros32, ZSTD_highbit32};
 use crate::common::error::{ErrorCode, ERROR};
 use crate::common::mem::MEM_readLE32;
 
-pub const FSE_VERSION_NUMBER: u32 = 5;
+pub const FSE_VERSION_NUMBER: u32 = 900;
 
 /// Re-exports — canonical definitions live in `fse_decompress`.
 pub use crate::common::fse_decompress::{
@@ -33,14 +33,12 @@ pub const fn FSE_DTABLE_SIZE(maxTableLog: u32) -> usize {
     FSE_DTABLE_SIZE_U32(maxTableLog) * 4
 }
 
-/// Upstream `FSE_BUILD_DTABLE_WKSP_SIZE` (`fse.h:266`). Scratch
+/// Upstream `FSE_BUILD_DTABLE_WKSP_SIZE` (`fse.h:267`). Scratch
 /// required by `FSE_buildDTable_wksp`. Upstream formula:
-/// `(2 * (maxSymbolValue+1) * maxTableLog) + ((maxTableLog==15) ? 1 : 0)`.
+/// `sizeof(short) * (maxSymbolValue + 1) + (1ULL << maxTableLog) + 8`.
 #[inline]
 pub const fn FSE_BUILD_DTABLE_WKSP_SIZE(maxTableLog: u32, maxSymbolValue: u32) -> usize {
-    // Upstream bakes in the +1 slack at tableLog = 15.
-    let extra = if maxTableLog == 15 { 1 } else { 0 };
-    2 * (maxSymbolValue as usize + 1) * (maxTableLog as usize) + extra
+    2 * (maxSymbolValue as usize + 1) + (1usize << maxTableLog) + 8
 }
 
 /// Upstream `FSE_BUILD_DTABLE_WKSP_SIZE_U32`. Same in u32 counts.
@@ -168,8 +166,12 @@ fn FSE_readNCount_body(
     let iend = hbSize;
     let mut ip: usize = 0;
     let mut charnum: u32 = 0;
-    let maxSV1 = *maxSVPtr + 1;
+    let maxSV1 = (*maxSVPtr).wrapping_add(1);
     let mut previous0 = false;
+
+    if normalizedCounter.len() < maxSV1 as usize {
+        return ERROR(ErrorCode::MaxSymbolValueTooSmall);
+    }
 
     // Zero out the counter; symbols not present stay at 0.
     if clear_counts {
@@ -250,6 +252,9 @@ fn FSE_readNCount_body(
             debug_assert_eq!(count, -1);
             remaining += count;
         }
+        if charnum as usize >= normalizedCounter.len() {
+            return ERROR(ErrorCode::MaxSymbolValueTooSmall);
+        }
         normalizedCounter[charnum as usize] = count as i16;
         charnum += 1;
         previous0 = count == 0;
@@ -286,7 +291,7 @@ fn FSE_readNCount_body(
     if bitCount > 32 {
         return ERROR(ErrorCode::CorruptionDetected);
     }
-    *maxSVPtr = charnum - 1;
+    *maxSVPtr = charnum.wrapping_sub(1);
     ip += ((bitCount + 7) >> 3) as usize;
     ip
 }
@@ -314,7 +319,7 @@ pub fn HUF_readStats(
     tableLogPtr: &mut u32,
     src: &[u8],
 ) -> usize {
-    let mut wksp = [0u32; 256]; // upper-bound; real size FSE_DECOMPRESS_WKSP_SIZE_U32
+    let mut wksp = [0u32; HUF_READ_STATS_WORKSPACE_SIZE_U32];
     HUF_readStats_wksp(
         huffWeight,
         hwSize,
@@ -359,26 +364,23 @@ pub fn HUF_readStats_wksp(
         if oSize >= hwSize {
             return ERROR(ErrorCode::CorruptionDetected);
         }
+        if huffWeight.len() < hwSize {
+            return ERROR(ErrorCode::CorruptionDetected);
+        }
         let payload = &src[1..];
         let mut n = 0;
         while n < oSize {
             huffWeight[n] = payload[n / 2] >> 4;
-            if n + 1 < oSize {
-                huffWeight[n + 1] = payload[n / 2] & 0x0F;
-            } else {
-                // Upstream writes both in a pair but the upper bound is
-                // oSize, so the last iteration of the +=2 loop happens
-                // only when n+1 < oSize; when oSize is odd, writing
-                // huffWeight[n+1] would step past the valid range.
-                // We mirror the upstream loop by writing only when
-                // n+1<oSize.
-            }
+            huffWeight[n + 1] = payload[n / 2] & 0x0F;
             n += 2;
         }
     } else {
         // FSE-compressed header. Requires `FSE_decompress_wksp_bmi2`.
         if iSize + 1 > src.len() {
             return ERROR(ErrorCode::SrcSizeWrong);
+        }
+        if hwSize == 0 || huffWeight.len() < hwSize {
+            return ERROR(ErrorCode::CorruptionDetected);
         }
         let bmi2 = (flags & HUF_flags_bmi2) != 0;
         oSize = crate::common::fse_decompress::FSE_decompress_wksp_bmi2(
@@ -396,6 +398,9 @@ pub fn HUF_readStats_wksp(
     }
 
     // Reset rank stats.
+    if rankStats.len() < HUF_TABLELOG_MAX as usize + 1 {
+        return ERROR(ErrorCode::CorruptionDetected);
+    }
     for r in rankStats.iter_mut().take(HUF_TABLELOG_MAX as usize + 1) {
         *r = 0;
     }
@@ -464,8 +469,30 @@ mod tests {
     }
 
     #[test]
-    fn fse_version_is_five() {
-        assert_eq!(FSE_versionNumber(), 5);
+    fn fse_version_matches_upstream() {
+        assert_eq!(FSE_versionNumber(), 900);
+    }
+
+    #[test]
+    fn fse_workspace_sizes_match_upstream_macros() {
+        assert_eq!(FSE_DTABLE_SIZE_U32(6), 65);
+        assert_eq!(FSE_DTABLE_SIZE(6), 260);
+
+        assert_eq!(FSE_BUILD_DTABLE_WKSP_SIZE(0, 0), 11);
+        assert_eq!(FSE_BUILD_DTABLE_WKSP_SIZE_U32(0, 0), 3);
+        assert_eq!(FSE_BUILD_DTABLE_WKSP_SIZE(6, HUF_TABLELOG_MAX - 1), 96);
+        assert_eq!(FSE_BUILD_DTABLE_WKSP_SIZE_U32(6, HUF_TABLELOG_MAX - 1), 24);
+        assert_eq!(
+            FSE_BUILD_DTABLE_WKSP_SIZE(FSE_TABLELOG_ABSOLUTE_MAX, FSE_MAX_SYMBOL_VALUE),
+            33_288
+        );
+        assert_eq!(
+            FSE_BUILD_DTABLE_WKSP_SIZE_U32(FSE_TABLELOG_ABSOLUTE_MAX, FSE_MAX_SYMBOL_VALUE),
+            8_322
+        );
+
+        assert_eq!(HUF_READ_STATS_WORKSPACE_SIZE_U32, 219);
+        assert_eq!(HUF_READ_STATS_WORKSPACE_SIZE, 876);
     }
 
     #[test]
@@ -483,6 +510,52 @@ mod tests {
             crate::common::error::ERR_getErrorCode(rc),
             ErrorCode::TableLogTooLarge
         );
+    }
+
+    #[test]
+    fn fse_readncount_rejects_counter_buffer_too_small() {
+        let src = [0x00, 0, 0, 0, 0, 0, 0, 0];
+        let mut counts = [0i16; 1];
+        let mut maxSV: u32 = 255;
+        let mut tl: u32 = 0;
+        let rc = FSE_readNCount(&mut counts, &mut maxSV, &mut tl, &src);
+        assert!(crate::common::error::ERR_isError(rc));
+        assert_eq!(
+            crate::common::error::ERR_getErrorCode(rc),
+            ErrorCode::MaxSymbolValueTooSmall
+        );
+    }
+
+    #[test]
+    fn fse_readncount_no_clear_still_rejects_counter_buffer_too_small() {
+        let src = [0x00, 0, 0, 0, 0, 0, 0, 0];
+        let mut counts = [0i16; 1];
+        let mut maxSV: u32 = 255;
+        let mut tl: u32 = 0;
+        let rc = FSE_readNCount_no_clear(&mut counts, &mut maxSV, &mut tl, &src);
+        assert!(crate::common::error::ERR_isError(rc));
+        assert_eq!(
+            crate::common::error::ERR_getErrorCode(rc),
+            ErrorCode::MaxSymbolValueTooSmall
+        );
+    }
+
+    #[test]
+    fn fse_readncount_short_header_recursion_preserves_clear_counts() {
+        let src = [0x0B];
+        let mut counts = [7i16; 4];
+        let mut maxSV: u32 = 3;
+        let mut tl: u32 = 0;
+        let rc = FSE_readNCount_no_clear(&mut counts, &mut maxSV, &mut tl, &src);
+        assert!(crate::common::error::ERR_isError(rc));
+        assert_eq!(counts, [7i16; 4]);
+
+        let mut counts = [7i16; 4];
+        let mut maxSV: u32 = 3;
+        let mut tl: u32 = 0;
+        let rc = FSE_readNCount(&mut counts, &mut maxSV, &mut tl, &src);
+        assert!(crate::common::error::ERR_isError(rc));
+        assert_eq!(counts, [0i16; 4]);
     }
 
     #[test]
@@ -508,5 +581,21 @@ mod tests {
         let mut wksp = [0u32; 64];
         let rc = HUF_readStats_wksp(&mut hw, 256, &mut rs, &mut ns, &mut tl, &src, &mut wksp, 0);
         assert!(crate::common::error::ERR_isError(rc));
+    }
+
+    #[test]
+    fn huf_readstats_rejects_invalid_output_capacity() {
+        let src = [128 + 2, 0x11, 0x11];
+        let mut hw = [0u8; 1];
+        let mut rs = [0u32; 16];
+        let mut ns: u32 = 0;
+        let mut tl: u32 = 0;
+        let mut wksp = [0u32; HUF_READ_STATS_WORKSPACE_SIZE_U32];
+        let rc = HUF_readStats_wksp(&mut hw, 0, &mut rs, &mut ns, &mut tl, &src, &mut wksp, 0);
+        assert!(crate::common::error::ERR_isError(rc));
+        assert_eq!(
+            crate::common::error::ERR_getErrorCode(rc),
+            ErrorCode::CorruptionDetected
+        );
     }
 }

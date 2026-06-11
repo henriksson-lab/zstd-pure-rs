@@ -2,7 +2,10 @@
 //! by the entropy stage. No SIMD / SVE2 variant is ported; upstream's
 //! portable "parallel stripe" loop is the reference implementation.
 
-use crate::common::error::{ErrorCode, ERROR};
+use crate::common::{
+    error::{ErrorCode, ERROR},
+    mem::MEM_read32,
+};
 
 /// Upstream threshold below which we use the simple single-counter
 /// loop; above it, the 4-way parallel counters amortize cache-miss
@@ -22,16 +25,6 @@ pub enum HIST_checkInput_e {
     CheckMaxSymbolValue,
 }
 
-/// Port of `min_size` (`hist.c:75`).
-#[inline]
-pub fn min_size(a: usize, b: usize) -> usize {
-    if a < b {
-        a
-    } else {
-        b
-    }
-}
-
 /// Port of `HIST_isError`.
 #[inline]
 pub fn HIST_isError(code: usize) -> u32 {
@@ -41,7 +34,7 @@ pub fn HIST_isError(code: usize) -> u32 {
 /// Port of `HIST_add`. Adds 1 to `count[b]` for every byte `b` in `src`.
 pub fn HIST_add(count: &mut [u32], src: &[u8]) {
     for &b in src {
-        count[b as usize] += 1;
+        count[b as usize] = count[b as usize].wrapping_add(1);
     }
 }
 
@@ -59,7 +52,7 @@ pub fn HIST_count_simple(count: &mut [u32], maxSymbolValuePtr: &mut u32, src: &[
     }
     for &b in src {
         debug_assert!(b as u32 <= maxSymbolValue as u32);
-        count[b as usize] += 1;
+        count[b as usize] = count[b as usize].wrapping_add(1);
     }
     // Shrink maxSymbolValue to last non-zero slot.
     let mut msv = maxSymbolValue;
@@ -87,8 +80,9 @@ pub fn HIST_count_parallel_wksp(
     workSpace: &mut [u32],
 ) -> usize {
     debug_assert!(*maxSymbolValuePtr <= 255);
+    let count_size = *maxSymbolValuePtr as usize + 1;
     if src.is_empty() {
-        for c in count.iter_mut().take(*maxSymbolValuePtr as usize + 1) {
+        for c in count.iter_mut().take(count_size) {
             *c = 0;
         }
         *maxSymbolValuePtr = 0;
@@ -109,54 +103,67 @@ pub fn HIST_count_parallel_wksp(
     if iend < 4 {
         // Can't even prime the pipeline. Fall back to the scalar tail.
         for &b in src {
-            c1[b as usize] += 1;
+            c1[b as usize] = c1[b as usize].wrapping_add(1);
         }
     } else {
         // Pipeline the first u32 like upstream's `cached` variable.
         let mut ip = 4usize;
-        let src_ptr = src.as_ptr();
-        // SAFETY: ip + 4 ≤ iend on each read (loop condition `ip + 15 < iend`
-        // gives us 16 bytes of headroom, dwarfing the 4-byte read). Counter
-        // arrays c1/c2/c3/c4 are 256 entries; all symbols are u8 so indices
-        // are in 0..256.
-        let mut cached: u32 = unsafe { (src_ptr as *const u32).read_unaligned() };
+        // Counter arrays c1/c2/c3/c4 are 256 entries; all symbols are u8 so
+        // indices are in 0..256.
+        let mut cached: u32 = MEM_read32(src);
         // Process in stripes of 16 bytes (4 × u32 loads).
         while ip + 15 < iend {
             let c = cached;
-            cached = unsafe { (src_ptr.add(ip) as *const u32).read_unaligned() };
+            cached = MEM_read32(&src[ip..]);
             ip += 4;
             unsafe {
-                *c1.get_unchecked_mut((c & 0xFF) as usize) += 1;
-                *c2.get_unchecked_mut(((c >> 8) & 0xFF) as usize) += 1;
-                *c3.get_unchecked_mut(((c >> 16) & 0xFF) as usize) += 1;
-                *c4.get_unchecked_mut((c >> 24) as usize) += 1;
+                let v = c1.get_unchecked_mut((c & 0xFF) as usize);
+                *v = (*v).wrapping_add(1);
+                let v = c2.get_unchecked_mut(((c >> 8) & 0xFF) as usize);
+                *v = (*v).wrapping_add(1);
+                let v = c3.get_unchecked_mut(((c >> 16) & 0xFF) as usize);
+                *v = (*v).wrapping_add(1);
+                let v = c4.get_unchecked_mut((c >> 24) as usize);
+                *v = (*v).wrapping_add(1);
             }
             let c = cached;
-            cached = unsafe { (src_ptr.add(ip) as *const u32).read_unaligned() };
+            cached = MEM_read32(&src[ip..]);
             ip += 4;
             unsafe {
-                *c1.get_unchecked_mut((c & 0xFF) as usize) += 1;
-                *c2.get_unchecked_mut(((c >> 8) & 0xFF) as usize) += 1;
-                *c3.get_unchecked_mut(((c >> 16) & 0xFF) as usize) += 1;
-                *c4.get_unchecked_mut((c >> 24) as usize) += 1;
+                let v = c1.get_unchecked_mut((c & 0xFF) as usize);
+                *v = (*v).wrapping_add(1);
+                let v = c2.get_unchecked_mut(((c >> 8) & 0xFF) as usize);
+                *v = (*v).wrapping_add(1);
+                let v = c3.get_unchecked_mut(((c >> 16) & 0xFF) as usize);
+                *v = (*v).wrapping_add(1);
+                let v = c4.get_unchecked_mut((c >> 24) as usize);
+                *v = (*v).wrapping_add(1);
             }
             let c = cached;
-            cached = unsafe { (src_ptr.add(ip) as *const u32).read_unaligned() };
+            cached = MEM_read32(&src[ip..]);
             ip += 4;
             unsafe {
-                *c1.get_unchecked_mut((c & 0xFF) as usize) += 1;
-                *c2.get_unchecked_mut(((c >> 8) & 0xFF) as usize) += 1;
-                *c3.get_unchecked_mut(((c >> 16) & 0xFF) as usize) += 1;
-                *c4.get_unchecked_mut((c >> 24) as usize) += 1;
+                let v = c1.get_unchecked_mut((c & 0xFF) as usize);
+                *v = (*v).wrapping_add(1);
+                let v = c2.get_unchecked_mut(((c >> 8) & 0xFF) as usize);
+                *v = (*v).wrapping_add(1);
+                let v = c3.get_unchecked_mut(((c >> 16) & 0xFF) as usize);
+                *v = (*v).wrapping_add(1);
+                let v = c4.get_unchecked_mut((c >> 24) as usize);
+                *v = (*v).wrapping_add(1);
             }
             let c = cached;
-            cached = unsafe { (src_ptr.add(ip) as *const u32).read_unaligned() };
+            cached = MEM_read32(&src[ip..]);
             ip += 4;
             unsafe {
-                *c1.get_unchecked_mut((c & 0xFF) as usize) += 1;
-                *c2.get_unchecked_mut(((c >> 8) & 0xFF) as usize) += 1;
-                *c3.get_unchecked_mut(((c >> 16) & 0xFF) as usize) += 1;
-                *c4.get_unchecked_mut((c >> 24) as usize) += 1;
+                let v = c1.get_unchecked_mut((c & 0xFF) as usize);
+                *v = (*v).wrapping_add(1);
+                let v = c2.get_unchecked_mut(((c >> 8) & 0xFF) as usize);
+                *v = (*v).wrapping_add(1);
+                let v = c3.get_unchecked_mut(((c >> 16) & 0xFF) as usize);
+                *v = (*v).wrapping_add(1);
+                let v = c4.get_unchecked_mut((c >> 24) as usize);
+                *v = (*v).wrapping_add(1);
             }
         }
         // Roll back the "cached" prefetch: its 4 bytes weren't yet
@@ -166,7 +173,8 @@ pub fn HIST_count_parallel_wksp(
         while ip < iend {
             // SAFETY: ip < iend == src.len(). c1 is 256 entries.
             unsafe {
-                *c1.get_unchecked_mut(*src.get_unchecked(ip) as usize) += 1;
+                let v = c1.get_unchecked_mut(*src.get_unchecked(ip) as usize);
+                *v = (*v).wrapping_add(1);
             }
             ip += 1;
         }
@@ -175,7 +183,7 @@ pub fn HIST_count_parallel_wksp(
     // Sum the four lanes into c1.
     let mut max: u32 = 0;
     for s in 0..256 {
-        c1[s] += c2[s] + c3[s] + c4[s];
+        c1[s] = c1[s].wrapping_add(c2[s].wrapping_add(c3[s]).wrapping_add(c4[s]));
         if c1[s] > max {
             max = c1[s];
         }
@@ -191,9 +199,10 @@ pub fn HIST_count_parallel_wksp(
         return ERROR(ErrorCode::MaxSymbolValueTooSmall);
     }
     *maxSymbolValuePtr = maxSymbolValue as u32;
-    // Copy lane-1 counts into caller's `count` array (memmove because
-    // the slices may alias in upstream; in Rust they can't here).
-    count[..=maxSymbolValue].copy_from_slice(&c1[..=maxSymbolValue]);
+    // Copy the original requested count width, matching upstream's
+    // `countSize = (*maxSymbolValuePtr + 1) * sizeof(*count)` before it
+    // shrinks `*maxSymbolValuePtr`.
+    count[..count_size].copy_from_slice(&c1[..count_size]);
     max as usize
 }
 
@@ -259,73 +268,6 @@ pub fn HIST_count(count: &mut [u32], maxSymbolValuePtr: &mut u32, src: &[u8]) ->
     HIST_count_wksp(count, maxSymbolValuePtr, src, &mut tmp)
 }
 
-/// Port of `HIST_count_6_sve2`.
-pub fn HIST_count_6_sve2(
-    src: &[u8],
-    count: &mut [u32],
-    maxSymbolValuePtr: &mut u32,
-    workSpace: &mut [u32],
-) -> usize {
-    if src.is_empty() {
-        for c in count.iter_mut().take((*maxSymbolValuePtr as usize) + 1) {
-            *c = 0;
-        }
-        *maxSymbolValuePtr = 0;
-        return 0;
-    }
-    if workSpace.len() < HIST_WKSP_SIZE_U32 {
-        return ERROR(ErrorCode::WorkSpaceTooSmall);
-    }
-
-    let largest = HIST_count_parallel_wksp(
-        count,
-        maxSymbolValuePtr,
-        src,
-        HIST_checkInput_e::CheckMaxSymbolValue,
-        workSpace,
-    );
-    if HIST_isError(largest) != 0 {
-        return largest;
-    }
-    largest
-}
-
-/// Port of `HIST_count_sve2`.
-pub fn HIST_count_sve2(
-    count: &mut [u32],
-    maxSymbolValuePtr: &mut u32,
-    source: &[u8],
-    workSpace: &mut [u32],
-) -> usize {
-    debug_assert!(*maxSymbolValuePtr <= 255);
-    if source.is_empty() {
-        let maxCount = (*maxSymbolValuePtr as usize) + 1;
-        for c in count.iter_mut().take(maxCount) {
-            *c = 0;
-        }
-        *maxSymbolValuePtr = 0;
-        return 0;
-    }
-    if source.len() < HIST_FAST_THRESHOLD {
-        return HIST_count_simple(count, maxSymbolValuePtr, source) as usize;
-    }
-    if workSpace.len() < HIST_WKSP_SIZE_U32 {
-        return ERROR(ErrorCode::WorkSpaceTooSmall);
-    }
-
-    let check = if *maxSymbolValuePtr < 255 {
-        HIST_checkInput_e::CheckMaxSymbolValue
-    } else {
-        *maxSymbolValuePtr = 255;
-        HIST_checkInput_e::TrustInput
-    };
-    let largest = HIST_count_parallel_wksp(count, maxSymbolValuePtr, source, check, workSpace);
-    if HIST_isError(largest) != 0 {
-        return largest;
-    }
-    largest
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -370,6 +312,14 @@ mod tests {
         HIST_add(&mut count, b"ab");
         assert_eq!(count[b'a' as usize], 4);
         assert_eq!(count[b'b' as usize], 1);
+    }
+
+    #[test]
+    fn add_wraps_like_unsigned_c_counter() {
+        let mut count = [0u32; 256];
+        count[b'a' as usize] = u32::MAX;
+        HIST_add(&mut count, b"aa");
+        assert_eq!(count[b'a' as usize], 1);
     }
 
     #[test]
@@ -429,6 +379,39 @@ mod tests {
         use crate::common::error::{ERR_getErrorCode, ErrorCode};
         assert!(crate::common::error::ERR_isError(rc));
         assert_eq!(ERR_getErrorCode(rc), ErrorCode::WorkSpaceTooSmall);
+    }
+
+    #[test]
+    fn parallel_clears_original_count_range() {
+        let src = vec![b'a'; HIST_FAST_THRESHOLD];
+        let mut count = [7u32; 256];
+        let mut msv: u32 = 255;
+        let mut wksp = [0u32; HIST_WKSP_SIZE_U32];
+
+        let largest = HIST_countFast_wksp(&mut count, &mut msv, &src, &mut wksp);
+
+        assert_eq!(largest, HIST_FAST_THRESHOLD);
+        assert_eq!(msv, b'a' as u32);
+        assert_eq!(count[b'a' as usize], HIST_FAST_THRESHOLD as u32);
+        assert_eq!(count[b'b' as usize], 0);
+        assert_eq!(count[255], 0);
+    }
+
+    #[test]
+    fn checked_parallel_clears_original_count_range() {
+        let src = [1u8, 1, 1];
+        let mut count = [7u32; 256];
+        let mut msv: u32 = 10;
+        let mut wksp = [0u32; HIST_WKSP_SIZE_U32];
+
+        let largest = HIST_count_wksp(&mut count, &mut msv, &src, &mut wksp);
+
+        assert_eq!(largest, 3);
+        assert_eq!(msv, 1);
+        assert_eq!(count[1], 3);
+        assert_eq!(count[2], 0);
+        assert_eq!(count[10], 0);
+        assert_eq!(count[11], 7);
     }
 
     #[test]

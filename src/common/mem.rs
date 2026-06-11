@@ -38,38 +38,28 @@ pub const fn MEM_32bits() -> u32 {
 /// Port of `MEM_read16`. Native-endian unaligned 2-byte load.
 #[inline(always)]
 pub fn MEM_read16(ptr: &[u8]) -> u16 {
-    debug_assert!(ptr.len() >= 2);
-    unsafe { (ptr.as_ptr() as *const u16).read_unaligned() }
-}
-
-/// Port of `MEM_read24`. Native-endian 3-byte load packed into `u32`.
-#[inline(always)]
-pub fn MEM_read24(ptr: &[u8]) -> u32 {
-    // Upstream returns a U32 containing three bytes in natural endianness.
-    MEM_read16(ptr) as u32 | ((ptr[2] as u32) << 16)
+    u16::from_ne_bytes(ptr[..2].try_into().unwrap())
 }
 
 /// Port of `MEM_read32`. Native-endian unaligned 4-byte load.
 #[inline(always)]
 pub fn MEM_read32(ptr: &[u8]) -> u32 {
-    debug_assert!(ptr.len() >= 4);
-    unsafe { (ptr.as_ptr() as *const u32).read_unaligned() }
+    u32::from_ne_bytes(ptr[..4].try_into().unwrap())
 }
 
 /// Port of `MEM_read64`. Native-endian unaligned 8-byte load.
 #[inline(always)]
 pub fn MEM_read64(ptr: &[u8]) -> u64 {
-    debug_assert!(ptr.len() >= 8);
-    unsafe { (ptr.as_ptr() as *const u64).read_unaligned() }
+    u64::from_ne_bytes(ptr[..8].try_into().unwrap())
 }
 
 /// `size_t` load (`MEM_readST`): 4 or 8 bytes depending on target.
 #[inline(always)]
 pub fn MEM_readST(ptr: &[u8]) -> usize {
-    if core::mem::size_of::<usize>() == 8 {
-        MEM_read64(ptr) as usize
-    } else {
+    if core::mem::size_of::<usize>() == 4 {
         MEM_read32(ptr) as usize
+    } else {
+        MEM_read64(ptr) as usize
     }
 }
 
@@ -99,8 +89,11 @@ pub fn MEM_write64(dst: &mut [u8], value: u64) {
 /// Port of `MEM_readLE16`. Little-endian unaligned 2-byte load.
 #[inline(always)]
 pub fn MEM_readLE16(ptr: &[u8]) -> u16 {
-    debug_assert!(ptr.len() >= 2);
-    u16::from_le(unsafe { (ptr.as_ptr() as *const u16).read_unaligned() })
+    if MEM_isLittleEndian() != 0 {
+        MEM_read16(ptr)
+    } else {
+        (ptr[0] as u16) | ((ptr[1] as u16) << 8)
+    }
 }
 
 /// Port of `MEM_readLE24`. Little-endian 3-byte load packed into `u32`.
@@ -112,31 +105,42 @@ pub fn MEM_readLE24(ptr: &[u8]) -> u32 {
 /// Port of `MEM_readLE32`. Little-endian unaligned 4-byte load.
 #[inline(always)]
 pub fn MEM_readLE32(ptr: &[u8]) -> u32 {
-    debug_assert!(ptr.len() >= 4);
-    u32::from_le(unsafe { (ptr.as_ptr() as *const u32).read_unaligned() })
+    if MEM_isLittleEndian() != 0 {
+        MEM_read32(ptr)
+    } else {
+        MEM_swap32(MEM_read32(ptr))
+    }
 }
 
 /// Port of `MEM_readLE64`. Little-endian unaligned 8-byte load.
 #[inline(always)]
 pub fn MEM_readLE64(ptr: &[u8]) -> u64 {
-    debug_assert!(ptr.len() >= 8);
-    u64::from_le(unsafe { (ptr.as_ptr() as *const u64).read_unaligned() })
+    if MEM_isLittleEndian() != 0 {
+        MEM_read64(ptr)
+    } else {
+        MEM_swap64(MEM_read64(ptr))
+    }
 }
 
 /// Port of `MEM_readLEST`. Little-endian `size_t`-wide load.
 #[inline(always)]
 pub fn MEM_readLEST(ptr: &[u8]) -> usize {
-    if core::mem::size_of::<usize>() == 8 {
-        MEM_readLE64(ptr) as usize
-    } else {
+    if core::mem::size_of::<usize>() == 4 {
         MEM_readLE32(ptr) as usize
+    } else {
+        MEM_readLE64(ptr) as usize
     }
 }
 
 /// Port of `MEM_writeLE16`. Little-endian unaligned 2-byte store.
 #[inline(always)]
 pub fn MEM_writeLE16(dst: &mut [u8], value: u16) {
-    dst[..2].copy_from_slice(&value.to_le_bytes());
+    if MEM_isLittleEndian() != 0 {
+        MEM_write16(dst, value);
+    } else {
+        dst[0] = value as u8;
+        dst[1] = (value >> 8) as u8;
+    }
 }
 
 /// Port of `MEM_writeLE24`. Little-endian 3-byte store.
@@ -149,22 +153,30 @@ pub fn MEM_writeLE24(dst: &mut [u8], value: u32) {
 /// Port of `MEM_writeLE32`. Little-endian unaligned 4-byte store.
 #[inline(always)]
 pub fn MEM_writeLE32(dst: &mut [u8], value: u32) {
-    dst[..4].copy_from_slice(&value.to_le_bytes());
+    if MEM_isLittleEndian() != 0 {
+        MEM_write32(dst, value);
+    } else {
+        MEM_write32(dst, MEM_swap32(value));
+    }
 }
 
 /// Port of `MEM_writeLE64`. Little-endian unaligned 8-byte store.
 #[inline(always)]
 pub fn MEM_writeLE64(dst: &mut [u8], value: u64) {
-    dst[..8].copy_from_slice(&value.to_le_bytes());
+    if MEM_isLittleEndian() != 0 {
+        MEM_write64(dst, value);
+    } else {
+        MEM_write64(dst, MEM_swap64(value));
+    }
 }
 
 /// Port of `MEM_writeLEST`. Little-endian `size_t`-wide store.
 #[inline(always)]
 pub fn MEM_writeLEST(dst: &mut [u8], value: usize) {
-    if core::mem::size_of::<usize>() == 8 {
-        MEM_writeLE64(dst, value as u64);
-    } else {
+    if core::mem::size_of::<usize>() == 4 {
         MEM_writeLE32(dst, value as u32);
+    } else {
+        MEM_writeLE64(dst, value as u64);
     }
 }
 
@@ -173,46 +185,60 @@ pub fn MEM_writeLEST(dst: &mut [u8], value: usize) {
 /// Port of `MEM_readBE32`. Big-endian 4-byte load.
 #[inline(always)]
 pub fn MEM_readBE32(ptr: &[u8]) -> u32 {
-    u32::from_be_bytes([ptr[0], ptr[1], ptr[2], ptr[3]])
+    if MEM_isLittleEndian() != 0 {
+        MEM_swap32(MEM_read32(ptr))
+    } else {
+        MEM_read32(ptr)
+    }
 }
 
 /// Port of `MEM_readBE64`. Big-endian 8-byte load.
 #[inline(always)]
 pub fn MEM_readBE64(ptr: &[u8]) -> u64 {
-    u64::from_be_bytes([
-        ptr[0], ptr[1], ptr[2], ptr[3], ptr[4], ptr[5], ptr[6], ptr[7],
-    ])
+    if MEM_isLittleEndian() != 0 {
+        MEM_swap64(MEM_read64(ptr))
+    } else {
+        MEM_read64(ptr)
+    }
 }
 
 /// Port of `MEM_readBEST`. Big-endian `size_t`-wide load.
 #[inline(always)]
 pub fn MEM_readBEST(ptr: &[u8]) -> usize {
-    if core::mem::size_of::<usize>() == 8 {
-        MEM_readBE64(ptr) as usize
-    } else {
+    if core::mem::size_of::<usize>() == 4 {
         MEM_readBE32(ptr) as usize
+    } else {
+        MEM_readBE64(ptr) as usize
     }
 }
 
 /// Port of `MEM_writeBE32`. Big-endian 4-byte store.
 #[inline(always)]
 pub fn MEM_writeBE32(dst: &mut [u8], value: u32) {
-    dst[..4].copy_from_slice(&value.to_be_bytes());
+    if MEM_isLittleEndian() != 0 {
+        MEM_write32(dst, MEM_swap32(value));
+    } else {
+        MEM_write32(dst, value);
+    }
 }
 
 /// Port of `MEM_writeBE64`. Big-endian 8-byte store.
 #[inline(always)]
 pub fn MEM_writeBE64(dst: &mut [u8], value: u64) {
-    dst[..8].copy_from_slice(&value.to_be_bytes());
+    if MEM_isLittleEndian() != 0 {
+        MEM_write64(dst, MEM_swap64(value));
+    } else {
+        MEM_write64(dst, value);
+    }
 }
 
 /// Port of `MEM_writeBEST`. Big-endian `size_t`-wide store.
 #[inline(always)]
 pub fn MEM_writeBEST(dst: &mut [u8], value: usize) {
-    if core::mem::size_of::<usize>() == 8 {
-        MEM_writeBE64(dst, value as u64);
-    } else {
+    if core::mem::size_of::<usize>() == 4 {
         MEM_writeBE32(dst, value as u32);
+    } else {
+        MEM_writeBE64(dst, value as u64);
     }
 }
 
@@ -233,7 +259,17 @@ pub const fn MEM_swap64(x: u64) -> u64 {
 /// Port of `MEM_swapST`. Byte-swaps a `size_t`.
 #[inline(always)]
 pub const fn MEM_swapST(x: usize) -> usize {
-    x.swap_bytes()
+    if core::mem::size_of::<usize>() == 4 {
+        MEM_swap32(x as u32) as usize
+    } else {
+        MEM_swap64(x as u64) as usize
+    }
+}
+
+/// Upstream `MEM_check`: zstd only supports 32-bit and 64-bit `size_t`.
+#[inline(always)]
+pub const fn MEM_check() {
+    assert!(core::mem::size_of::<usize>() == 4 || core::mem::size_of::<usize>() == 8);
 }
 
 #[cfg(test)]
@@ -246,21 +282,6 @@ mod tests {
         MEM_writeLE16(&mut buf, 0x1234);
         assert_eq!(buf, [0x34, 0x12]);
         assert_eq!(MEM_readLE16(&buf), 0x1234);
-    }
-
-    #[test]
-    fn MEM_read24_reads_native_endian_3_bytes() {
-        // MEM_read24 is upstream's natural-endian 3-byte read. On LE
-        // hosts (where our port runs) it should match MEM_readLE24.
-        // Pins the semantic so a future refactor can't silently swap
-        // in a BE composition.
-        let bytes = [0xAB, 0xCD, 0xEF];
-        // On LE, both readers produce the same value.
-        assert_eq!(MEM_read24(&bytes), MEM_readLE24(&bytes));
-        // Concrete value: 0xEFCDAB on LE.
-        if is_little_endian() {
-            assert_eq!(MEM_read24(&bytes), 0xEFCDAB);
-        }
     }
 
     #[test]
@@ -304,6 +325,12 @@ mod tests {
     }
 
     #[test]
+    fn mem_check_accepts_supported_pointer_width() {
+        MEM_check();
+        assert!(MEM_32bits() != 0 || MEM_64bits() != 0);
+    }
+
+    #[test]
     fn best_roundtrip_matches_size_of_usize() {
         // `MEM_readBEST` / `MEM_writeBEST` dispatch on usize width,
         // parallel to the `*LEST` variants. On 64-bit targets they
@@ -334,6 +361,35 @@ mod tests {
         MEM_writeBE64(&mut buf, 0x0123_4567_89ab_cdef);
         assert_eq!(buf, [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef]);
         assert_eq!(MEM_readBE64(&buf), 0x0123_4567_89ab_cdef);
+    }
+
+    #[test]
+    fn native_roundtrips_match_target_endianness() {
+        let mut buf = [0u8; 8];
+        MEM_write16(&mut buf[..2], 0x1234);
+        assert_eq!(&buf[..2], &0x1234u16.to_ne_bytes());
+        assert_eq!(MEM_read16(&buf[..2]), 0x1234);
+
+        MEM_write32(&mut buf[..4], 0x89ab_cdef);
+        assert_eq!(&buf[..4], &0x89ab_cdefu32.to_ne_bytes());
+        assert_eq!(MEM_read32(&buf[..4]), 0x89ab_cdef);
+
+        MEM_write64(&mut buf, 0x0123_4567_89ab_cdef);
+        assert_eq!(buf, 0x0123_4567_89ab_cdefu64.to_ne_bytes());
+        assert_eq!(MEM_read64(&buf), 0x0123_4567_89ab_cdef);
+    }
+
+    #[test]
+    fn swap_helpers_match_intrinsic_byte_swaps() {
+        assert_eq!(MEM_swap32(0x0123_4567), 0x6745_2301);
+        assert_eq!(MEM_swap64(0x0123_4567_89ab_cdef), 0xefcd_ab89_6745_2301);
+
+        let value = 0x0123_4567usize;
+        if core::mem::size_of::<usize>() == 4 {
+            assert_eq!(MEM_swapST(value), MEM_swap32(value as u32) as usize);
+        } else {
+            assert_eq!(MEM_swapST(value), MEM_swap64(value as u64) as usize);
+        }
     }
 
     #[test]

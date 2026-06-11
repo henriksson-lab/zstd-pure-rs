@@ -3,7 +3,7 @@
 //! **Fully implemented**: constants (`FSE_MAX_MEMORY_USAGE`,
 //! `FSE_MAX_TABLELOG`, `FSE_TABLELOG_ABSOLUTE_MAX`), bound math
 //! (`FSE_NCountWriteBound`, `FSE_optimalTableLog{,_internal}`,
-//! `FSE_CTABLE_SIZE_U32`), CTable build
+//! `FSE_CTABLE_SIZE_U32`, `FSE_BUILD_CTABLE_WORKSPACE_SIZE{,_U32}`), CTable build
 //! (`FSE_buildCTable_rle`, `FSE_buildCTable_wksp`), cost estimator
 //! (`FSE_bitCost`), NCount writer (`FSE_writeNCount`), encoder
 //! state + symbol emit (`FSE_initCState{,2}`, `FSE_encodeSymbol`,
@@ -24,12 +24,14 @@ pub type FSE_CTable = u32;
 /// Port of `FSE_NCountWriteBound`. Returns the upper bound on the
 /// encoded NCount header size for a given `(maxSymbolValue, tableLog)`.
 pub fn FSE_NCountWriteBound(maxSymbolValue: u32, tableLog: u32) -> usize {
-    let maxHeaderSize = (((maxSymbolValue as usize + 1) * tableLog as usize
-        + 4  // bitCount initialized at 4
-        + 2  // first two symbols may use one additional bit each
-    ) / 8)
-        + 1  // round up to whole bytes
-        + 2; // bitstream flush
+    let maxHeaderSize = maxSymbolValue
+        .wrapping_add(1)
+        .wrapping_mul(tableLog)
+        .wrapping_add(4) // bitCount initialized at 4
+        .wrapping_add(2) // first two symbols may use one additional bit each
+        .wrapping_div(8)
+        .wrapping_add(1) // round up to whole bytes
+        .wrapping_add(2) as usize; // bitstream flush
     if maxSymbolValue != 0 {
         maxHeaderSize
     } else {
@@ -59,7 +61,7 @@ pub fn FSE_optimalTableLog_internal(
     minus: u32,
 ) -> u32 {
     debug_assert!(srcSize > 1);
-    let maxBitsSrc = ZSTD_highbit32(srcSize as u32 - 1).saturating_sub(minus);
+    let maxBitsSrc = ZSTD_highbit32((srcSize as u32).wrapping_sub(1)).wrapping_sub(minus);
     let mut tableLog = maxTableLog;
     let minBits = FSE_minTableLog(srcSize, maxSymbolValue);
     if tableLog == 0 {
@@ -80,12 +82,13 @@ pub fn FSE_optimalTableLog(maxTableLog: u32, srcSize: usize, maxSymbolValue: u32
     FSE_optimalTableLog_internal(maxTableLog, srcSize, maxSymbolValue, 2)
 }
 
-/// Upstream `FSE_symbolCompressionTransform` — two i32 fields stored
+/// Upstream `FSE_symbolCompressionTransform` — two fields stored
 /// inside the CTable after the nextState u16 table.
+#[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FSE_symbolCompressionTransform {
-    pub deltaNbBits: i32,
     pub deltaFindState: i32,
+    pub deltaNbBits: u32,
 }
 
 /// Port of `FSE_getMaxNbBits`. Approximate upper bound on the number
@@ -100,7 +103,7 @@ pub struct FSE_symbolCompressionTransform {
 /// `deltaNbBits` read.
 #[inline(always)]
 pub fn FSE_getMaxNbBits(symbolTT: &[FSE_symbolCompressionTransform], symbolValue: u32) -> u32 {
-    ((symbolTT[symbolValue as usize].deltaNbBits + ((1 << 16) - 1)) as u32) >> 16
+    (symbolTT[symbolValue as usize].deltaNbBits + ((1 << 16) - 1)) >> 16
 }
 
 // ---- CTable layout helpers ---------------------------------------------
@@ -144,7 +147,11 @@ fn ct_u16_write(ct: &mut [FSE_CTable], i: usize, val: u16) {
 #[inline(always)]
 fn symbolTT_offset(tableLog: u32) -> usize {
     let tableSize = 1usize << tableLog;
-    1 + tableSize / 2
+    if tableLog == 0 {
+        2
+    } else {
+        1 + tableSize / 2
+    }
 }
 
 /// Internal helper: write the `FSE_symbolCompressionTransform` entry for symbol `s`.
@@ -156,8 +163,8 @@ fn symbolTT_write(
     t: FSE_symbolCompressionTransform,
 ) {
     let base = symbolTT_offset(tableLog) + 2 * s;
-    ct[base] = t.deltaNbBits as u32;
-    ct[base + 1] = t.deltaFindState as u32;
+    ct[base] = t.deltaFindState as u32;
+    ct[base + 1] = t.deltaNbBits;
 }
 
 /// Read the `FSE_symbolCompressionTransform` entry for symbol `s` from a CTable.
@@ -170,8 +177,8 @@ pub fn symbolTT_read(ct: &[FSE_CTable], tableLog: u32, s: usize) -> FSE_symbolCo
         .try_into()
         .expect("symbolTT_read: 2 slots");
     FSE_symbolCompressionTransform {
-        deltaNbBits: pair[0] as i32,
-        deltaFindState: pair[1] as i32,
+        deltaFindState: pair[0] as i32,
+        deltaNbBits: pair[1],
     }
 }
 
@@ -193,8 +200,8 @@ unsafe fn symbolTT_read_unchecked(
     let p0 = unsafe { *ct.get_unchecked(base) };
     let p1 = unsafe { *ct.get_unchecked(base + 1) };
     FSE_symbolCompressionTransform {
-        deltaNbBits: p0 as i32,
-        deltaFindState: p1 as i32,
+        deltaFindState: p0 as i32,
+        deltaNbBits: p1,
     }
 }
 
@@ -202,8 +209,34 @@ unsafe fn symbolTT_read_unchecked(
 /// maxSymbolValue. Matches upstream's `FSE_CTABLE_SIZE_U32`.
 #[inline(always)]
 pub fn FSE_CTABLE_SIZE_U32(tableLog: u32, maxSymbolValue: u32) -> usize {
-    let tableSize = 1usize << tableLog;
-    1 + tableSize / 2 + 2 * (maxSymbolValue as usize + 1)
+    symbolTT_offset(tableLog) + 2 * (maxSymbolValue as usize + 1)
+}
+
+/// Upstream `FSE_BUILD_CTABLE_WORKSPACE_SIZE_U32`.
+#[inline(always)]
+pub const fn FSE_BUILD_CTABLE_WORKSPACE_SIZE_U32(maxSymbolValue: u32, tableLog: u32) -> usize {
+    (((maxSymbolValue as usize + 2) + (1usize << tableLog)) / 2)
+        + core::mem::size_of::<u64>() / core::mem::size_of::<u32>()
+}
+
+/// Upstream `FSE_BUILD_CTABLE_WORKSPACE_SIZE`.
+#[inline(always)]
+pub const fn FSE_BUILD_CTABLE_WORKSPACE_SIZE(maxSymbolValue: u32, tableLog: u32) -> usize {
+    core::mem::size_of::<u32>() * FSE_BUILD_CTABLE_WORKSPACE_SIZE_U32(maxSymbolValue, tableLog)
+}
+
+#[inline(always)]
+fn wksp_u16_read(buf: &[u8], index: usize) -> u16 {
+    let offset = index * 2;
+    u16::from_ne_bytes([buf[offset], buf[offset + 1]])
+}
+
+#[inline(always)]
+fn wksp_u16_write(buf: &mut [u8], index: usize, value: u16) {
+    let offset = index * 2;
+    let bytes = value.to_ne_bytes();
+    buf[offset] = bytes[0];
+    buf[offset + 1] = bytes[1];
 }
 
 /// Port of `FSE_buildCTable_rle`. Single-symbol CTable: tableLog=0,
@@ -235,13 +268,12 @@ pub fn FSE_buildCTable_rle(ct: &mut [FSE_CTable], symbolValue: u8) -> usize {
 /// the forbidden threshold).
 pub fn FSE_bitCost(ct: &[FSE_CTable], tableLog: u32, symbolValue: u32, accuracyLog: u32) -> u32 {
     let tt = symbolTT_read(ct, tableLog, symbolValue as usize);
-    let minNbBits = (tt.deltaNbBits as u32) >> 16;
+    let minNbBits = tt.deltaNbBits >> 16;
     let threshold = (minNbBits + 1) << 16;
     debug_assert!(tableLog < 16);
     debug_assert!(accuracyLog < 31 - tableLog);
     let tableSize = 1u32 << tableLog;
-    let deltaFromThreshold =
-        threshold.wrapping_sub((tt.deltaNbBits as u32).wrapping_add(tableSize));
+    let deltaFromThreshold = threshold.wrapping_sub(tt.deltaNbBits.wrapping_add(tableSize));
     let normalizedDeltaFromThreshold = (deltaFromThreshold << accuracyLog) >> tableLog;
     let bitMultiplier = 1u32 << accuracyLog;
     (minNbBits + 1) * bitMultiplier - normalizedDeltaFromThreshold
@@ -251,10 +283,10 @@ pub fn FSE_bitCost(ct: &[FSE_CTable], tableLog: u32, symbolValue: u32, accuracyL
 /// for FSE encoding out of a normalized count distribution.
 ///
 /// Rust signature note: upstream takes the workspace as `void*` with
-/// 2-byte alignment; the Rust port takes separate `cumul` (u16) and
-/// `tableSymbol` (u8) slices so the alignment invariant is
-/// type-encoded. Callers that want upstream's single-workspace shape
-/// can split a `&mut [u8]` in two.
+/// 2-byte alignment. The Rust port receives the same single scratch
+/// buffer as bytes and stores the `cumul` u16 table in native-endian
+/// byte pairs to avoid imposing an unsafe alignment requirement on
+/// callers.
 pub fn FSE_buildCTable_wksp(
     ct: &mut [FSE_CTable],
     normalizedCounter: &[i16],
@@ -273,39 +305,38 @@ pub fn FSE_buildCTable_wksp(
     // Workspace split: cumul[maxSV1+1] u16 + tableSymbol[tableSize] u8.
     let cumul_bytes = (maxSV1 as usize + 1) * 2;
     let ts_bytes = tableSize as usize;
-    let needed = cumul_bytes + ts_bytes + 8; // +8 for upstream's 8-byte MEM_write64 slack on `spread`
+    let layout_needed = cumul_bytes + ts_bytes + 8; // +8 for upstream's 8-byte MEM_write64 slack on `spread`
+    let needed = FSE_BUILD_CTABLE_WORKSPACE_SIZE(maxSymbolValue, tableLog).max(layout_needed);
     if workSpace.len() < needed {
         return ERROR(ErrorCode::TableLogTooLarge);
     }
     let (cumul_bytes_slice, rest) = workSpace.split_at_mut(cumul_bytes);
-    let (tableSymbol, _spread_slack) = rest.split_at_mut(ts_bytes + 8);
-    let mut cumul = vec![0u16; maxSV1 as usize + 1];
+    let (tableSymbol, spread) = rest.split_at_mut(ts_bytes);
 
     debug_assert!(tableLog < 16);
     ct_header_write(ct, tableLog as u16, maxSymbolValue as u16);
 
     // Symbol start positions + lowprob placement.
     let mut highThreshold: i64 = tableSize as i64 - 1;
-    cumul[0] = 0;
+    wksp_u16_write(cumul_bytes_slice, 0, 0);
     for u in 1..=maxSV1 as usize {
         let nc = normalizedCounter[u - 1];
+        let prev = wksp_u16_read(cumul_bytes_slice, u - 1);
         if nc == -1 {
-            cumul[u] = cumul[u - 1] + 1;
+            wksp_u16_write(cumul_bytes_slice, u, prev + 1);
             tableSymbol[highThreshold as usize] = (u - 1) as u8;
             highThreshold -= 1;
         } else {
             debug_assert!(nc >= 0);
-            cumul[u] = cumul[u - 1] + nc as u16;
+            wksp_u16_write(cumul_bytes_slice, u, prev + nc as u16);
         }
     }
-    cumul[maxSV1 as usize] = (tableSize + 1) as u16;
+    wksp_u16_write(cumul_bytes_slice, maxSV1 as usize, (tableSize + 1) as u16);
 
     // Spread symbols.
     if highThreshold == tableSize as i64 - 1 {
-        // Fast path: lay down in order into `spread` (separate from
-        // the final `tableSymbol` buffer — upstream stashes `spread`
-        // at `tableSymbol + tableSize`, 8-byte slack tail included).
-        let mut spread = vec![0u8; tableSize as usize + 8];
+        // Fast path: lay down in order into `spread` (upstream stashes
+        // `spread` at `tableSymbol + tableSize`, 8-byte slack tail included).
         let mut pos = 0usize;
         for (s, &nc) in normalizedCounter.iter().enumerate().take(maxSV1 as usize) {
             let n = nc as i32;
@@ -345,8 +376,8 @@ pub fn FSE_buildCTable_wksp(
     // tableU16[cumul[s]++] = tableSize + u (where s is symbol at slot u).
     for (u, &sym) in tableSymbol.iter().enumerate().take(tableSize as usize) {
         let s = sym as usize;
-        let idx = cumul[s] as usize;
-        cumul[s] += 1;
+        let idx = wksp_u16_read(cumul_bytes_slice, s) as usize;
+        wksp_u16_write(cumul_bytes_slice, s, idx as u16 + 1);
         ct_u16_write(ct, idx, (tableSize as usize + u) as u16);
     }
 
@@ -360,14 +391,14 @@ pub fn FSE_buildCTable_wksp(
         let t: FSE_symbolCompressionTransform = match nc {
             0 => {
                 // For the cost estimator: (tableLog+1) << 16 - tableSize
-                let dnb = ((tableLog + 1) << 16) as i32 - (1i32 << tableLog);
+                let dnb = ((tableLog + 1) << 16) - (1u32 << tableLog);
                 FSE_symbolCompressionTransform {
                     deltaNbBits: dnb,
                     deltaFindState: 0,
                 }
             }
             -1 | 1 => {
-                let dnb = (tableLog << 16) as i32 - (1i32 << tableLog);
+                let dnb = (tableLog << 16) - (1u32 << tableLog);
                 let t = FSE_symbolCompressionTransform {
                     deltaNbBits: dnb,
                     deltaFindState: total as i32 - 1,
@@ -379,7 +410,7 @@ pub fn FSE_buildCTable_wksp(
                 let nu = n as u32;
                 let maxBitsOut = tableLog - crate::common::bits::ZSTD_highbit32(nu - 1);
                 let minStatePlus = nu << maxBitsOut;
-                let dnb = (maxBitsOut << 16) as i32 - minStatePlus as i32;
+                let dnb = (maxBitsOut << 16) - minStatePlus;
                 let t = FSE_symbolCompressionTransform {
                     deltaNbBits: dnb,
                     deltaFindState: total as i32 - nu as i32,
@@ -392,7 +423,6 @@ pub fn FSE_buildCTable_wksp(
         symbolTT_write(ct, tableLog, s, t);
     }
 
-    let _ = cumul_bytes_slice; // workspace split kept for layout faithfulness
     0
 }
 
@@ -419,7 +449,7 @@ fn FSE_writeNCount_generic(
     let mut previousIs0 = false;
 
     // Table size header (4 bits).
-    bitStream += (tableLog - FSE_MIN_TABLELOG) << bitCount;
+    bitStream = bitStream.wrapping_add((tableLog - FSE_MIN_TABLELOG) << bitCount);
     bitCount += 4;
 
     let mut remaining: i32 = tableSize + 1; // +1 for extra accuracy
@@ -428,7 +458,7 @@ fn FSE_writeNCount_generic(
 
     // Helper for the two 16-bit flushes upstream does inline.
     let flush16 = |buffer: &mut [u8], out: &mut usize, bitStream: &mut u32| -> Option<usize> {
-        if !writeIsSafe && *out > oend.saturating_sub(2) {
+        if !writeIsSafe && oend.saturating_sub(*out) < 2 {
             return Some(ERROR(ErrorCode::DstSizeTooSmall));
         }
         buffer[*out] = *bitStream as u8;
@@ -450,17 +480,17 @@ fn FSE_writeNCount_generic(
             let mut start = start_base;
             while symbol >= start + 24 {
                 start += 24;
-                bitStream += 0xFFFFu32 << bitCount;
+                bitStream = bitStream.wrapping_add(0xFFFFu32 << bitCount);
                 if let Some(err) = flush16(buffer, &mut out, &mut bitStream) {
                     return err;
                 }
             }
             while symbol >= start + 3 {
                 start += 3;
-                bitStream += 3u32 << bitCount;
+                bitStream = bitStream.wrapping_add(3u32 << bitCount);
                 bitCount += 2;
             }
-            bitStream += (symbol - start) << bitCount;
+            bitStream = bitStream.wrapping_add((symbol - start) << bitCount);
             bitCount += 2;
             if bitCount > 16 {
                 if let Some(err) = flush16(buffer, &mut out, &mut bitStream) {
@@ -478,7 +508,7 @@ fn FSE_writeNCount_generic(
             if count >= threshold {
                 count += max; // [0..max[ [max..threshold[ (...) [threshold+max, 2*threshold[
             }
-            bitStream += (count as u32) << bitCount;
+            bitStream = bitStream.wrapping_add((count as u32) << bitCount);
             bitCount += nbBits;
             bitCount -= (count < max) as i32;
             previousIs0 = count == 1;
@@ -504,13 +534,11 @@ fn FSE_writeNCount_generic(
     debug_assert!(symbol <= alphabetSize);
 
     // Final flush — up to 2 bytes plus any remaining bit fragment.
-    if !writeIsSafe && out > oend.saturating_sub(2) {
+    if !writeIsSafe && oend.saturating_sub(out) < 2 {
         return ERROR(ErrorCode::DstSizeTooSmall);
     }
     buffer[out] = bitStream as u8;
-    if out + 1 < oend {
-        buffer[out + 1] = (bitStream >> 8) as u8;
-    }
+    buffer[out + 1] = (bitStream >> 8) as u8;
     out += ((bitCount + 7) / 8) as usize;
     out
 }
@@ -600,7 +628,7 @@ pub fn FSE_initCState2(st: &mut FSE_CState_t, ct: &[FSE_CTable], symbol: u32) {
     // per block at the last sequence, not in a hot loop, but using the
     // same unchecked path keeps the helper consistent and cheaper).
     let tt = unsafe { symbolTT_read_unchecked(ct, tableLog, symbol as usize) };
-    let nbBitsOut = ((tt.deltaNbBits + (1 << 15)) >> 16) as u32;
+    let nbBitsOut = (tt.deltaNbBits + (1 << 15)) >> 16;
     let v = ((nbBitsOut as isize) << 16) - (tt.deltaNbBits as isize);
     let idx = ((v >> nbBitsOut) + tt.deltaFindState as isize) as usize;
     st.value = unsafe { ct_u16_read_unchecked(ct, idx) } as isize;
@@ -630,7 +658,7 @@ pub fn FSE_encodeSymbol(
     // SAFETY: see function docstring — symbol ≤ maxSymbolValue, idx is
     // in-range by FSE state-machine invariants, ct sized accordingly.
     let tt = unsafe { symbolTT_read_unchecked(ct, tableLog, symbol as usize) };
-    let nbBitsOut = ((st.value + tt.deltaNbBits as isize) >> 16) as u32;
+    let nbBitsOut = ((st.value as isize + tt.deltaNbBits as isize) >> 16) as u32;
     crate::common::bitstream::BIT_addBits(bitC, st.value as usize, nbBitsOut);
     let idx = ((st.value >> nbBitsOut) + tt.deltaFindState as isize) as usize;
     st.value = unsafe { ct_u16_read_unchecked(ct, idx) } as isize;
@@ -784,7 +812,7 @@ fn FSE_normalizeM2(
 ) -> usize {
     const NOT_YET_ASSIGNED: i16 = -2;
     let lowThreshold = (total >> tableLog) as u32;
-    let mut lowOne = ((total * 3) >> (tableLog + 1)) as u32;
+    let mut lowOne = (total.wrapping_mul(3) >> (tableLog + 1)) as u32;
     let mut distributed: u32 = 0;
 
     for s in 0..=maxSymbolValue as usize {
@@ -811,8 +839,8 @@ fn FSE_normalizeM2(
         return 0;
     }
 
-    if total as u32 / ToDistribute > lowOne {
-        lowOne = ((total as u32) * 3) / (ToDistribute * 2);
+    if total / ToDistribute as usize > lowOne as usize {
+        lowOne = (total.wrapping_mul(3) / ToDistribute.wrapping_mul(2) as usize) as u32;
         for s in 0..=maxSymbolValue as usize {
             if norm[s] == NOT_YET_ASSIGNED && count[s] <= lowOne {
                 norm[s] = 1;
@@ -854,11 +882,11 @@ fn FSE_normalizeM2(
 
     let vStepLog = 62u32 - tableLog;
     let mid = (1u64 << (vStepLog - 1)) - 1;
-    let rStep = ((1u64 << vStepLog) * ToDistribute as u64 + mid) / (total as u64);
+    let rStep = ((1u64 << vStepLog) * ToDistribute as u64 + mid) / ((total as u32) as u64);
     let mut tmpTotal = mid;
     for s in 0..=maxSymbolValue as usize {
         if norm[s] == NOT_YET_ASSIGNED {
-            let end = tmpTotal + (count[s] as u64 * rStep);
+            let end = tmpTotal.wrapping_add((count[s] as u64).wrapping_mul(rStep));
             let sStart = (tmpTotal >> vStepLog) as u32;
             let sEnd = (end >> vStepLog) as u32;
             let weight = sEnd - sStart;
@@ -902,7 +930,7 @@ pub fn FSE_normalizeCount(
 
     let lowProbCount: i16 = if useLowProbCount != 0 { -1 } else { 1 };
     let scale = 62u32 - tableLog;
-    let step = (1u64 << 62) / total as u64;
+    let step = (1u64 << 62) / ((total as u32) as u64);
     let vStep = 1u64 << (scale - 20);
     let mut stillToDistribute: i32 = 1 << tableLog;
     let mut largest: u32 = 0;
@@ -921,10 +949,11 @@ pub fn FSE_normalizeCount(
             normalizedCounter[s] = lowProbCount;
             stillToDistribute -= 1;
         } else {
-            let mut proba = ((count[s] as u64 * step) >> scale) as i16;
+            let scaled = (count[s] as u64).wrapping_mul(step);
+            let mut proba = (scaled >> scale) as i16;
             if proba < 8 {
                 let restToBeat = vStep * RTB_TABLE[proba as usize] as u64;
-                let excess = (count[s] as u64 * step) - ((proba as u64) << scale);
+                let excess = scaled.wrapping_sub((proba as u64) << scale);
                 if excess > restToBeat {
                     proba += 1;
                 }
@@ -978,6 +1007,18 @@ mod tests {
     }
 
     #[test]
+    fn optimal_tablelog_internal_wraps_minus_like_upstream_u32() {
+        // Upstream computes `ZSTD_highbit32((U32)(srcSize - 1)) - minus`
+        // in U32 arithmetic. For tiny inputs this wraps instead of
+        // saturating, so the default tableLog is preserved.
+        assert_eq!(FSE_optimalTableLog(0, 2, 255), FSE_DEFAULT_TABLELOG);
+        assert_eq!(
+            FSE_optimalTableLog_internal(FSE_MAX_TABLELOG, 2, 255, 5),
+            FSE_MAX_TABLELOG
+        );
+    }
+
+    #[test]
     fn ncount_write_bound_zero_maxsymbol_is_default() {
         // maxSymbolValue == 0 → upstream falls back to FSE_NCOUNTBOUND.
         assert_eq!(FSE_NCountWriteBound(0, 8), FSE_NCOUNTBOUND);
@@ -991,6 +1032,17 @@ mod tests {
         // Formula: ((alphabet * tableLog + 6) / 8) + 3. For (31, 6):
         //   ((32 * 6 + 6)/8) + 3 = (198/8) + 3 = 24 + 3 = 27.
         assert_eq!(small, 27);
+    }
+
+    #[test]
+    fn write_ncount_rejects_tiny_output_buffer() {
+        let norm: [i16; 2] = [16, 16];
+        let mut dst = [0u8; 1];
+        let rc = FSE_writeNCount(&mut dst, &norm, 1, FSE_MIN_TABLELOG);
+        assert_eq!(
+            crate::common::error::ERR_getErrorCode(rc),
+            crate::common::error::ErrorCode::DstSizeTooSmall
+        );
     }
 
     #[test]
@@ -1027,6 +1079,17 @@ mod tests {
     }
 
     #[test]
+    fn normalize_count_uses_wrapping_u64_products() {
+        // Upstream multiplies U32 counts by U64 fixed-point steps in
+        // unsigned arithmetic. Large caller-provided totals can make
+        // that product wrap; the Rust port must not debug-panic.
+        let count = [u32::MAX, 2];
+        let total = count.iter().map(|&c| c as usize).sum();
+        let mut norm = [0i16; 2];
+        let _ = FSE_normalizeCount(&mut norm, FSE_MIN_TABLELOG, &count, total, 1, 0);
+    }
+
+    #[test]
     fn normalize_count_rejects_tablelog_too_small_for_alphabet() {
         // Six symbols → need at least ⌈log2(6)⌉+2 = 5 bits in
         // FSE_minTableLog. Ask for tableLog=4 → error.
@@ -1060,9 +1123,9 @@ mod tests {
         // evaluates to:
         //   1 + (1 << (maxTableLog - 1)) + (maxSymbolValue + 1) * 2
         // for maxTableLog >= 1. Our port uses `1 + tableSize/2 + ...`
-        // which is equivalent for positive logs and also defined for
-        // tableLog=0 (produces `1 + 0 + 2*(maxSymbolValue+1)` — the
-        // RLE-CTable size we actually use). Pin both cases so any
+        // which is equivalent for positive logs and uses the upstream
+        // RLE placement (`symbolTT` starts at `ct + 2`) for tableLog=0.
+        // Pin both cases so any
         // future refactor can't drift the memory budget.
         for (tl, max_sym) in [(6u32, 35u32), (9, 35), (11, 255), (12, 255)] {
             let expected: usize = 1 + (1usize << (tl - 1)) + (max_sym as usize + 1) * 2;
@@ -1072,10 +1135,26 @@ mod tests {
                 "FSE_CTABLE_SIZE_U32({tl}, {max_sym})",
             );
         }
-        // tableLog=0 → RLE case: allocator must still return a
-        // positive slot count (our port yields `1 + 0 + 2*(sym+1)`).
-        assert_eq!(FSE_CTABLE_SIZE_U32(0, 0), 3);
-        assert_eq!(FSE_CTABLE_SIZE_U32(0, 255), 1 + 2 * 256);
+        // tableLog=0 → RLE case: upstream places symbolTT at ct + 2.
+        assert_eq!(FSE_CTABLE_SIZE_U32(0, 0), 4);
+        assert_eq!(FSE_CTABLE_SIZE_U32(0, 255), 2 + 2 * 256);
+    }
+
+    #[test]
+    fn FSE_BUILD_CTABLE_WORKSPACE_SIZE_matches_upstream_formula() {
+        for (tl, max_sym) in [(6u32, 35u32), (9, 35), (11, 255), (12, 255)] {
+            let expected_u32 = (((max_sym as usize + 2) + (1usize << tl)) / 2) + 2;
+            assert_eq!(
+                FSE_BUILD_CTABLE_WORKSPACE_SIZE_U32(max_sym, tl),
+                expected_u32,
+                "FSE_BUILD_CTABLE_WORKSPACE_SIZE_U32({max_sym}, {tl})",
+            );
+            assert_eq!(
+                FSE_BUILD_CTABLE_WORKSPACE_SIZE(max_sym, tl),
+                expected_u32 * core::mem::size_of::<u32>(),
+                "FSE_BUILD_CTABLE_WORKSPACE_SIZE({max_sym}, {tl})",
+            );
+        }
     }
 
     #[test]
@@ -1179,7 +1258,7 @@ mod tests {
         // Build CTable.
         let ct_size = FSE_CTABLE_SIZE_U32(tableLog, msv);
         let mut ct = vec![0u32; ct_size];
-        let build_ws = vec![0u8; (msv as usize + 2) * 2 + (1 << tableLog) + 8];
+        let build_ws = vec![0u8; FSE_BUILD_CTABLE_WORKSPACE_SIZE(msv, tableLog)];
         let mut build_ws = build_ws;
         let rc = FSE_buildCTable_wksp(&mut ct, &norm, msv, tableLog, &mut build_ws);
         assert_eq!(rc, 0);
@@ -1239,7 +1318,7 @@ mod tests {
         let max_sv = 5u32;
         let ct_size = FSE_CTABLE_SIZE_U32(tableLog, max_sv);
         let mut ct = vec![0u32; ct_size];
-        let ws_size = (max_sv as usize + 2) * 2 + (1 << tableLog) + 8;
+        let ws_size = FSE_BUILD_CTABLE_WORKSPACE_SIZE(max_sv, tableLog);
         let mut wksp = vec![0u8; ws_size];
 
         let rc = FSE_buildCTable_wksp(&mut ct, &norm, max_sv, tableLog, &mut wksp);
@@ -1254,7 +1333,7 @@ mod tests {
         for (s, &n) in norm.iter().enumerate().take(max_sv as usize + 1) {
             let t = symbolTT_read(&ct, tableLog, s);
             if n == 0 {
-                let expected = ((tableLog + 1) << 16) as i32 - (1i32 << tableLog);
+                let expected = ((tableLog + 1) << 16) - (1u32 << tableLog);
                 assert_eq!(
                     t.deltaNbBits, expected,
                     "zero-count symbol {s} has unexpected deltaNbBits"
@@ -1285,7 +1364,7 @@ mod tests {
         let norm: [i16; 8] = [128, 64, 32, 16, 8, 4, 2, 2];
 
         let mut ct = vec![0u32; FSE_CTABLE_SIZE_U32(TABLELOG, MSV)];
-        let mut ws = vec![0u8; (MSV as usize + 2) * 2 + (1usize << TABLELOG) + 8];
+        let mut ws = vec![0u8; FSE_BUILD_CTABLE_WORKSPACE_SIZE(MSV, TABLELOG)];
         let rc = FSE_buildCTable_wksp(&mut ct, &norm, MSV, TABLELOG, &mut ws);
         assert_eq!(rc, 0, "buildCTable failed: {rc:#x}");
 

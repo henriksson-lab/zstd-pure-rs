@@ -15,15 +15,16 @@ use crate::common::pool::{
 };
 use crate::common::xxhash::XXH64_state_t;
 use crate::compress::match_state::ZSTD_WINDOW_START_INDEX;
+use crate::compress::zstd_compress::ZSTD_customMem_validate;
+use crate::compress::zstd_compress::ZSTD_WINDOWLOG_MAX;
 use crate::compress::zstd_compress::{
-    ZSTD_CCtx, ZSTD_CCtxParams_init, ZSTD_CCtxParams_setParameter, ZSTD_CCtx_params,
-    ZSTD_CCtx_trace, ZSTD_CParamMode_e, ZSTD_EndDirective, ZSTD_compressBegin_advanced_internal,
-    ZSTD_compressBound, ZSTD_compressContinue_public, ZSTD_compressEnd_public,
-    ZSTD_createCCtx_advanced, ZSTD_customMem, ZSTD_cycleLog, ZSTD_frameProgression,
-    ZSTD_getCParamsFromCCtxParams, ZSTD_invalidateRepCodes, ZSTD_referenceExternalSequences,
-    ZSTD_sizeof_CCtx, ZSTD_writeLastEmptyBlock, ZSTD_CLEVEL_DEFAULT,
+    ZSTD_CCtx, ZSTD_CCtxParams_init, ZSTD_CCtx_params, ZSTD_CCtx_trace, ZSTD_CParamMode_e,
+    ZSTD_EndDirective, ZSTD_compressBegin_advanced_internal, ZSTD_compressBound,
+    ZSTD_compressContinue_public, ZSTD_compressEnd_public, ZSTD_createCCtx_advanced,
+    ZSTD_customMem, ZSTD_cycleLog, ZSTD_frameProgression, ZSTD_getCParamsFromCCtxParams,
+    ZSTD_invalidateRepCodes, ZSTD_referenceExternalSequences, ZSTD_sizeof_CCtx,
+    ZSTD_writeLastEmptyBlock, ZSTD_CLEVEL_DEFAULT,
 };
-use crate::compress::zstd_compress::{ZSTD_cParameter, ZSTD_WINDOWLOG_MAX};
 use crate::compress::zstd_hashes::{
     ZSTD_rollingHash_append, ZSTD_rollingHash_compute, ZSTD_rollingHash_primePower,
     ZSTD_rollingHash_rotate,
@@ -39,14 +40,20 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::OnceLock;
 use std::time::Instant;
 
+#[cfg(target_pointer_width = "32")]
+pub const ZSTDMT_JOBLOG_MAX: u32 = 29;
+#[cfg(not(target_pointer_width = "32"))]
 pub const ZSTDMT_JOBLOG_MAX: u32 = 30;
-pub const ZSTDMT_JOBSIZE_MIN: usize = 1 << 20;
+#[cfg(target_pointer_width = "32")]
+pub const ZSTDMT_NBWORKERS_MAX: u32 = 64;
+#[cfg(not(target_pointer_width = "32"))]
+pub const ZSTDMT_NBWORKERS_MAX: u32 = 256;
+pub const ZSTDMT_JOBSIZE_MIN: usize = 512 * 1024;
 pub const ZSTDMT_JOBSIZE_MAX: usize = 1 << ZSTDMT_JOBLOG_MAX;
 pub const RSYNC_LENGTH: usize = 32;
-pub const RSYNC_MIN_BLOCK_LOG: usize = 17;
-pub const RSYNC_MIN_BLOCK_SIZE: usize = 1 << RSYNC_MIN_BLOCK_LOG;
+pub const RSYNC_MIN_BLOCK_SIZE: usize = ZSTD_BLOCKSIZE_MAX;
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Range {
     pub start: usize,
     pub size: usize,
@@ -107,8 +114,33 @@ pub struct ZSTDMT_jobDescription {
 
 impl Buffer {
     #[inline]
+    fn from_vec(data: Vec<u8>) -> Self {
+        Self {
+            data,
+            view: Range::default(),
+        }
+    }
+
+    #[inline]
+    fn borrowed(start: usize, size: usize) -> Self {
+        Self {
+            data: Vec::new(),
+            view: Range { start, size },
+        }
+    }
+
+    #[inline]
+    fn is_borrowed(&self) -> bool {
+        self.view.start != 0 || self.view.size != 0
+    }
+
+    #[inline]
     pub fn start(&self) -> usize {
-        self.data.as_ptr() as usize
+        if self.is_borrowed() {
+            self.view.start
+        } else {
+            self.data.as_ptr() as usize
+        }
     }
 }
 
@@ -130,6 +162,55 @@ fn range_as_slice(range: Range) -> &'static [u8] {
         // `Range` always points into buffers owned by the MT context.
         unsafe { core::slice::from_raw_parts(range.start as *const u8, range.size) }
     }
+}
+
+#[inline]
+fn ZSTDMT_inBuffFilledSlice(mtctx: &ZSTDMT_CCtx) -> &[u8] {
+    let filled = mtctx.inBuff.filled.min(mtctx.inBuff.buffer.capacity());
+    if filled == 0 {
+        &[]
+    } else if mtctx.inBuff.buffer.is_borrowed() {
+        range_as_slice(Range {
+            start: mtctx.inBuff.buffer.start(),
+            size: filled,
+        })
+    } else {
+        &mtctx.inBuff.buffer.data[..filled]
+    }
+}
+
+#[inline]
+fn ZSTDMT_roundBufferOffset(roundBuff: &RoundBuff_t, start: usize, size: usize) -> Option<usize> {
+    let base = roundBuff.buffer.start();
+    let end = start.checked_add(size)?;
+    let rel = start.checked_sub(base)?;
+    if end <= base.checked_add(roundBuff.buffer.data.len())? {
+        Some(rel)
+    } else {
+        None
+    }
+}
+
+fn ZSTDMT_copyToInputBuffer(mtctx: &mut ZSTDMT_CCtx, src: &[u8]) -> bool {
+    let filled = mtctx.inBuff.filled;
+    if mtctx.inBuff.buffer.is_borrowed() {
+        let Some(offset) = ZSTDMT_roundBufferOffset(
+            &mtctx.roundBuff,
+            mtctx.inBuff.buffer.start(),
+            filled + src.len(),
+        ) else {
+            return false;
+        };
+        let dst_start = offset + filled;
+        let dst_end = dst_start + src.len();
+        mtctx.roundBuff.buffer.data[dst_start..dst_end].copy_from_slice(src);
+    } else {
+        if mtctx.inBuff.buffer.data.len() < filled + src.len() {
+            mtctx.inBuff.buffer.data.resize(filled + src.len(), 0);
+        }
+        mtctx.inBuff.buffer.data[filled..filled + src.len()].copy_from_slice(src);
+    }
+    true
 }
 
 pub struct ZSTDMT_CCtx {
@@ -199,12 +280,17 @@ impl Default for ZSTDMT_CCtx {
 #[derive(Debug, Clone, Default)]
 pub struct Buffer {
     pub data: Vec<u8>,
+    view: Range,
 }
 
 impl Buffer {
     #[inline]
     pub fn capacity(&self) -> usize {
-        self.data.len()
+        if self.is_borrowed() {
+            self.view.size
+        } else {
+            self.data.len()
+        }
     }
 }
 
@@ -217,6 +303,16 @@ pub struct ZSTDMT_bufferPool {
 }
 
 pub type ZSTDMT_seqPool = ZSTDMT_bufferPool;
+
+#[inline]
+fn ZSTDMT_bufPoolMaxNbBuffers(nbWorkers: u32) -> u32 {
+    2 * nbWorkers + 3
+}
+
+#[inline]
+fn ZSTDMT_seqPoolMaxNbBuffers(nbWorkers: u32) -> u32 {
+    nbWorkers
+}
 
 #[derive(Debug)]
 pub struct ZSTDMT_CCtxPool {
@@ -262,7 +358,7 @@ pub fn ZSTDMT_createBufferPool(
 /// Port of `ZSTDMT_sizeof_bufferPool`.
 pub fn ZSTDMT_sizeof_bufferPool(bufPool: &ZSTDMT_bufferPool) -> usize {
     core::mem::size_of::<ZSTDMT_bufferPool>()
-        + bufPool.buffers.capacity() * core::mem::size_of::<Buffer>()
+        + bufPool.totalBuffers * core::mem::size_of::<Buffer>()
         + bufPool.buffers.iter().map(Buffer::capacity).sum::<usize>()
 }
 
@@ -273,32 +369,42 @@ pub fn ZSTDMT_setBufferSize(bufPool: &mut ZSTDMT_bufferPool, bSize: usize) {
 
 /// Port of `ZSTDMT_expandBufferPool`.
 pub fn ZSTDMT_expandBufferPool(
-    mut srcBufPool: Box<ZSTDMT_bufferPool>,
+    srcBufPool: Box<ZSTDMT_bufferPool>,
     maxNbBuffers: u32,
 ) -> Option<Box<ZSTDMT_bufferPool>> {
-    if srcBufPool.totalBuffers < maxNbBuffers as usize {
-        srcBufPool.totalBuffers = maxNbBuffers as usize;
+    if srcBufPool.totalBuffers >= maxNbBuffers as usize {
+        return Some(srcBufPool);
     }
-    Some(srcBufPool)
+    let cMem = srcBufPool._cMem;
+    let bSize = srcBufPool.bufferSize;
+    drop(srcBufPool);
+    let mut newBufPool = ZSTDMT_createBufferPool(maxNbBuffers, cMem)?;
+    ZSTDMT_setBufferSize(&mut newBufPool, bSize);
+    Some(newBufPool)
 }
 
 /// Port of `ZSTDMT_getBuffer`.
 pub fn ZSTDMT_getBuffer(bufPool: &mut ZSTDMT_bufferPool) -> Buffer {
     let bSize = bufPool.bufferSize;
-    if let Some(pos) = bufPool
-        .buffers
-        .iter()
-        .position(|buf| buf.capacity() >= bSize && (buf.capacity() >> 3) <= bSize)
-    {
-        return bufPool.buffers.swap_remove(pos);
+    if let Some(buf) = bufPool.buffers.pop() {
+        let availBufferSize = buf.capacity();
+        if availBufferSize >= bSize && (availBufferSize >> 3) <= bSize {
+            return buf;
+        }
     }
-    Buffer {
-        data: vec![0; bSize],
-    }
+    Buffer::from_vec(vec![0; bSize])
 }
 
 /// Port of `ZSTDMT_resizeBuffer`.
 pub fn ZSTDMT_resizeBuffer(bufPool: &ZSTDMT_bufferPool, mut buffer: Buffer) -> Buffer {
+    if buffer.is_borrowed() {
+        let mut resized = vec![0; bufPool.bufferSize];
+        let to_copy = buffer.capacity().min(resized.len());
+        if to_copy != 0 {
+            resized[..to_copy].copy_from_slice(&range_as_slice(buffer.view)[..to_copy]);
+        }
+        return Buffer::from_vec(resized);
+    }
     if buffer.capacity() < bufPool.bufferSize {
         buffer.data.resize(bufPool.bufferSize, 0);
     }
@@ -307,7 +413,7 @@ pub fn ZSTDMT_resizeBuffer(bufPool: &ZSTDMT_bufferPool, mut buffer: Buffer) -> B
 
 /// Port of `ZSTDMT_releaseBuffer`.
 pub fn ZSTDMT_releaseBuffer(bufPool: &mut ZSTDMT_bufferPool, buf: Buffer) {
-    if buf.capacity() == 0 {
+    if buf.is_borrowed() || buf.capacity() == 0 {
         return;
     }
     if bufPool.buffers.len() < bufPool.totalBuffers {
@@ -328,9 +434,7 @@ pub fn bufferToSeq(buffer: Buffer) -> RawSeqStore_t {
 
 /// Port of `seqToBuffer`.
 pub fn seqToBuffer(seq: RawSeqStore_t) -> Buffer {
-    Buffer {
-        data: vec![0; seq.capacity * core::mem::size_of::<rawSeq>()],
-    }
+    Buffer::from_vec(vec![0; seq.capacity * core::mem::size_of::<rawSeq>()])
 }
 
 /// Port of `ZSTDMT_getSeq`.
@@ -359,7 +463,7 @@ pub fn ZSTDMT_setNbSeq(seqPool: &mut ZSTDMT_seqPool, nbSeq: usize) {
 
 /// Port of `ZSTDMT_createSeqPool`.
 pub fn ZSTDMT_createSeqPool(nbWorkers: u32, cMem: ZSTD_customMem) -> Option<Box<ZSTDMT_seqPool>> {
-    let mut seqPool = ZSTDMT_createBufferPool(nbWorkers, cMem)?;
+    let mut seqPool = ZSTDMT_createBufferPool(ZSTDMT_seqPoolMaxNbBuffers(nbWorkers), cMem)?;
     ZSTDMT_setNbSeq(&mut seqPool, 0);
     Some(seqPool)
 }
@@ -372,7 +476,7 @@ pub fn ZSTDMT_expandSeqPool(
     pool: Box<ZSTDMT_seqPool>,
     nbWorkers: u32,
 ) -> Option<Box<ZSTDMT_seqPool>> {
-    ZSTDMT_expandBufferPool(pool, nbWorkers)
+    ZSTDMT_expandBufferPool(pool, ZSTDMT_seqPoolMaxNbBuffers(nbWorkers))
 }
 
 /// Port of `ZSTDMT_freeCCtxPool`.
@@ -404,19 +508,21 @@ pub fn ZSTDMT_createCCtxPool(nbWorkers: i32, cMem: ZSTD_customMem) -> Option<Box
 
 /// Port of `ZSTDMT_expandCCtxPool`.
 pub fn ZSTDMT_expandCCtxPool(
-    mut srcPool: Box<ZSTDMT_CCtxPool>,
+    srcPool: Box<ZSTDMT_CCtxPool>,
     nbWorkers: i32,
 ) -> Option<Box<ZSTDMT_CCtxPool>> {
-    if nbWorkers > srcPool.totalCCtx as i32 {
-        srcPool.totalCCtx = nbWorkers as usize;
+    if nbWorkers <= srcPool.totalCCtx as i32 {
+        return Some(srcPool);
     }
-    Some(srcPool)
+    let cMem = srcPool._cMem;
+    drop(srcPool);
+    ZSTDMT_createCCtxPool(nbWorkers, cMem)
 }
 
 /// Port of `ZSTDMT_sizeof_CCtxPool`.
 pub fn ZSTDMT_sizeof_CCtxPool(cctxPool: &ZSTDMT_CCtxPool) -> usize {
     core::mem::size_of::<ZSTDMT_CCtxPool>()
-        + cctxPool.cctxs.capacity() * core::mem::size_of::<Box<ZSTD_CCtx>>()
+        + cctxPool.totalCCtx * core::mem::size_of::<Box<ZSTD_CCtx>>()
         + cctxPool
             .cctxs
             .iter()
@@ -429,7 +535,7 @@ pub fn ZSTDMT_getCCtx(cctxPool: &mut ZSTDMT_CCtxPool) -> Option<Box<ZSTD_CCtx>> 
     if let Some(cctx) = cctxPool.cctxs.pop() {
         Some(cctx)
     } else {
-        ZSTD_createCCtx_advanced(ZSTD_customMem::default())
+        ZSTD_createCCtx_advanced(cctxPool._cMem)
     }
 }
 
@@ -537,9 +643,9 @@ pub fn ZSTDMT_createJobsTable(
     nbJobsPtr: &mut u32,
     _cMem: ZSTD_customMem,
 ) -> Option<Vec<ZSTDMT_jobDescription>> {
-    let nbJobsLog2 = 32 - nbJobsPtr.saturating_sub(1).leading_zeros();
+    let nbJobsLog2 = ZSTD_highbit32(*nbJobsPtr) + 1;
     let nbJobs = 1u32 << nbJobsLog2;
-    *nbJobsPtr = nbJobs.max(1);
+    *nbJobsPtr = nbJobs;
     Some(vec![ZSTDMT_jobDescription::default(); *nbJobsPtr as usize])
 }
 
@@ -557,7 +663,11 @@ pub fn ZSTDMT_expandJobsTable(mtctx: &mut ZSTDMT_CCtx, nbWorkers: u32) -> usize 
 
 /// Port of `ZSTDMT_CCtxParam_setNbWorkers`.
 pub fn ZSTDMT_CCtxParam_setNbWorkers(params: &mut ZSTD_CCtx_params, nbWorkers: u32) -> usize {
-    ZSTD_CCtxParams_setParameter(params, ZSTD_cParameter::ZSTD_c_nbWorkers, nbWorkers as i32)
+    let nbWorkers = nbWorkers.min(ZSTDMT_NBWORKERS_MAX);
+    params.nbWorkers = nbWorkers as i32;
+    params.overlapLog = 6;
+    params.jobSize = 0;
+    nbWorkers as usize
 }
 
 /// Port of `ZSTDMT_getFrameProgression`.
@@ -572,7 +682,8 @@ pub fn ZSTDMT_getFrameProgression(mtctx: &ZSTDMT_CCtx) -> ZSTD_frameProgression 
         currentJobID: mtctx.nextJobID,
         nbActiveWorkers: 0,
     };
-    let lastJobNb = mtctx.nextJobID;
+    debug_assert!(mtctx.jobReady <= 1);
+    let lastJobNb = mtctx.nextJobID + mtctx.jobReady;
     for jobNb in mtctx.doneJobID..lastJobNb {
         let wJobID = (jobNb & mtctx.jobIDMask) as usize;
         if let Some(jobPtr) = mtctx.jobs.get(wJobID) {
@@ -955,20 +1066,40 @@ fn ZSTDMT_tryJoinFinishedJob(mtctx: &mut ZSTDMT_CCtx, wJobID: usize) -> usize {
 
 /// Port of `ZSTDMT_resize`.
 pub fn ZSTDMT_resize(mtctx: &mut ZSTDMT_CCtx, nbWorkers: u32) -> usize {
-    ZSTDMT_expandJobsTable(mtctx, nbWorkers);
+    use crate::common::error::{ErrorCode, ERROR};
+
+    if let Some(pool) = mtctx.threadPool.as_mut() {
+        if POOL_resize(pool, nbWorkers as usize) != 0 {
+            return ERROR(ErrorCode::MemoryAllocation);
+        }
+    }
+    let jobs_error = ZSTDMT_expandJobsTable(mtctx, nbWorkers);
+    if crate::common::error::ERR_isError(jobs_error) {
+        return jobs_error;
+    }
     if let Some(pool) = mtctx.bufPool.take() {
-        mtctx.bufPool = ZSTDMT_expandBufferPool(pool, 2 * nbWorkers + 3);
+        mtctx.bufPool = ZSTDMT_expandBufferPool(pool, ZSTDMT_bufPoolMaxNbBuffers(nbWorkers));
+    }
+    if mtctx.bufPool.is_none() {
+        return ERROR(ErrorCode::MemoryAllocation);
     }
     if let Some(pool) = mtctx.cctxPool.take() {
         mtctx.cctxPool = ZSTDMT_expandCCtxPool(pool, nbWorkers as i32);
     }
+    if mtctx.cctxPool.is_none() {
+        return ERROR(ErrorCode::MemoryAllocation);
+    }
     if let Some(pool) = mtctx.seqPool.take() {
         mtctx.seqPool = ZSTDMT_expandSeqPool(pool, nbWorkers);
     }
-    if let Some(pool) = mtctx.threadPool.as_mut() {
-        let _ = POOL_resize(pool, nbWorkers as usize);
-    } else if mtctx.threadPoolRef == 0 && mtctx.rayonThreadPoolRef == 0 {
+    if mtctx.seqPool.is_none() {
+        return ERROR(ErrorCode::MemoryAllocation);
+    }
+    if mtctx.threadPool.is_none() && mtctx.threadPoolRef == 0 && mtctx.rayonThreadPoolRef == 0 {
         mtctx.threadPool = ZSTD_createThreadPool(nbWorkers as usize);
+        if mtctx.threadPool.is_none() {
+            return ERROR(ErrorCode::MemoryAllocation);
+        }
     }
     ZSTDMT_CCtxParam_setNbWorkers(&mut mtctx.params, nbWorkers)
 }
@@ -1005,13 +1136,15 @@ pub fn ZSTDMT_isOverlapped(buffer: &Buffer, range: Range) -> i32 {
 /// Port of `ZSTDMT_getInputDataInUse`.
 pub fn ZSTDMT_getInputDataInUse(mtctx: &ZSTDMT_CCtx) -> Range {
     let roundBuffCapacity = mtctx.roundBuff.capacity;
-    if mtctx.targetSectionSize == 0 {
-        return Range::default();
-    }
-    let nbJobs1stRoundMin = roundBuffCapacity / mtctx.targetSectionSize;
+    let nbJobs1stRoundMin = if mtctx.targetSectionSize == 0 {
+        0
+    } else {
+        roundBuffCapacity / mtctx.targetSectionSize
+    };
     if mtctx.nextJobID < nbJobs1stRoundMin as u32 {
         return Range::default();
     }
+
     for jobID in mtctx.doneJobID..mtctx.nextJobID {
         let wJobID = (jobID & mtctx.jobIDMask) as usize;
         if let Some(job) = mtctx.jobs.get(wJobID) {
@@ -1061,26 +1194,56 @@ pub fn ZSTDMT_waitForLdmComplete(mtctx: &mut ZSTDMT_CCtx, buffer: &Buffer) {
 
 /// Port of `ZSTDMT_tryGetInputRange`.
 pub fn ZSTDMT_tryGetInputRange(mtctx: &mut ZSTDMT_CCtx) -> i32 {
-    let inUse = ZSTDMT_getInputDataInUse(mtctx);
-    let spaceLeft = mtctx.roundBuff.capacity.saturating_sub(mtctx.roundBuff.pos);
     let spaceNeeded = mtctx.targetSectionSize;
     if spaceNeeded == 0 || mtctx.roundBuff.buffer.capacity() < spaceNeeded {
         return 0;
     }
+    let roundStart = mtctx.roundBuff.buffer.start();
+    let spaceLeft = mtctx.roundBuff.capacity.saturating_sub(mtctx.roundBuff.pos);
+
     if spaceLeft < spaceNeeded {
-        mtctx.roundBuff.pos = mtctx.inBuff.prefix.size;
+        let prefix = mtctx.inBuff.prefix;
+        if prefix.size > mtctx.roundBuff.capacity.saturating_sub(spaceNeeded) {
+            return 0;
+        }
+
+        let prefixDst = Buffer::borrowed(roundStart, prefix.size);
+        if ZSTDMT_isOverlapped(&prefixDst, ZSTDMT_getInputDataInUse(mtctx)) != 0 {
+            return 0;
+        }
+        ZSTDMT_waitForLdmComplete(mtctx, &prefixDst);
+
+        if prefix.size != 0 {
+            if let Some(srcOffset) =
+                ZSTDMT_roundBufferOffset(&mtctx.roundBuff, prefix.start, prefix.size)
+            {
+                mtctx
+                    .roundBuff
+                    .buffer
+                    .data
+                    .copy_within(srcOffset..srcOffset + prefix.size, 0);
+            } else {
+                let prefixCopy = range_as_slice(prefix).to_vec();
+                mtctx.roundBuff.buffer.data[..prefix.size].copy_from_slice(&prefixCopy);
+            }
+        }
+        mtctx.inBuff.prefix = Range {
+            start: roundStart,
+            size: prefix.size,
+        };
+        mtctx.roundBuff.pos = prefix.size;
     }
+
     let start = mtctx.roundBuff.pos;
-    let end = (start + spaceNeeded).min(mtctx.roundBuff.buffer.capacity());
-    let buffer = Buffer {
-        data: mtctx.roundBuff.buffer.data[start..end].to_vec(),
-    };
-    if ZSTDMT_isOverlapped(&buffer, inUse) != 0 {
+    if mtctx.roundBuff.capacity.saturating_sub(start) < spaceNeeded {
         return 0;
     }
-    mtctx.inBuff.buffer = Buffer {
-        data: vec![0; buffer.capacity()],
-    };
+    let buffer = Buffer::borrowed(roundStart + start, spaceNeeded);
+    if ZSTDMT_isOverlapped(&buffer, ZSTDMT_getInputDataInUse(mtctx)) != 0 {
+        return 0;
+    }
+    ZSTDMT_waitForLdmComplete(mtctx, &buffer);
+    mtctx.inBuff.buffer = buffer;
     mtctx.inBuff.filled = 0;
     1
 }
@@ -1107,10 +1270,13 @@ pub fn findSynchronizationPoint(mtctx: &ZSTDMT_CCtx, input: &[u8], input_pos: us
         return syncPoint;
     }
 
-    let buffered = &mtctx.inBuff.buffer.data;
+    let buffered = ZSTDMT_inBuffFilledSlice(mtctx);
     let (mut pos, mut hash, prev): (usize, u64, &[u8]) =
         if mtctx.inBuff.filled < RSYNC_MIN_BLOCK_SIZE {
             let pos = RSYNC_MIN_BLOCK_SIZE - mtctx.inBuff.filled;
+            if pos >= syncPoint.toLoad {
+                return syncPoint;
+            }
             if pos >= RSYNC_LENGTH {
                 let prev = &istart[pos - RSYNC_LENGTH..pos];
                 (pos, ZSTD_rollingHash_compute(prev), prev)
@@ -1122,7 +1288,7 @@ pub fn findSynchronizationPoint(mtctx: &ZSTDMT_CCtx, input: &[u8], input_pos: us
                 (pos, hash, prev)
             }
         } else {
-            debug_assert!(mtctx.inBuff.filled >= RSYNC_LENGTH);
+            debug_assert!(mtctx.inBuff.filled >= RSYNC_MIN_BLOCK_SIZE);
             let prev = &buffered[mtctx.inBuff.filled - RSYNC_LENGTH..mtctx.inBuff.filled];
             let hash = ZSTD_rollingHash_compute(prev);
             if (hash & hitMask) == hitMask {
@@ -1153,7 +1319,7 @@ pub fn findSynchronizationPoint(mtctx: &ZSTDMT_CCtx, input: &[u8], input_pos: us
 /// Port of `ZSTDMT_writeLastEmptyBlock`.
 pub fn ZSTDMT_writeLastEmptyBlock(job: &mut ZSTDMT_jobDescription) {
     if job.dstBuff.capacity() < crate::decompress::zstd_decompress_block::ZSTD_blockHeaderSize {
-        job.dstBuff = Buffer { data: vec![0; 3] };
+        job.dstBuff = Buffer::from_vec(vec![0; 3]);
     }
     job.cSize = ZSTD_writeLastEmptyBlock(&mut job.dstBuff.data);
 }
@@ -1205,9 +1371,7 @@ pub fn ZSTDMT_createCompressionJob(
             }
             dst
         } else {
-            Buffer {
-                data: vec![0; neededDstSize],
-            }
+            Buffer::from_vec(vec![0; neededDstSize])
         };
         if srcSize == 0 && mtctx.nextJobID > 0 && endFrame {
             ZSTDMT_writeLastEmptyBlock(job);
@@ -1351,10 +1515,14 @@ pub fn ZSTDMT_flushProduced(
 
 /// Port of `ZSTDMT_createCCtx_advanced_internal`.
 pub fn ZSTDMT_createCCtx_advanced_internal(
-    nbWorkers: u32,
+    mut nbWorkers: u32,
     cMem: ZSTD_customMem,
 ) -> Option<Box<ZSTDMT_CCtx>> {
     if nbWorkers < 1 {
+        return None;
+    }
+    nbWorkers = nbWorkers.min(ZSTDMT_NBWORKERS_MAX);
+    if !ZSTD_customMem_validate(cMem) {
         return None;
     }
     let mut nbJobs = nbWorkers + 2;
@@ -1366,9 +1534,16 @@ pub fn ZSTDMT_createCCtx_advanced_internal(
     mtctx.jobReceivers.resize_with(jobs.len(), || None);
     mtctx.jobs = jobs;
     mtctx.jobIDMask = nbJobs - 1;
-    mtctx.bufPool = ZSTDMT_createBufferPool(2 * nbWorkers + 3, cMem);
+    mtctx.bufPool = ZSTDMT_createBufferPool(ZSTDMT_bufPoolMaxNbBuffers(nbWorkers), cMem);
     mtctx.cctxPool = ZSTDMT_createCCtxPool(nbWorkers as i32, cMem);
     mtctx.seqPool = ZSTDMT_createSeqPool(nbWorkers, cMem);
+    if mtctx.threadPool.is_none()
+        || mtctx.bufPool.is_none()
+        || mtctx.cctxPool.is_none()
+        || mtctx.seqPool.is_none()
+    {
+        return None;
+    }
     Some(mtctx)
 }
 
@@ -1390,7 +1565,10 @@ pub fn ZSTDMT_initCStream_internal(
         params.cParams.windowLog = params.cParams.windowLog.max(20);
     }
     if params.nbWorkers != mtctx.params.nbWorkers {
-        ZSTDMT_resize(mtctx, params.nbWorkers as u32);
+        let resize_error = ZSTDMT_resize(mtctx, params.nbWorkers as u32);
+        if crate::common::error::ERR_isError(resize_error) {
+            return resize_error;
+        }
     }
     if params.jobSize != 0 {
         params.jobSize = params.jobSize.clamp(ZSTDMT_JOBSIZE_MIN, ZSTDMT_JOBSIZE_MAX);
@@ -1439,9 +1617,7 @@ pub fn ZSTDMT_initCStream_internal(
     let sectionsSize = mtctx.targetSectionSize.saturating_mul(nbWorkers);
     let roundBuffCapacity = windowSize.max(sectionsSize).saturating_add(slackSize);
     if mtctx.roundBuff.capacity < roundBuffCapacity {
-        mtctx.roundBuff.buffer = Buffer {
-            data: vec![0; roundBuffCapacity],
-        };
+        mtctx.roundBuff.buffer = Buffer::from_vec(vec![0; roundBuffCapacity]);
         mtctx.roundBuff.capacity = roundBuffCapacity;
     }
     mtctx.jobReady = 0;
@@ -1493,7 +1669,7 @@ pub fn ZSTDMT_compressionJob(job: &mut ZSTDMT_jobDescription, cctx: &mut Box<ZST
 
     if job.lastJob != 0 && job.src.size == 0 && job.jobID > 0 {
         if job.dstBuff.capacity() < 3 {
-            job.dstBuff = Buffer { data: vec![0; 3] };
+            job.dstBuff = Buffer::from_vec(vec![0; 3]);
         }
         job.cSize = ZSTD_writeLastEmptyBlock(&mut job.dstBuff.data);
         job.consumed = job.src.size;
@@ -1557,7 +1733,6 @@ pub fn ZSTDMT_compressionJob(job: &mut ZSTDMT_jobDescription, cctx: &mut Box<ZST
             job.cSize = hSize;
             return;
         }
-        op += hSize;
         ZSTD_invalidateRepCodes(cctx);
     }
 
@@ -1669,11 +1844,11 @@ pub fn ZSTDMT_compressStream_generic(
     let mut effective_end = end_op;
 
     if mtctx.jobReady == 0 && *input_pos < input.len() {
-        if mtctx.inBuff.buffer.data.is_empty() {
+        if mtctx.inBuff.buffer.capacity() == 0 {
             debug_assert_eq!(mtctx.inBuff.filled, 0);
             let _ = ZSTDMT_tryGetInputRange(mtctx);
         }
-        if !mtctx.inBuff.buffer.data.is_empty() {
+        if mtctx.inBuff.buffer.capacity() != 0 {
             let syncPoint = findSynchronizationPoint(mtctx, input, *input_pos);
             if syncPoint.flush != 0 && effective_end == ZSTD_EndDirective::ZSTD_e_continue {
                 effective_end = ZSTD_EndDirective::ZSTD_e_flush;
@@ -1682,15 +1857,9 @@ pub fn ZSTDMT_compressStream_generic(
                 .toLoad
                 .min(input.len().saturating_sub(*input_pos))
                 .min(mtctx.targetSectionSize.saturating_sub(mtctx.inBuff.filled));
-            if mtctx.inBuff.buffer.data.len() < mtctx.inBuff.filled + to_load {
-                mtctx
-                    .inBuff
-                    .buffer
-                    .data
-                    .resize(mtctx.inBuff.filled + to_load, 0);
+            if !ZSTDMT_copyToInputBuffer(mtctx, &input[*input_pos..*input_pos + to_load]) {
+                return ERROR(ErrorCode::Generic);
             }
-            mtctx.inBuff.buffer.data[mtctx.inBuff.filled..mtctx.inBuff.filled + to_load]
-                .copy_from_slice(&input[*input_pos..*input_pos + to_load]);
             *input_pos += to_load;
             mtctx.inBuff.filled += to_load;
             forwardInputProgress = to_load > 0;
@@ -1831,6 +2000,14 @@ mod tests {
         assert!(ctx.bufPool.is_some());
         assert!(ctx.cctxPool.is_some());
         assert!(ctx.seqPool.is_some());
+        assert_eq!(
+            ctx.bufPool.as_ref().unwrap().totalBuffers,
+            ZSTDMT_bufPoolMaxNbBuffers(1) as usize
+        );
+        assert_eq!(
+            ctx.seqPool.as_ref().unwrap().totalBuffers,
+            ZSTDMT_seqPoolMaxNbBuffers(1) as usize
+        );
         let advanced =
             ZSTDMT_createCCtx_advanced(1, ZSTD_customMem::default()).expect("advanced mt ctx");
         assert_eq!(advanced.params.nbWorkers, 1);
@@ -1897,6 +2074,47 @@ mod tests {
     }
 
     #[test]
+    fn zstdmt_header_constants_match_upstream_defaults() {
+        #[cfg(target_pointer_width = "32")]
+        assert_eq!(ZSTDMT_NBWORKERS_MAX, 64);
+        #[cfg(not(target_pointer_width = "32"))]
+        assert_eq!(ZSTDMT_NBWORKERS_MAX, 256);
+        assert_eq!(ZSTDMT_JOBSIZE_MIN, 512 * 1024);
+        assert_eq!(RSYNC_MIN_BLOCK_SIZE, ZSTD_BLOCKSIZE_MAX);
+    }
+
+    #[test]
+    fn zstdmt_ldm_target_job_log_uses_strategy_cycle_log() {
+        let mut params = ZSTD_CCtx_params::default();
+        params.ldmParams.enableLdm = ZSTD_ParamSwitch_e::ZSTD_ps_enable;
+        params.cParams.chainLog = 20;
+        params.cParams.strategy = 6;
+
+        assert_eq!(ZSTDMT_computeTargetJobLog(&params), 22);
+
+        params.cParams.strategy = 5;
+        assert_eq!(ZSTDMT_computeTargetJobLog(&params), 23);
+    }
+
+    #[test]
+    fn zstdmt_resize_borrowed_buffer_preserves_existing_bytes() {
+        let backing = [1u8, 2, 3, 4];
+        let pool = ZSTDMT_bufferPool {
+            bufferSize: 8,
+            totalBuffers: 1,
+            buffers: Vec::new(),
+            _cMem: ZSTD_customMem::default(),
+        };
+        let borrowed = Buffer::borrowed(backing.as_ptr() as usize, backing.len());
+
+        let resized = ZSTDMT_resizeBuffer(&pool, borrowed);
+
+        assert_eq!(resized.capacity(), 8);
+        assert_eq!(&resized.data[..backing.len()], &backing);
+        assert_eq!(&resized.data[backing.len()..], &[0, 0, 0, 0]);
+    }
+
+    #[test]
     fn zstdmt_update_cparams_while_compressing_rederives_but_preserves_windowlog() {
         use crate::decompress::zstd_decompress::ZSTD_CONTENTSIZE_UNKNOWN;
 
@@ -1942,7 +2160,7 @@ mod tests {
         assert_eq!(ZSTDMT_initCStream_internal(&mut mt, params, 0), 0);
 
         let src = vec![b'a'; 4096];
-        mt.inBuff.buffer = Buffer { data: src.clone() };
+        mt.inBuff.buffer = Buffer::from_vec(src.clone());
         mt.inBuff.filled = src.len();
 
         assert_eq!(
@@ -1969,17 +2187,12 @@ mod tests {
         {
             let pool = mt.bufPool.as_mut().expect("buf pool");
             ZSTDMT_setBufferSize(pool, 1024);
-            ZSTDMT_releaseBuffer(
-                pool,
-                Buffer {
-                    data: vec![0xA5; 1024],
-                },
-            );
+            ZSTDMT_releaseBuffer(pool, Buffer::from_vec(vec![0xA5; 1024]));
             assert_eq!(pool.buffers.len(), 1);
         }
 
         let src = b"pooled destination buffer job payload".to_vec();
-        mt.inBuff.buffer = Buffer { data: src.clone() };
+        mt.inBuff.buffer = Buffer::from_vec(src.clone());
         mt.inBuff.filled = src.len();
 
         assert_eq!(
@@ -2013,6 +2226,78 @@ mod tests {
     }
 
     #[test]
+    fn zstdmt_try_get_input_range_borrows_round_buffer_memory() {
+        let mut params = ZSTD_CCtx_params::default();
+        ZSTD_CCtxParams_init(&mut params, 3);
+        params.nbWorkers = 1;
+        params.jobSize = ZSTDMT_JOBSIZE_MIN;
+        params.overlapLog = 1;
+
+        let mut mt = ZSTDMT_createCCtx(1).expect("mt");
+        assert_eq!(ZSTDMT_initCStream_internal(&mut mt, params, 0), 0);
+
+        let round_start = mt.roundBuff.buffer.start();
+        assert_eq!(ZSTDMT_tryGetInputRange(&mut mt), 1);
+        assert!(mt.inBuff.buffer.is_borrowed());
+        assert_eq!(mt.inBuff.buffer.start(), round_start);
+        assert_eq!(mt.inBuff.buffer.capacity(), mt.targetSectionSize);
+        assert!(mt.inBuff.buffer.data.is_empty());
+
+        let src = b"range lives in round buffer";
+        assert!(ZSTDMT_copyToInputBuffer(&mut mt, src));
+        mt.inBuff.filled = src.len();
+        assert_eq!(&mt.roundBuff.buffer.data[..src.len()], src);
+
+        assert_eq!(
+            ZSTDMT_createCompressionJob(&mut mt, src.len(), ZSTD_EndDirective::ZSTD_e_flush),
+            0
+        );
+        let job = &mt.jobs[0];
+        assert!(job.srcBuff.is_borrowed());
+        assert_eq!(job.src.start, round_start);
+        assert_eq!(range_as_slice(job.src), src);
+    }
+
+    #[test]
+    fn zstdmt_try_get_input_range_wraps_prefix_into_round_buffer_start() {
+        let mut mt = ZSTDMT_CCtx {
+            targetSectionSize: 10,
+            targetPrefixSize: 4,
+            roundBuff: RoundBuff_t {
+                buffer: Buffer::from_vec(vec![0; 32]),
+                capacity: 32,
+                pos: 28,
+            },
+            ..ZSTDMT_CCtx::default()
+        };
+        let round_start = mt.roundBuff.buffer.start();
+        mt.roundBuff.buffer.data[24..28].copy_from_slice(b"pref");
+        mt.inBuff.prefix = Range {
+            start: round_start + 24,
+            size: 4,
+        };
+
+        assert_eq!(ZSTDMT_tryGetInputRange(&mut mt), 1);
+
+        assert_eq!(&mt.roundBuff.buffer.data[..4], b"pref");
+        assert_eq!(
+            mt.inBuff.prefix,
+            Range {
+                start: round_start,
+                size: 4
+            }
+        );
+        assert!(mt.inBuff.buffer.is_borrowed());
+        assert_eq!(mt.inBuff.buffer.start(), round_start + 4);
+        assert_eq!(mt.inBuff.buffer.capacity(), mt.targetSectionSize);
+        assert_eq!(mt.roundBuff.pos, 4);
+
+        assert!(ZSTDMT_copyToInputBuffer(&mut mt, b"0123456789"));
+        mt.inBuff.filled = 10;
+        assert_eq!(&mt.roundBuff.buffer.data[4..14], b"0123456789");
+    }
+
+    #[test]
     fn zstdmt_worker_cctx_returns_to_pool_after_join() {
         let mut params = ZSTD_CCtx_params::default();
         ZSTD_CCtxParams_init(&mut params, 3);
@@ -2022,9 +2307,7 @@ mod tests {
         assert_eq!(ZSTDMT_initCStream_internal(&mut mt, params, 0), 0);
         assert_eq!(mt.cctxPool.as_ref().unwrap().cctxs.len(), 1);
 
-        mt.inBuff.buffer = Buffer {
-            data: b"x".to_vec(),
-        };
+        mt.inBuff.buffer = Buffer::from_vec(b"x".to_vec());
         mt.inBuff.filled = mt.inBuff.buffer.data.len();
         let job_size = mt.inBuff.filled;
 
@@ -2269,6 +2552,11 @@ mod tests {
         let trailer = crate::common::mem::MEM_readLE32(&compressed[cpos - 4..cpos]);
         assert_eq!(trailer, expected, "MT frame must end with XXH64 trailer");
 
+        let mut decoded = vec![0u8; src.len()];
+        let dsize = ZSTD_decompress(&mut decoded, &compressed[..cpos]);
+        assert_eq!(dsize, src.len());
+        assert_eq!(decoded, src);
+
         let truncated = &compressed[..cpos - 4];
         let mut rejected = vec![0u8; src.len() + 4096];
         let rc = ZSTD_decompress(&mut rejected, truncated);
@@ -2351,9 +2639,7 @@ mod tests {
             consumed: 4,
             cSize: 3,
             dstFlushed: 0,
-            dstBuff: Buffer {
-                data: vec![1, 2, 3],
-            },
+            dstBuff: Buffer::from_vec(vec![1, 2, 3]),
             ..ZSTDMT_jobDescription::default()
         };
 
@@ -2386,18 +2672,14 @@ mod tests {
         mt.nextJobID = 1;
         mt.doneJobID = 0;
         mt.jobIDMask = 3;
-        mt.inBuff.buffer = Buffer {
-            data: vec![9, 8, 7],
-        };
+        mt.inBuff.buffer = Buffer::from_vec(vec![9, 8, 7]);
         mt.inBuff.filled = 3;
         mt.allJobsCompleted = 0;
         mt.jobs[0] = ZSTDMT_jobDescription {
             src: Range { start: 0, size: 4 },
             consumed: 1,
             cSize: ERROR(ErrorCode::MemoryAllocation),
-            dstBuff: Buffer {
-                data: vec![1, 2, 3],
-            },
+            dstBuff: Buffer::from_vec(vec![1, 2, 3]),
             ..ZSTDMT_jobDescription::default()
         };
 
@@ -2423,14 +2705,47 @@ mod tests {
     }
 
     #[test]
+    fn zstdmt_get_input_data_in_use_skips_first_round_buffer_pass() {
+        let mut mt = ZSTDMT_CCtx {
+            targetSectionSize: 10,
+            roundBuff: RoundBuff_t {
+                capacity: 40,
+                ..RoundBuff_t::default()
+            },
+            doneJobID: 0,
+            nextJobID: 3,
+            jobIDMask: 3,
+            jobs: vec![ZSTDMT_jobDescription::default(); 4],
+            ..ZSTDMT_CCtx::default()
+        };
+        mt.jobs[0] = ZSTDMT_jobDescription {
+            src: Range {
+                start: 1000,
+                size: 10,
+            },
+            consumed: 0,
+            ..ZSTDMT_jobDescription::default()
+        };
+
+        assert_eq!(ZSTDMT_getInputDataInUse(&mt), Range::default());
+
+        mt.nextJobID = 4;
+        assert_eq!(
+            ZSTDMT_getInputDataInUse(&mt),
+            Range {
+                start: 1000,
+                size: 10
+            }
+        );
+    }
+
+    #[test]
     fn find_synchronization_point_flushes_immediately_when_buffer_tail_already_hits() {
         let mut mt = ZSTDMT_CCtx::default();
         mt.params.rsyncable = 1;
-        mt.targetSectionSize = RSYNC_MIN_BLOCK_SIZE;
-        mt.inBuff.buffer = Buffer {
-            data: vec![b'a'; RSYNC_MIN_BLOCK_SIZE],
-        };
-        mt.inBuff.filled = RSYNC_MIN_BLOCK_SIZE;
+        mt.targetSectionSize = ZSTDMT_JOBSIZE_MIN;
+        mt.inBuff.buffer = Buffer::from_vec(vec![b'a'; ZSTDMT_JOBSIZE_MIN]);
+        mt.inBuff.filled = ZSTDMT_JOBSIZE_MIN;
         let tail_hash = ZSTD_rollingHash_compute(
             &mt.inBuff.buffer.data[mt.inBuff.filled - RSYNC_LENGTH..mt.inBuff.filled],
         );
@@ -2444,14 +2759,44 @@ mod tests {
     }
 
     #[test]
+    fn zstdmt_init_rsync_mask_uses_target_section_kilobytes() {
+        let mut params = ZSTD_CCtx_params::default();
+        ZSTD_CCtxParams_init(&mut params, 3);
+        params.nbWorkers = 1;
+        params.jobSize = ZSTDMT_JOBSIZE_MIN;
+        params.rsyncable = 1;
+
+        let mut mt = ZSTDMT_createCCtx(1).expect("mt");
+        assert_eq!(ZSTDMT_initCStream_internal(&mut mt, params, 0), 0);
+
+        let rsync_bits = ZSTD_highbit32((ZSTDMT_JOBSIZE_MIN >> 10) as u32) + 10;
+        assert_eq!(rsync_bits, 19);
+        assert_eq!(mt.rsync.hitMask, (1u64 << rsync_bits) - 1);
+    }
+
+    #[test]
+    fn find_synchronization_point_waits_for_minimum_rsync_block_size() {
+        let mut mt = ZSTDMT_CCtx::default();
+        mt.params.rsyncable = 1;
+        mt.targetSectionSize = ZSTDMT_JOBSIZE_MIN;
+        mt.inBuff.buffer = Buffer::from_vec(vec![b'a'; RSYNC_LENGTH]);
+        mt.inBuff.filled = RSYNC_LENGTH;
+        mt.rsync.primePower =
+            crate::compress::zstd_hashes::ZSTD_rollingHash_primePower(RSYNC_LENGTH as u32);
+        mt.rsync.hitMask = 0;
+
+        let sync = findSynchronizationPoint(&mt, b"short rsync input", 0);
+        assert_eq!(sync.toLoad, b"short rsync input".len());
+        assert_eq!(sync.flush, 0);
+    }
+
+    #[test]
     fn find_synchronization_point_uses_buffered_tail_when_scanning_new_input() {
         let mut mt = ZSTDMT_CCtx::default();
         mt.params.rsyncable = 1;
-        mt.targetSectionSize = RSYNC_MIN_BLOCK_SIZE + 3;
-        mt.inBuff.buffer = Buffer {
-            data: vec![b'b'; RSYNC_MIN_BLOCK_SIZE],
-        };
-        mt.inBuff.filled = RSYNC_MIN_BLOCK_SIZE;
+        mt.targetSectionSize = ZSTDMT_JOBSIZE_MIN + 3;
+        mt.inBuff.buffer = Buffer::from_vec(vec![b'b'; ZSTDMT_JOBSIZE_MIN]);
+        mt.inBuff.filled = ZSTDMT_JOBSIZE_MIN;
         mt.rsync.primePower =
             crate::compress::zstd_hashes::ZSTD_rollingHash_primePower(RSYNC_LENGTH as u32);
 

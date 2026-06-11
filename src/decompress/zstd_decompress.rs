@@ -20,6 +20,21 @@ pub const ZSTD_CONTENTSIZE_ERROR: u64 = u64::MAX - 1;
 
 pub const ZSTD_fcs_fieldSize: [usize; 4] = [0, 2, 4, 8];
 pub const ZSTD_did_fieldSize: [usize; 4] = [0, 1, 2, 4];
+const ZSTD_HISTORY_COMPACT_SLACK_BLOCKS: usize = 12;
+
+#[inline]
+const fn ZSTD_maxWindowSize_default() -> u64 {
+    (1u64 << ZSTD_WINDOWLOG_LIMIT_DEFAULT) + 1
+}
+
+#[inline]
+fn ZSTD_highbit64(v: u64) -> i32 {
+    if v == 0 {
+        0
+    } else {
+        (u64::BITS - 1 - v.leading_zeros()) as i32
+    }
+}
 
 /// Port of `ZSTD_format_e`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -342,7 +357,7 @@ mod tests {
         let totalCount: usize = count.iter().sum::<u32>() as usize;
         let tableLog =
             crate::compress::huf_compress::HUF_optimalTableLog(11, totalCount, maxSymbolValue);
-        let mut ct = vec![0u64; 257];
+        let mut ct = vec![crate::compress::huf_compress::HUF_CElt::default(); 257];
         let mut wksp = vec![0u32; HUF_CTABLE_WORKSPACE_SIZE_U32];
         FSE_buildCTable_wksp(
             &mut [0u32; 512], // dummy to avoid unused import
@@ -374,8 +389,10 @@ mod tests {
         // Silence unused-import warnings.
         let _ = FSE_normalizeCount;
 
-        // 3 × rep values — must be nonzero and ≤ content.len().
-        let safe = (content.len() as u32).clamp(1, 8);
+        // 3 × rep values — upstream requires nonzero and strictly
+        // smaller than the content size.
+        assert!(content.len() > 1);
+        let safe = ((content.len() as u32) - 1).clamp(1, 8);
         for r in [safe, safe.saturating_sub(1).max(1), 1u32] {
             let mut rb = [0u8; 4];
             MEM_writeLE32(&mut rb, r);
@@ -409,6 +426,28 @@ mod tests {
         assert_eq!(dctx.stream_dict, content);
         assert_eq!(dctx.litEntropy, 1);
         assert_eq!(dctx.fseEntropy, 1);
+    }
+
+    #[test]
+    fn insertDictionary_accepts_repcode_equal_to_content_size() {
+        use crate::common::mem::MEM_writeLE32;
+        use crate::decompress::zstd_decompress_block::ZSTD_DCtx;
+
+        let content = b"12345678";
+        let mut dict = build_minimal_zstd_dict(0x1020_3040, content);
+        let rep_pos = dict.len() - content.len() - 12;
+        MEM_writeLE32(&mut dict[rep_pos..rep_pos + 4], content.len() as u32);
+
+        let mut dctx = ZSTD_DCtx::new();
+        let rc = ZSTD_decompress_insertDictionary(&mut dctx, &dict);
+
+        assert!(
+            !crate::common::error::ERR_isError(rc),
+            "repcode equal to content size must be accepted: {}",
+            crate::common::error::ERR_getErrorName(rc)
+        );
+        assert_eq!(dctx.ddict_rep[0], content.len() as u32);
+        assert_eq!(dctx.stream_dict, content);
     }
 
     #[test]
@@ -606,11 +645,27 @@ mod tests {
         let n = crate::compress::zstd_compress::ZSTD_compress(&mut dst, &src, 1);
         dst.truncate(n);
         let from_frame = ZSTD_estimateDStreamSize_fromFrame(&dst);
-        // Bogus input → falls back to default (1<<17 window).
-        let fallback = ZSTD_estimateDStreamSize_fromFrame(&[0xFF, 0xFF, 0xFF, 0xFF]);
-        // Both are non-zero and fallback covers at least the default.
+        // Bogus input mirrors upstream: return the parse error.
+        let err = ZSTD_estimateDStreamSize_fromFrame(&[0xFF, 0xFF, 0xFF, 0xFF]);
         assert!(from_frame > 0);
-        assert!(fallback > 0);
+        assert!(crate::common::error::ERR_isError(err));
+    }
+
+    #[test]
+    fn estimateDStreamSize_fromFrame_rejects_single_segment_window_above_max() {
+        use crate::common::error::{ERR_getErrorCode, ERR_isError};
+
+        let mut src = Vec::new();
+        src.extend_from_slice(&ZSTD_MAGICNUMBER.to_le_bytes());
+        src.push(0xE0); // singleSegment=1, fcsID=3, no dict/checksum
+        src.extend_from_slice(&(1u64 << 40).to_le_bytes());
+
+        let rc = ZSTD_estimateDStreamSize_fromFrame(&src);
+        assert!(ERR_isError(rc));
+        assert_eq!(
+            ERR_getErrorCode(rc),
+            ErrorCode::FrameParameterWindowTooLarge
+        );
     }
 
     #[test]
@@ -1588,6 +1643,52 @@ mod tests {
     }
 
     #[test]
+    fn DCtx_session_reset_restores_legacy_decode_state() {
+        use crate::decompress::zstd_decompress_block::blockType_e;
+
+        let mut dctx = ZSTD_DCtx::new();
+        assert_eq!(
+            ZSTD_DCtx_setFormat(&mut dctx, ZSTD_format_e::ZSTD_f_zstd1_magicless),
+            0
+        );
+
+        dctx.expected = 99;
+        dctx.stage = ZSTD_dStage::ZSTDds_decompressBlock;
+        dctx.processedCSize = 123;
+        dctx.decodedSize = 456;
+        dctx.bType = blockType_e::bt_raw;
+        dctx.rleSize = 7;
+        dctx.historyBuffer.extend_from_slice(b"history");
+        dctx.validateChecksum = 1;
+
+        assert_eq!(
+            ZSTD_DCtx_reset(&mut dctx, ZSTD_DResetDirective::ZSTD_reset_session_only),
+            0
+        );
+        assert_eq!(dctx.expected, ZSTD_startingInputLength(dctx.format));
+        assert_eq!(dctx.expected, 1);
+        assert_eq!(dctx.stage, ZSTD_dStage::ZSTDds_getFrameHeaderSize);
+        assert_eq!(dctx.processedCSize, 0);
+        assert_eq!(dctx.decodedSize, 0);
+        assert_eq!(dctx.bType, blockType_e::bt_reserved);
+        assert_eq!(dctx.rleSize, 0);
+        assert!(dctx.historyBuffer.is_empty());
+        assert_eq!(dctx.validateChecksum, 0);
+
+        dctx.expected = 77;
+        dctx.stage = ZSTD_dStage::ZSTDds_checkChecksum;
+        assert_eq!(ZSTD_resetDStream(&mut dctx), 1);
+        assert_eq!(dctx.expected, 1);
+        assert_eq!(dctx.stage, ZSTD_dStage::ZSTDds_getFrameHeaderSize);
+
+        dctx.expected = 55;
+        dctx.stage = ZSTD_dStage::ZSTDds_skipFrame;
+        assert_eq!(ZSTD_initDStream(&mut dctx), 1);
+        assert_eq!(dctx.expected, 1);
+        assert_eq!(dctx.stage, ZSTD_dStage::ZSTDds_getFrameHeaderSize);
+    }
+
+    #[test]
     fn DCtx_param_setters_reject_mid_stream_with_StageWrong() {
         // Upstream contract (zstd_decompress.c:1809, 1908): every
         // DCtx parameter setter rejects mid-stream with `StageWrong`.
@@ -2131,11 +2232,7 @@ mod tests {
         let mut dctx = ZSTD_DCtx::new();
         assert_eq!(ZSTD_DCtx_setMaxWindowSize(&mut dctx, 1151), 0);
         let rc = ZSTD_decodeFrameHeader(&mut dctx, &src, src.len());
-        assert!(crate::common::error::ERR_isError(rc));
-        assert_eq!(
-            crate::common::error::ERR_getErrorCode(rc),
-            ErrorCode::FrameParameterWindowTooLarge
-        );
+        assert_eq!(rc, 0);
     }
 
     #[test]
@@ -2222,6 +2319,8 @@ mod tests {
         assert_eq!(ZSTD_dParameter::ZSTD_d_windowLogMax as i32, 100);
         // `ZSTD_d_format` = `ZSTD_d_experimentalParam1` = 1000.
         assert_eq!(ZSTD_dParameter::ZSTD_d_format as i32, 1000);
+        // `ZSTD_d_forceIgnoreChecksum` = `ZSTD_d_experimentalParam3` = 1002.
+        assert_eq!(ZSTD_dParameter::ZSTD_d_forceIgnoreChecksum as i32, 1002);
     }
 
     #[test]
@@ -2336,7 +2435,7 @@ mod tests {
         let mut cctx = ZSTD_createCCtx().unwrap();
         assert_eq!(
             ZSTD_CCtx_setFormat(&mut cctx, ZSTD_format_e::ZSTD_f_zstd1_magicless),
-            0,
+            ZSTD_format_e::ZSTD_f_zstd1_magicless as usize,
         );
         ZSTD_initCStream_usingDict(&mut cctx, &dict, 3);
 
@@ -3029,7 +3128,14 @@ mod tests {
         use crate::decompress::zstd_ddict::ZSTD_DDict;
 
         fn make_ddict(dictID: u32, content: &[u8]) -> ZSTD_DDict {
-            ZSTD_DDict::raw_with_dict_id(dictID, content)
+            let mut dict = vec![0u8; ZSTD_FRAMEIDSIZE + 4];
+            crate::common::mem::MEM_writeLE32(&mut dict[..4], ZSTD_MAGIC_DICTIONARY);
+            crate::common::mem::MEM_writeLE32(
+                &mut dict[ZSTD_FRAMEIDSIZE..ZSTD_FRAMEIDSIZE + 4],
+                dictID,
+            );
+            dict.extend_from_slice(content);
+            ZSTD_DDict::raw_with_dict_id(dictID, &dict)
         }
 
         let first = make_ddict(7, b"first");
@@ -3077,6 +3183,12 @@ mod tests {
 
         let mut dctx = ZSTD_DCtx::default();
         dctx.fParams.dictID = 117;
+        assert!(ZSTD_DCtx_selectFrameDDict(&mut dctx, &set).is_none());
+        assert_eq!(dctx.dictID, 0);
+        assert_eq!(dctx.dictUses, ZSTD_dictUses_e::ZSTD_dont_use);
+
+        assert_eq!(ZSTD_DCtx_refDDict(&mut dctx, &first), 0);
+        dctx.fParams.dictID = 117;
         let selected = ZSTD_DCtx_selectFrameDDict(&mut dctx, &set).expect("selected");
         assert_eq!(
             crate::decompress::zstd_ddict::ZSTD_getDictID_fromDDict(selected),
@@ -3084,7 +3196,10 @@ mod tests {
         );
         assert_eq!(dctx.dictID, 117);
         assert_eq!(dctx.dictUses, ZSTD_dictUses_e::ZSTD_use_indefinitely);
-        assert_eq!(dctx.stream_dict, [117u8; 3]);
+        assert_eq!(
+            dctx.stream_dict,
+            crate::decompress::zstd_ddict::ZSTD_DDict_dictContent(selected)
+        );
     }
 
     #[test]
@@ -3494,7 +3609,7 @@ mod tests {
     }
 
     #[test]
-    fn decodeFrameHeader_rejects_window_above_dctx_windowLogMax() {
+    fn decodeFrameHeader_does_not_enforce_dctx_window_limit() {
         use crate::decompress::zstd_decompress_block::ZSTD_DCtx;
 
         let mut src = ZSTD_MAGICNUMBER.to_le_bytes().to_vec();
@@ -3505,11 +3620,7 @@ mod tests {
         dctx.d_windowLogMax = 10; // permits 1024 bytes, not 1152
         dctx.d_maxWindowSize = 1 << 10;
         let rc = ZSTD_decodeFrameHeader(&mut dctx, &src, src.len());
-        assert!(crate::common::error::ERR_isError(rc));
-        assert_eq!(
-            crate::common::error::ERR_getErrorCode(rc),
-            ErrorCode::FrameParameterWindowTooLarge
-        );
+        assert_eq!(rc, 0);
     }
 
     #[test]
@@ -4036,7 +4147,14 @@ mod tests {
         // Symmetric with CCtx side — every ZSTD_dParameter variant
         // should round-trip via setParameter / getParameter.
         let mut dctx = ZSTD_DCtx::default();
-        let cases = [(ZSTD_dParameter::ZSTD_d_windowLogMax, 20)];
+        let cases = [
+            (ZSTD_dParameter::ZSTD_d_windowLogMax, 20),
+            (
+                ZSTD_dParameter::ZSTD_d_forceIgnoreChecksum,
+                crate::compress::zstd_compress::ZSTD_forceIgnoreChecksum_e::ZSTD_d_ignoreChecksum
+                    as i32,
+            ),
+        ];
         for &(param, value) in &cases {
             ZSTD_DCtx_setParameter(&mut dctx, param, value);
             let mut got = -1i32;
@@ -4064,7 +4182,7 @@ mod tests {
         ZSTD_DCtx_reset(&mut dctx, ZSTD_DResetDirective::ZSTD_reset_parameters);
         assert!(dctx.stream_dict.is_empty());
         assert_eq!(dctx.d_windowLogMax, ZSTD_WINDOWLOG_LIMIT_DEFAULT);
-        assert_eq!(dctx.d_maxWindowSize, 1u64 << ZSTD_WINDOWLOG_LIMIT_DEFAULT);
+        assert_eq!(dctx.d_maxWindowSize, ZSTD_maxWindowSize_default());
         assert!(!dctx.d_maxWindowSizeSet);
 
         // session_and_parameters: superset — does both in one call.
@@ -4077,7 +4195,7 @@ mod tests {
         );
         assert!(dctx.stream_dict.is_empty());
         assert_eq!(dctx.d_windowLogMax, ZSTD_WINDOWLOG_LIMIT_DEFAULT);
-        assert_eq!(dctx.d_maxWindowSize, 1u64 << ZSTD_WINDOWLOG_LIMIT_DEFAULT);
+        assert_eq!(dctx.d_maxWindowSize, ZSTD_maxWindowSize_default());
         assert!(!dctx.d_maxWindowSizeSet);
     }
 
@@ -4121,7 +4239,7 @@ mod tests {
     #[test]
     fn DCtx_refDDict_seeds_stream_dict_and_roundtrips_via_stream_api() {
         // Symmetric with ZSTD_CCtx_refCDict: refDDict wires the
-        // DDict's raw content into the DCtx so a subsequent
+        // DDict's exposed content into the DCtx so a subsequent
         // streaming decompress honors the dict.
         use crate::compress::zstd_compress::{ZSTD_compress_usingDict, ZSTD_createCCtx};
         use crate::decompress::zstd_ddict::ZSTD_createDDict;
@@ -4252,6 +4370,40 @@ mod tests {
             let _ = ZSTD_decompressStream(&mut dctx, &mut out, &mut out_pos, &[], &mut 0usize);
         }
         assert_eq!(&out[..out_pos], &src[..]);
+    }
+
+    #[test]
+    fn decompressStream_decodes_buffered_concatenated_frames_in_one_call() {
+        let first = b"streaming-first-frame ".repeat(16);
+        let second = b"streaming-second-frame ".repeat(16);
+        let mut f1 = vec![0u8; 4096];
+        let mut f2 = vec![0u8; 4096];
+        let n1 = crate::compress::zstd_compress::ZSTD_compress(&mut f1, &first, 3);
+        let n2 = crate::compress::zstd_compress::ZSTD_compress(&mut f2, &second, 3);
+        assert!(!crate::common::error::ERR_isError(n1));
+        assert!(!crate::common::error::ERR_isError(n2));
+
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&f1[..n1]);
+        stream.extend_from_slice(&f2[..n2]);
+
+        let mut dctx = ZSTD_DCtx::new();
+        ZSTD_initDStream(&mut dctx);
+        let mut out = vec![0u8; first.len() + second.len() + 64];
+        let mut in_pos = 0usize;
+        let mut out_pos = 0usize;
+        let hint = ZSTD_decompressStream(&mut dctx, &mut out, &mut out_pos, &stream, &mut in_pos);
+
+        assert!(
+            !crate::common::error::ERR_isError(hint),
+            "stream decode failed: {}",
+            crate::common::error::ERR_getErrorName(hint)
+        );
+        assert_eq!(hint, 0);
+        assert_eq!(in_pos, stream.len());
+        assert_eq!(out_pos, first.len() + second.len());
+        assert_eq!(&out[..first.len()], first.as_slice());
+        assert_eq!(&out[first.len()..out_pos], second.as_slice());
     }
 
     #[test]
@@ -4560,6 +4712,26 @@ mod tests {
     }
 
     #[test]
+    fn prepared_dict_decoders_short_garbage_is_src_size_wrong() {
+        use crate::common::error::{ERR_getErrorCode, ERR_isError};
+        use crate::decompress::zstd_ddict::ZSTD_createDDict;
+
+        let dict = b"short-garbage-dict".repeat(4);
+        let short_garbage = b"x";
+        let mut dctx = ZSTD_DCtx::new();
+        let mut out = [0u8; 16];
+
+        let rc = ZSTD_decompress_usingDict(&mut dctx, &mut out, short_garbage, &dict);
+        assert!(ERR_isError(rc));
+        assert_eq!(ERR_getErrorCode(rc), ErrorCode::SrcSizeWrong);
+
+        let ddict = ZSTD_createDDict(&dict).expect("ddict");
+        let rc = ZSTD_decompress_usingDDict(&mut dctx, &mut out, short_garbage, &ddict);
+        assert!(ERR_isError(rc));
+        assert_eq!(ERR_getErrorCode(rc), ErrorCode::SrcSizeWrong);
+    }
+
+    #[test]
     fn decompressDCtx_maps_late_prefix_unknown_to_srcSizeWrong() {
         use crate::common::error::{ERR_getErrorCode, ERR_isError};
         use crate::common::xxhash::XXH64_state_t;
@@ -4686,7 +4858,7 @@ mod tests {
         );
         assert_eq!(rc, 0);
         assert_eq!(full.dictID, 0x1020_3040);
-        assert_eq!(full.stream_dict, content);
+        assert_eq!(full.stream_dict, dict);
         assert_eq!(full.litEntropy, 1);
         assert_eq!(full.fseEntropy, 1);
         assert_eq!(full.ddict_rep, [8, 7, 1]);
@@ -4797,6 +4969,50 @@ mod tests {
     }
 
     #[test]
+    fn decompressDCtx_refPrefix_use_once_spans_entire_multiframe_call() {
+        use crate::common::error::ERR_isError;
+        use crate::common::xxhash::XXH64_state_t;
+        use crate::compress::zstd_compress::{
+            ZSTD_compressBound, ZSTD_compress_usingDict, ZSTD_createCCtx,
+        };
+        use crate::decompress::zstd_decompress_block::ZSTD_decoder_entropy_rep;
+
+        let dict = b"concat-use-once-prefix-shared-across-call ".repeat(8);
+        let src1 = b"first frame uses concat-use-once-prefix-shared-across-call ".repeat(9);
+        let src2 = b"second frame also uses concat-use-once-prefix-shared-across-call ".repeat(9);
+        let mut cctx = ZSTD_createCCtx().unwrap();
+        let mut f1 = vec![0u8; ZSTD_compressBound(src1.len())];
+        let n1 = ZSTD_compress_usingDict(&mut cctx, &mut f1, &src1, &dict, 3);
+        assert!(!ERR_isError(n1));
+        let mut f2 = vec![0u8; ZSTD_compressBound(src2.len())];
+        let n2 = ZSTD_compress_usingDict(&mut cctx, &mut f2, &src2, &dict, 3);
+        assert!(!ERR_isError(n2));
+
+        let mut concatenated = Vec::new();
+        concatenated.extend_from_slice(&f1[..n1]);
+        concatenated.extend_from_slice(&f2[..n2]);
+
+        let mut dctx = ZSTD_DCtx::new();
+        assert_eq!(ZSTD_DCtx_refPrefix(&mut dctx, &dict), 0);
+        assert_eq!(dctx.dictUses, ZSTD_dictUses_e::ZSTD_use_once);
+        let mut out = vec![0u8; src1.len() + src2.len() + 32];
+        let mut rep = ZSTD_decoder_entropy_rep::default();
+        let mut xxh = XXH64_state_t::default();
+        let decoded = ZSTD_decompressDCtx(&mut dctx, &mut rep, &mut xxh, &mut out, &concatenated);
+
+        assert!(
+            !ERR_isError(decoded),
+            "multiframe refPrefix decode failed: {}",
+            crate::common::error::ERR_getErrorName(decoded)
+        );
+        assert_eq!(decoded, src1.len() + src2.len());
+        assert_eq!(&out[..src1.len()], src1.as_slice());
+        assert_eq!(&out[src1.len()..decoded], src2.as_slice());
+        assert_eq!(dctx.dictUses, ZSTD_dictUses_e::ZSTD_dont_use);
+        assert!(dctx.stream_dict.is_empty());
+    }
+
+    #[test]
     fn DCtx_refPrefix_advanced_matches_plain_across_every_contentType() {
         use crate::decompress::zstd_ddict::ZSTD_dictContentType_e;
         let prefix = b"advanced-refPrefix-roundtrip".to_vec();
@@ -4889,6 +5105,10 @@ mod tests {
         let ddict = ZSTD_initStaticDDict(bytes, &dict).expect("static full ddict");
         assert_eq!(
             crate::decompress::zstd_ddict::ZSTD_DDict_dictContent(ddict),
+            dict.as_slice()
+        );
+        assert_eq!(
+            crate::decompress::zstd_ddict::ZSTD_DDict_rawContent(ddict),
             content.as_slice()
         );
         assert_eq!(
@@ -4898,7 +5118,7 @@ mod tests {
 
         let mut dctx = ZSTD_DCtx::new();
         crate::decompress::zstd_ddict::ZSTD_copyDDictParameters(&mut dctx, ddict);
-        assert_eq!(dctx.stream_dict, content);
+        assert_eq!(dctx.stream_dict, dict);
         assert_eq!(dctx.dictID, 0x1357_2468);
         assert_eq!(dctx.litEntropy, 1);
         assert_eq!(dctx.fseEntropy, 1);
@@ -5217,8 +5437,7 @@ mod tests {
     }
 
     #[test]
-    fn one_shot_frame_decoders_reject_explicit_dctx_window_limit() {
-        use crate::common::error::{ERR_getErrorCode, ERR_isError};
+    fn one_shot_frame_decoders_do_not_enforce_explicit_dctx_window_limit() {
         use crate::common::xxhash::XXH64_state_t;
         use crate::decompress::zstd_decompress_block::{
             ZSTD_DCtx, ZSTD_buildDefaultSeqTables, ZSTD_decoder_entropy_rep,
@@ -5236,11 +5455,8 @@ mod tests {
         let mut dst = vec![0u8; 16];
         let mut consumed = 0usize;
         let rc = ZSTD_decompressFrame(&mut dctx, &mut rep, &mut xxh, &mut dst, &src, &mut consumed);
-        assert!(ERR_isError(rc));
-        assert_eq!(
-            ERR_getErrorCode(rc),
-            ErrorCode::FrameParameterWindowTooLarge
-        );
+        assert_eq!(rc, 0);
+        assert_eq!(consumed, src.len());
 
         let mut dctx = ZSTD_DCtx::new();
         dctx.d_windowLogMax = 10;
@@ -5260,11 +5476,8 @@ mod tests {
             &src,
             &mut consumed,
         );
-        assert!(ERR_isError(rc));
-        assert_eq!(
-            ERR_getErrorCode(rc),
-            ErrorCode::FrameParameterWindowTooLarge
-        );
+        assert_eq!(rc, 0);
+        assert_eq!(consumed, src.len());
     }
 
     #[test]
@@ -5445,7 +5658,9 @@ pub fn ZSTD_decompressFrame_withOpStart(
     if zfh.frameType != ZSTD_FrameType_e::ZSTD_frame {
         return ERROR(ErrorCode::PrefixUnknown);
     }
-    let validateChecksum = zfh.checksumFlag != 0;
+    let validateChecksum = zfh.checksumFlag != 0
+        && dctx.forceIgnoreChecksum
+            == crate::compress::zstd_compress::ZSTD_forceIgnoreChecksum_e::ZSTD_d_validateChecksum;
     if validateChecksum {
         XXH64_reset(xxh, 0);
     }
@@ -5506,14 +5721,16 @@ pub fn ZSTD_decompressFrame_withOpStart(
     {
         return ERROR(ErrorCode::CorruptionDetected);
     }
-    if validateChecksum {
+    if zfh.checksumFlag != 0 {
         if remaining < 4 {
             return ERROR(ErrorCode::ChecksumWrong);
         }
-        let calc = XXH64_digest(xxh) as u32;
-        let read = MEM_readLE32(&src[ip..ip + 4]);
-        if calc != read {
-            return ERROR(ErrorCode::ChecksumWrong);
+        if validateChecksum {
+            let calc = XXH64_digest(xxh) as u32;
+            let read = MEM_readLE32(&src[ip..ip + 4]);
+            if calc != read {
+                return ERROR(ErrorCode::ChecksumWrong);
+            }
         }
         ip += 4;
     }
@@ -5577,7 +5794,9 @@ pub fn ZSTD_decompressFrame(
         // should use a different entry point. We reject here.
         return ERROR(ErrorCode::PrefixUnknown);
     }
-    let validateChecksum = zfh.checksumFlag != 0;
+    let validateChecksum = zfh.checksumFlag != 0
+        && dctx.forceIgnoreChecksum
+            == crate::compress::zstd_compress::ZSTD_forceIgnoreChecksum_e::ZSTD_d_validateChecksum;
     if validateChecksum {
         XXH64_reset(xxh, 0);
     }
@@ -5645,14 +5864,16 @@ pub fn ZSTD_decompressFrame(
     }
 
     // Checksum trailer.
-    if validateChecksum {
+    if zfh.checksumFlag != 0 {
         if remaining < 4 {
             return ERROR(ErrorCode::ChecksumWrong);
         }
-        let calc = XXH64_digest(xxh) as u32;
-        let read = MEM_readLE32(&src[ip..ip + 4]);
-        if calc != read {
-            return ERROR(ErrorCode::ChecksumWrong);
+        if validateChecksum {
+            let calc = XXH64_digest(xxh) as u32;
+            let read = MEM_readLE32(&src[ip..ip + 4]);
+            if calc != read {
+                return ERROR(ErrorCode::ChecksumWrong);
+            }
         }
         ip += 4;
     }
@@ -5673,6 +5894,8 @@ pub fn ZSTD_decompressDCtx(
     dst: &mut [u8],
     src: &[u8],
 ) -> usize {
+    let clear_dict_after_call = dctx.dictUses == ZSTD_dictUses_e::ZSTD_use_once;
+    let prepared_dict = ZSTD_takePreparedDictForFrame(dctx);
     let mut ip = 0usize;
     let mut op = 0usize;
     while ip < src.len() {
@@ -5693,23 +5916,25 @@ pub fn ZSTD_decompressDCtx(
             ip += sz;
             continue;
         }
-        let clear_dict_after_frame = dctx.dictUses == ZSTD_dictUses_e::ZSTD_use_once;
-        if let Some(dict) = ZSTD_takePreparedDictForFrame(dctx) {
+        if let Some(dict) = prepared_dict.as_ref() {
             let frame_sz = ZSTD_findFrameCompressedSize_advanced(rem, dctx.format);
             if crate::common::error::ERR_isError(frame_sz) {
+                if clear_dict_after_call {
+                    ZSTD_clearDict(dctx);
+                }
                 return ZSTD_mapPrefixUnknownAfterDecodedFrame(frame_sz, op);
             }
             let decoded = ZSTD_decompressFrame_usingPreparedDict(
                 dctx,
                 &mut dst[op..],
                 &rem[..frame_sz],
-                &dict,
+                dict,
             );
             if crate::common::error::ERR_isError(decoded) {
+                if clear_dict_after_call {
+                    ZSTD_clearDict(dctx);
+                }
                 return ZSTD_mapPrefixUnknownAfterDecodedFrame(decoded, op);
-            }
-            if clear_dict_after_frame {
-                ZSTD_clearDict(dctx);
             }
             ip += frame_sz;
             op += decoded;
@@ -5727,6 +5952,9 @@ pub fn ZSTD_decompressDCtx(
         }
         ip += consumed;
         op += decoded;
+    }
+    if clear_dict_after_call {
+        ZSTD_clearDict(dctx);
     }
     op
 }
@@ -5769,13 +5997,22 @@ pub fn ZSTD_decompress_usingDict(
     src: &[u8],
     dict: &[u8],
 ) -> usize {
-    let prepared = match ZSTD_prepareDict_forDecompression(
+    let rc = ZSTD_DCtx_loadDictionary_advanced_internal(
+        dctx,
         dict,
         crate::decompress::zstd_ddict::ZSTD_dictContentType_e::ZSTD_dct_auto,
-    ) {
-        Ok(prepared) => prepared,
-        Err(err) => return err,
-    };
+        ZSTD_dictUses_e::ZSTD_use_once,
+    );
+    if crate::common::error::ERR_isError(rc) {
+        return rc;
+    }
+    let prepared = ZSTD_takePreparedDictForFrame(dctx).unwrap_or_else(|| ZSTD_preparedDict {
+        content: Vec::new(),
+        dictID: 0,
+        entropyPresent: false,
+        rep: [1, 4, 8],
+        entropy: None,
+    });
     ZSTD_decompressMultiFrame_preparedDict(dctx, dst, src, &prepared)
 }
 
@@ -5785,6 +6022,33 @@ struct ZSTD_preparedDict {
     dictID: u32,
     entropyPresent: bool,
     rep: [u32; 3],
+    entropy: Option<ZSTD_preparedDictEntropy>,
+}
+
+#[derive(Clone)]
+struct ZSTD_preparedDictEntropy {
+    hufTable: Vec<u32>,
+    LLTable: Vec<crate::decompress::zstd_decompress_block::ZSTD_seqSymbol>,
+    OFTable: Vec<crate::decompress::zstd_decompress_block::ZSTD_seqSymbol>,
+    MLTable: Vec<crate::decompress::zstd_decompress_block::ZSTD_seqSymbol>,
+    rep: [u32; 3],
+}
+
+fn ZSTD_preparedDictEntropy_parse(dict: &[u8]) -> Result<ZSTD_preparedDictEntropy, usize> {
+    let mut tmp = ZSTD_DCtx::new();
+    crate::decompress::zstd_decompress_block::ZSTD_buildDefaultSeqTables(&mut tmp);
+    let mut rep = [0u32; 3];
+    let rc = ZSTD_loadDEntropy(&mut tmp, &mut rep, dict);
+    if crate::common::error::ERR_isError(rc) {
+        return Err(ERROR(ErrorCode::DictionaryCorrupted));
+    }
+    Ok(ZSTD_preparedDictEntropy {
+        hufTable: tmp.hufTable,
+        LLTable: tmp.LLTable,
+        OFTable: tmp.OFTable,
+        MLTable: tmp.MLTable,
+        rep,
+    })
 }
 
 fn ZSTD_preparedDict_fromDDict(
@@ -5792,51 +6056,22 @@ fn ZSTD_preparedDict_fromDDict(
 ) -> ZSTD_preparedDict {
     let entropyPresent = crate::decompress::zstd_ddict::ZSTD_DDict_entropyPresent(ddict) != 0;
     let mut rep = [1, 4, 8];
+    let mut entropy = None;
     if entropyPresent {
-        let mut tmp = ZSTD_DCtx::new();
-        let mut parsed_rep = [0u32; 3];
-        let rc = ZSTD_loadDEntropy(
-            &mut tmp,
-            &mut parsed_rep,
+        if let Ok(parsed) = ZSTD_preparedDictEntropy_parse(
             crate::decompress::zstd_ddict::ZSTD_DDict_originalContent(ddict),
-        );
-        if !crate::common::error::ERR_isError(rc) {
-            rep = parsed_rep;
+        ) {
+            rep = parsed.rep;
+            entropy = Some(parsed);
         }
     }
     ZSTD_preparedDict {
-        content: crate::decompress::zstd_ddict::ZSTD_DDict_rawContent(ddict).to_vec(),
+        content: crate::decompress::zstd_ddict::ZSTD_DDict_dictContent(ddict).to_vec(),
         dictID: crate::decompress::zstd_ddict::ZSTD_getDictID_fromDDict(ddict),
         entropyPresent,
         rep,
+        entropy,
     }
-}
-
-fn ZSTD_prepareDict_forDecompression(
-    dict: &[u8],
-    dictContentType: crate::decompress::zstd_ddict::ZSTD_dictContentType_e,
-) -> Result<ZSTD_preparedDict, usize> {
-    let ddict = crate::decompress::zstd_ddict::ZSTD_createDDict_advanced(
-        dict,
-        crate::decompress::zstd_ddict::ZSTD_dictLoadMethod_e::ZSTD_dlm_byCopy,
-        dictContentType,
-    )
-    .ok_or_else(|| ERROR(ErrorCode::DictionaryCorrupted))?;
-    let mut prepared = ZSTD_preparedDict_fromDDict(&ddict);
-    if prepared.entropyPresent {
-        let mut tmp = ZSTD_DCtx::new();
-        let mut rep = [0u32; 3];
-        let rc = ZSTD_loadDEntropy(
-            &mut tmp,
-            &mut rep,
-            crate::decompress::zstd_ddict::ZSTD_DDict_originalContent(&ddict),
-        );
-        if crate::common::error::ERR_isError(rc) {
-            return Err(ERROR(ErrorCode::DictionaryCorrupted));
-        }
-        prepared.rep = rep;
-    }
-    Ok(prepared)
 }
 
 fn ZSTD_takePreparedDictForFrame(dctx: &mut ZSTD_DCtx) -> Option<ZSTD_preparedDict> {
@@ -5852,6 +6087,17 @@ fn ZSTD_takePreparedDictForFrame(dctx: &mut ZSTD_DCtx) -> Option<ZSTD_preparedDi
             dictID: dctx.dictID,
             entropyPresent: dctx.litEntropy != 0 || dctx.fseEntropy != 0,
             rep: dctx.ddict_rep,
+            entropy: if dctx.litEntropy != 0 || dctx.fseEntropy != 0 {
+                Some(ZSTD_preparedDictEntropy {
+                    hufTable: dctx.hufTable.clone(),
+                    LLTable: dctx.LLTable.clone(),
+                    OFTable: dctx.OFTable.clone(),
+                    MLTable: dctx.MLTable.clone(),
+                    rep: dctx.ddict_rep,
+                })
+            } else {
+                None
+            },
         })
     };
     match dctx.dictUses {
@@ -5907,8 +6153,25 @@ fn ZSTD_decompressFrame_usingPreparedDict(
         return rc;
     }
     dctx.stream_dict = dict.content.clone();
+    let dict_start = dctx.stream_dict.as_ptr() as usize;
+    let dict_end = dict_start.wrapping_add(dctx.stream_dict.len());
+    dctx.prefixStart = Some(dict_start);
+    dctx.virtualStart = Some(dict_start);
+    dctx.dictEnd = Some(dict_end);
+    dctx.previousDstEnd = Some(dict_end);
     dctx.dictID = dict.dictID;
-    if dict.entropyPresent {
+    if let Some(entropy) = dict.entropy.as_ref() {
+        dctx.hufTable = entropy.hufTable.clone();
+        dctx.LLTable = entropy.LLTable.clone();
+        dctx.OFTable = entropy.OFTable.clone();
+        dctx.MLTable = entropy.MLTable.clone();
+        dctx.ddict_rep = entropy.rep;
+        dctx.litEntropy = 1;
+        dctx.fseEntropy = 1;
+        dctx.ll_default_active = false;
+        dctx.of_default_active = false;
+        dctx.ml_default_active = false;
+    } else if dict.entropyPresent {
         dctx.ddict_rep = dict.rep;
         dctx.litEntropy = 1;
         dctx.fseEntropy = 1;
@@ -5954,7 +6217,7 @@ fn ZSTD_decompressMultiFrame_preparedDict(
 ) -> usize {
     let mut ip = 0usize;
     let mut op = 0usize;
-    while ip < src.len() {
+    while src.len() - ip >= ZSTD_startingInputLength(dctx.format) {
         let rem = &src[ip..];
         if dctx.format == ZSTD_format_e::ZSTD_f_zstd1
             && rem.len() >= ZSTD_SKIPPABLEHEADERSIZE
@@ -5978,6 +6241,9 @@ fn ZSTD_decompressMultiFrame_preparedDict(
         }
         ip += frame_sz;
         op += decoded;
+    }
+    if ip != src.len() {
+        return ERROR(ErrorCode::SrcSizeWrong);
     }
     op
 }
@@ -6008,6 +6274,17 @@ pub fn ZSTD_dParam_getBounds(
             lowerBound: ZSTD_format_e::ZSTD_f_zstd1 as i32,
             upperBound: ZSTD_format_e::ZSTD_f_zstd1_magicless as i32,
         },
+        ZSTD_dParameter::ZSTD_d_forceIgnoreChecksum => {
+            crate::compress::zstd_compress::ZSTD_bounds {
+                error: 0,
+                lowerBound:
+                    crate::compress::zstd_compress::ZSTD_forceIgnoreChecksum_e::ZSTD_d_validateChecksum
+                        as i32,
+                upperBound:
+                    crate::compress::zstd_compress::ZSTD_forceIgnoreChecksum_e::ZSTD_d_ignoreChecksum
+                        as i32,
+            }
+        }
     }
 }
 
@@ -6159,11 +6436,18 @@ pub fn ZSTD_DCtx_selectFrameDDict<'a>(
     dctx: &mut ZSTD_DCtx,
     hashSet: &ZSTD_DDictHashSet<'a>,
 ) -> Option<&'a crate::decompress::zstd_ddict::ZSTD_DDict> {
+    let has_active_ddict = dctx.dictUses != ZSTD_dictUses_e::ZSTD_dont_use
+        && (!dctx.stream_dict.is_empty()
+            || dctx.dictID != 0
+            || dctx.litEntropy != 0
+            || dctx.fseEntropy != 0);
+    if !has_active_ddict {
+        return None;
+    }
     let frameDDict = ZSTD_DDictHashSet_getDDict(hashSet, dctx.fParams.dictID)?;
     ZSTD_clearDict(dctx);
     dctx.dictID = dctx.fParams.dictID;
     crate::decompress::zstd_ddict::ZSTD_copyDDictParameters(dctx, frameDDict);
-    dctx.stream_dict = crate::decompress::zstd_ddict::ZSTD_DDict_rawContent(frameDDict).to_vec();
     dctx.dictUses = ZSTD_dictUses_e::ZSTD_use_indefinitely;
     Some(frameDDict)
 }
@@ -6234,14 +6518,14 @@ pub fn ZSTD_initDCtx_internal(dctx: &mut ZSTD_DCtx) {
 
 /// Port of `ZSTD_DCtx_resetParameters` (zstd_decompress.c:240).
 /// Resets the DCtx's decoder-parameter slots back to upstream
-/// defaults: `maxWindowSize = (1 << ZSTD_WINDOWLOG_LIMIT_DEFAULT)`,
+/// defaults: `maxWindowSize = (1 << ZSTD_WINDOWLOG_LIMIT_DEFAULT) + 1`,
 /// leaving session state untouched. Several upstream DCtx fields
 /// (format, outBufferMode, forceIgnoreChecksum, refMultipleDDicts,
 /// disableHufAsm, maxBlockSizeParam) aren't tracked in v0.1 — the
 /// ones we do carry are reset here.
 pub fn ZSTD_DCtx_resetParameters(dctx: &mut ZSTD_DCtx) {
     dctx.d_windowLogMax = ZSTD_WINDOWLOG_LIMIT_DEFAULT;
-    dctx.d_maxWindowSize = 1u64 << ZSTD_WINDOWLOG_LIMIT_DEFAULT;
+    dctx.d_maxWindowSize = ZSTD_maxWindowSize_default();
     dctx.d_maxWindowSizeSet = false;
     // Include `format` — now tracked as a parameter via the
     // `ZSTD_d_format` enum variant, so a parameter-reset must
@@ -6251,6 +6535,8 @@ pub fn ZSTD_DCtx_resetParameters(dctx: &mut ZSTD_DCtx) {
     // parameter-reset returns it to `ZSTD_dont_use` to stay
     // consistent with `ZSTD_DCtx_reset(parameters)`.
     dctx.dictUses = ZSTD_dictUses_e::ZSTD_dont_use;
+    dctx.forceIgnoreChecksum =
+        crate::compress::zstd_compress::ZSTD_forceIgnoreChecksum_e::ZSTD_d_validateChecksum;
 }
 
 /// Port of `ZSTD_dParam_withinBounds` (zstd_decompress.c:1864).
@@ -6338,6 +6624,30 @@ fn dctx_is_in_init_stage(dctx: &ZSTD_DCtx) -> bool {
     dctx.stream_in_buffer.is_empty()
         && dctx.stream_out_buffer.is_empty()
         && dctx.stream_out_drained == 0
+}
+
+fn ZSTD_DCtx_resetSession(dctx: &mut ZSTD_DCtx) {
+    dctx.stream_in_buffer.clear();
+    dctx.stream_out_buffer.clear();
+    dctx.stream_out_drained = 0;
+    dctx.oversizedDuration = 0;
+    dctx.isFrameDecompression = 1;
+    dctx.expected = ZSTD_startingInputLength(dctx.format);
+    dctx.stage = ZSTD_dStage::ZSTDds_getFrameHeaderSize;
+    dctx.processedCSize = 0;
+    dctx.decodedSize = 0;
+    dctx.previousDstEnd = None;
+    dctx.prefixStart = None;
+    dctx.virtualStart = None;
+    dctx.dictEnd = None;
+    dctx.bType = crate::decompress::zstd_decompress_block::blockType_e::bt_reserved;
+    dctx.rleSize = 0;
+    dctx.headerSize = 0;
+    dctx.validateChecksum = 0;
+    dctx.fParams = ZSTD_FrameHeader::default();
+    dctx.headerBuffer.fill(0);
+    dctx.historyBuffer.clear();
+    crate::common::xxhash::XXH64_reset(&mut dctx.xxhState, 0);
 }
 
 /// Port of `ZSTD_DCtx_loadDictionary`. Configures the DCtx with a
@@ -6516,6 +6826,8 @@ pub enum ZSTD_dParameter {
     /// Upstream `ZSTD_d_format` = `ZSTD_d_experimentalParam1` (1000).
     /// Toggles between `ZSTD_f_zstd1` and `ZSTD_f_zstd1_magicless`.
     ZSTD_d_format = 1000,
+    /// Upstream `ZSTD_d_forceIgnoreChecksum` = `ZSTD_d_experimentalParam3` (1002).
+    ZSTD_d_forceIgnoreChecksum = 1002,
 }
 
 /// Port of `ZSTD_DCtx_setParameter`. For `windowLogMax` we record
@@ -6569,6 +6881,21 @@ pub fn ZSTD_DCtx_setParameter(dctx: &mut ZSTD_DCtx, param: ZSTD_dParameter, valu
             };
             0
         }
+        ZSTD_dParameter::ZSTD_d_forceIgnoreChecksum => {
+            let bounds = ZSTD_dParam_getBounds(ZSTD_dParameter::ZSTD_d_forceIgnoreChecksum);
+            if value < bounds.lowerBound || value > bounds.upperBound {
+                return ERROR(ErrorCode::ParameterOutOfBound);
+            }
+            dctx.forceIgnoreChecksum = if value
+                == crate::compress::zstd_compress::ZSTD_forceIgnoreChecksum_e::ZSTD_d_ignoreChecksum
+                    as i32
+            {
+                crate::compress::zstd_compress::ZSTD_forceIgnoreChecksum_e::ZSTD_d_ignoreChecksum
+            } else {
+                crate::compress::zstd_compress::ZSTD_forceIgnoreChecksum_e::ZSTD_d_validateChecksum
+            };
+            0
+        }
     }
 }
 
@@ -6580,8 +6907,9 @@ pub const ZSTD_WINDOWLOG_LIMIT_DEFAULT: u32 = 27;
 /// Port of `ZSTD_DCtx_getParameter`.
 pub fn ZSTD_DCtx_getParameter(dctx: &ZSTD_DCtx, param: ZSTD_dParameter, value: &mut i32) -> usize {
     *value = match param {
-        ZSTD_dParameter::ZSTD_d_windowLogMax => dctx.d_windowLogMax as i32,
+        ZSTD_dParameter::ZSTD_d_windowLogMax => ZSTD_highbit64(dctx.d_maxWindowSize),
         ZSTD_dParameter::ZSTD_d_format => dctx.format as i32,
+        ZSTD_dParameter::ZSTD_d_forceIgnoreChecksum => dctx.forceIgnoreChecksum as i32,
     };
     0
 }
@@ -6608,7 +6936,7 @@ pub fn ZSTD_DCtx_reset(dctx: &mut ZSTD_DCtx, reset: ZSTD_DResetDirective) -> usi
         return ERROR(ErrorCode::StageWrong);
     }
     if clear_session {
-        ZSTD_resetDStream(dctx);
+        ZSTD_DCtx_resetSession(dctx);
     }
     if clear_params {
         // Upstream (zstd_decompress.c:1958) routes through
@@ -6685,8 +7013,19 @@ pub fn ZSTD_estimateDStreamSize(windowSize: usize) -> usize {
 pub fn ZSTD_estimateDStreamSize_fromFrame(src: &[u8]) -> usize {
     let mut zfh = ZSTD_FrameHeader::default();
     let rc = ZSTD_getFrameHeader(&mut zfh, src);
-    if crate::common::error::ERR_isError(rc) || rc != 0 {
-        return ZSTD_estimateDStreamSize(1 << 17); // default block-size estimate
+    if crate::common::error::ERR_isError(rc) {
+        return rc;
+    }
+    if rc != 0 {
+        return ERROR(ErrorCode::SrcSizeWrong);
+    }
+    let windowSizeMax = if crate::common::mem::MEM_32bits() != 0 {
+        1u64 << ZSTD_WINDOWLOG_MAX_32
+    } else {
+        1u64 << ZSTD_WINDOWLOG_MAX_64
+    };
+    if zfh.windowSize > windowSizeMax {
+        return ERROR(ErrorCode::FrameParameterWindowTooLarge);
     }
     ZSTD_estimateDStreamSize(zfh.windowSize as usize)
 }
@@ -6801,12 +7140,16 @@ pub fn ZSTD_decodeFrameHeader(dctx: &mut ZSTD_DCtx, src: &[u8], headerSize: usiz
     if dctx.fParams.dictID != 0 && dctx.dictID != dctx.fParams.dictID {
         return ERROR(ErrorCode::DictionaryWrong);
     }
-    if dctx.fParams.windowSize > dctx.d_maxWindowSize {
-        return ERROR(ErrorCode::FrameParameterWindowTooLarge);
-    }
     dctx.isFrameDecompression = 1;
     dctx.blockSizeMax = dctx.fParams.blockSizeMax as usize;
-    dctx.validateChecksum = dctx.fParams.checksumFlag;
+    dctx.validateChecksum = if dctx.fParams.checksumFlag != 0
+        && dctx.forceIgnoreChecksum
+            == crate::compress::zstd_compress::ZSTD_forceIgnoreChecksum_e::ZSTD_d_validateChecksum
+    {
+        1
+    } else {
+        0
+    };
     if dctx.validateChecksum != 0 {
         XXH64_reset(&mut dctx.xxhState, 0);
     }
@@ -7044,6 +7387,9 @@ pub fn ZSTD_loadDEntropy(dctx: &mut ZSTD_DCtx, repOut: &mut [u32; 3], dict: &[u8
         llLog,
     );
     pos += llSize;
+    dctx.ll_default_active = false;
+    dctx.of_default_active = false;
+    dctx.ml_default_active = false;
 
     // --- 3 × 4-byte rep values ---
     if pos + 12 > dict.len() {
@@ -7269,9 +7615,7 @@ pub fn ZSTD_findDecompressedSize(src: &[u8]) -> u64 {
 /// state (input/output buffers + drain cursor) and clears any
 /// configured dictionary reference.
 pub fn ZSTD_initDStream(zds: &mut ZSTD_DCtx) -> usize {
-    zds.stream_in_buffer.clear();
-    zds.stream_out_buffer.clear();
-    zds.stream_out_drained = 0;
+    ZSTD_DCtx_resetSession(zds);
     ZSTD_clearDict(zds);
     // Upstream (zstd_decompress.c:1755) returns
     // `ZSTD_startingInputLength(dctx->format)`. Same contract as
@@ -7592,7 +7936,7 @@ pub fn ZSTD_decompressBegin(dctx: &mut ZSTD_DCtx) -> usize {
     dctx.decodedSize = 0;
     dctx.headerSize = 0;
     dctx.rleSize = 0;
-    dctx.bType = crate::decompress::zstd_decompress_block::blockType_e::bt_raw;
+    dctx.bType = crate::decompress::zstd_decompress_block::blockType_e::bt_reserved;
     dctx.validateChecksum = 0;
     dctx.fParams = ZSTD_FrameHeader::default();
     dctx.headerBuffer.fill(0);
@@ -7622,7 +7966,7 @@ pub fn ZSTD_decompressBegin_usingDict(dctx: &mut ZSTD_DCtx, dict: &[u8]) -> usiz
 }
 
 /// Port of `ZSTD_decompressBegin_usingDDict` (`zstd_decompress.c:1601`).
-/// Uses the DDict's preloaded parameters and raw content.
+/// Uses the DDict's preloaded parameters and exposed dictionary content.
 pub fn ZSTD_decompressBegin_usingDDict(
     dctx: &mut ZSTD_DCtx,
     ddict: &crate::decompress::zstd_ddict::ZSTD_DDict,
@@ -7790,9 +8134,9 @@ pub fn ZSTD_decompressContinue(dctx: &mut ZSTD_DCtx, dst: &mut [u8], src: &[u8])
             }
             // Append this block's output to the rolling history buffer
             // so subsequent blocks' back-references can resolve into it
-            // via the ext-dict path. Cap at the frame's window size
-            // (or the ZSTD_BLOCKSIZE_MAX fallback before a frame
-            // header has been parsed).
+            // via the ext-dict path. The block decoder exposes only the
+            // frame-window suffix; keep a few blocks of slack to avoid
+            // shifting the retained window on every block.
             if rSize > 0 {
                 let cap = if dctx.fParams.windowSize > 0 {
                     dctx.fParams.windowSize as usize
@@ -7800,7 +8144,11 @@ pub fn ZSTD_decompressContinue(dctx: &mut ZSTD_DCtx, dst: &mut [u8], src: &[u8])
                     crate::decompress::zstd_decompress_block::ZSTD_BLOCKSIZE_MAX
                 };
                 dctx.historyBuffer.extend_from_slice(&dst[..rSize]);
-                if dctx.historyBuffer.len() > cap {
+                let compact_at = cap.saturating_add(
+                    crate::decompress::zstd_decompress_block::ZSTD_BLOCKSIZE_MAX
+                        * ZSTD_HISTORY_COMPACT_SLACK_BLOCKS,
+                );
+                if dctx.historyBuffer.len() > compact_at {
                     let drop = dctx.historyBuffer.len() - cap;
                     dctx.historyBuffer.drain(..drop);
                 }
@@ -7858,6 +8206,272 @@ pub fn ZSTD_decompressContinue(dctx: &mut ZSTD_DCtx, dst: &mut [u8], src: &[u8])
     }
 }
 
+/// Streaming-only variant of `ZSTD_decompressContinue` that decodes
+/// block payloads directly into `dctx.historyBuffer` and returns the
+/// produced slice. Metadata chunks still delegate to the public API.
+///
+/// This mirrors upstream's round-buffer usage more closely than the
+/// generic safe API path: the regenerated block becomes the rolling
+/// history window immediately, so the caller can write it out without
+/// copying it into a second history buffer.
+pub fn ZSTD_decompressContinue_into_history<'a>(
+    dctx: &'a mut ZSTD_DCtx,
+    src: &[u8],
+) -> Result<&'a [u8], usize> {
+    use crate::common::error::{ErrorCode, ERROR};
+    use crate::common::xxhash::XXH64_update;
+    use crate::decompress::zstd_decompress_block::{
+        blockType_e, streaming_operation, ZSTD_blockHeaderSize, ZSTD_decoder_entropy_rep,
+        ZSTD_decompressBlock_internal, WILDCOPY_OVERLENGTH, ZSTD_BLOCKSIZE_MAX,
+    };
+
+    if !matches!(
+        dctx.stage,
+        ZSTD_dStage::ZSTDds_decompressBlock | ZSTD_dStage::ZSTDds_decompressLastBlock
+    ) {
+        let mut empty = [];
+        let rc = ZSTD_decompressContinue(dctx, &mut empty, src);
+        if crate::common::error::ERR_isError(rc) {
+            return Err(rc);
+        }
+        return Ok(&[]);
+    }
+
+    let expected_src_size = if dctx.bType == blockType_e::bt_raw {
+        src.len().clamp(1, dctx.expected)
+    } else {
+        dctx.expected
+    };
+    if src.len() != expected_src_size {
+        return Err(ERROR(ErrorCode::SrcSizeWrong));
+    }
+
+    dctx.processedCSize = dctx.processedCSize.wrapping_add(src.len() as u64);
+
+    let cap = if dctx.fParams.windowSize > 0 {
+        dctx.fParams.windowSize as usize
+    } else {
+        ZSTD_BLOCKSIZE_MAX
+    };
+    let compact_at = cap.saturating_add(ZSTD_BLOCKSIZE_MAX * ZSTD_HISTORY_COMPACT_SLACK_BLOCKS);
+    if dctx.historyBuffer.len() > compact_at {
+        let drop = dctx.historyBuffer.len() - cap;
+        dctx.historyBuffer.drain(..drop);
+    }
+
+    let max_out = match dctx.bType {
+        blockType_e::bt_compressed => dctx.fParams.blockSizeMax as usize,
+        blockType_e::bt_raw => src.len(),
+        blockType_e::bt_rle => dctx.rleSize,
+        blockType_e::bt_reserved => return Err(ERROR(ErrorCode::CorruptionDetected)),
+    };
+    let old_len = dctx.historyBuffer.len();
+    let dst_capacity = max_out.saturating_add(WILDCOPY_OVERLENGTH);
+    dctx.historyBuffer.reserve(dst_capacity);
+
+    // SAFETY: reserve() guarantees at least `dst_capacity` spare bytes
+    // after `old_len`. The Vec length remains `old_len` while the block
+    // decoder writes into that spare region, so ext-history lookups see
+    // only bytes from previous blocks. The overlength slack mirrors
+    // upstream's wildcopy contract; only the reported `rSize` is
+    // committed to the Vec below.
+    let dst = unsafe {
+        std::slice::from_raw_parts_mut(dctx.historyBuffer.as_mut_ptr().add(old_len), dst_capacity)
+    };
+    let mut entropy_rep = ZSTD_decoder_entropy_rep {
+        rep: dctx.ddict_rep,
+    };
+    let rSize = match dctx.bType {
+        blockType_e::bt_compressed => {
+            let r = ZSTD_decompressBlock_internal(
+                dctx,
+                &mut entropy_rep,
+                dst,
+                0,
+                src,
+                streaming_operation::is_streaming,
+            );
+            dctx.expected = 0;
+            r
+        }
+        blockType_e::bt_raw => {
+            let r = ZSTD_copyRawBlock(dst, src);
+            if crate::common::error::ERR_isError(r) {
+                return Err(r);
+            }
+            dctx.expected -= r;
+            r
+        }
+        blockType_e::bt_rle => {
+            let r = ZSTD_setRleBlock(dst, src[0], dctx.rleSize);
+            dctx.expected = 0;
+            r
+        }
+        blockType_e::bt_reserved => return Err(ERROR(ErrorCode::CorruptionDetected)),
+    };
+    if crate::common::error::ERR_isError(rSize) {
+        return Err(rSize);
+    }
+    if rSize > dctx.fParams.blockSizeMax as usize || rSize > max_out {
+        return Err(ERROR(ErrorCode::CorruptionDetected));
+    }
+
+    // SAFETY: the decoder reported `rSize <= max_out`, so exactly this
+    // prefix of the spare region has been initialized.
+    unsafe {
+        dctx.historyBuffer.set_len(old_len + rSize);
+    }
+    dctx.previousDstEnd =
+        Some(unsafe { dctx.historyBuffer.as_ptr().add(old_len + rSize) } as usize);
+    dctx.ddict_rep = entropy_rep.rep;
+    dctx.decodedSize = dctx.decodedSize.wrapping_add(rSize as u64);
+    if dctx.validateChecksum != 0 && rSize > 0 {
+        XXH64_update(
+            &mut dctx.xxhState,
+            &dctx.historyBuffer[old_len..old_len + rSize],
+        );
+    }
+
+    if dctx.expected > 0 {
+        return Ok(&dctx.historyBuffer[old_len..old_len + rSize]);
+    }
+    if dctx.stage == ZSTD_dStage::ZSTDds_decompressLastBlock {
+        if dctx.fParams.frameContentSize != ZSTD_CONTENTSIZE_UNKNOWN
+            && dctx.decodedSize != dctx.fParams.frameContentSize
+        {
+            return Err(ERROR(ErrorCode::CorruptionDetected));
+        }
+        if dctx.fParams.checksumFlag != 0 {
+            dctx.expected = 4;
+            dctx.stage = ZSTD_dStage::ZSTDds_checkChecksum;
+        } else {
+            dctx.expected = 0;
+            dctx.stage = ZSTD_dStage::ZSTDds_getFrameHeaderSize;
+        }
+    } else {
+        dctx.expected = ZSTD_blockHeaderSize;
+        dctx.stage = ZSTD_dStage::ZSTDds_decodeBlockHeader;
+    }
+
+    Ok(&dctx.historyBuffer[old_len..old_len + rSize])
+}
+
+/// Streaming-only variant of `ZSTD_decompressContinue` that decodes a
+/// block into `dst[op_start..]` while borrowing a previous wrapped
+/// output segment as external history. The virtual history seen by the
+/// sequence decoder is `[ext_history][dst[..op_start]]`.
+pub fn ZSTD_decompressContinue_into_prefix(
+    dctx: &mut ZSTD_DCtx,
+    src: &[u8],
+    dst: &mut [u8],
+    op_start: usize,
+    ext_history: &[u8],
+) -> Result<usize, usize> {
+    use crate::common::error::{ErrorCode, ERROR};
+    use crate::common::xxhash::XXH64_update;
+    use crate::decompress::zstd_decompress_block::{
+        blockType_e, streaming_operation, ZSTD_blockHeaderSize, ZSTD_decoder_entropy_rep,
+        ZSTD_decompressBlock_internal_with_ext_history,
+    };
+
+    if !matches!(
+        dctx.stage,
+        ZSTD_dStage::ZSTDds_decompressBlock | ZSTD_dStage::ZSTDds_decompressLastBlock
+    ) {
+        return Err(ERROR(ErrorCode::StageWrong));
+    }
+
+    let expected_src_size = if dctx.bType == blockType_e::bt_raw {
+        src.len().clamp(1, dctx.expected)
+    } else {
+        dctx.expected
+    };
+    if src.len() != expected_src_size {
+        return Err(ERROR(ErrorCode::SrcSizeWrong));
+    }
+
+    dctx.processedCSize = dctx.processedCSize.wrapping_add(src.len() as u64);
+
+    let max_out = match dctx.bType {
+        blockType_e::bt_compressed => dctx.fParams.blockSizeMax as usize,
+        blockType_e::bt_raw => src.len(),
+        blockType_e::bt_rle => dctx.rleSize,
+        blockType_e::bt_reserved => return Err(ERROR(ErrorCode::CorruptionDetected)),
+    };
+    if op_start.saturating_add(max_out) > dst.len() {
+        return Err(ERROR(ErrorCode::DstSizeTooSmall));
+    }
+
+    let mut entropy_rep = ZSTD_decoder_entropy_rep {
+        rep: dctx.ddict_rep,
+    };
+    let rSize = match dctx.bType {
+        blockType_e::bt_compressed => {
+            let r = ZSTD_decompressBlock_internal_with_ext_history(
+                dctx,
+                &mut entropy_rep,
+                dst,
+                op_start,
+                src,
+                streaming_operation::is_streaming,
+                Some(ext_history),
+            );
+            dctx.expected = 0;
+            r
+        }
+        blockType_e::bt_raw => {
+            let r = ZSTD_copyRawBlock(&mut dst[op_start..], src);
+            if crate::common::error::ERR_isError(r) {
+                return Err(r);
+            }
+            dctx.expected -= r;
+            r
+        }
+        blockType_e::bt_rle => {
+            let r = ZSTD_setRleBlock(&mut dst[op_start..], src[0], dctx.rleSize);
+            dctx.expected = 0;
+            r
+        }
+        blockType_e::bt_reserved => return Err(ERROR(ErrorCode::CorruptionDetected)),
+    };
+    if crate::common::error::ERR_isError(rSize) {
+        return Err(rSize);
+    }
+    if rSize > dctx.fParams.blockSizeMax as usize || rSize > max_out {
+        return Err(ERROR(ErrorCode::CorruptionDetected));
+    }
+
+    dctx.previousDstEnd = Some(unsafe { dst.as_ptr().add(op_start + rSize) } as usize);
+    dctx.ddict_rep = entropy_rep.rep;
+    dctx.decodedSize = dctx.decodedSize.wrapping_add(rSize as u64);
+    if dctx.validateChecksum != 0 && rSize > 0 {
+        XXH64_update(&mut dctx.xxhState, &dst[op_start..op_start + rSize]);
+    }
+
+    if dctx.expected > 0 {
+        return Ok(rSize);
+    }
+    if dctx.stage == ZSTD_dStage::ZSTDds_decompressLastBlock {
+        if dctx.fParams.frameContentSize != ZSTD_CONTENTSIZE_UNKNOWN
+            && dctx.decodedSize != dctx.fParams.frameContentSize
+        {
+            return Err(ERROR(ErrorCode::CorruptionDetected));
+        }
+        if dctx.fParams.checksumFlag != 0 {
+            dctx.expected = 4;
+            dctx.stage = ZSTD_dStage::ZSTDds_checkChecksum;
+        } else {
+            dctx.expected = 0;
+            dctx.stage = ZSTD_dStage::ZSTDds_getFrameHeaderSize;
+        }
+    } else {
+        dctx.expected = ZSTD_blockHeaderSize;
+        dctx.stage = ZSTD_dStage::ZSTDds_decodeBlockHeader;
+    }
+
+    Ok(rSize)
+}
+
 /// Port of `ZSTD_copyDCtx`. Deep-copies `src` into `dst`. Upstream
 /// only copies the "header" portion of the struct to skip the large
 /// `inBuff` workspace; the Rust port owns each field in a `Vec`, so
@@ -7870,9 +8484,8 @@ pub fn ZSTD_copyDCtx(dst: &mut ZSTD_DCtx, src: &ZSTD_DCtx) {
 }
 
 /// Port of `ZSTD_initDStream_usingDDict`. Like `ZSTD_initDStream` but
-/// attaches a pre-built `ZSTD_DDict` — the DDict's raw content is
-/// copied onto `dctx.stream_dict` so every frame decoded in this
-/// session sees it as history.
+/// attaches a pre-built `ZSTD_DDict` and copies its exposed dictionary
+/// content onto `dctx.stream_dict`.
 pub fn ZSTD_initDStream_usingDDict(
     zds: &mut ZSTD_DCtx,
     ddict: &crate::decompress::zstd_ddict::ZSTD_DDict,
@@ -7909,10 +8522,7 @@ pub fn ZSTD_nextSrcSizeToDecompress(dctx: &ZSTD_DCtx) -> usize {
 /// buffers) but preserves the configured dict for subsequent frames.
 /// Returns a hint for the suggested next input size.
 pub fn ZSTD_resetDStream(zds: &mut ZSTD_DCtx) -> usize {
-    zds.stream_in_buffer.clear();
-    zds.stream_out_buffer.clear();
-    zds.stream_out_drained = 0;
-    zds.oversizedDuration = 0;
+    ZSTD_DCtx_resetSession(zds);
     // Upstream (zstd_decompress.c:1772) returns
     // `ZSTD_startingInputLength(dctx->format)` — the number of bytes
     // needed to query the next frame header. Magicless-mode (`ZSTD_f_zstd1_magicless`)
@@ -8028,9 +8638,22 @@ pub fn ZSTD_decompressStream(
     if zds.stream_out_drained == zds.stream_out_buffer.len() && zds.stream_in_buffer.is_empty() {
         return 0;
     }
-    // If output fully drained AND fresh input available, try to probe
-    // a new frame.
-    if zds.stream_out_drained == zds.stream_out_buffer.len() {
+    // If output fully drained AND fresh input is available, keep
+    // probing complete frames. Upstream's streaming loop continues
+    // while it can make progress, so concatenated frames supplied in
+    // one input buffer should all decode in this call when output has
+    // room.
+    while zds.stream_out_drained == zds.stream_out_buffer.len() && !zds.stream_in_buffer.is_empty()
+    {
+        if *output_pos == output.len()
+            && !(zds.format == ZSTD_format_e::ZSTD_f_zstd1
+                && zds.stream_in_buffer.len() >= ZSTD_SKIPPABLEHEADERSIZE
+                && (MEM_readLE32(&zds.stream_in_buffer[..4]) & ZSTD_MAGIC_SKIPPABLE_MASK)
+                    == ZSTD_MAGIC_SKIPPABLE_START)
+        {
+            break;
+        }
+
         // Try to measure a full frame from the staged input. Thread
         // the dctx's stored format through so magicless-mode streams
         // decode without the 4-byte magic prefix.
@@ -8091,9 +8714,9 @@ pub fn ZSTD_decompressStream(
             ZSTD_decompressDCtx(zds, &mut rep, &mut xxh, &mut decoded, &frame_bytes)
         } else {
             // Snapshot the already-loaded dictionary state. For full
-            // dictionaries, `stream_dict` contains only raw content;
-            // dictID, entropy flags, and repcodes live on the DCtx and
-            // must be replayed as a unit.
+            // dictionaries, `stream_dict` contains the exposed DDict
+            // content; dictID, entropy flags, and repcodes live on the
+            // DCtx and must be replayed as a unit.
             let was_use_once = zds.dictUses == ZSTD_dictUses_e::ZSTD_use_once;
             let prepared = ZSTD_takePreparedDictForFrame(zds);
             let decoded_len = match prepared {
@@ -8133,6 +8756,9 @@ pub fn ZSTD_decompressStream(
             );
             zds.stream_out_drained += n;
             *output_pos += n;
+        }
+        if zds.stream_out_drained < zds.stream_out_buffer.len() {
+            break;
         }
     }
 

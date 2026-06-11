@@ -57,7 +57,10 @@ pub fn ZSTD_pthread_mutex_destroy(mutex: &mut Option<ZSTD_pthread_mutex_t>) -> i
 pub fn ZSTD_pthread_mutex_lock<'a>(
     mutex: &'a ZSTD_pthread_mutex_t,
 ) -> ZSTD_pthread_mutex_guard<'a> {
-    mutex.inner.lock().expect("threading mutex")
+    mutex
+        .inner
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
 }
 
 /// Port of `ZSTD_pthread_mutex_unlock`.
@@ -83,17 +86,21 @@ pub fn ZSTD_pthread_cond_wait<'a>(
     cond: &ZSTD_pthread_cond_t,
     guard: ZSTD_pthread_mutex_guard<'a>,
 ) -> ZSTD_pthread_mutex_guard<'a> {
-    cond.inner.wait(guard).expect("threading condvar")
+    cond.inner
+        .wait(guard)
+        .unwrap_or_else(|poison| poison.into_inner())
 }
 
 /// Port of `ZSTD_pthread_cond_signal`.
-pub fn ZSTD_pthread_cond_signal(cond: &ZSTD_pthread_cond_t) {
+pub fn ZSTD_pthread_cond_signal(cond: &ZSTD_pthread_cond_t) -> i32 {
     cond.inner.notify_one();
+    0
 }
 
 /// Port of `ZSTD_pthread_cond_broadcast`.
-pub fn ZSTD_pthread_cond_broadcast(cond: &ZSTD_pthread_cond_t) {
+pub fn ZSTD_pthread_cond_broadcast(cond: &ZSTD_pthread_cond_t) -> i32 {
     cond.inner.notify_all();
+    0
 }
 
 /// Port of `ZSTD_pthread_create`.
@@ -104,15 +111,20 @@ pub fn ZSTD_pthread_create(
     arg: *mut c_void,
 ) -> i32 {
     let arg_bits = arg as usize;
-    thread.inner = Some(std::thread::spawn(move || {
-        start_routine(arg_bits as *mut c_void) as usize
-    }));
-    0
+    thread.inner = None;
+    match std::thread::Builder::new().spawn(move || start_routine(arg_bits as *mut c_void) as usize)
+    {
+        Ok(handle) => {
+            thread.inner = Some(handle);
+            0
+        }
+        Err(err) => err.raw_os_error().unwrap_or(1),
+    }
 }
 
 /// Port of `ZSTD_pthread_join`.
-pub fn ZSTD_pthread_join(thread: &mut ZSTD_pthread_t) -> i32 {
-    match thread.inner.take() {
+pub fn ZSTD_pthread_join(thread: ZSTD_pthread_t) -> i32 {
+    match thread.inner {
         Some(handle) => match handle.join() {
             Ok(_) => 0,
             Err(_) => 1,
@@ -154,7 +166,7 @@ mod tests {
             let args = unsafe { Box::from_raw(arg as *mut WaitSignalArgs) };
             std::thread::sleep(Duration::from_millis(10));
             args.ready.store(true, Ordering::SeqCst);
-            ZSTD_pthread_cond_signal(&args.cond);
+            assert_eq!(ZSTD_pthread_cond_signal(&args.cond), 0);
             core::ptr::null_mut()
         }
         assert_eq!(
@@ -172,7 +184,7 @@ mod tests {
             guard = ZSTD_pthread_cond_wait(&cond, guard);
         }
         assert_eq!(ZSTD_pthread_mutex_unlock(guard), 0);
-        assert_eq!(ZSTD_pthread_join(&mut thread), 0);
+        assert_eq!(ZSTD_pthread_join(thread), 0);
     }
 
     #[test]
@@ -189,13 +201,39 @@ mod tests {
 
         let mut thread = ZSTD_pthread_t::default();
         assert_eq!(ZSTD_pthread_create(&mut thread, None, bump, raw), 0);
-        assert_eq!(ZSTD_pthread_join(&mut thread), 0);
+        assert_eq!(ZSTD_pthread_join(thread), 0);
         assert_eq!(seen.load(Ordering::SeqCst), 1);
-        assert_eq!(ZSTD_pthread_join(&mut thread), 0);
+    }
+
+    #[test]
+    fn poisoned_mutex_and_condvar_do_not_panic() {
+        let mutex = Arc::new(ZSTD_pthread_mutex_t::default());
+        let cond = Arc::new(ZSTD_pthread_cond_t::default());
+        let poison_mutex = Arc::clone(&mutex);
+
+        let _ = std::thread::spawn(move || {
+            let _guard = ZSTD_pthread_mutex_lock(&poison_mutex);
+            panic!("poison mutex");
+        })
+        .join();
+
+        let notifier = {
+            let cond = Arc::clone(&cond);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(10));
+                assert_eq!(ZSTD_pthread_cond_signal(&cond), 0);
+            })
+        };
+
+        let guard = ZSTD_pthread_mutex_lock(&mutex);
+        let guard = ZSTD_pthread_cond_wait(&cond, guard);
+        assert_eq!(ZSTD_pthread_mutex_unlock(guard), 0);
+        notifier.join().expect("notifier");
     }
 
     #[test]
     fn condvar_broadcast_wakes_multiple_waiters() {
+        let mutex = Arc::new(ZSTD_pthread_mutex_t::default());
         let cond = Arc::new(ZSTD_pthread_cond_t::default());
         let started = Arc::new(AtomicUsize::new(0));
         let awakened = Arc::new(AtomicUsize::new(0));
@@ -203,12 +241,12 @@ mod tests {
 
         let mut handles = Vec::new();
         for _ in 0..2 {
+            let mutex = Arc::clone(&mutex);
             let cond = Arc::clone(&cond);
             let started = Arc::clone(&started);
             let awakened = Arc::clone(&awakened);
             let gate = Arc::clone(&gate);
             handles.push(std::thread::spawn(move || {
-                let mutex = ZSTD_pthread_mutex_t::default();
                 let mut guard = ZSTD_pthread_mutex_lock(&mutex);
                 started.fetch_add(1, Ordering::SeqCst);
                 while !gate.load(Ordering::SeqCst) {
@@ -222,8 +260,10 @@ mod tests {
         while started.load(Ordering::SeqCst) != 2 {
             std::thread::yield_now();
         }
+        let guard = ZSTD_pthread_mutex_lock(&mutex);
         gate.store(true, Ordering::SeqCst);
-        ZSTD_pthread_cond_broadcast(&cond);
+        assert_eq!(ZSTD_pthread_cond_broadcast(&cond), 0);
+        assert_eq!(ZSTD_pthread_mutex_unlock(guard), 0);
 
         for handle in handles {
             handle.join().expect("waiter");

@@ -72,7 +72,7 @@ pub const ZSTD_btultra2: u32 = 9;
 
 use crate::decompress::zstd_decompress_block::SymbolEncodingType_e;
 
-/// Upstream's `kInverseProbabilityLog256`: `ceil(-256 * log2(p/256))`
+/// Upstream's `kInverseProbabilityLog256`: `floor(-256 * log2(p/256))`
 /// for p in 0..=255. Used by entropy-cost estimators.
 pub const kInverseProbabilityLog256: [u32; 256] = [
     0, 2048, 1792, 1642, 1536, 1453, 1386, 1329, 1280, 1236, 1197, 1162, 1130, 1100, 1073, 1047,
@@ -110,7 +110,7 @@ pub fn ZSTD_entropyCost(count: &[u32], max: u32, total: usize) -> usize {
     let mut cost: u32 = 0;
     for &c_u32 in count.iter().take(max as usize + 1) {
         let c = c_u32 as usize;
-        let mut norm = (256 * c) / total;
+        let mut norm = c_u32.wrapping_mul(256) as usize / total;
         if c != 0 && norm == 0 {
             norm = 1;
         }
@@ -125,15 +125,15 @@ pub fn ZSTD_entropyCost(count: &[u32], max: u32, total: usize) -> usize {
 pub fn ZSTD_crossEntropyCost(norm: &[i16], accuracyLog: u32, count: &[u32], max: u32) -> usize {
     debug_assert!(accuracyLog <= 8);
     let shift = 8u32 - accuracyLog;
-    let mut cost: u32 = 0;
+    let mut cost: usize = 0;
     for (s, &n) in norm.iter().enumerate().take(max as usize + 1) {
         let norm_acc = if n != -1 { n as u32 } else { 1 };
         let norm256 = norm_acc << shift;
         debug_assert!(norm256 > 0 && norm256 < 256);
-        cost =
-            cost.wrapping_add(count[s].wrapping_mul(kInverseProbabilityLog256[norm256 as usize]));
+        let symbol_cost = count[s].wrapping_mul(kInverseProbabilityLog256[norm256 as usize]);
+        cost = cost.wrapping_add(symbol_cost as usize);
     }
-    (cost >> 8) as usize
+    cost >> 8
 }
 
 // ---- Skeletons (need FSE_CTable + FSE_writeNCount etc.) ---------------
@@ -178,7 +178,7 @@ pub fn ZSTD_fseBitCost(ctable: &[FSE_CTable], count: &[u32], max: u32) -> usize 
     if ZSTD_getFSEMaxSymbolValue(ctable) < max {
         return ERROR(ErrorCode::Generic);
     }
-    let mut cost: u64 = 0;
+    let mut cost: usize = 0;
     for (s, &c) in count.iter().enumerate().take(max as usize + 1) {
         let tableLog = cstate.stateLog;
         let badCost = (tableLog + 1) << kAccuracyLog;
@@ -189,9 +189,9 @@ pub fn ZSTD_fseBitCost(ctable: &[FSE_CTable], count: &[u32], max: u32) -> usize 
         if bitCost >= badCost {
             return ERROR(ErrorCode::Generic);
         }
-        cost = cost.wrapping_add(c as u64 * bitCost as u64);
+        cost = cost.wrapping_add((c as usize).wrapping_mul(bitCost as usize));
     }
-    (cost >> kAccuracyLog) as usize
+    cost >> kAccuracyLog
 }
 
 /// Port of `ZSTD_selectEncodingType`. Chooses between set_basic,
@@ -216,7 +216,6 @@ pub fn ZSTD_selectEncodingType(
     isDefaultAllowed: ZSTD_DefaultPolicy_e,
     strategy: u32,
 ) -> SymbolEncodingType_e {
-    const UNAVAILABLE_COST: usize = usize::MAX / 4;
     let defaultsAllowed = isDefaultAllowed == ZSTD_DefaultPolicy_e::ZSTD_defaultAllowed;
 
     if mostFrequent == nbSeq {
@@ -246,15 +245,15 @@ pub fn ZSTD_selectEncodingType(
         let basicCost = if defaultsAllowed {
             ZSTD_crossEntropyCost(defaultNorm, defaultNormLog, count, max)
         } else {
-            UNAVAILABLE_COST
+            ERROR(ErrorCode::Generic)
         };
         let repeatCost = if *repeatMode != FSE_repeat::FSE_repeat_none {
             ZSTD_fseBitCost(prevCTable, count, max)
         } else {
-            UNAVAILABLE_COST
+            ERROR(ErrorCode::Generic)
         };
         let NCountCost = ZSTD_NCountCost(count, max, nbSeq, FSELog);
-        let compressedCost = (NCountCost << 3) + ZSTD_entropyCost(count, max, nbSeq);
+        let compressedCost = (NCountCost << 3).wrapping_add(ZSTD_entropyCost(count, max, nbSeq));
 
         if basicCost <= repeatCost && basicCost <= compressedCost {
             *repeatMode = FSE_repeat::FSE_repeat_none;
@@ -287,7 +286,7 @@ pub fn ZSTD_buildCTable(
     defaultNormLog: u32,
     defaultMax: u32,
     prevCTable: &[FSE_CTable],
-    _prevCTableSize: usize,
+    prevCTableSize: usize,
     entropyWorkspace: &mut [u8],
 ) -> usize {
     match type_ {
@@ -303,7 +302,12 @@ pub fn ZSTD_buildCTable(
             1
         }
         SymbolEncodingType_e::set_repeat => {
-            let n = nextCTable.len().min(prevCTable.len());
+            let elem_size = core::mem::size_of::<FSE_CTable>();
+            debug_assert_eq!(prevCTableSize % elem_size, 0);
+            let n = prevCTableSize / elem_size;
+            if n > nextCTable.len() || n > prevCTable.len() {
+                return ERROR(ErrorCode::Generic);
+            }
             nextCTable[..n].copy_from_slice(&prevCTable[..n]);
             0
         }
@@ -769,6 +773,28 @@ mod tests {
     }
 
     #[test]
+    fn entropy_cost_uses_upstream_u32_wrapping_for_norm() {
+        let mut count = [0u32; 1];
+        count[0] = u32::MAX;
+        let total = u32::MAX as usize + 1;
+        let expected = count[0].wrapping_mul(kInverseProbabilityLog256[1]) >> 8;
+
+        assert_eq!(ZSTD_entropyCost(&count, 0, total), expected as usize);
+    }
+
+    #[test]
+    fn cross_entropy_cost_uses_upstream_u32_wrapping_for_symbol_cost() {
+        let norm = [1i16];
+        let count = [u32::MAX];
+        let expected = count[0].wrapping_mul(kInverseProbabilityLog256[128]) >> 8;
+
+        assert_eq!(
+            ZSTD_crossEntropyCost(&norm, 1, &count, 0),
+            expected as usize
+        );
+    }
+
+    #[test]
     fn select_encoding_type_picks_rle_when_one_symbol_dominates_all() {
         // mostFrequent == nbSeq → format prefers RLE over basic when
         // nbSeq > 2 (or when defaults are disallowed).
@@ -813,7 +839,7 @@ mod tests {
     }
 
     #[test]
-    fn select_encoding_type_high_strategy_uses_cost_sentinels_not_error_codes() {
+    fn select_encoding_type_high_strategy_uses_upstream_error_sentinels() {
         use crate::compress::fse_compress::FSE_CTABLE_SIZE_U32;
 
         let mut rm = FSE_repeat::FSE_repeat_none;
@@ -865,6 +891,40 @@ mod tests {
         assert!(!crate::common::error::ERR_isError(n));
         assert_eq!(n, 1);
         assert_eq!(dst[0], 7);
+    }
+
+    #[test]
+    fn build_ctable_repeat_copies_exact_prev_ctable_size() {
+        let mut dst = [0u8; 16];
+        let mut next = [0xDEAD_BEEFu32; 5];
+        let prev = [
+            0x1111_2222u32,
+            0x3333_4444,
+            0x5555_6666,
+            0x7777_8888,
+            0x9999_AAAA,
+        ];
+        let mut count = [0u32; 4];
+        let mut wksp = vec![0u8; 4096];
+        let n = ZSTD_buildCTable(
+            &mut dst,
+            &mut next,
+            6,
+            SymbolEncodingType_e::set_repeat,
+            &mut count,
+            3,
+            &[],
+            4,
+            &[],
+            0,
+            0,
+            &prev,
+            2 * core::mem::size_of::<FSE_CTable>(),
+            &mut wksp,
+        );
+        assert_eq!(n, 0);
+        assert_eq!(next[..2], prev[..2]);
+        assert_eq!(next[2..], [0xDEAD_BEEFu32; 3]);
     }
 
     #[test]

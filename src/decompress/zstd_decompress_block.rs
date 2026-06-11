@@ -979,11 +979,6 @@ unsafe fn ZSTD_execSequence_rawLit(
                     let v = (src_p as *const [u8; 16]).read_unaligned();
                     (dst_p as *mut [u8; 16]).write_unaligned(v);
                 }
-            } else if ml >= 32 {
-                unsafe {
-                    let dst_ptr = dst.as_mut_ptr();
-                    std::ptr::copy_nonoverlapping(dst_ptr.add(match_src), dst_ptr.add(oLitEnd), ml);
-                }
             } else if oLitEnd + ml + 16 <= oend {
                 // Wildcopy fast path for longer matches with full slack.
                 // Stamps end at oLitEnd + ((ml-1) | 15) + 1 ≤ oLitEnd +
@@ -1139,9 +1134,6 @@ unsafe fn ZSTD_execSequence_rawLit_fast(
             let v = (lit_src.add(copied) as *const [u8; 16]).read_unaligned();
             (lit_dst.add(copied) as *mut [u8; 16]).write_unaligned(v);
             copied += 16;
-            let v = (lit_src.add(copied) as *const [u8; 16]).read_unaligned();
-            (lit_dst.add(copied) as *mut [u8; 16]).write_unaligned(v);
-            copied += 16;
         }
     }
     let match_src = oLitEnd - offset;
@@ -1153,9 +1145,6 @@ unsafe fn ZSTD_execSequence_rawLit_fast(
         if matchLength > 16 {
             let mut copied = 16usize;
             while copied < matchLength {
-                let v = (dst_ptr.add(match_src + copied) as *const [u8; 16]).read_unaligned();
-                (dst_ptr.add(oLitEnd + copied) as *mut [u8; 16]).write_unaligned(v);
-                copied += 16;
                 let v = (dst_ptr.add(match_src + copied) as *const [u8; 16]).read_unaligned();
                 (dst_ptr.add(oLitEnd + copied) as *mut [u8; 16]).write_unaligned(v);
                 copied += 16;
@@ -1237,9 +1226,6 @@ unsafe fn ZSTD_execSequence_rawLit_fast_ptr(
             let v = (lit_src.add(copied) as *const [u8; 16]).read_unaligned();
             (lit_dst.add(copied) as *mut [u8; 16]).write_unaligned(v);
             copied += 16;
-            let v = (lit_src.add(copied) as *const [u8; 16]).read_unaligned();
-            (lit_dst.add(copied) as *mut [u8; 16]).write_unaligned(v);
-            copied += 16;
         }
     }
     let match_src = oLitEnd - offset;
@@ -1251,9 +1237,6 @@ unsafe fn ZSTD_execSequence_rawLit_fast_ptr(
         if matchLength > 16 {
             let mut copied = 16usize;
             while copied < matchLength {
-                let v = (dst_ptr.add(match_src + copied) as *const [u8; 16]).read_unaligned();
-                (dst_ptr.add(oLitEnd + copied) as *mut [u8; 16]).write_unaligned(v);
-                copied += 16;
                 let v = (dst_ptr.add(match_src + copied) as *const [u8; 16]).read_unaligned();
                 (dst_ptr.add(oLitEnd + copied) as *mut [u8; 16]).write_unaligned(v);
                 copied += 16;
@@ -1453,8 +1436,9 @@ pub struct ZSTD_DCtx {
     /// is broken and it becomes an external dictionary.
     pub dictEnd: Option<usize>,
 
-    /// isFrameDecompression toggles `ZSTD_blockSizeMax` behaviour;
-    /// for standalone block decode (our current scope) it's 0.
+    /// Upstream `dctx->isFrameDecompression`. Fresh DCtx defaults to
+    /// frame mode; standalone block wrappers temporarily force this to
+    /// 0 so `ZSTD_blockSizeMax()` ignores the frame header cap.
     pub isFrameDecompression: i32,
     /// Most fParams fields are unused in the literal-block decode;
     /// keep just the block-size cap we read in frame mode.
@@ -1471,10 +1455,9 @@ pub struct ZSTD_DCtx {
     pub of_default_active: bool,
     pub ml_default_active: bool,
     pub fseEntropy: u32,
-    /// `1` if the last sequences block had its FSE tables fresh
-    /// (`set_compressed`) — gates `set_repeat` validity for the next
-    /// block of the same type. Upstream tracks this as a bitmask inside
-    /// `dctx->fseEntropy`; here we keep it as three independent flags.
+    /// Per-table repeat breadcrumbs retained for compatibility with
+    /// older tests. `set_repeat` validity is gated by `fseEntropy`,
+    /// matching upstream's single `flagRepeatTable` argument.
     pub fse_ll_fresh: bool,
     pub fse_of_fresh: bool,
     pub fse_ml_fresh: bool,
@@ -1517,6 +1500,10 @@ pub struct ZSTD_DCtx {
     /// magic) or zstd1_magicless (for embedded / streaming contexts
     /// where the 4-byte magic is known redundantly).
     pub format: crate::decompress::zstd_decompress::ZSTD_format_e,
+    /// Upstream `dctx->forceIgnoreChecksum`. User-specified override
+    /// for skipping frame checksum validation even when the frame
+    /// header advertises a checksum. Default is validate (0).
+    pub forceIgnoreChecksum: crate::compress::zstd_compress::ZSTD_forceIgnoreChecksum_e,
     /// Legacy `decompressContinue()` expected compressed-byte count
     /// for the next state-machine transition.
     pub expected: usize,
@@ -1650,7 +1637,7 @@ impl Default for ZSTD_DCtx {
             prefixStart: None,
             virtualStart: None,
             dictEnd: None,
-            isFrameDecompression: 0,
+            isFrameDecompression: 1,
             blockSizeMax: ZSTD_BLOCKSIZE_MAX,
             disableHufAsm: 0,
             bmi2: crate::common::zstd_internal::ZSTD_cpuSupportsBmi2(),
@@ -1672,10 +1659,13 @@ impl Default for ZSTD_DCtx {
             stream_dict: Vec::new(),
             historyBuffer: Vec::new(),
             d_windowLogMax: crate::decompress::zstd_decompress::ZSTD_WINDOWLOG_LIMIT_DEFAULT,
-            d_maxWindowSize: 1u64
-                << crate::decompress::zstd_decompress::ZSTD_WINDOWLOG_LIMIT_DEFAULT,
+            d_maxWindowSize: (1u64
+                << crate::decompress::zstd_decompress::ZSTD_WINDOWLOG_LIMIT_DEFAULT)
+                + 1,
             d_maxWindowSizeSet: false,
             format: crate::decompress::zstd_decompress::ZSTD_format_e::ZSTD_f_zstd1,
+            forceIgnoreChecksum:
+                crate::compress::zstd_compress::ZSTD_forceIgnoreChecksum_e::ZSTD_d_validateChecksum,
             expected: crate::decompress::zstd_decompress::ZSTD_startingInputLength(
                 crate::decompress::zstd_decompress::ZSTD_format_e::ZSTD_f_zstd1,
             ),
@@ -2339,8 +2329,7 @@ unsafe fn ZSTD_decompressSequences_body_bmi2_rawLit(
             );
             let oLitEnd = op + litLength;
             let sequenceLength = litLength + matchLength;
-            let oneSeqSize = if ext_history.is_empty()
-                && matchLength != 0
+            let oneSeqSize = if matchLength != 0
                 && litPtr + litLength + 16 <= litSize
                 && op + sequenceLength + WILDCOPY_OVERLENGTH <= dst.len()
                 && offset <= oLitEnd
@@ -3494,6 +3483,41 @@ pub fn ZSTD_decompressBlock_internal(
     src: &[u8],
     streaming: streaming_operation,
 ) -> usize {
+    ZSTD_decompressBlock_internal_with_ext_history(
+        dctx,
+        entropy_rep,
+        dst,
+        op_start,
+        src,
+        streaming,
+        None,
+    )
+}
+
+/// Rust-only variant of `ZSTD_decompressBlock_internal` that lets a
+/// caller provide the prior contiguous history segment explicitly.
+/// This is used by the CLI output ring: the current prefix lives in
+/// `dst[..op_start]`, while the previous wrapped segment is borrowed
+/// as `ext_history_override`, matching upstream's virtual
+/// `[dict][prefix]` layout without copying the ring tail into
+/// `dctx.historyBuffer`.
+pub fn ZSTD_decompressBlock_internal_with_ext_history(
+    dctx: &mut ZSTD_DCtx,
+    entropy_rep: &mut ZSTD_decoder_entropy_rep,
+    dst: &mut [u8],
+    op_start: usize,
+    src: &[u8],
+    streaming: streaming_operation,
+    ext_history_override: Option<&[u8]>,
+) -> usize {
+    #[inline]
+    fn finish_block(dctx: &mut ZSTD_DCtx, nbSeq: i32, rc: usize) -> usize {
+        if nbSeq > 0 {
+            dctx.fseEntropy = 1;
+        }
+        rc
+    }
+
     let dstCapacity = dst.len().saturating_sub(op_start);
     let mut srcSize = src.len();
     if srcSize > ZSTD_blockSizeMax(dctx) {
@@ -3539,8 +3563,11 @@ pub fn ZSTD_decompressBlock_internal(
     }
 
     let blockSizeMax = dstCapacity.min(ZSTD_blockSizeMax(dctx));
-    let totalHistorySize =
-        dctx.stream_dict.len() + dctx.historyBuffer.len() + op_start + blockSizeMax;
+    let override_history_len = ext_history_override.map_or(0, |h| h.len());
+    let totalHistorySize = dctx.stream_dict.len()
+        + override_history_len.max(dctx.historyBuffer.len())
+        + op_start
+        + blockSizeMax;
     let mut isLongOffset =
         if crate::common::mem::MEM_32bits() != 0 && totalHistorySize > ZSTD_maxShortOffset() {
             ZSTD_longOffset_e::ZSTD_lo_isLongOffset
@@ -3587,15 +3614,46 @@ pub fn ZSTD_decompressBlock_internal(
     //   (e.g. the dict concatenated by `ZSTD_decompress_usingDict`,
     //   or earlier blocks of the same frame for `ZSTD_decompressFrame`).
     //
-    // Cloning for borrow hygiene; the slice is only used while
-    // regenerating this block.
-    let ext_history = if dctx.stream_dict.is_empty() && dctx.historyBuffer.is_empty() {
-        Vec::new()
+    let cap = if dctx.fParams.windowSize > 0 {
+        dctx.fParams.windowSize as usize
     } else {
-        let mut v = Vec::with_capacity(dctx.stream_dict.len() + dctx.historyBuffer.len());
-        v.extend_from_slice(&dctx.stream_dict);
-        v.extend_from_slice(&dctx.historyBuffer);
-        v
+        ZSTD_BLOCKSIZE_MAX
+    };
+    let ext_history_joined;
+    let ext_history = if let Some(history) = ext_history_override {
+        if dctx.stream_dict.is_empty() {
+            history
+        } else {
+            let history_len = history.len().min(cap);
+            let dict_len = dctx.stream_dict.len().min(cap.saturating_sub(history_len));
+            let mut v = Vec::with_capacity(dict_len + history_len);
+            v.extend_from_slice(&dctx.stream_dict[dctx.stream_dict.len() - dict_len..]);
+            v.extend_from_slice(&history[history.len() - history_len..]);
+            ext_history_joined = v;
+            ext_history_joined.as_slice()
+        }
+    } else if dctx.stream_dict.is_empty() {
+        // Hot streaming path: historyBuffer is not mutated until this
+        // block has finished regenerating, so avoid cloning it for each
+        // block. Expose only the valid window suffix; the backing Vec
+        // may keep older bytes to avoid shifting on every block. The
+        // raw slice sidesteps an immutable borrow of `dctx` while the
+        // decoder updates entropy tables below.
+        let start = dctx.historyBuffer.len().saturating_sub(cap);
+        unsafe {
+            std::slice::from_raw_parts(
+                dctx.historyBuffer.as_ptr().add(start),
+                dctx.historyBuffer.len() - start,
+            )
+        }
+    } else {
+        let history_len = dctx.historyBuffer.len().min(cap);
+        let dict_len = dctx.stream_dict.len().min(cap.saturating_sub(history_len));
+        let mut v = Vec::with_capacity(dict_len + history_len);
+        v.extend_from_slice(&dctx.stream_dict[dctx.stream_dict.len() - dict_len..]);
+        v.extend_from_slice(&dctx.historyBuffer[dctx.historyBuffer.len() - history_len..]);
+        ext_history_joined = v;
+        ext_history_joined.as_slice()
     };
 
     // 3. Regenerate sequences into dst. Keep literal and FSE table
@@ -3622,11 +3680,11 @@ pub fn ZSTD_decompressBlock_internal(
                 && std::is_x86_feature_detected!("bmi2")
                 && std::is_x86_feature_detected!("lzcnt")
             {
-                return ZSTD_decompressSequencesLong_bodySplitLitBuffer_impl::<true>(
+                let rc = ZSTD_decompressSequencesLong_bodySplitLitBuffer_impl::<true>(
                     dst,
                     op_start,
                     out_limit,
-                    &ext_history,
+                    ext_history,
                     &src[ip..ip + srcSize],
                     nbSeq,
                     lit_base,
@@ -3639,12 +3697,13 @@ pub fn ZSTD_decompressBlock_internal(
                     ML,
                     entropy_rep,
                 );
+                return finish_block(dctx, nbSeq, rc);
             }
-            return ZSTD_decompressSequencesLong_bodySplitLitBuffer_impl::<false>(
+            let rc = ZSTD_decompressSequencesLong_bodySplitLitBuffer_impl::<false>(
                 dst,
                 op_start,
                 out_limit,
-                &ext_history,
+                ext_history,
                 &src[ip..ip + srcSize],
                 nbSeq,
                 lit_base,
@@ -3657,6 +3716,7 @@ pub fn ZSTD_decompressBlock_internal(
                 ML,
                 entropy_rep,
             );
+            return finish_block(dctx, nbSeq, rc);
         }
         #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
         if ZSTD_DCtx_get_bmi2(dctx) != 0
@@ -3665,12 +3725,12 @@ pub fn ZSTD_decompressBlock_internal(
             && std::is_x86_feature_detected!("bmi2")
             && std::is_x86_feature_detected!("lzcnt")
         {
-            return unsafe {
+            let rc = unsafe {
                 ZSTD_decompressSequences_bodySplitLitBuffer_bmi2_raw(
                     dst,
                     op_start,
                     out_limit,
-                    &ext_history,
+                    ext_history,
                     &src[ip..ip + srcSize],
                     nbSeq,
                     lit_base,
@@ -3684,13 +3744,14 @@ pub fn ZSTD_decompressBlock_internal(
                     entropy_rep,
                 )
             };
+            return finish_block(dctx, nbSeq, rc);
         }
-        return unsafe {
+        let rc = unsafe {
             ZSTD_decompressSequences_bodySplitLitBuffer_raw(
                 dst,
                 op_start,
                 out_limit,
-                &ext_history,
+                ext_history,
                 &src[ip..ip + srcSize],
                 nbSeq,
                 lit_base,
@@ -3704,6 +3765,7 @@ pub fn ZSTD_decompressBlock_internal(
                 entropy_rep,
             )
         };
+        return finish_block(dctx, nbSeq, rc);
     }
 
     if dctx.litPtr_from_dst {
@@ -3725,11 +3787,11 @@ pub fn ZSTD_decompressBlock_internal(
             && std::is_x86_feature_detected!("bmi2")
             && std::is_x86_feature_detected!("lzcnt")
         {
-            return unsafe {
+            let rc = unsafe {
                 ZSTD_decompressSequences_body_bmi2_rawLit(
                     dst_limited,
                     op_start,
-                    &ext_history,
+                    ext_history,
                     &src[ip..ip + srcSize],
                     nbSeq,
                     lit_base,
@@ -3741,12 +3803,13 @@ pub fn ZSTD_decompressBlock_internal(
                     entropy_rep,
                 )
             };
+            return finish_block(dctx, nbSeq, rc);
         }
-        return unsafe {
+        let rc = unsafe {
             ZSTD_decompressSequences_body_rawLit(
                 dst_limited,
                 op_start,
-                &ext_history,
+                ext_history,
                 &src[ip..ip + srcSize],
                 nbSeq,
                 lit_base,
@@ -3758,6 +3821,7 @@ pub fn ZSTD_decompressBlock_internal(
                 entropy_rep,
             )
         };
+        return finish_block(dctx, nbSeq, rc);
     }
 
     let lit_snapshot = lit_snapshot.expect("non-dst literal buffer must be available");
@@ -3768,10 +3832,10 @@ pub fn ZSTD_decompressBlock_internal(
             && std::is_x86_feature_detected!("bmi2")
             && std::is_x86_feature_detected!("lzcnt")
         {
-            return ZSTD_decompressSequencesLong_body_impl::<true>(
+            let rc = ZSTD_decompressSequencesLong_body_impl::<true>(
                 dst,
                 op_start,
-                &ext_history,
+                ext_history,
                 &src[ip..ip + srcSize],
                 nbSeq,
                 lit_snapshot,
@@ -3782,11 +3846,12 @@ pub fn ZSTD_decompressBlock_internal(
                 ML,
                 entropy_rep,
             );
+            return finish_block(dctx, nbSeq, rc);
         }
-        return ZSTD_decompressSequencesLong_body_impl::<false>(
+        let rc = ZSTD_decompressSequencesLong_body_impl::<false>(
             dst,
             op_start,
-            &ext_history,
+            ext_history,
             &src[ip..ip + srcSize],
             nbSeq,
             lit_snapshot,
@@ -3797,12 +3862,13 @@ pub fn ZSTD_decompressBlock_internal(
             ML,
             entropy_rep,
         );
+        return finish_block(dctx, nbSeq, rc);
     }
     if ZSTD_DCtx_get_bmi2(dctx) != 0 {
-        return ZSTD_decompressSequences_body_bmi2_withLongOffset(
+        let rc = ZSTD_decompressSequences_body_bmi2_withLongOffset(
             dst,
             op_start,
-            &ext_history,
+            ext_history,
             &src[ip..ip + srcSize],
             nbSeq,
             lit_snapshot,
@@ -3813,11 +3879,12 @@ pub fn ZSTD_decompressBlock_internal(
             ML,
             entropy_rep,
         );
+        return finish_block(dctx, nbSeq, rc);
     }
-    ZSTD_decompressSequences_body_withLongOffset(
+    let rc = ZSTD_decompressSequences_body_withLongOffset(
         dst,
         op_start,
-        &ext_history,
+        ext_history,
         &src[ip..ip + srcSize],
         nbSeq,
         lit_snapshot,
@@ -3827,7 +3894,8 @@ pub fn ZSTD_decompressBlock_internal(
         OF,
         ML,
         entropy_rep,
-    )
+    );
+    finish_block(dctx, nbSeq, rc)
 }
 
 /// Port of `ZSTD_decodeLiteralsBlock_wrapper` (`zstd_decompress_block.c:342`).
@@ -4858,7 +4926,7 @@ pub fn ZSTD_decodeSeqHeaders(dctx: &mut ZSTD_DCtx, nbSeqPtr: &mut i32, src: &[u8
                 &LL_base,
                 &LL_bits,
                 Some(default_ll_dtable()),
-                dctx.fse_ll_fresh,
+                dctx.fseEntropy != 0,
                 dctx.ddictIsCold,
                 hdr.nbSeq,
             );
@@ -4893,7 +4961,7 @@ pub fn ZSTD_decodeSeqHeaders(dctx: &mut ZSTD_DCtx, nbSeqPtr: &mut i32, src: &[u8
                 &OF_base,
                 &OF_bits,
                 Some(default_of_dtable()),
-                dctx.fse_of_fresh,
+                dctx.fseEntropy != 0,
                 dctx.ddictIsCold,
                 hdr.nbSeq,
             );
@@ -4928,7 +4996,7 @@ pub fn ZSTD_decodeSeqHeaders(dctx: &mut ZSTD_DCtx, nbSeqPtr: &mut i32, src: &[u8
                 &ML_base,
                 &ML_bits,
                 Some(default_ml_dtable()),
-                dctx.fse_ml_fresh,
+                dctx.fseEntropy != 0,
                 dctx.ddictIsCold,
                 hdr.nbSeq,
             );
@@ -4954,6 +5022,33 @@ pub fn ZSTD_decodeSeqHeaders(dctx: &mut ZSTD_DCtx, nbSeqPtr: &mut i32, src: &[u8
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dctx_default_max_window_size_matches_upstream_byte_cap() {
+        let dctx = ZSTD_DCtx::default();
+        assert_eq!(
+            dctx.d_maxWindowSize,
+            (1u64 << crate::decompress::zstd_decompress::ZSTD_WINDOWLOG_LIMIT_DEFAULT) + 1
+        );
+        assert!(!dctx.d_maxWindowSizeSet);
+        assert_eq!(dctx.isFrameDecompression, 1);
+    }
+
+    #[test]
+    fn decode_literals_block_wrapper_forces_standalone_block_cap() {
+        let mut src = vec![56u8];
+        src.extend_from_slice(b"ABCDEFG");
+        let mut dst = [0u8; 16];
+        let mut dctx = ZSTD_DCtx::new();
+        dctx.isFrameDecompression = 1;
+        dctx.blockSizeMax = 1;
+
+        let rc = ZSTD_decodeLiteralsBlock_wrapper(&mut dctx, &src, &mut dst);
+
+        assert_eq!(rc, 8);
+        assert_eq!(dctx.isFrameDecompression, 0);
+        assert_eq!(dctx.litSize, 7);
+    }
 
     #[test]
     fn checkContinuity_rotates_history_when_destination_changes() {
@@ -5642,6 +5737,32 @@ mod tests {
     }
 
     #[test]
+    fn decompress_block_internal_nonempty_sequences_set_fse_entropy_on_body_error() {
+        // Upstream sequence bodies set dctx->fseEntropy as soon as
+        // nbSeq is non-zero, before BIT_initDStream can fail. This
+        // block has a valid literal section and sequence header, but
+        // no sequence bitstream payload, so the body errors after the
+        // entropy flag is made repeatable.
+        let src = [0u8, 1u8, 0u8];
+        let mut dst = vec![0u8; 32];
+        let mut dctx = ZSTD_DCtx::new();
+        ZSTD_buildDefaultSeqTables(&mut dctx);
+        let mut entropy = ZSTD_decoder_entropy_rep::default();
+
+        let out = ZSTD_decompressBlock_internal(
+            &mut dctx,
+            &mut entropy,
+            &mut dst,
+            0,
+            &src,
+            streaming_operation::not_streaming,
+        );
+
+        assert!(crate::common::error::ERR_isError(out));
+        assert_eq!(dctx.fseEntropy, 1);
+    }
+
+    #[test]
     fn decompress_block_internal_rle_literals_zero_sequences() {
         // Literals block: set_rle, lhlCode=0, litSize=10 → header
         // byte = (10<<3)|(0<<2)|1 = 81. Payload: 1 RLE byte.
@@ -5751,6 +5872,40 @@ mod tests {
         assert_eq!(&dst[16..21], b"HELLO");
         assert_eq!(&dst[21..37], b"56789ABCDEFHELLO");
         assert_eq!(litPtr, 5);
+    }
+
+    #[test]
+    fn exec_sequence_fast_boundary_uses_single_wildcopy_stamps() {
+        // The fast helper mirrors upstream's copy16 + wildcopy shape.
+        // At length 17 it may use exactly one extra 16-byte stamp, but
+        // must not issue the second unrolled stamp that would read
+        // beyond the caller-provided WILDCOPY_OVERLENGTH slack.
+        let op = 32usize;
+        let lit_len = 17usize;
+        let match_len = 17usize;
+        let offset = 32usize;
+        let mut dst = vec![0u8; op + lit_len + match_len + WILDCOPY_OVERLENGTH];
+        for (i, b) in dst.iter_mut().take(op).enumerate() {
+            *b = b'a' + (i % 26) as u8;
+        }
+        let lit = vec![b'0'; lit_len + 16];
+
+        let written = unsafe {
+            ZSTD_execSequence_rawLit_fast(&mut dst, op, lit_len, match_len, offset, lit.as_ptr(), 0)
+        };
+
+        assert_eq!(written, lit_len + match_len);
+        assert_eq!(&dst[op..op + lit_len], &lit[..lit_len]);
+        let expected_match = {
+            let mut v = Vec::new();
+            v.extend_from_slice(&dst[op + lit_len - offset..op]);
+            v.extend_from_slice(&lit[..match_len - v.len()]);
+            v
+        };
+        assert_eq!(
+            &dst[op + lit_len..op + lit_len + match_len],
+            expected_match.as_slice()
+        );
     }
 
     #[test]
@@ -5881,6 +6036,39 @@ mod tests {
         );
         assert_eq!(rc, 2);
         assert_eq!(nbSeq, 1);
+    }
+
+    #[test]
+    fn decode_seq_headers_repeat_uses_global_fse_entropy_flag() {
+        // Upstream passes dctx->fseEntropy as flagRepeatTable for all
+        // three sequence tables. A repeat OF table is valid even if the
+        // previous active OF table was the default table.
+        let src = [0x01u8, 0x30]; // nbSeq=1, LL=basic, OF=repeat, ML=basic.
+        let mut dctx = ZSTD_DCtx::new();
+        dctx.fseEntropy = 1;
+        dctx.of_default_active = true;
+        let mut nbSeq = 0;
+
+        let rc = ZSTD_decodeSeqHeaders(&mut dctx, &mut nbSeq, &src);
+
+        assert_eq!(rc, 2);
+        assert_eq!(nbSeq, 1);
+        assert!(dctx.of_default_active);
+    }
+
+    #[test]
+    fn decode_seq_headers_repeat_rejects_without_global_fse_entropy() {
+        // Per-table breadcrumbs must not make set_repeat valid when
+        // upstream's single dctx->fseEntropy flag is unset.
+        let src = [0x01u8, 0x30]; // nbSeq=1, LL=basic, OF=repeat, ML=basic.
+        let mut dctx = ZSTD_DCtx::new();
+        dctx.fseEntropy = 0;
+        dctx.fse_of_fresh = true;
+        let mut nbSeq = 0;
+
+        let rc = ZSTD_decodeSeqHeaders(&mut dctx, &mut nbSeq, &src);
+
+        assert!(crate::common::error::ERR_isError(rc));
     }
 
     #[test]

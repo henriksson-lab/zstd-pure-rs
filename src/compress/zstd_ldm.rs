@@ -212,8 +212,8 @@ pub struct ldmParams_t {
 ///   - `hashRateLog`: derived from either `hashLog` or the strategy
 ///     (mapping strategy 1..=9 → rate 7..=4 via `7 - strategy/3`).
 ///   - `hashLog`: clamped to `[ZSTD_HASHLOG_MIN, ZSTD_HASHLOG_MAX]`,
-///     derived from `windowLog − hashRateLog` when `windowLog` is big
-///     enough; otherwise pinned at the minimum.
+///     derived from `windowLog - hashRateLog`, or set directly to
+///     `ZSTD_HASHLOG_MIN` when the rate is at least the window size.
 ///   - `minMatchLength`: defaults to `LDM_MIN_MATCH_LENGTH` (halved
 ///     for btultra+ strategies).
 ///   - `bucketSizeLog`: capped at `hashLog` and clamped to
@@ -232,10 +232,12 @@ pub fn ZSTD_ldm_adjustParameters(params: &mut ldmParams_t, cParams: &ZSTD_compre
         }
     }
     if params.hashLog == 0 {
-        params.hashLog = params
-            .windowLog
-            .wrapping_sub(params.hashRateLog)
-            .clamp(ZSTD_HASHLOG_MIN, ZSTD_HASHLOG_MAX);
+        if params.windowLog <= params.hashRateLog {
+            params.hashLog = ZSTD_HASHLOG_MIN;
+        } else {
+            params.hashLog =
+                (params.windowLog - params.hashRateLog).clamp(ZSTD_HASHLOG_MIN, ZSTD_HASHLOG_MAX);
+        }
     }
     if params.minMatchLength == 0 {
         params.minMatchLength = LDM_MIN_MATCH_LENGTH;
@@ -408,9 +410,9 @@ pub fn ZSTD_ldm_gear_init(state: &mut ldmRollingHashState_t, params: &ldmParams_
     }
 }
 
-/// Port of `ZSTD_ldm_gear_reset`. Feeds `minMatchLength` bytes into
-/// the rolling state WITHOUT recording any splits — used to "warm up"
-/// the hash window before entering the main feed loop.
+/// Port of `ZSTD_ldm_gear_reset`. Feeds `minMatchLength` bytes into a
+/// local hash WITHOUT recording any splits. Upstream doesn't store the
+/// warmed hash back into the rolling state.
 pub fn ZSTD_ldm_gear_reset(state: &mut ldmRollingHashState_t, data: &[u8], minMatchLength: usize) {
     let mut hash = state.rolling;
     let mut n = 0usize;
@@ -981,7 +983,7 @@ pub fn ZSTD_ldm_generateSequences(
     let srcSize = src_end - src_pos;
     let maxDist = 1u32 << params.windowLog;
     const K_MAX_CHUNK_SIZE: usize = 1 << 20;
-    let nbChunks = srcSize.div_ceil(K_MAX_CHUNK_SIZE).max(1);
+    let nbChunks = srcSize.div_ceil(K_MAX_CHUNK_SIZE);
     let mut leftoverSize: usize = 0;
 
     let mut chunk = 0;
@@ -1067,7 +1069,7 @@ pub fn ZSTD_ldm_blockCompress(
     useRowMatchFinder: ZSTD_ParamSwitch_e,
 ) -> usize {
     use crate::compress::match_state::ZSTD_matchState_dictMode;
-    use crate::compress::seq_store::{ZSTD_storeSeq, ZSTD_updateRep, OFFSET_TO_OFFBASE};
+    use crate::compress::seq_store::{ZSTD_storeSeq, OFFSET_TO_OFFBASE};
     use crate::compress::zstd_compress::ZSTD_selectBlockCompressor;
 
     let cParams = ms.cParams;
@@ -1114,7 +1116,9 @@ pub fn ZSTD_ldm_blockCompress(
             return newLitLength;
         }
         ip += sequence.litLength as usize;
-        ZSTD_updateRep(rep, OFFSET_TO_OFFBASE(sequence.offset), 0);
+        rep[2] = rep[1];
+        rep[1] = rep[0];
+        rep[0] = sequence.offset;
         ZSTD_storeSeq(
             seqStore,
             newLitLength,
@@ -1177,7 +1181,7 @@ mod tests {
     }
 
     #[test]
-    fn adjust_parameters_wraps_excessive_hashRateLog_to_hashLog_max() {
+    fn adjust_parameters_uses_hashlog_min_when_hash_rate_covers_window() {
         let mut lp = ldmParams_t {
             hashRateLog: 40,
             ..Default::default()
@@ -1185,7 +1189,19 @@ mod tests {
         let mut cp = base_cparams(3);
         cp.windowLog = 23;
         ZSTD_ldm_adjustParameters(&mut lp, &cp);
-        assert_eq!(lp.hashLog, ZSTD_HASHLOG_MAX);
+        assert_eq!(lp.hashLog, ZSTD_HASHLOG_MIN);
+    }
+
+    #[test]
+    fn adjust_parameters_uses_hashlog_min_when_hash_rate_equals_window() {
+        let mut lp = ldmParams_t {
+            hashRateLog: 23,
+            ..Default::default()
+        };
+        let mut cp = base_cparams(3);
+        cp.windowLog = 23;
+        ZSTD_ldm_adjustParameters(&mut lp, &cp);
+        assert_eq!(lp.hashLog, ZSTD_HASHLOG_MIN);
     }
 
     #[test]
@@ -1752,6 +1768,57 @@ mod tests {
     }
 
     #[test]
+    fn generateSequences_extdict_preserves_distance_with_nonzero_dict_base() {
+        let dict = b"TTGACCATGGTACCTA".repeat(16);
+        let src = [b"noise-".as_slice(), &dict[..96], b"-tail".as_slice()].concat();
+        let buf = [dict.clone(), src.clone()].concat();
+
+        let lp = dense_ldm_params();
+        let run = |dict_base: u32| {
+            let mut st = ldmState_t::new(&lp);
+            st.window.dictBase_offset = dict_base;
+            st.window.lowLimit = dict_base;
+            st.window.dictLimit = dict_base.wrapping_add(dict.len() as u32);
+            st.window.base_offset = dict_base.wrapping_add(dict.len() as u32);
+            st.window.nextSrc = dict_base.wrapping_add(buf.len() as u32);
+
+            ZSTD_ldm_fillHashTable(&mut st, &buf[..dict.len()], dict_base, &lp);
+
+            let mut store = RawSeqStore_t::with_capacity(1024);
+            let lowest = st.window.lowLimit;
+            let leftover = ZSTD_ldm_generateSequences_internal(
+                &mut st,
+                &mut store,
+                &lp,
+                &buf,
+                dict.len(),
+                buf.len(),
+                lowest,
+            );
+            assert!(!crate::common::error::ERR_isError(leftover));
+            (
+                leftover,
+                store.seq[..store.size]
+                    .iter()
+                    .map(|s| (s.litLength, s.matchLength, s.offset))
+                    .collect::<Vec<_>>(),
+            )
+        };
+
+        let zero_base = run(0);
+        let shifted_base = run(10_000);
+
+        assert!(
+            !zero_base.1.is_empty(),
+            "expected at least one ext-dict-backed LDM sequence"
+        );
+        assert_eq!(
+            shifted_base, zero_base,
+            "nonzero dictionary base must not change emitted sequence distances"
+        );
+    }
+
+    #[test]
     fn maybeSplitSequence_returns_whole_seq_when_fits() {
         let mut s = RawSeqStore_t::with_capacity(2);
         s.seq[0] = rawSeq {
@@ -1894,6 +1961,44 @@ mod tests {
         store.size = 2;
         ZSTD_ldm_skipSequences(&mut store, 12, 4); // 4+8 = full seq[0]
         assert_eq!(store.pos, 1);
+    }
+
+    #[test]
+    fn blockCompress_rotates_repcodes_as_plain_ldm_offsets() {
+        use crate::compress::match_state::{ZSTD_MatchState_t, ZSTD_compressionParameters};
+        use crate::compress::seq_store::SeqStore_t;
+
+        let mut store = RawSeqStore_t::with_capacity(2);
+        store.seq[0] = rawSeq {
+            offset: 9,
+            litLength: 4,
+            matchLength: 8,
+        };
+        store.size = 1;
+
+        let mut ms = ZSTD_MatchState_t::new(ZSTD_compressionParameters {
+            windowLog: 20,
+            hashLog: 10,
+            chainLog: 10,
+            minMatch: 4,
+            strategy: ZSTD_fast,
+            ..Default::default()
+        });
+        let mut seq = SeqStore_t::with_capacity(16, 256);
+        let mut rep = [3u32, 5, 7];
+        let src = b"abcdEFGHIJKLMNOPQRST";
+
+        let trailing = ZSTD_ldm_blockCompress(
+            &mut store,
+            &mut ms,
+            &mut seq,
+            &mut rep,
+            src,
+            ZSTD_ParamSwitch_e::ZSTD_ps_disable,
+        );
+
+        assert!(trailing <= src.len());
+        assert_eq!(rep, [9, 3, 5]);
     }
 
     #[test]

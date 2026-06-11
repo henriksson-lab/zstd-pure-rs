@@ -33,16 +33,15 @@ pub struct ZSTD_compressionParameters {
 /// stashing a pointer.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ZSTD_window_t {
-    /// Index one-past the last processed byte. Upstream's `nextSrc`
-    /// is a pointer; we store the byte offset relative to `base`.
+    /// Index one-past the last processed byte. Upstream computes this
+    /// as `nextSrc - base`; the Rust port stores that index directly.
     pub nextSrc: u32,
-    /// Index of the first byte of the current contiguous prefix. All
-    /// regular indexes are relative to this position. In upstream
-    /// this is a pointer and `index = offset - base`; we store the
-    /// bookkeeping u32 directly.
+    /// Index assigned to `src[0]` for the current contiguous prefix.
+    /// Match finders convert between a source-slice position and an
+    /// upstream index with `base_offset + pos`.
     pub base_offset: u32,
-    /// Start of the external-dictionary segment (mirrors upstream's
-    /// `dictBase`). Indexes below `dictLimit` look in this region.
+    /// Index assigned to `dictContent[0]` for the external-dictionary
+    /// segment. Indexes below `dictLimit` look in this region.
     pub dictBase_offset: u32,
     /// Below this index, the caller must consult the ext-dict.
     pub dictLimit: u32,
@@ -159,7 +158,7 @@ pub fn ZSTD_reduceTable_internal(table: &mut [u32], reducerValue: u32, preserveM
     debug_assert!(size < (1usize << 31));
 
     // Protect index values below ZSTD_WINDOW_START_INDEX from wrapping.
-    let reducerThreshold = reducerValue + ZSTD_WINDOW_START_INDEX;
+    let reducerThreshold = reducerValue.wrapping_add(ZSTD_WINDOW_START_INDEX);
 
     for cell in table.iter_mut() {
         *cell = if preserveMark && *cell == ZSTD_DUBT_UNSORTED_MARK {
@@ -167,7 +166,7 @@ pub fn ZSTD_reduceTable_internal(table: &mut [u32], reducerValue: u32, preserveM
         } else if *cell < reducerThreshold {
             0
         } else {
-            *cell - reducerValue
+            cell.wrapping_sub(reducerValue)
         };
     }
 }
@@ -197,7 +196,8 @@ pub fn ZSTD_rowMatchFinderSupported(strategy: u32) -> bool {
 
 /// Port of `ZSTD_resolveRowMatchFinderMode`. Converts an auto/enable/
 /// disable setting plus cParams into a concrete enable/disable
-/// decision. Non-Linux-kernel path (14-bit windowLog floor) only.
+/// decision. Upstream's normal build uses the 14-bit windowLog floor;
+/// the 17-bit floor is specific to the Linux-kernel port.
 pub fn ZSTD_resolveRowMatchFinderMode(
     mode: crate::compress::zstd_ldm::ZSTD_ParamSwitch_e,
     cParams: &ZSTD_compressionParameters,
@@ -364,30 +364,34 @@ pub fn ZSTD_invalidateMatchState(ms: &mut ZSTD_MatchState_t) {
 /// The btlazy2 chain table is special-cased to preserve the
 /// `ZSTD_DUBT_UNSORTED_MARK` sentinel.
 ///
-/// Upstream takes `ZSTD_CCtx_params*` to look up `useRowMatchFinder`
-/// and `dedicatedDictSearch`; the Rust port accepts those two as
-/// explicit parameters.
+/// Upstream takes `ZSTD_CCtx_params*` to look up `useRowMatchFinder`;
+/// `dedicatedDictSearch` lives on the match state itself.
 pub fn ZSTD_reduceIndex(
     ms: &mut ZSTD_MatchState_t,
     useRowMatchFinder: crate::compress::zstd_ldm::ZSTD_ParamSwitch_e,
-    dedicatedDictSearch: u32,
     reducerValue: u32,
 ) {
-    ZSTD_reduceTable(&mut ms.hashTable, reducerValue);
+    let hSize = 1usize << ms.cParams.hashLog;
+    ZSTD_reduceTable(&mut ms.hashTable[..hSize], reducerValue);
 
-    if ZSTD_allocateChainTable(ms.cParams.strategy, useRowMatchFinder, dedicatedDictSearch)
-        && !ms.chainTable.is_empty()
+    if ZSTD_allocateChainTable(
+        ms.cParams.strategy,
+        useRowMatchFinder,
+        ms.dedicatedDictSearch,
+    ) && !ms.chainTable.is_empty()
     {
+        let chainSize = 1usize << ms.cParams.chainLog;
         // ZSTD_btlazy2 = 6.
         if ms.cParams.strategy == 6 {
-            ZSTD_reduceTable_btlazy2(&mut ms.chainTable, reducerValue);
+            ZSTD_reduceTable_btlazy2(&mut ms.chainTable[..chainSize], reducerValue);
         } else {
-            ZSTD_reduceTable(&mut ms.chainTable, reducerValue);
+            ZSTD_reduceTable(&mut ms.chainTable[..chainSize], reducerValue);
         }
     }
 
     if ms.hashLog3 > 0 && !ms.hashTable3.is_empty() {
-        ZSTD_reduceTable(&mut ms.hashTable3, reducerValue);
+        let h3Size = 1usize << ms.hashLog3;
+        ZSTD_reduceTable(&mut ms.hashTable3[..h3Size], reducerValue);
     }
 }
 
@@ -448,8 +452,11 @@ pub fn ZSTD_window_clear(window: &mut ZSTD_window_t) {
 /// when the segment is non-contiguous.
 ///
 /// In the pointer-based C code `src` is a raw pointer; in this index-
-/// based Rust port the caller supplies the new segment's absolute
-/// start index in the same coordinate space as `window.nextSrc`.
+/// based Rust port the caller supplies the new segment's index in the
+/// same coordinate space as `window.nextSrc`. On the non-contiguous
+/// branch, upstream rebases the new segment so its first byte keeps
+/// the old current index; `src_abs` is only used for the contiguous
+/// fast path and for detecting that the branch is needed.
 ///
 /// Returns `true` when the segment is contiguous, `false` when the
 /// window had to pivot into ext-dict mode.
@@ -464,12 +471,14 @@ pub fn ZSTD_window_update(
         return contiguous;
     }
 
+    let mut segmentStartIndex = src_abs;
     if src_abs != window.nextSrc || forceNonContiguous {
-        let distanceFromBase = window.nextSrc.wrapping_sub(window.base_offset);
+        let distanceFromBase = window.nextSrc;
         window.lowLimit = window.dictLimit;
         window.dictLimit = distanceFromBase;
         window.dictBase_offset = window.base_offset;
-        window.base_offset = src_abs.wrapping_sub(distanceFromBase);
+        window.base_offset = distanceFromBase;
+        segmentStartIndex = distanceFromBase;
         if window.dictLimit.wrapping_sub(window.lowLimit)
             < crate::compress::zstd_fast::HASH_READ_SIZE as u32
         {
@@ -478,14 +487,12 @@ pub fn ZSTD_window_update(
         contiguous = false;
     }
 
-    let src_end_abs = src_abs.wrapping_add(srcSize as u32);
+    let src_end_for_overlap = src_abs.wrapping_add(srcSize as u32);
+    let src_end_abs = segmentStartIndex.wrapping_add(srcSize as u32);
     window.nextSrc = src_end_abs;
 
-    if src_end_abs > window.dictBase_offset.wrapping_add(window.lowLimit)
-        && src_abs < window.dictBase_offset.wrapping_add(window.dictLimit)
-    {
-        let highInputIdx = src_end_abs.wrapping_sub(window.dictBase_offset);
-        window.lowLimit = highInputIdx.min(window.dictLimit);
+    if src_end_for_overlap > window.lowLimit && src_abs < window.dictLimit {
+        window.lowLimit = src_end_for_overlap.min(window.dictLimit);
     }
 
     contiguous
@@ -592,15 +599,16 @@ pub fn ZSTD_window_correctOverflow(
     window.base_offset = window.base_offset.wrapping_sub(correction);
     window.dictBase_offset = window.dictBase_offset.wrapping_sub(correction);
     window.nextSrc = window.nextSrc.wrapping_sub(correction);
-    window.lowLimit = if window.lowLimit < correction + ZSTD_WINDOW_START_INDEX {
+    let correctionThreshold = correction.wrapping_add(ZSTD_WINDOW_START_INDEX);
+    window.lowLimit = if window.lowLimit < correctionThreshold {
         ZSTD_WINDOW_START_INDEX
     } else {
-        window.lowLimit - correction
+        window.lowLimit.wrapping_sub(correction)
     };
-    window.dictLimit = if window.dictLimit < correction + ZSTD_WINDOW_START_INDEX {
+    window.dictLimit = if window.dictLimit < correctionThreshold {
         ZSTD_WINDOW_START_INDEX
     } else {
-        window.dictLimit - correction
+        window.dictLimit.wrapping_sub(correction)
     };
 
     debug_assert!(newCurrent >= maxDist);
@@ -618,12 +626,10 @@ pub fn ZSTD_window_correctOverflow(
 pub fn ZSTD_window_init(window: &mut ZSTD_window_t) {
     *window = ZSTD_window_t::default();
     window.base_offset = ZSTD_WINDOW_START_INDEX;
+    window.dictBase_offset = ZSTD_WINDOW_START_INDEX;
     window.dictLimit = ZSTD_WINDOW_START_INDEX;
     window.lowLimit = ZSTD_WINDOW_START_INDEX;
     window.nextSrc = ZSTD_WINDOW_START_INDEX;
-    // base_offset / dictBase_offset start at 0 — upstream points them
-    // at a dummy byte, but in the u32-index encoding any shared value
-    // will do.
 }
 
 /// Port of `ZSTD_window_enforceMaxDist`. Advances `window.lowLimit`
@@ -754,7 +760,7 @@ pub fn ZSTD_window_needOverflowCorrection(
 pub fn ZSTD_overflowCorrectIfNeeded(
     ms: &mut ZSTD_MatchState_t,
     useRowMatchFinder: crate::compress::zstd_ldm::ZSTD_ParamSwitch_e,
-    dedicatedDictSearch: u32,
+    _dedicatedDictSearch: u32,
     windowLog: u32,
     chainLog: u32,
     strategy: u32,
@@ -772,7 +778,7 @@ pub fn ZSTD_overflowCorrectIfNeeded(
         srcEnd_abs,
     ) {
         let correction = ZSTD_window_correctOverflow(&mut ms.window, cycleLog, maxDist, src_abs);
-        ZSTD_reduceIndex(ms, useRowMatchFinder, dedicatedDictSearch, correction);
+        ZSTD_reduceIndex(ms, useRowMatchFinder, correction);
         if ms.nextToUpdate < correction {
             ms.nextToUpdate = 0;
         } else {
@@ -892,7 +898,7 @@ impl ZSTD_MatchState_t {
             window: ZSTD_window_t {
                 base_offset: ZSTD_WINDOW_START_INDEX,
                 nextSrc: ZSTD_WINDOW_START_INDEX,
-                dictBase_offset: 0,
+                dictBase_offset: ZSTD_WINDOW_START_INDEX,
                 dictLimit: ZSTD_WINDOW_START_INDEX,
                 lowLimit: ZSTD_WINDOW_START_INDEX,
                 nbOverflowCorrections: 0,
@@ -926,7 +932,7 @@ impl ZSTD_MatchState_t {
         self.window = ZSTD_window_t {
             base_offset: ZSTD_WINDOW_START_INDEX,
             nextSrc: ZSTD_WINDOW_START_INDEX,
-            dictBase_offset: 0,
+            dictBase_offset: ZSTD_WINDOW_START_INDEX,
             dictLimit: ZSTD_WINDOW_START_INDEX,
             lowLimit: ZSTD_WINDOW_START_INDEX,
             nbOverflowCorrections: 0,
@@ -1009,6 +1015,7 @@ mod tests {
         // a zero-valued `hashTable[k] == 0` means "never inserted".
         assert_eq!(ms.nextToUpdate, ZSTD_WINDOW_START_INDEX);
         assert_eq!(ms.window.base_offset, ZSTD_WINDOW_START_INDEX);
+        assert_eq!(ms.window.dictBase_offset, ZSTD_WINDOW_START_INDEX);
     }
 
     #[test]
@@ -1093,10 +1100,45 @@ mod tests {
         let contiguous = ZSTD_window_update(&mut w, 300, 16, true);
         assert!(!contiguous);
         assert_eq!(w.dictBase_offset, 100);
-        assert_eq!(w.dictLimit, 80);
-        assert_eq!(w.base_offset, 220);
+        assert_eq!(w.dictLimit, 180);
+        assert_eq!(w.base_offset, 180);
         assert_eq!(w.lowLimit, 110);
-        assert_eq!(w.nextSrc, 316);
+        assert_eq!(w.nextSrc, 196);
+    }
+
+    #[test]
+    fn window_update_non_contiguous_trims_overlapping_prefix() {
+        let mut w = ZSTD_window_t {
+            base_offset: 100,
+            dictBase_offset: 50,
+            dictLimit: 110,
+            lowLimit: 70,
+            nextSrc: 180,
+            nbOverflowCorrections: 0,
+        };
+
+        let contiguous = ZSTD_window_update(&mut w, 170, 16, true);
+
+        assert!(!contiguous);
+        assert_eq!(w.dictBase_offset, 100);
+        assert_eq!(w.dictLimit, 180);
+        assert_eq!(w.base_offset, 180);
+        assert_eq!(w.lowLimit, 180);
+        assert_eq!(w.nextSrc, 196);
+    }
+
+    #[test]
+    fn window_update_first_forced_segment_starts_at_window_start_index() {
+        let mut w = ZSTD_window_t::default();
+        ZSTD_window_init(&mut w);
+
+        let contiguous = ZSTD_window_update(&mut w, ZSTD_WINDOW_START_INDEX, 64, true);
+
+        assert!(!contiguous);
+        assert_eq!(w.base_offset, ZSTD_WINDOW_START_INDEX);
+        assert_eq!(w.dictLimit, ZSTD_WINDOW_START_INDEX);
+        assert_eq!(w.lowLimit, ZSTD_WINDOW_START_INDEX);
+        assert_eq!(w.nextSrc, ZSTD_WINDOW_START_INDEX + 64);
     }
 
     #[test]
@@ -1254,6 +1296,7 @@ mod tests {
         ZSTD_window_init(&mut w);
         assert_eq!(w.nextSrc, ZSTD_WINDOW_START_INDEX);
         assert_eq!(w.base_offset, ZSTD_WINDOW_START_INDEX);
+        assert_eq!(w.dictBase_offset, ZSTD_WINDOW_START_INDEX);
         assert_eq!(w.dictLimit, ZSTD_WINDOW_START_INDEX);
         assert_eq!(w.lowLimit, ZSTD_WINDOW_START_INDEX);
         assert_eq!(w.nbOverflowCorrections, 0);
@@ -1450,6 +1493,20 @@ mod tests {
     }
 
     #[test]
+    fn reduceTable_uses_wrapping_u32_arithmetic() {
+        let mut t = vec![0u32; ZSTD_ROWSIZE];
+        t[0] = 0;
+        t[1] = 1;
+        t[2] = u32::MAX;
+
+        ZSTD_reduceTable(&mut t, u32::MAX);
+
+        assert_eq!(t[0], 0);
+        assert_eq!(t[1], 2);
+        assert_eq!(t[2], 0);
+    }
+
+    #[test]
     fn rowMatchFinderSupported_only_for_greedy_lazy_lazy2() {
         assert!(!ZSTD_rowMatchFinderSupported(1)); // fast
         assert!(!ZSTD_rowMatchFinderSupported(2)); // dfast
@@ -1517,12 +1574,40 @@ mod tests {
             *h = 100;
         }
 
-        ZSTD_reduceIndex(&mut ms, ZSTD_ParamSwitch_e::ZSTD_ps_disable, 0, 40);
+        ZSTD_reduceIndex(&mut ms, ZSTD_ParamSwitch_e::ZSTD_ps_disable, 40);
 
         // All three tables shifted by 40 — entries that were 100 become 60.
         assert!(ms.hashTable.iter().all(|&x| x == 60));
         assert!(ms.chainTable.iter().all(|&x| x == 60));
         assert!(ms.hashTable3.iter().all(|&x| x == 60));
+    }
+
+    #[test]
+    fn reduceIndex_uses_c_table_sizes_not_vec_tail() {
+        use crate::compress::zstd_ldm::ZSTD_ParamSwitch_e;
+        let cp = ZSTD_compressionParameters {
+            hashLog: 4,
+            chainLog: 4,
+            strategy: 2,
+            ..Default::default()
+        };
+        let mut ms = ZSTD_MatchState_t::new(cp);
+        ms.hashTable.resize(32, 100);
+        ms.chainTable = vec![100u32; 32];
+        ms.hashTable3 = vec![100u32; 32];
+        ms.hashLog3 = 4;
+        for h in ms.hashTable.iter_mut() {
+            *h = 100;
+        }
+
+        ZSTD_reduceIndex(&mut ms, ZSTD_ParamSwitch_e::ZSTD_ps_disable, 40);
+
+        assert!(ms.hashTable[..16].iter().all(|&x| x == 60));
+        assert!(ms.hashTable[16..].iter().all(|&x| x == 100));
+        assert!(ms.chainTable[..16].iter().all(|&x| x == 60));
+        assert!(ms.chainTable[16..].iter().all(|&x| x == 100));
+        assert!(ms.hashTable3[..16].iter().all(|&x| x == 60));
+        assert!(ms.hashTable3[16..].iter().all(|&x| x == 100));
     }
 
     #[test]
@@ -1537,9 +1622,27 @@ mod tests {
         let mut ms = ZSTD_MatchState_t::new(cp);
         ms.chainTable = vec![100u32; 16];
 
-        ZSTD_reduceIndex(&mut ms, ZSTD_ParamSwitch_e::ZSTD_ps_disable, 0, 40);
+        ZSTD_reduceIndex(&mut ms, ZSTD_ParamSwitch_e::ZSTD_ps_disable, 40);
         // Fast strategy skips chain reduction.
         assert!(ms.chainTable.iter().all(|&x| x == 100));
+    }
+
+    #[test]
+    fn reduceIndex_uses_match_state_dedicated_dict_search_for_chain_allocation() {
+        use crate::compress::zstd_ldm::ZSTD_ParamSwitch_e;
+        let cp = ZSTD_compressionParameters {
+            hashLog: 4,
+            chainLog: 4,
+            strategy: 1, // fast normally skips chainTable
+            ..Default::default()
+        };
+        let mut ms = ZSTD_MatchState_t::new(cp);
+        ms.dedicatedDictSearch = 1;
+        ms.chainTable = vec![100u32; 16];
+
+        ZSTD_reduceIndex(&mut ms, ZSTD_ParamSwitch_e::ZSTD_ps_disable, 40);
+
+        assert!(ms.chainTable.iter().all(|&x| x == 60));
     }
 
     #[test]
@@ -1559,16 +1662,17 @@ mod tests {
     #[test]
     fn resolveRowMatchFinderMode_auto_requires_windowLog_above_14() {
         use crate::compress::zstd_ldm::ZSTD_ParamSwitch_e;
+        let lower_bound = 14;
         let mut cp = ZSTD_compressionParameters {
             strategy: 3,
-            windowLog: 14,
+            windowLog: lower_bound,
             ..Default::default()
         };
         assert_eq!(
             ZSTD_resolveRowMatchFinderMode(ZSTD_ParamSwitch_e::ZSTD_ps_auto, &cp),
             ZSTD_ParamSwitch_e::ZSTD_ps_disable,
         );
-        cp.windowLog = 15;
+        cp.windowLog = lower_bound + 1;
         assert_eq!(
             ZSTD_resolveRowMatchFinderMode(ZSTD_ParamSwitch_e::ZSTD_ps_auto, &cp),
             ZSTD_ParamSwitch_e::ZSTD_ps_enable,
@@ -1839,6 +1943,7 @@ mod tests {
         ms.reset();
         assert!(ms.hashTable.iter().all(|&c| c == 0));
         assert_eq!(ms.nextToUpdate, ZSTD_WINDOW_START_INDEX);
+        assert_eq!(ms.window.dictBase_offset, ZSTD_WINDOW_START_INDEX);
         assert_eq!(ms.hashTable.len(), 1 << 10);
     }
 }

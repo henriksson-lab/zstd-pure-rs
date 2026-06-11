@@ -35,12 +35,8 @@ fn decompress_upstream_lorem50_level1() {
     let expected = read_fixture("lorem50.txt");
     let declared = ZSTD_findDecompressedSize(&compressed);
     // FCS not declared for non-single-segment with fcsID=0.
-    let dst_cap = if declared == ZSTD_CONTENTSIZE_UNKNOWN {
-        compressed.len() * 32
-    } else {
-        declared as usize
-    };
-    let mut dst = vec![0u8; dst_cap.max(64)];
+    assert_eq!(declared, ZSTD_CONTENTSIZE_UNKNOWN);
+    let mut dst = vec![0u8; expected.len()];
     let out = ZSTD_decompress(&mut dst, &compressed);
     assert!(
         !ERR_isError(out),
@@ -71,6 +67,28 @@ fn decompress_upstream_rep100_level1() {
     assert_eq!(&dst[..out], &expected[..]);
 }
 
+#[test]
+fn decompress_upstream_lorem80_level1() {
+    // 80-byte lorem fixture. Upstream emits a compressed literals block
+    // plus sequences, so count-only literal tests below are not enough:
+    // verify the public one-shot decompressor reconstructs the exact
+    // original payload.
+    let compressed = read_fixture("lorem80_l1.zst");
+    let expected = read_fixture("lorem80.txt");
+    let declared = ZSTD_findDecompressedSize(&compressed);
+    // FCS not declared for non-single-segment with fcsID=0.
+    assert_eq!(declared, ZSTD_CONTENTSIZE_UNKNOWN);
+    let mut dst = vec![0u8; expected.len()];
+    let out = ZSTD_decompress(&mut dst, &compressed);
+    assert!(
+        !ERR_isError(out),
+        "decoder returned error: {}",
+        ERR_getErrorName(out)
+    );
+    assert_eq!(out, expected.len());
+    assert_eq!(&dst[..out], &expected[..]);
+}
+
 /// Targeted test: pull the HUF-compressed literals section out of the
 /// failing `lorem80_l1.zst` fixture and hand it directly to
 /// `HUF_decompress1X1_DCtx_wksp`. Localizes whether the bug is in the
@@ -89,6 +107,8 @@ fn huf_literals_blob_from_lorem80_single_stream() {
     let huf_start = 12;
     let huf_size = 63;
     let exp_lit = 73;
+    let expected_literals =
+        b"fox the pack dog dog jumps fox brown dozen quick thelazy dog the\nlazy doz";
     let blob = &zst[huf_start..huf_start + huf_size];
 
     let mut dtable = vec![0u32; HUF_DTABLE_SIZE_U32(HUF_TABLELOG_MAX)];
@@ -111,6 +131,7 @@ fn huf_literals_blob_from_lorem80_single_stream() {
         ERR_getErrorName(rc)
     );
     assert_eq!(rc, exp_lit, "decoded literal count");
+    assert_eq!(&out[..rc], expected_literals);
 }
 
 /// Targeted test: run `ZSTD_decodeLiteralsBlock` on the full
@@ -143,6 +164,11 @@ fn decode_literals_block_lorem80() {
     );
     assert_eq!(consumed, 66, "should consume 3 header + 63 HUF bytes");
     assert_eq!(dctx.litSize, 73);
+    assert!(!dctx.litPtr_from_dst, "literals should be stored in DCtx");
+    assert_eq!(
+        &dctx.litExtraBuffer[..dctx.litSize],
+        b"fox the pack dog dog jumps fox brown dozen quick thelazy dog the\nlazy doz"
+    );
 }
 
 #[test]
@@ -153,6 +179,11 @@ fn decompress_upstream_lorem_level1_with_checksum() {
     // block-update loop plus the trailer compare.
     let compressed = read_fixture("lorem_l1_checksum.zst");
     let expected = read_fixture("lorem.txt");
+    // Upstream `zstd -lv` reports an XXH64 checksum but no decompressed size.
+    assert_eq!(
+        ZSTD_findDecompressedSize(&compressed),
+        ZSTD_CONTENTSIZE_UNKNOWN
+    );
     let mut dst = vec![0u8; expected.len()];
     let out = ZSTD_decompress(&mut dst, &compressed);
     assert!(
@@ -172,6 +203,10 @@ fn decompress_upstream_lorem_level19() {
     // handle it.
     let compressed = read_fixture("lorem_l19.zst");
     let expected = read_fixture("lorem.txt");
+    assert_eq!(
+        ZSTD_findDecompressedSize(&compressed),
+        ZSTD_CONTENTSIZE_UNKNOWN
+    );
     let mut dst = vec![0u8; expected.len()];
     let out = ZSTD_decompress(&mut dst, &compressed);
     assert!(
@@ -189,6 +224,10 @@ fn decompress_zstd_header_level3() {
     // 47 KB compressed at level 3. Many blocks, diverse content.
     let compressed = read_fixture("zstd_h_l3.zst");
     let expected = read_fixture("zstd_h.txt");
+    assert_eq!(
+        ZSTD_findDecompressedSize(&compressed),
+        ZSTD_CONTENTSIZE_UNKNOWN
+    );
     let mut dst = vec![0u8; expected.len()];
     let out = ZSTD_decompress(&mut dst, &compressed);
     assert!(!ERR_isError(out), "err: {}", ERR_getErrorName(out));
@@ -213,6 +252,11 @@ fn decompress_zstd_header_level9_with_checksum() {
     // decoder path on a realistic payload.
     let compressed = read_fixture("zstd_h_l9_checksum.zst");
     let expected = read_fixture("zstd_h.txt");
+    // Upstream `zstd -lv` reports an XXH64 checksum but no decompressed size.
+    assert_eq!(
+        ZSTD_findDecompressedSize(&compressed),
+        ZSTD_CONTENTSIZE_UNKNOWN
+    );
     let mut dst = vec![0u8; expected.len()];
     let out = ZSTD_decompress(&mut dst, &compressed);
     assert!(!ERR_isError(out), "err: {}", ERR_getErrorName(out));
@@ -237,6 +281,10 @@ fn decompress_binary_level3() {
     // high-entropy literals + realistic back-references.
     let compressed = read_fixture("binary_l3.zst");
     let expected = read_fixture("binary.bin");
+    assert_eq!(
+        ZSTD_findDecompressedSize(&compressed),
+        ZSTD_CONTENTSIZE_UNKNOWN
+    );
     let mut dst = vec![0u8; expected.len()];
     let out = ZSTD_decompress(&mut dst, &compressed);
     assert!(!ERR_isError(out), "err: {}", ERR_getErrorName(out));
@@ -250,6 +298,10 @@ fn decompress_binary_level12() {
     // higher-tableLog FSE + possibly HUF-X2 literals.
     let compressed = read_fixture("binary_l12.zst");
     let expected = read_fixture("binary.bin");
+    assert_eq!(
+        ZSTD_findDecompressedSize(&compressed),
+        ZSTD_CONTENTSIZE_UNKNOWN
+    );
     let mut dst = vec![0u8; expected.len()];
     let out = ZSTD_decompress(&mut dst, &compressed);
     assert!(!ERR_isError(out), "err: {}", ERR_getErrorName(out));
@@ -275,7 +327,7 @@ fn decompress_upstream_lorem_level1() {
     // Generated via:
     //   python lorem-generator > tests/fixtures/lorem.txt
     //   zstd --no-check -1 -o tests/fixtures/lorem_l1.zst tests/fixtures/lorem.txt
-    // 10106 → 2755 bytes. Exercises HUF literals + full FSE
+    // 10106 → 2753 bytes. Exercises HUF literals + full FSE
     // sequence-decode path + back-reference matches of varying offsets.
     let compressed = read_fixture("lorem_l1.zst");
     let expected = read_fixture("lorem.txt");

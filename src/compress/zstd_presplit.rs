@@ -17,7 +17,6 @@
 use crate::common::mem::MEM_read16;
 use crate::compress::hist::HIST_add;
 
-const BLOCKSIZE_MIN: usize = 3500;
 const THRESHOLD_PENALTY_RATE: u64 = 16;
 const THRESHOLD_BASE: u64 = THRESHOLD_PENALTY_RATE - 2;
 const THRESHOLD_PENALTY: i32 = 3;
@@ -51,6 +50,20 @@ fn hash2_const<const HASH_LOG: u32>(p: &[u8]) -> usize {
     }
     debug_assert!(HASH_LOG <= HASHLOG_MAX);
     let v = MEM_read16(p) as u32;
+    ((v.wrapping_mul(KNUTH)) >> (32 - HASH_LOG)) as usize
+}
+
+/// Pointer variant for the by-chunks hot path. The caller guarantees
+/// that `p` has at least two readable bytes, matching upstream's
+/// pointer walk and avoiding per-sample slice bounds checks.
+#[inline(always)]
+unsafe fn hash2_ptr_const<const HASH_LOG: u32>(p: *const u8) -> usize {
+    debug_assert!(HASH_LOG >= 8);
+    if HASH_LOG == 8 {
+        return unsafe { *p } as usize;
+    }
+    debug_assert!(HASH_LOG <= HASHLOG_MAX);
+    let v = unsafe { core::ptr::read_unaligned(p as *const u16) } as u32;
     ((v.wrapping_mul(KNUTH)) >> (32 - HASH_LOG)) as usize
 }
 
@@ -114,9 +127,26 @@ fn addEvents_const<const SAMPLING_RATE: usize, const HASH_LOG: u32>(
     fp.nbEvents += limit / SAMPLING_RATE;
 }
 
+#[inline(always)]
+unsafe fn addEvents_chunk_const<const SAMPLING_RATE: usize, const HASH_LOG: u32>(
+    events: &mut [u32; HASHTABLESIZE],
+    src: *const u8,
+) -> usize {
+    const HASHLENGTH: usize = 2;
+    const LIMIT: usize = CHUNKSIZE - HASHLENGTH + 1;
+    let mut n = 0;
+    while n < LIMIT {
+        let h = unsafe { hash2_ptr_const::<HASH_LOG>(src.add(n)) };
+        events[h] += 1;
+        n += SAMPLING_RATE;
+    }
+    LIMIT / SAMPLING_RATE
+}
+
 /// Port of `recordFingerprint`. Resets `fp` then populates it via
 /// `addEvents_const` — i.e. a fresh fingerprint of `src` under the
 /// given sampling rate / hash width.
+#[allow(dead_code)]
 #[inline(always)]
 fn recordFingerprint_const<const SAMPLING_RATE: usize, const HASH_LOG: u32>(
     fp: &mut Fingerprint,
@@ -124,6 +154,15 @@ fn recordFingerprint_const<const SAMPLING_RATE: usize, const HASH_LOG: u32>(
 ) {
     fp.reset(HASH_LOG);
     addEvents_const::<SAMPLING_RATE, HASH_LOG>(fp, src);
+}
+
+#[inline(always)]
+unsafe fn recordFingerprint_chunk_const<const SAMPLING_RATE: usize, const HASH_LOG: u32>(
+    fp: &mut Fingerprint,
+    src: *const u8,
+) {
+    fp.events[..(1usize << HASH_LOG)].fill(0);
+    fp.nbEvents = unsafe { addEvents_chunk_const::<SAMPLING_RATE, HASH_LOG>(&mut fp.events, src) };
 }
 
 /// Port of `abs64`. Absolute value of a signed 64-bit difference,
@@ -148,6 +187,19 @@ fn fpDistance(fp1: &Fingerprint, fp2: &Fingerprint, hashLog: u32) -> u64 {
     distance
 }
 
+#[inline(always)]
+fn fpDistance_const<const HASH_LOG: u32>(fp1: &Fingerprint, fp2: &Fingerprint) -> u64 {
+    let mut distance: u64 = 0;
+    let mut n = 0;
+    while n < (1usize << HASH_LOG) {
+        let a = (fp1.events[n] as i64) * (fp2.nbEvents as i64);
+        let b = (fp2.events[n] as i64) * (fp1.nbEvents as i64);
+        distance = distance.wrapping_add(abs64(a - b));
+        n += 1;
+    }
+    distance
+}
+
 /// Port of `compareFingerprints`. Returns `true` when the new
 /// fingerprint has deviated beyond threshold from the reference.
 fn compareFingerprints(
@@ -160,15 +212,41 @@ fn compareFingerprints(
     debug_assert!(newfp.nbEvents > 0);
     let p50 = (r#ref.nbEvents as u64) * (newfp.nbEvents as u64);
     let deviation = fpDistance(r#ref, newfp, hashLog);
-    let penalty_term = if penalty < 0 { 0 } else { penalty as u64 };
-    let threshold = p50 * (THRESHOLD_BASE + penalty_term) / THRESHOLD_PENALTY_RATE;
+    let threshold =
+        p50.wrapping_mul((THRESHOLD_BASE as i32 + penalty) as u64) / THRESHOLD_PENALTY_RATE;
+    deviation >= threshold
+}
+
+#[inline(always)]
+fn compareFingerprints_const<const HASH_LOG: u32>(
+    r#ref: &Fingerprint,
+    newfp: &Fingerprint,
+    penalty: i32,
+) -> bool {
+    debug_assert!(r#ref.nbEvents > 0);
+    debug_assert!(newfp.nbEvents > 0);
+    let p50 = (r#ref.nbEvents as u64) * (newfp.nbEvents as u64);
+    let deviation = fpDistance_const::<HASH_LOG>(r#ref, newfp);
+    let threshold =
+        p50.wrapping_mul((THRESHOLD_BASE as i32 + penalty) as u64) / THRESHOLD_PENALTY_RATE;
     deviation >= threshold
 }
 
 /// Port of `mergeEvents`.
+#[allow(dead_code)]
 fn mergeEvents(acc: &mut Fingerprint, newfp: &Fingerprint) {
     for n in 0..HASHTABLESIZE {
         acc.events[n] += newfp.events[n];
+    }
+    acc.nbEvents += newfp.nbEvents;
+}
+
+#[inline(always)]
+fn mergeEvents_const<const HASH_LOG: u32>(acc: &mut Fingerprint, newfp: &Fingerprint) {
+    let mut n = 0;
+    while n < (1usize << HASH_LOG) {
+        acc.events[n] += newfp.events[n];
+        n += 1;
     }
     acc.nbEvents += newfp.nbEvents;
 }
@@ -225,22 +303,27 @@ fn ZSTD_splitBlock_byChunks_specialized<const SAMPLING_RATE: usize, const HASH_L
 
     let mut fpstats = FPStats::new();
     let mut penalty = THRESHOLD_PENALTY;
+    let block_ptr = block.as_ptr();
 
-    recordFingerprint_const::<SAMPLING_RATE, HASH_LOG>(
-        &mut fpstats.pastEvents,
-        &block[..CHUNKSIZE],
-    );
+    unsafe {
+        recordFingerprint_chunk_const::<SAMPLING_RATE, HASH_LOG>(
+            &mut fpstats.pastEvents,
+            block_ptr,
+        );
+    }
 
     let mut pos = CHUNKSIZE;
     while pos <= block.len() - CHUNKSIZE {
-        recordFingerprint_const::<SAMPLING_RATE, HASH_LOG>(
-            &mut fpstats.newEvents,
-            &block[pos..pos + CHUNKSIZE],
-        );
-        if compareFingerprints(&fpstats.pastEvents, &fpstats.newEvents, penalty, HASH_LOG) {
+        unsafe {
+            recordFingerprint_chunk_const::<SAMPLING_RATE, HASH_LOG>(
+                &mut fpstats.newEvents,
+                block_ptr.add(pos),
+            );
+        }
+        if compareFingerprints_const::<HASH_LOG>(&fpstats.pastEvents, &fpstats.newEvents, penalty) {
             return pos;
         }
-        mergeEvents(&mut fpstats.pastEvents, &fpstats.newEvents);
+        mergeEvents_const::<HASH_LOG>(&mut fpstats.pastEvents, &fpstats.newEvents);
         if penalty > 0 {
             penalty -= 1;
         }
@@ -294,9 +377,7 @@ fn ZSTD_splitBlock_fromBorders(block: &[u8]) -> usize {
 ///   - level 1-4 → `splitBlock_byChunks` with internal level = level-1
 pub fn ZSTD_splitBlock(block: &[u8], level: i32) -> usize {
     debug_assert!((0..=4).contains(&level));
-    if block.len() < BLOCKSIZE_MIN {
-        return block.len();
-    }
+    debug_assert_eq!(block.len(), 128 << 10);
     if level == 0 {
         ZSTD_splitBlock_fromBorders(block)
     } else {
@@ -348,12 +429,12 @@ mod tests {
         );
     }
 
+    #[cfg(debug_assertions)]
     #[test]
-    fn tiny_block_returns_full_size() {
+    #[should_panic]
+    fn tiny_block_violates_upstream_assert_contract() {
         let block = vec![0u8; 1024];
-        for level in 0..=4 {
-            assert_eq!(ZSTD_splitBlock(&block, level), block.len());
-        }
+        let _ = ZSTD_splitBlock(&block, 0);
     }
 
     #[test]
@@ -380,6 +461,14 @@ mod tests {
         assert_ne!(hash2(&buf, 10), hash2(&buf, 9));
         // Hash fits within the 1<<hashLog range.
         assert!(h1 < (1usize << 10));
+    }
+
+    #[test]
+    fn addEvents_counts_partial_final_stride_like_c_loop() {
+        let mut fp = Fingerprint::new();
+        addEvents_const::<43, 8>(&mut fp, &[7; CHUNKSIZE]);
+        assert_eq!(fp.nbEvents, (CHUNKSIZE - 1) / 43);
+        assert_eq!(fp.events[7] as usize, (CHUNKSIZE - 1).div_ceil(43));
     }
 
     #[test]

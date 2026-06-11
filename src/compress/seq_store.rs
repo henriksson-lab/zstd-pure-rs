@@ -92,12 +92,26 @@ impl SeqStore_t {
     }
 }
 
+#[inline(always)]
+fn extend_literals(dst: &mut Vec<u8>, src: &[u8]) {
+    let old_len = dst.len();
+    let new_len = old_len + src.len();
+    if new_len <= dst.capacity() {
+        unsafe {
+            core::ptr::copy_nonoverlapping(src.as_ptr(), dst.as_mut_ptr().add(old_len), src.len());
+            dst.set_len(new_len);
+        }
+    } else {
+        dst.extend_from_slice(src);
+    }
+}
+
 /// Port of `ZSTD_storeLastLiterals`. Appends a trailing-literals run
 /// to the seq store — used at the end of a block when the matcher
 /// stops before the block boundary.
 #[inline]
 pub fn ZSTD_storeLastLiterals(ss: &mut SeqStore_t, anchor: &[u8]) {
-    ss.literals.extend_from_slice(anchor);
+    extend_literals(&mut ss.literals, anchor);
 }
 
 /// Port of `ZSTD_resetSeqStore`. Clears the sequence + literals
@@ -106,31 +120,25 @@ pub fn ZSTD_storeLastLiterals(ss: &mut SeqStore_t, anchor: &[u8]) {
 pub fn ZSTD_resetSeqStore(ss: &mut SeqStore_t) {
     ss.sequences.clear();
     ss.literals.clear();
+    ss.llCode.clear();
+    ss.mlCode.clear();
+    ss.ofCode.clear();
     ss.longLengthType = ZSTD_longLengthType_e::ZSTD_llt_none;
 }
 
-/// Port of `ZSTD_deriveSeqStoreChunk` (`zstd_compress.c:4025`). Builds
-/// a new `SeqStore_t` that represents the sequence subrange
-/// `[startIdx, endIdx)` of `originalSeqStore`, used by the block
-/// splitter to cost-estimate potential splits.
-///
-/// Upstream reuses the allocation via pointer arithmetic into
-/// `sequencesStart`/`litStart`/`llCode`/`mlCode`/`ofCode`. Our port
-/// clones the relevant subranges into fresh `Vec`s — correct but
-/// allocates; the block splitter isn't yet wired into our compressor
-/// so the allocation cost is moot for now.
-///
-/// `longLengthPos` is rebased or cleared if it falls outside the
-/// chunk range, mirroring upstream exactly.
-pub fn ZSTD_deriveSeqStoreChunk(
+/// Reuses `dst` to represent the sequence subrange `[startIdx, endIdx)`
+/// of `originalSeqStore`. Upstream does this with pointer arithmetic into
+/// caller-owned buffers; the Rust store is still owned, so we copy only the
+/// active subranges while preserving `dst` allocations.
+pub fn ZSTD_deriveSeqStoreChunkInto(
+    dst: &mut SeqStore_t,
     originalSeqStore: &SeqStore_t,
     startIdx: usize,
     endIdx: usize,
-) -> SeqStore_t {
+) {
+    debug_assert!(!core::ptr::eq(dst, originalSeqStore));
     debug_assert!(endIdx <= originalSeqStore.sequences.len());
     debug_assert!(startIdx <= endIdx);
-
-    let seqs_chunk: Vec<SeqDef> = originalSeqStore.sequences[startIdx..endIdx].to_vec();
 
     // Sum literals bytes before startIdx (consumed by prior chunks)
     // and within [startIdx, endIdx) (kept for this chunk).
@@ -148,7 +156,7 @@ pub fn ZSTD_deriveSeqStoreChunk(
         })
         .sum();
 
-    let chunk_lits: usize = seqs_chunk
+    let chunk_lits: usize = originalSeqStore.sequences[startIdx..endIdx]
         .iter()
         .enumerate()
         .map(|(i, s)| {
@@ -170,25 +178,6 @@ pub fn ZSTD_deriveSeqStoreChunk(
     } else {
         chunk_lits
     };
-    let literals_chunk: Vec<u8> =
-        originalSeqStore.literals[prior_lits..prior_lits + lit_take].to_vec();
-
-    // Carry per-sequence code-tables if they've been materialized.
-    let ll_chunk = if originalSeqStore.llCode.len() >= endIdx {
-        originalSeqStore.llCode[startIdx..endIdx].to_vec()
-    } else {
-        Vec::new()
-    };
-    let ml_chunk = if originalSeqStore.mlCode.len() >= endIdx {
-        originalSeqStore.mlCode[startIdx..endIdx].to_vec()
-    } else {
-        Vec::new()
-    };
-    let of_chunk = if originalSeqStore.ofCode.len() >= endIdx {
-        originalSeqStore.ofCode[startIdx..endIdx].to_vec()
-    } else {
-        Vec::new()
-    };
 
     let (longLengthType, longLengthPos) = match originalSeqStore.longLengthType {
         ZSTD_longLengthType_e::ZSTD_llt_none => (ZSTD_longLengthType_e::ZSTD_llt_none, 0),
@@ -202,17 +191,58 @@ pub fn ZSTD_deriveSeqStoreChunk(
         }
     };
 
-    SeqStore_t {
-        sequences: seqs_chunk,
-        literals: literals_chunk,
-        llCode: ll_chunk,
-        mlCode: ml_chunk,
-        ofCode: of_chunk,
+    dst.sequences.clear();
+    dst.sequences
+        .extend_from_slice(&originalSeqStore.sequences[startIdx..endIdx]);
+    dst.literals.clear();
+    dst.literals
+        .extend_from_slice(&originalSeqStore.literals[prior_lits..prior_lits + lit_take]);
+    dst.llCode.clear();
+    if originalSeqStore.llCode.len() >= endIdx {
+        dst.llCode
+            .extend_from_slice(&originalSeqStore.llCode[startIdx..endIdx]);
+    }
+    dst.mlCode.clear();
+    if originalSeqStore.mlCode.len() >= endIdx {
+        dst.mlCode
+            .extend_from_slice(&originalSeqStore.mlCode[startIdx..endIdx]);
+    }
+    dst.ofCode.clear();
+    if originalSeqStore.ofCode.len() >= endIdx {
+        dst.ofCode
+            .extend_from_slice(&originalSeqStore.ofCode[startIdx..endIdx]);
+    }
+    dst.maxNbSeq = originalSeqStore.maxNbSeq;
+    dst.maxNbLit = originalSeqStore.maxNbLit;
+    dst.longLengthType = longLengthType;
+    dst.longLengthPos = longLengthPos;
+}
+
+/// Port of `ZSTD_deriveSeqStoreChunk` (`zstd_compress.c:4025`). Builds
+/// a new `SeqStore_t` that represents the sequence subrange
+/// `[startIdx, endIdx)` of `originalSeqStore`, used by the block
+/// splitter to cost-estimate potential splits.
+///
+/// `longLengthPos` is rebased or cleared if it falls outside the
+/// chunk range, mirroring upstream exactly.
+pub fn ZSTD_deriveSeqStoreChunk(
+    originalSeqStore: &SeqStore_t,
+    startIdx: usize,
+    endIdx: usize,
+) -> SeqStore_t {
+    let mut dst = SeqStore_t {
+        sequences: Vec::new(),
+        literals: Vec::new(),
+        llCode: Vec::new(),
+        mlCode: Vec::new(),
+        ofCode: Vec::new(),
         maxNbSeq: originalSeqStore.maxNbSeq,
         maxNbLit: originalSeqStore.maxNbLit,
-        longLengthType,
-        longLengthPos,
-    }
+        longLengthType: ZSTD_longLengthType_e::ZSTD_llt_none,
+        longLengthPos: 0,
+    };
+    ZSTD_deriveSeqStoreChunkInto(&mut dst, originalSeqStore, startIdx, endIdx);
+    dst
 }
 
 /// Port of `ZSTD_countSeqStoreLiteralsBytes` (`zstd_compress.c:3993`).
@@ -285,7 +315,7 @@ pub fn REPCODE_TO_OFFBASE(r: u32) -> u32 {
 #[inline]
 pub fn OFFSET_TO_OFFBASE(offset: u32) -> u32 {
     debug_assert!(offset > 0);
-    offset + ZSTD_REP_NUM as u32
+    offset.wrapping_add(ZSTD_REP_NUM as u32)
 }
 
 /// Port of `OFFBASE_IS_OFFSET` macro. True when `o` carries a full raw
@@ -299,7 +329,7 @@ pub fn OFFBASE_IS_OFFSET(o: u32) -> bool {
 /// `1..=ZSTD_REP_NUM`.
 #[inline]
 pub fn OFFBASE_IS_REPCODE(o: u32) -> bool {
-    o <= ZSTD_REP_NUM as u32
+    1 <= o && o <= ZSTD_REP_NUM as u32
 }
 
 /// Port of `OFFBASE_TO_OFFSET` macro. Inverse of `OFFSET_TO_OFFBASE` —
@@ -329,7 +359,9 @@ pub fn ZSTD_storeSeqOnly(
     matchLength: usize,
 ) {
     debug_assert!(seqStore.sequences.len() < seqStore.maxNbSeq);
+    debug_assert!(litLength <= crate::decompress::zstd_decompress_block::ZSTD_BLOCKSIZE_MAX);
     debug_assert!(matchLength >= MINMATCH as usize);
+    debug_assert!(matchLength <= crate::decompress::zstd_decompress_block::ZSTD_BLOCKSIZE_MAX);
 
     // litLength may exceed U16; flag as long.
     if litLength > 0xFFFF {
@@ -367,11 +399,11 @@ pub fn ZSTD_storeSeqOnly(
 /// over-allocated by `WILDCOPY_OVERLENGTH` so a 16-byte write past
 /// `litLength` never overruns capacity. The source slice's overrun
 /// protection is the responsibility of the caller — for callers
-/// that pass `&src[anchor..]` (most matchers do), there's at least
-/// `src.len() - anchor ≥ litLength + 16` bytes available unless we're
-/// near end-of-block where the wildcopy could fault. We guard against
-/// that by falling back to `copy_nonoverlapping(litLength)` when the
-/// source slice itself doesn't have 16 bytes available.
+/// that pass `&src[anchor..]` (most matchers do), this can hold until
+/// we get near end-of-block. We mirror upstream's `litEnd <=
+/// litLimit_w` check by falling back to an exact copy unless the
+/// source slice has `WILDCOPY_OVERLENGTH` bytes of slack after the
+/// literal run.
 #[inline(always)]
 pub fn ZSTD_storeSeq(
     seqStore: &mut SeqStore_t,
@@ -380,18 +412,22 @@ pub fn ZSTD_storeSeq(
     offBase: u32,
     matchLength: usize,
 ) {
-    debug_assert!(litLength <= literals.len());
-    debug_assert!(seqStore.literals.len() + litLength <= seqStore.maxNbLit);
+    assert!(litLength <= literals.len());
+    assert!(seqStore.literals.len() + litLength <= seqStore.maxNbLit);
     if litLength != 0 {
         let cur_len = seqStore.literals.len();
-        // Match upstream's ZSTD_copy16 + ZSTD_wildcopy pattern:
-        // always copy 16 bytes (single xmm load+store), then loop
-        // 16-byte chunks until litLength is reached. Destination has
-        // `WILDCOPY_OVERLENGTH=32` bytes of slack past `maxNbLit`.
-        unsafe {
-            let dst = seqStore.literals.as_mut_ptr().add(cur_len);
-            let src = literals.as_ptr();
-            if literals.len() >= 16 {
+        let has_wildcopy_slack = litLength
+            <= literals
+                .len()
+                .saturating_sub(crate::common::zstd_internal::WILDCOPY_OVERLENGTH);
+        if has_wildcopy_slack {
+            // Match upstream's ZSTD_copy16 + ZSTD_wildcopy pattern:
+            // always copy 16 bytes (single xmm load+store), then loop
+            // 16-byte chunks until litLength is reached. Destination has
+            // `WILDCOPY_OVERLENGTH=32` bytes of slack past `maxNbLit`.
+            unsafe {
+                let dst = seqStore.literals.as_mut_ptr().add(cur_len);
+                let src = literals.as_ptr();
                 // Fast wildcopy path: source has 16-byte slack.
                 // Always copy 16, then 16-byte loop for the rest.
                 core::ptr::copy_nonoverlapping(src, dst, 16);
@@ -400,11 +436,10 @@ pub fn ZSTD_storeSeq(
                     core::ptr::copy_nonoverlapping(src.add(off), dst.add(off), 16);
                     off += 16;
                 }
-            } else {
-                // Source slice is shorter than 16 bytes — exact copy.
-                core::ptr::copy_nonoverlapping(src, dst, litLength);
+                seqStore.literals.set_len(cur_len + litLength);
             }
-            seqStore.literals.set_len(cur_len + litLength);
+        } else {
+            extend_literals(&mut seqStore.literals, &literals[..litLength]);
         }
     }
     ZSTD_storeSeqOnly(seqStore, litLength, offBase, matchLength);
@@ -431,7 +466,7 @@ pub fn ZSTD_updateRep(rep: &mut [u32; ZSTD_REP_NUM], offBase: u32, ll0: u32) {
         let repCode = OFFBASE_TO_REPCODE(offBase) + ll0 - 1;
         if repCode > 0 {
             let currentOffset = if repCode == ZSTD_REP_NUM as u32 {
-                rep[0] - 1
+                rep[0].wrapping_sub(1)
             } else {
                 rep[repCode as usize]
             };
@@ -563,10 +598,16 @@ mod tests {
         let mut ss = SeqStore_t::with_capacity(16, 128);
         ss.literals.extend_from_slice(b"junk");
         ZSTD_storeSeqOnly(&mut ss, 5, OFFSET_TO_OFFBASE(17), 4);
+        ss.llCode.extend_from_slice(&[1, 2, 3]);
+        ss.mlCode.extend_from_slice(&[4, 5, 6]);
+        ss.ofCode.extend_from_slice(&[7, 8, 9]);
         ss.longLengthType = ZSTD_longLengthType_e::ZSTD_llt_matchLength;
         ZSTD_resetSeqStore(&mut ss);
         assert!(ss.sequences.is_empty());
         assert!(ss.literals.is_empty());
+        assert!(ss.llCode.is_empty());
+        assert!(ss.mlCode.is_empty());
+        assert!(ss.ofCode.is_empty());
         assert_eq!(ss.longLengthType, ZSTD_longLengthType_e::ZSTD_llt_none);
     }
 
@@ -618,7 +659,7 @@ mod tests {
     }
 
     #[test]
-    fn deriveSeqStoreChunk_excludes_long_length_at_end_boundary() {
+    fn deriveSeqStoreChunk_clears_long_length_at_end_boundary() {
         let mut ss = SeqStore_t::with_capacity(8, 128);
         ZSTD_storeSeqOnly(&mut ss, 3, OFFSET_TO_OFFBASE(10), 7);
         ZSTD_storeSeqOnly(&mut ss, 4, OFFSET_TO_OFFBASE(11), 8);
@@ -634,11 +675,34 @@ mod tests {
     }
 
     #[test]
+    fn deriveSeqStoreChunk_end_boundary_is_safe_for_seq_to_codes() {
+        let mut ss = SeqStore_t::with_capacity(8, 128);
+        ZSTD_storeSeqOnly(&mut ss, 3, OFFSET_TO_OFFBASE(10), 7);
+        ZSTD_storeSeqOnly(&mut ss, 4, OFFSET_TO_OFFBASE(11), 8);
+        ZSTD_storeSeqOnly(
+            &mut ss,
+            5,
+            OFFSET_TO_OFFBASE(12),
+            0x10000 + MINMATCH as usize,
+        );
+        ss.literals.extend_from_slice(&[b'a'; 12]);
+
+        let mut chunk = ZSTD_deriveSeqStoreChunk(&ss, 0, 2);
+        crate::compress::zstd_compress::ZSTD_seqToCodes(&mut chunk);
+        assert_eq!(chunk.llCode.len(), 2);
+        assert_eq!(chunk.mlCode.len(), 2);
+        assert_eq!(chunk.ofCode.len(), 2);
+    }
+
+    #[test]
     fn offbase_sumtype_roundtrips() {
         // Full offset: encode → is_offset → decode.
         let ob = OFFSET_TO_OFFBASE(42);
         assert!(OFFBASE_IS_OFFSET(ob));
         assert_eq!(OFFBASE_TO_OFFSET(ob), 42);
+
+        let wrapped = OFFSET_TO_OFFBASE(u32::MAX);
+        assert_eq!(wrapped, (u32::MAX).wrapping_add(ZSTD_REP_NUM as u32));
 
         // Repcode: 1, 2, 3 don't cross the ZSTD_REP_NUM threshold.
         for r in 1..=3u32 {
@@ -646,6 +710,7 @@ mod tests {
             assert!(OFFBASE_IS_REPCODE(ob));
             assert_eq!(OFFBASE_TO_REPCODE(ob), r);
         }
+        assert!(!OFFBASE_IS_REPCODE(0));
     }
 
     #[test]
@@ -670,6 +735,16 @@ mod tests {
         assert_eq!(ss.sequences[0].litLength, 5);
         // MINMATCH=3 → mlBase = 0.
         assert_eq!(ss.sequences[0].mlBase, 0);
+    }
+
+    #[test]
+    fn store_seq_near_literal_limit_uses_exact_copy() {
+        let mut ss = SeqStore_t::with_capacity(16, 1024);
+        let src = b"abcdefghijklmnopqrst";
+        ZSTD_storeSeq(&mut ss, src.len(), src, OFFSET_TO_OFFBASE(33), 5);
+        assert_eq!(ss.literals, src);
+        assert_eq!(ss.sequences.len(), 1);
+        assert_eq!(ss.sequences[0].litLength, src.len() as u16);
     }
 
     #[test]
@@ -718,6 +793,13 @@ mod tests {
         let mut rep = [5u32, 10, 20];
         ZSTD_updateRep(&mut rep, REPCODE_TO_OFFBASE(3), 1);
         assert_eq!(rep, [4, 5, 10]); // new rep[0] = 5-1 = 4
+    }
+
+    #[test]
+    fn update_rep_rep0_minus_one_wraps_like_u32() {
+        let mut rep = [0u32, 10, 20];
+        ZSTD_updateRep(&mut rep, REPCODE_TO_OFFBASE(3), 1);
+        assert_eq!(rep, [u32::MAX, 0, 10]);
     }
 
     #[test]

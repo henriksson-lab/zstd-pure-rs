@@ -4,6 +4,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use zstd_pure_rs::common::error::{ERR_getErrorName, ERR_isError};
 use zstd_pure_rs::compress::zstd_compress::{
@@ -11,10 +12,15 @@ use zstd_pure_rs::compress::zstd_compress::{
     ZSTD_compress2, ZSTD_compressBound, ZSTD_compressStream, ZSTD_endStream, ZSTD_initCStream,
     ZSTD_writeSkippableFrame,
 };
+use zstd_pure_rs::decompress::zstd_ddict::ZSTD_getDictID_fromDict;
 use zstd_pure_rs::decompress::zstd_decompress::{
-    ZSTD_decompress, ZSTD_decompressStream, ZSTD_decompress_usingDict, ZSTD_initDStream,
+    ZSTD_decompress, ZSTD_decompressStream, ZSTD_decompress_usingDict, ZSTD_findDecompressedSize,
+    ZSTD_findFrameCompressedSize, ZSTD_getDictID_fromFrame, ZSTD_getFrameContentSize,
+    ZSTD_initDStream, ZSTD_isSkippableFrame, ZSTD_readSkippableFrame, ZSTD_CONTENTSIZE_ERROR,
 };
 use zstd_pure_rs::decompress::zstd_decompress_block::{ZSTD_DCtx, ZSTD_buildDefaultSeqTables};
+
+static TEMP_DICT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn upstream_zstd() -> Option<PathBuf> {
     let out = Command::new("which").arg("zstd").output().ok()?;
@@ -53,13 +59,17 @@ fn compress_one_shot(src: &[u8], level: i32) -> Vec<u8> {
 
 fn compress_with_checksum(src: &[u8], level: i32) -> Vec<u8> {
     let mut cctx = ZSTD_CCtx::default();
-    assert_eq!(
-        ZSTD_CCtx_setParameter(&mut cctx, ZSTD_cParameter::ZSTD_c_compressionLevel, level),
-        0
+    let rc = ZSTD_CCtx_setParameter(&mut cctx, ZSTD_cParameter::ZSTD_c_compressionLevel, level);
+    assert!(
+        !ERR_isError(rc),
+        "set compression level {level} failed: {}",
+        ERR_getErrorName(rc)
     );
-    assert_eq!(
-        ZSTD_CCtx_setParameter(&mut cctx, ZSTD_cParameter::ZSTD_c_checksumFlag, 1),
-        0
+    let rc = ZSTD_CCtx_setParameter(&mut cctx, ZSTD_cParameter::ZSTD_c_checksumFlag, 1);
+    assert!(
+        !ERR_isError(rc),
+        "set checksum flag failed: {}",
+        ERR_getErrorName(rc)
     );
     let mut dst = vec![0u8; ZSTD_compressBound(src.len()).max(64) + 4];
     let n = ZSTD_compress2(&mut cctx, &mut dst, src);
@@ -107,6 +117,64 @@ fn upstream_decode(bin: &Path, frame: &[u8]) -> Vec<u8> {
     out.stdout
 }
 
+fn upstream_rejects_decode(bin: &Path, frame: &[u8]) {
+    let mut child = Command::new(bin)
+        .args(["-d", "-c", "-q", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn upstream zstd reject probe");
+    let mut stdin = child.stdin.take().expect("upstream stdin");
+    let frame = frame.to_vec();
+    let writer = std::thread::spawn(move || {
+        stdin.write_all(&frame).expect("write upstream stdin");
+    });
+    let out = child.wait_with_output().expect("wait upstream zstd");
+    writer.join().expect("join upstream writer");
+    assert!(
+        !out.status.success(),
+        "upstream accepted frame that should be rejected"
+    );
+}
+
+fn upstream_dict_file(dict: &[u8]) -> PathBuf {
+    let suffix = TEMP_DICT_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!(
+        "zstd-pure-rs-real-data-expanded-dict-{}-{suffix}",
+        std::process::id()
+    ));
+    std::fs::write(&path, dict).expect("write upstream dict");
+    path
+}
+
+fn upstream_decode_with_dict(bin: &Path, frame: &[u8], dict: &[u8]) -> Vec<u8> {
+    let dict_path = upstream_dict_file(dict);
+    let mut child = Command::new(bin)
+        .args(["-d", "-c", "-q", "-D"])
+        .arg(&dict_path)
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn upstream zstd dict decoder");
+    let mut stdin = child.stdin.take().expect("upstream stdin");
+    let frame = frame.to_vec();
+    let writer = std::thread::spawn(move || {
+        stdin.write_all(&frame).expect("write upstream stdin");
+    });
+    let out = child.wait_with_output().expect("wait upstream zstd");
+    writer.join().expect("join upstream writer");
+    let _ = std::fs::remove_file(&dict_path);
+    assert!(
+        out.status.success(),
+        "upstream rejected dict frame: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out.stdout
+}
+
 fn upstream_compress(bin: &Path, payload: &[u8], level: i32) -> Vec<u8> {
     let mut child = Command::new(bin)
         .args(["-c", "-q", &format!("-{level}"), "-"])
@@ -125,6 +193,33 @@ fn upstream_compress(bin: &Path, payload: &[u8], level: i32) -> Vec<u8> {
     assert!(
         out.status.success(),
         "upstream compression failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out.stdout
+}
+
+fn upstream_compress_with_dict(bin: &Path, payload: &[u8], dict: &[u8], level: i32) -> Vec<u8> {
+    let dict_path = upstream_dict_file(dict);
+    let mut child = Command::new(bin)
+        .args(["-c", "-q", &format!("-{level}"), "-D"])
+        .arg(&dict_path)
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn upstream zstd dict compressor");
+    let mut stdin = child.stdin.take().expect("upstream stdin");
+    let payload = payload.to_vec();
+    let writer = std::thread::spawn(move || {
+        stdin.write_all(&payload).expect("write upstream stdin");
+    });
+    let out = child.wait_with_output().expect("wait upstream zstd");
+    writer.join().expect("join upstream writer");
+    let _ = std::fs::remove_file(&dict_path);
+    assert!(
+        out.status.success(),
+        "upstream dict compression failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
     out.stdout
@@ -175,6 +270,7 @@ fn streaming_decompress(frame: &[u8], expected_len: usize, chunk_size: usize) ->
         "init dstream failed: {}",
         ERR_getErrorName(init)
     );
+    assert_eq!(init, 5, "init dstream returned wrong first-input hint");
     let mut out = vec![0u8; expected_len.max(1)];
     let mut out_pos = 0usize;
     let mut cursor = 0usize;
@@ -284,26 +380,127 @@ fn committed_fastq_fixture_exercises_one_shot_and_streaming_paths() {
 }
 
 #[test]
+fn real_frame_size_metadata_tracks_payloads_and_boundaries() {
+    let upstream = upstream_zstd();
+    let mut concatenated = Vec::new();
+    let mut expected_size = 0u64;
+
+    for (name, payload) in corpus_cases() {
+        let plain = compress_one_shot(&payload, 3);
+        let checked = compress_with_checksum(&payload, 5);
+
+        for (kind, frame) in [("plain", plain), ("checksum", checked)] {
+            assert_eq!(
+                ZSTD_getFrameContentSize(&frame),
+                payload.len() as u64,
+                "{name} {kind} frame advertised wrong content size"
+            );
+            assert_eq!(
+                ZSTD_findFrameCompressedSize(&frame),
+                frame.len(),
+                "{name} {kind} frame reported wrong compressed size"
+            );
+
+            let mut with_trailer = frame.clone();
+            with_trailer.extend_from_slice(b"trailing bytes after first frame");
+            assert_eq!(
+                ZSTD_findFrameCompressedSize(&with_trailer),
+                frame.len(),
+                "{name} {kind} frame walk consumed trailing bytes"
+            );
+
+            if kind == "checksum" {
+                let mut corrupted = frame.clone();
+                *corrupted.last_mut().expect("checksum frame trailer") ^= 0x80;
+                let mut decoded = vec![0u8; payload.len()];
+                let rc = ZSTD_decompress(&mut decoded, &corrupted);
+                assert!(
+                    ERR_isError(rc),
+                    "{name} checksum frame with corrupted trailer decoded successfully"
+                );
+                if let Some(bin) = upstream.as_deref() {
+                    upstream_rejects_decode(bin, &corrupted);
+                }
+            }
+
+            concatenated.extend_from_slice(&frame);
+            concatenated.extend_from_slice(&skippable(b"metadata between real frames", 3));
+            expected_size += payload.len() as u64;
+        }
+    }
+
+    assert_eq!(
+        ZSTD_findDecompressedSize(&concatenated),
+        expected_size,
+        "multi-frame size walk diverged from upstream semantics"
+    );
+    concatenated.push(0);
+    assert_eq!(
+        ZSTD_findDecompressedSize(&concatenated),
+        ZSTD_CONTENTSIZE_ERROR,
+        "multi-frame size walk accepted trailing junk"
+    );
+}
+
+#[test]
+fn skippable_frame_metadata_and_payload_match_upstream_semantics() {
+    let regular = compress_one_shot(include_bytes!("fixtures/lorem.txt"), 1);
+    assert_eq!(ZSTD_isSkippableFrame(&regular), 0);
+
+    for variant in [0u32, 7, 15] {
+        let payload = include_bytes!("fixtures/upstream-zstd/golden-compression/http");
+        let frame = skippable(payload, variant);
+
+        assert_eq!(ZSTD_isSkippableFrame(&frame), 1);
+        assert_eq!(ZSTD_getFrameContentSize(&frame), 0);
+        assert_eq!(ZSTD_findFrameCompressedSize(&frame), frame.len());
+
+        let mut decoded = vec![0u8; payload.len()];
+        let mut got_variant = u32::MAX;
+        let n = ZSTD_readSkippableFrame(&mut decoded, Some(&mut got_variant), &frame);
+        assert!(
+            !ERR_isError(n),
+            "read skippable failed: {}",
+            ERR_getErrorName(n)
+        );
+        decoded.truncate(n);
+        assert_eq!(decoded, payload);
+        assert_eq!(got_variant, variant);
+    }
+}
+
+#[test]
 fn dictionary_roundtrips_cover_http_fastq_and_header_payloads() {
-    let cases: Vec<(&str, Vec<u8>, Vec<u8>)> = vec![
+    let upstream = upstream_zstd();
+    let cases: Vec<(&str, Vec<u8>, Vec<u8>, bool)> = vec![
         (
             "http",
             include_bytes!("fixtures/upstream-zstd/golden-compression/http").to_vec(),
             include_bytes!("fixtures/upstream-zstd/golden-compression/http").repeat(4),
+            true,
         ),
         (
             "fastq",
             include_bytes!("fixtures/small.fastq")[..512].to_vec(),
             include_bytes!("fixtures/small.fastq").repeat(16),
+            true,
         ),
         (
             "header",
             include_bytes!("fixtures/zstd_h.txt")[..4096].to_vec(),
             include_bytes!("fixtures/zstd_h.txt")[2048..24576].to_vec(),
+            true,
+        ),
+        (
+            "zstd-format-dict",
+            include_bytes!("fixtures/upstream-zstd/dict-files/zero-weight-dict").to_vec(),
+            include_bytes!("fixtures/upstream-zstd/golden-compression/http").to_vec(),
+            true,
         ),
     ];
 
-    for (name, dict, payload) in cases {
+    for (name, dict, payload, expect_rust_roundtrip) in cases {
+        let expected_dict_id = ZSTD_getDictID_fromDict(&dict);
         let mut cctx = ZSTD_CCtx::default();
         let mut compressed = vec![0u8; ZSTD_compressBound(payload.len()).max(64)];
         let n = zstd_pure_rs::compress::zstd_compress::ZSTD_compress_usingDict(
@@ -319,17 +516,58 @@ fn dictionary_roundtrips_cover_http_fastq_and_header_payloads() {
             ERR_getErrorName(n)
         );
         compressed.truncate(n);
-
-        let mut dctx = ZSTD_DCtx::new();
-        let mut decoded = vec![0u8; payload.len()];
-        let d = ZSTD_decompress_usingDict(&mut dctx, &mut decoded, &compressed, &dict);
-        assert!(
-            !ERR_isError(d),
-            "{name} dict decompression failed: {}",
-            ERR_getErrorName(d)
+        assert_eq!(
+            ZSTD_getDictID_fromFrame(&compressed),
+            expected_dict_id,
+            "{name} dict frame advertised wrong dictID"
         );
-        decoded.truncate(d);
-        assert_eq!(decoded, payload, "{name} dict roundtrip mismatch");
+
+        if expect_rust_roundtrip {
+            let mut dctx = ZSTD_DCtx::new();
+            let mut decoded = vec![0u8; payload.len()];
+            let d = ZSTD_decompress_usingDict(&mut dctx, &mut decoded, &compressed, &dict);
+            assert!(
+                !ERR_isError(d),
+                "{name} dict decompression failed: {}",
+                ERR_getErrorName(d)
+            );
+            decoded.truncate(d);
+            assert_eq!(decoded, payload, "{name} dict roundtrip mismatch");
+        }
+
+        if let Some(bin) = upstream.as_deref() {
+            assert_eq!(
+                upstream_decode_with_dict(bin, &compressed, &dict),
+                payload,
+                "{name} dict frame upstream cross-decode mismatch"
+            );
+
+            let upstream_frame = upstream_compress_with_dict(bin, &payload, &dict, 3);
+            assert_eq!(
+                ZSTD_getDictID_fromFrame(&upstream_frame),
+                expected_dict_id,
+                "{name} upstream dict frame advertised wrong dictID"
+            );
+            if expect_rust_roundtrip {
+                let mut upstream_decoded = vec![0u8; payload.len()];
+                let d = ZSTD_decompress_usingDict(
+                    &mut ZSTD_DCtx::new(),
+                    &mut upstream_decoded,
+                    &upstream_frame,
+                    &dict,
+                );
+                assert!(
+                    !ERR_isError(d),
+                    "{name} upstream dict frame decompression failed: {}",
+                    ERR_getErrorName(d)
+                );
+                upstream_decoded.truncate(d);
+                assert_eq!(
+                    upstream_decoded, payload,
+                    "{name} upstream dict frame rust cross-decode mismatch"
+                );
+            }
+        }
     }
 }
 

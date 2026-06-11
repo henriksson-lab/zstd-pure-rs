@@ -32,11 +32,40 @@ pub const HUF_BLOCKSIZE_MAX: usize = 128 * 1024;
 const SUSPECT_INCOMPRESSIBLE_SAMPLE_SIZE: usize = 4096;
 const SUSPECT_INCOMPRESSIBLE_SAMPLE_RATIO: usize = 10;
 
-/// Upstream `HUF_CTABLE_WORKSPACE_SIZE_U32` (`huf.h:161`). Byte count
+/// Upstream `HUF_CTABLE_WORKSPACE_SIZE_U32` (`huf.h:161`). U32 count
 /// of the workspace the CTable-building family (`HUF_buildCTable_wksp`,
 /// etc.) expects. Broken out as U32 count + byte count per upstream.
-pub const HUF_CTABLE_WORKSPACE_SIZE_U32: usize = 4 * (256 + 1) + 192;
+pub const HUF_CTABLE_WORKSPACE_SIZE_U32: usize = 4 * (HUF_SYMBOLVALUE_MAX as usize + 1) + 192;
 pub const HUF_CTABLE_WORKSPACE_SIZE: usize = HUF_CTABLE_WORKSPACE_SIZE_U32 * 4;
+const HUF_COMPRESS_WEIGHTS_WORKSPACE_SIZE: usize = round_up_4(
+    (1 + (1 << (MAX_FSE_TABLELOG_FOR_HUFF_HEADER - 1))
+        + ((crate::decompress::huf_decompress::HUF_TABLELOG_MAX as usize + 1) * 2))
+        * 4
+        + (((crate::decompress::huf_decompress::HUF_TABLELOG_MAX as usize + 2)
+            + (1 << MAX_FSE_TABLELOG_FOR_HUFF_HEADER))
+            / 2
+            + 2)
+            * 4
+        + (crate::decompress::huf_decompress::HUF_TABLELOG_MAX as usize + 1) * 4
+        + (crate::decompress::huf_decompress::HUF_TABLELOG_MAX as usize + 1) * 2,
+);
+const HUF_COMPRESS_WEIGHTS_CTABLE_SIZE_U32: usize = 1
+    + (1usize << MAX_FSE_TABLELOG_FOR_HUFF_HEADER) / 2
+    + 2 * (crate::decompress::huf_decompress::HUF_TABLELOG_MAX as usize + 1);
+const HUF_COMPRESS_WEIGHTS_BUILD_WORKSPACE_SIZE: usize =
+    crate::compress::fse_compress::FSE_BUILD_CTABLE_WORKSPACE_SIZE(
+        crate::decompress::huf_decompress::HUF_TABLELOG_MAX,
+        MAX_FSE_TABLELOG_FOR_HUFF_HEADER,
+    );
+pub const HUF_WRITE_CTABLE_WORKSPACE_SIZE: usize = round_up_4(
+    HUF_COMPRESS_WEIGHTS_WORKSPACE_SIZE
+        + (crate::decompress::huf_decompress::HUF_TABLELOG_MAX as usize + 1)
+        + HUF_SYMBOLVALUE_MAX as usize,
+);
+
+const fn round_up_4(size: usize) -> usize {
+    (size + 3) & !3
+}
 
 /// Upstream `HUF_BLOCKBOUND` macro (`huf.h:52`). Only valid when the
 /// caller has pre-filtered incompressible input via the fast
@@ -71,10 +100,9 @@ pub const fn HUF_DTABLE_SIZE(maxTableLog: u32) -> usize {
     1 + (1usize << maxTableLog)
 }
 
-/// Upstream uses `U64` for `HUF_CElt` in the compressor (it packs both
-/// code value and nbBits into one 64-bit word so the hot emit loop can
-/// `BIT_addBitsFast` without a separate lookup).
-pub type HUF_CElt = u64;
+/// Upstream `HUF_CElt` is `size_t`, and each entry packs the code value
+/// plus its bit count into one machine word.
+pub type HUF_CElt = usize;
 
 /// Port of `showU32`. Debug helper in upstream; retained here so the
 /// function surface matches even though Rust tests don't log through it.
@@ -94,10 +122,9 @@ pub fn showCTableBits(ctable: &[HUF_CElt]) -> usize {
 }
 
 /// `HUF_COMPRESSBOUND` — mirror of the header macro.
-/// Compact worst-case: 129 bytes header + srcSize + 1 + 1 + 2 = srcSize + 129.
 #[inline]
 pub const fn HUF_COMPRESSBOUND(srcSize: usize) -> usize {
-    129 + srcSize + 1 + 1 + 2
+    HUF_CTABLEBOUND + HUF_BLOCKBOUND(srcSize)
 }
 
 /// Port of `HUF_compressBound`.
@@ -171,7 +198,7 @@ pub fn HUF_optimalTableLog_internal(
     let mut probe = [0u8; HUF_CTABLEBOUND];
 
     for optLogGuess in minTableLog..=maxTableLog {
-        let mut build_wksp = [0u32; 1024];
+        let mut build_wksp = [0u32; HUF_CTABLE_WORKSPACE_SIZE_U32];
         let maxBits =
             HUF_buildCTable_wksp(table, count, maxSymbolValue, optLogGuess, &mut build_wksp);
         if crate::common::error::ERR_isError(maxBits) {
@@ -182,7 +209,7 @@ pub fn HUF_optimalTableLog_internal(
             break;
         }
 
-        let mut write_wksp = [0u8; 1];
+        let mut write_wksp = [0u8; HUF_WRITE_CTABLE_WORKSPACE_SIZE + HUF_WORKSPACE_MAX_ALIGNMENT];
         let hSize = HUF_writeCTable_wksp(
             &mut probe,
             table,
@@ -210,15 +237,15 @@ pub fn HUF_optimalTableLog_internal(
 
 // ---- HUF_CElt accessors --------------------------------------------------
 //
-// Upstream layout packs (code, nbBits) into one u64:
+// Upstream layout packs (code, nbBits) into one size_t:
 //   bits 0..8      = nbBits (≤ HUF_TABLELOG_ABSOLUTEMAX = 12)
-//   bits (64-nbBits)..64 = code (MSB-justified)
+//   bits (size_t_bits-nbBits)..size_t_bits = code (MSB-justified)
 // Keeping that exact layout so code-complexity-comparator sees the
 // same accessor chain the C code uses.
 
 /// Port of `HUF_getNbBits`.
 #[inline]
-pub fn HUF_getNbBits(elt: HUF_CElt) -> u64 {
+pub fn HUF_getNbBits(elt: HUF_CElt) -> usize {
     elt & 0xFF
 }
 
@@ -226,56 +253,58 @@ pub fn HUF_getNbBits(elt: HUF_CElt) -> u64 {
 /// pre-masked to 8 bits (used in hot loops where the high bits hold
 /// the code).
 #[inline]
-pub fn HUF_getNbBitsFast(elt: HUF_CElt) -> u64 {
+pub fn HUF_getNbBitsFast(elt: HUF_CElt) -> usize {
     elt
 }
 
 /// Port of `HUF_getValue`. Returns the MSB-justified code value with
 /// the nbBits byte cleared.
 #[inline]
-pub fn HUF_getValue(elt: HUF_CElt) -> u64 {
+pub fn HUF_getValue(elt: HUF_CElt) -> usize {
     elt & !0xFF
 }
 
 /// Port of `HUF_getValueFast`. Caller guarantees low byte already
 /// cleared.
 #[inline]
-pub fn HUF_getValueFast(elt: HUF_CElt) -> u64 {
+pub fn HUF_getValueFast(elt: HUF_CElt) -> usize {
     elt
 }
 
 /// Port of `HUF_setNbBits`.
 #[inline]
-pub fn HUF_setNbBits(elt: &mut HUF_CElt, nbBits: u64) {
+pub fn HUF_setNbBits(elt: &mut HUF_CElt, nbBits: usize) {
     debug_assert!(nbBits <= HUF_TABLELOG_ABSOLUTEMAX);
     *elt = nbBits;
 }
 
 /// Port of `HUF_setValue`. Writes `value` MSB-justified above the
 /// existing nbBits byte. No-op when nbBits == 0 (dead symbol).
-pub fn HUF_setValue(elt: &mut HUF_CElt, value: u64) {
+pub fn HUF_setValue(elt: &mut HUF_CElt, value: usize) {
     let nbBits = HUF_getNbBits(*elt);
     if nbBits > 0 {
         debug_assert!(value >> nbBits == 0);
-        *elt |= value << (64 - nbBits);
+        *elt |= value << (usize::BITS as usize - nbBits);
     }
 }
 
 /// Upstream `HUF_TABLELOG_ABSOLUTEMAX` from the decoder header.
-pub const HUF_TABLELOG_ABSOLUTEMAX: u64 =
-    crate::decompress::huf_decompress::HUF_TABLELOG_ABSOLUTEMAX as u64;
+pub const HUF_TABLELOG_ABSOLUTEMAX: usize =
+    crate::decompress::huf_decompress::HUF_TABLELOG_ABSOLUTEMAX as usize;
 
 /// Upstream `HUF_SYMBOLVALUE_MAX`.
 pub const HUF_SYMBOLVALUE_MAX: u32 = crate::decompress::huf_decompress::HUF_SYMBOLVALUE_MAX;
 
 /// Port of `HUF_CTableHeader`. Upstream packs this at `CTable[0]` —
 /// the 64-bit CElt whose low bytes are { tableLog, maxSymbolValue,
-/// reserved*6 }.
+/// reserved bytes }.
+pub const HUF_CTABLE_HEADER_UNUSED_SIZE: usize = core::mem::size_of::<usize>() - 2;
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct HUF_CTableHeader {
     pub tableLog: u8,
     pub maxSymbolValue: u8,
-    pub unused: [u8; 6],
+    pub unused: [u8; HUF_CTABLE_HEADER_UNUSED_SIZE],
 }
 
 /// Port of `HUF_readCTableHeader`.
@@ -284,7 +313,7 @@ pub fn HUF_readCTableHeader(ctable: &[HUF_CElt]) -> HUF_CTableHeader {
     HUF_CTableHeader {
         tableLog: raw as u8,
         maxSymbolValue: (raw >> 8) as u8,
-        unused: [0; 6],
+        unused: [0; HUF_CTABLE_HEADER_UNUSED_SIZE],
     }
 }
 
@@ -356,7 +385,7 @@ pub fn HUF_readCTable(
     for (n, elt) in ct.iter_mut().take(nbSymbols as usize).enumerate() {
         let w = huffWeight[n];
         let nbBits = if w != 0 { tableLog + 1 - w as u32 } else { 0 };
-        HUF_setNbBits(elt, nbBits as u64);
+        HUF_setNbBits(elt, nbBits as usize);
     }
 
     // Count symbols per rank, compute starting code-value per rank.
@@ -379,7 +408,7 @@ pub fn HUF_readCTable(
     // Assign code value within each rank, in symbol order.
     for elt in ct.iter_mut().take(nbSymbols as usize) {
         let rank = HUF_getNbBits(*elt) as usize;
-        HUF_setValue(elt, valPerRank[rank] as u64);
+        HUF_setValue(elt, valPerRank[rank] as usize);
         valPerRank[rank] += 1;
     }
 
@@ -390,7 +419,7 @@ pub fn HUF_readCTable(
 pub fn HUF_writeCTableHeader(ctable: &mut [HUF_CElt], tableLog: u32, maxSymbolValue: u32) {
     debug_assert!(tableLog < 256);
     debug_assert!(maxSymbolValue < 256);
-    ctable[0] = (tableLog as u64) | ((maxSymbolValue as u64) << 8);
+    ctable[0] = (tableLog as usize) | ((maxSymbolValue as usize) << 8);
 }
 
 /// Port of `HUF_getNbBitsFromCTable`. The table starts at `CTable[1]`
@@ -467,7 +496,9 @@ pub const RANK_POSITION_MAX_COUNT_LOG: u32 = 32;
 pub const RANK_POSITION_LOG_BUCKETS_BEGIN: u32 =
     (RANK_POSITION_TABLE_SIZE as u32 - 1) - RANK_POSITION_MAX_COUNT_LOG - 1; // == 158
 /// Cutoff where count-buckets stop being 1:1 and switch to log2.
-pub const RANK_POSITION_DISTINCT_COUNT_CUTOFF: u32 = RANK_POSITION_LOG_BUCKETS_BEGIN + 7; // == 165
+pub const RANK_POSITION_DISTINCT_COUNT_CUTOFF: u32 = RANK_POSITION_LOG_BUCKETS_BEGIN + 7; // == ZSTD_highbit32(158) + 158
+
+const HUF_NODE_TABLE_SIZE: usize = 2 * (HUF_SYMBOLVALUE_MAX as usize + 1);
 
 /// Port of `HUF_getIndex`. Maps a symbol count to its bucket.
 #[inline]
@@ -896,13 +927,13 @@ pub fn HUF_buildCTableFromTree(
     // Push nbBits per symbol (in symbol order).
     for node in huffNode.iter().take(alphabetSize) {
         let b = node.byte as usize;
-        HUF_setNbBits(&mut ctable[ct_start + b], node.nbBits as u64);
+        HUF_setNbBits(&mut ctable[ct_start + b], node.nbBits as usize);
     }
     // Assign value within rank (also symbol order).
     for n in 0..alphabetSize {
         let nb = HUF_getNbBits(ctable[ct_start + n]) as usize;
         let v = valPerRank[nb] as u64;
-        HUF_setValue(&mut ctable[ct_start + n], v);
+        HUF_setValue(&mut ctable[ct_start + n], v as usize);
         valPerRank[nb] += 1;
     }
 
@@ -918,38 +949,56 @@ pub const HUF_TABLELOG_DEFAULT: u32 = 11;
 ///
 /// Rust signature note: upstream passes a single `void*` workspace
 /// containing both the nodeElt array and the rankPos array. The Rust
-/// port allocates them as typed arrays locally — the workspace
-/// argument is accepted for API parity but currently unused.
+/// port overlays those typed slices onto the caller's `[u32]`
+/// workspace.
 pub fn HUF_buildCTable_wksp(
     ct: &mut [HUF_CElt],
     count: &[u32],
     maxSymbolValue: u32,
     mut maxNbBits: u32,
-    _workSpace: &mut [u32],
+    workSpace: &mut [u32],
 ) -> usize {
     use crate::common::error::{ErrorCode, ERROR};
+    if workSpace.len() * core::mem::size_of::<u32>() < HUF_CTABLE_WORKSPACE_SIZE {
+        return ERROR(ErrorCode::WorkSpaceTooSmall);
+    }
     if maxNbBits == 0 {
         maxNbBits = HUF_TABLELOG_DEFAULT;
     }
     if maxSymbolValue > HUF_SYMBOLVALUE_MAX {
         return ERROR(ErrorCode::MaxSymbolValueTooLarge);
     }
-    // Upstream's huffNodeTbl: `2 * (HUF_SYMBOLVALUE_MAX + 1)` entries.
-    // `huffNode = huffNodeTbl + 1`. Our port treats huffNodeTbl and
-    // huffNode as the same buffer — the `huffNode[-1]` sentinel is
-    // emulated inside `HUF_buildTree`.
-    let mut huffNode = vec![nodeElt::default(); 2 * (HUF_SYMBOLVALUE_MAX as usize + 1)];
-    let mut rankPosition = vec![rankPos::default(); RANK_POSITION_TABLE_SIZE];
+    let (huffNode, rankPosition) = HUF_buildCTableWorkspaceSlices(workSpace);
+    huffNode.fill(nodeElt::default());
+    rankPosition.fill(rankPos::default());
 
-    HUF_sort(&mut huffNode, count, maxSymbolValue, &mut rankPosition);
-    let nonNullRank = HUF_buildTree(&mut huffNode, maxSymbolValue);
-    let finalMaxBits = HUF_setMaxHeight(&mut huffNode, nonNullRank as u32, maxNbBits);
+    HUF_sort(huffNode, count, maxSymbolValue, rankPosition);
+    let nonNullRank = HUF_buildTree(huffNode, maxSymbolValue);
+    let finalMaxBits = HUF_setMaxHeight(huffNode, nonNullRank as u32, maxNbBits);
     let HUF_TABLELOG_MAX = crate::decompress::huf_decompress::HUF_TABLELOG_MAX;
     if finalMaxBits > HUF_TABLELOG_MAX {
         return ERROR(ErrorCode::Generic);
     }
-    HUF_buildCTableFromTree(ct, &huffNode, nonNullRank, maxSymbolValue, finalMaxBits);
+    HUF_buildCTableFromTree(ct, huffNode, nonNullRank, maxSymbolValue, finalMaxBits);
     finalMaxBits as usize
+}
+
+fn HUF_buildCTableWorkspaceSlices(workSpace: &mut [u32]) -> (&mut [nodeElt], &mut [rankPos]) {
+    debug_assert_eq!(core::mem::size_of::<nodeElt>(), 8);
+    debug_assert_eq!(core::mem::align_of::<nodeElt>(), 4);
+    debug_assert_eq!(core::mem::size_of::<rankPos>(), 4);
+    debug_assert!(workSpace.len() * core::mem::size_of::<u32>() >= HUF_CTABLE_WORKSPACE_SIZE);
+
+    let base = workSpace.as_mut_ptr().cast::<u8>();
+    let node_bytes = HUF_NODE_TABLE_SIZE * core::mem::size_of::<nodeElt>();
+    unsafe {
+        let huffNode = core::slice::from_raw_parts_mut(base.cast::<nodeElt>(), HUF_NODE_TABLE_SIZE);
+        let rankPosition = core::slice::from_raw_parts_mut(
+            base.add(node_bytes).cast::<rankPos>(),
+            RANK_POSITION_TABLE_SIZE,
+        );
+        (huffNode, rankPosition)
+    }
 }
 
 /// Port of `HUF_buildCTable` — convenience wrapper with an internal
@@ -960,7 +1009,7 @@ pub fn HUF_buildCTable(
     maxSymbolValue: u32,
     maxNbBits: u32,
 ) -> usize {
-    let mut wksp = [0u32; 1024];
+    let mut wksp = [0u32; HUF_CTABLE_WORKSPACE_SIZE_U32];
     HUF_buildCTable_wksp(ct, count, maxSymbolValue, maxNbBits, &mut wksp)
 }
 
@@ -985,7 +1034,7 @@ pub fn HUF_estimateCompressedSize(
 /// the CTable — the precondition the emit loop needs.
 pub fn HUF_validateCTable(ctable: &[HUF_CElt], count: &[u32], maxSymbolValue: u32) -> bool {
     let header = HUF_readCTableHeader(ctable);
-    debug_assert!(header.tableLog as u64 <= HUF_TABLELOG_ABSOLUTEMAX);
+    debug_assert!(header.tableLog as usize <= HUF_TABLELOG_ABSOLUTEMAX);
     if (header.maxSymbolValue as u32) < maxSymbolValue {
         return false;
     }
@@ -1010,7 +1059,7 @@ pub const MAX_FSE_TABLELOG_FOR_HUFF_HEADER: u32 = 6;
 pub fn HUF_compressWeights(dst: &mut [u8], weightTable: &[u8]) -> usize {
     use crate::compress::fse_compress::{
         FSE_buildCTable_wksp, FSE_compress_usingCTable, FSE_normalizeCount, FSE_optimalTableLog,
-        FSE_writeNCount, FSE_CTABLE_SIZE_U32,
+        FSE_writeNCount,
     };
     use crate::compress::hist::HIST_count_simple;
 
@@ -1035,7 +1084,6 @@ pub fn HUF_compressWeights(dst: &mut [u8], weightTable: &[u8]) -> usize {
     if crate::common::error::ERR_isError(rc) {
         return rc;
     }
-    let tableLog = rc as u32;
 
     let mut written = 0usize;
     let hSize = FSE_writeNCount(&mut dst[written..], &norm, maxSymbolValue, tableLog);
@@ -1044,9 +1092,10 @@ pub fn HUF_compressWeights(dst: &mut [u8], weightTable: &[u8]) -> usize {
     }
     written += hSize;
 
-    let ct_slots = FSE_CTABLE_SIZE_U32(tableLog, maxSymbolValue);
-    let mut ct = vec![0u32; ct_slots];
-    let mut build_wksp = vec![0u8; (maxSymbolValue as usize + 2) * 2 + (1 << tableLog) + 8];
+    debug_assert!(tableLog <= MAX_FSE_TABLELOG_FOR_HUFF_HEADER);
+    debug_assert!(maxSymbolValue <= crate::decompress::huf_decompress::HUF_TABLELOG_MAX);
+    let mut ct = [0u32; HUF_COMPRESS_WEIGHTS_CTABLE_SIZE_U32];
+    let mut build_wksp = [0u8; HUF_COMPRESS_WEIGHTS_BUILD_WORKSPACE_SIZE];
     let rc = FSE_buildCTable_wksp(&mut ct, &norm, maxSymbolValue, tableLog, &mut build_wksp);
     if crate::common::error::ERR_isError(rc) {
         return rc;
@@ -1062,17 +1111,25 @@ pub fn HUF_compressWeights(dst: &mut [u8], weightTable: &[u8]) -> usize {
 }
 
 /// Port of `HUF_writeCTable_wksp` (`huf_compress.c:248`). External-
-/// workspace variant of `HUF_writeCTable`. Our port allocates the
-/// workspace internally and ignores the caller's — the `_wksp` entry
-/// exists only for upstream API-surface parity.
+/// workspace variant of `HUF_writeCTable`. The caller's workspace is
+/// used for the temporary Huffman weight table.
 pub fn HUF_writeCTable_wksp(
     dst: &mut [u8],
     ct: &[HUF_CElt],
     maxSymbolValue: u32,
     huffLog: u32,
-    _workspace: &mut [u8],
+    workspace: &mut [u8],
 ) -> usize {
-    HUF_writeCTable(dst, ct, maxSymbolValue, huffLog)
+    use crate::common::error::{ErrorCode, ERROR};
+    let mut workspaceSize = workspace.len();
+    let aligned = HUF_alignUpWorkspace(workspace.as_ptr() as usize, &mut workspaceSize, 4);
+    if aligned.is_none() || workspaceSize < HUF_WRITE_CTABLE_WORKSPACE_SIZE {
+        return ERROR(ErrorCode::Generic);
+    }
+    let aligned = aligned.unwrap();
+    let weight_len = HUF_SYMBOLVALUE_MAX as usize + 1;
+    let huffWeight = unsafe { core::slice::from_raw_parts_mut(aligned as *mut u8, weight_len) };
+    HUF_writeCTable_body(dst, ct, maxSymbolValue, huffLog, huffWeight)
 }
 
 /// Port of `HUF_writeCTable` (`huf_compress.c` — `_wksp` entry). Emits
@@ -1085,6 +1142,17 @@ pub fn HUF_writeCTable(
     maxSymbolValue: u32,
     huffLog: u32,
 ) -> usize {
+    let mut huffWeight = [0u8; HUF_SYMBOLVALUE_MAX as usize + 1];
+    HUF_writeCTable_body(dst, ct, maxSymbolValue, huffLog, &mut huffWeight)
+}
+
+fn HUF_writeCTable_body(
+    dst: &mut [u8],
+    ct: &[HUF_CElt],
+    maxSymbolValue: u32,
+    huffLog: u32,
+    huffWeight: &mut [u8],
+) -> usize {
     use crate::common::error::{ErrorCode, ERROR};
     debug_assert_eq!(
         HUF_readCTableHeader(ct).maxSymbolValue as u32,
@@ -1094,6 +1162,8 @@ pub fn HUF_writeCTable(
     if maxSymbolValue > HUF_SYMBOLVALUE_MAX {
         return ERROR(ErrorCode::MaxSymbolValueTooLarge);
     }
+    debug_assert!(huffWeight.len() > maxSymbolValue as usize);
+    huffWeight[..=maxSymbolValue as usize].fill(0);
     // bitsToWeight: convert nbBits → weight. weight[n] = tableLog+1-n.
     let mut bitsToWeight =
         [0u8; (crate::decompress::huf_decompress::HUF_TABLELOG_MAX + 1) as usize];
@@ -1107,7 +1177,6 @@ pub fn HUF_writeCTable(
         *w = (huffLog + 1 - n as u32) as u8;
     }
     // huffWeight[n] = bitsToWeight[nbBits(ct[n])] for n in [0..maxSymbolValue).
-    let mut huffWeight = vec![0u8; HUF_SYMBOLVALUE_MAX as usize + 1];
     for n in 0..maxSymbolValue as usize {
         let nb = HUF_getNbBits(ct[1 + n]) as usize;
         huffWeight[n] = bitsToWeight[nb];
@@ -1736,16 +1805,18 @@ pub fn HUF_compressCTable_internal(
     }
     // Post-check: total payload (header + emit) must be strictly
     // smaller than raw-size-1 to be worth keeping.
-    if op_start + cSize >= srcSize.saturating_sub(1) {
+    if op_start + cSize >= srcSize.wrapping_sub(1) {
         return 0;
     }
     op_start + cSize
 }
 
 /// Port of `HUF_compress_internal` — the tie-together that builds a
-/// new CTable from `src`, writes it, and emits the payload. `repeat`
-/// is mutated from `HUF_repeat_none` to `HUF_repeat_check` when a
-/// fresh table was used (matching upstream semantics).
+/// new CTable from `src`, writes it, and emits the payload. When a
+/// fresh table is used, `repeat` is left as `HUF_repeat_none` after
+/// saving the new table, matching upstream's `HUF_compress*_repeat`
+/// contract. The literals wrapper promotes successful compressed
+/// literal blocks to `HUF_repeat_check`.
 pub fn HUF_compress_internal(
     dst: &mut [u8],
     src: &[u8],
@@ -1792,7 +1863,7 @@ pub fn HUF_compress_internal(
     if (flags & crate::decompress::huf_decompress::HUF_flags_suspectUncompressible) != 0
         && srcSize >= (SUSPECT_INCOMPRESSIBLE_SAMPLE_SIZE * SUSPECT_INCOMPRESSIBLE_SAMPLE_RATIO)
     {
-        let mut count = vec![0u32; (HUF_SYMBOLVALUE_MAX + 1) as usize];
+        let mut count = [0u32; HUF_SYMBOLVALUE_MAX as usize + 1];
         let mut maxSymbolValueBegin = maxSymbolValue;
         let largestBegin = crate::compress::hist::HIST_count_simple(
             &mut count,
@@ -1812,8 +1883,8 @@ pub fn HUF_compress_internal(
     }
 
     // Histogram.
-    let mut count = vec![0u32; (HUF_SYMBOLVALUE_MAX + 1) as usize];
-    let mut hist_wksp = vec![0u32; crate::compress::hist::HIST_WKSP_SIZE_U32];
+    let mut count = [0u32; HUF_SYMBOLVALUE_MAX as usize + 1];
+    let mut hist_wksp = [0u32; crate::compress::hist::HIST_WKSP_SIZE_U32];
     let largest = HIST_count_wksp(&mut count, &mut maxSymbolValue, src, &mut hist_wksp);
     if crate::common::error::ERR_isError(largest) {
         return largest;
@@ -1843,7 +1914,7 @@ pub fn HUF_compress_internal(
     }
 
     // Build fresh CTable.
-    let mut ctable = vec![0u64; (HUF_SYMBOLVALUE_MAX + 2) as usize];
+    let mut ctable = [HUF_CElt::default(); HUF_SYMBOLVALUE_MAX as usize + 2];
     huffLog =
         HUF_optimalTableLog_internal(huffLog, srcSize, maxSymbolValue, &mut ctable, &count, flags);
     let maxBits = HUF_buildCTable(&mut ctable, &count, maxSymbolValue, huffLog);
@@ -1950,6 +2021,44 @@ mod tests {
     }
 
     #[test]
+    fn rank_position_cutoff_matches_upstream_formula() {
+        assert_eq!(RANK_POSITION_LOG_BUCKETS_BEGIN, 158);
+        assert_eq!(RANK_POSITION_DISTINCT_COUNT_CUTOFF, 165);
+        assert_eq!(
+            RANK_POSITION_DISTINCT_COUNT_CUTOFF,
+            RANK_POSITION_LOG_BUCKETS_BEGIN + ZSTD_highbit32(RANK_POSITION_LOG_BUCKETS_BEGIN)
+        );
+    }
+
+    #[test]
+    fn compress_weights_keeps_fse_tablelog_after_normalize_success() {
+        let mut weights = Vec::new();
+        for _ in 0..24 {
+            weights.push(1);
+        }
+        for _ in 0..17 {
+            weights.push(2);
+        }
+        for _ in 0..11 {
+            weights.push(3);
+        }
+        for _ in 0..7 {
+            weights.push(4);
+        }
+        for _ in 0..5 {
+            weights.push(5);
+        }
+        let mut dst = [0u8; HUF_COMPRESS_WEIGHTS_WORKSPACE_SIZE];
+
+        let got = HUF_compressWeights(&mut dst, &weights);
+
+        assert!(
+            !crate::common::error::ERR_isError(got),
+            "unexpected error code: {got}"
+        );
+    }
+
+    #[test]
     fn readCTable_roundtrip_via_writeCTable() {
         // Parity proof for `HUF_readCTable`: build a CTable → write
         // → read → compare the per-symbol nbBits. Upstream guarantees
@@ -1974,7 +2083,7 @@ mod tests {
             .unwrap_or(0) as u32;
         let totalCount: usize = count.iter().sum::<u32>() as usize;
         let tableLog = HUF_optimalTableLog(11, totalCount, maxSymbolValue);
-        let mut ct = vec![0u64; 257];
+        let mut ct = vec![HUF_CElt::default(); 257];
         let mut wksp = vec![0u32; HUF_CTABLE_WORKSPACE_SIZE_U32];
         let _ = HUF_buildCTable_wksp(&mut ct, &count, maxSymbolValue, tableLog, &mut wksp);
 
@@ -1982,7 +2091,7 @@ mod tests {
         let written = HUF_writeCTable(&mut hdr, &ct, maxSymbolValue, tableLog);
         assert!(!crate::common::error::ERR_isError(written));
 
-        let mut ct2 = vec![0u64; 257];
+        let mut ct2 = vec![HUF_CElt::default(); 257];
         let mut maxSymbolValuePtr = maxSymbolValue;
         let mut hasZeroWeights: u32 = 0;
         let consumed = HUF_readCTable(
@@ -2055,7 +2164,7 @@ mod tests {
         let mut count = vec![0u32; 256];
         let mut max_symbol_value = 255u32;
         crate::compress::hist::HIST_count_simple(&mut count, &mut max_symbol_value, src);
-        let mut table = vec![0u64; (HUF_SYMBOLVALUE_MAX + 2) as usize];
+        let mut table = vec![HUF_CElt::default(); (HUF_SYMBOLVALUE_MAX + 2) as usize];
         let got = HUF_optimalTableLog_internal(
             12,
             src.len(),
@@ -2070,7 +2179,7 @@ mod tests {
         let mut want = 12;
         let mut best_size = usize::MAX - 1;
         for guess in min_table_log..=12 {
-            let mut scratch = vec![0u64; (HUF_SYMBOLVALUE_MAX + 2) as usize];
+            let mut scratch = vec![HUF_CElt::default(); (HUF_SYMBOLVALUE_MAX + 2) as usize];
             let max_bits = HUF_buildCTable(&mut scratch, &count, max_symbol_value, guess);
             if crate::common::error::ERR_isError(max_bits) {
                 continue;
@@ -2132,12 +2241,12 @@ mod tests {
         HUF_setValue(&mut elt, 22);
         assert_eq!(HUF_getNbBits(elt), 5);
         // Value is MSB-justified: 22 << (64 - 5) = 22 << 59.
-        assert_eq!(HUF_getValue(elt), 22u64 << 59);
+        assert_eq!(HUF_getValue(elt), 22usize << (usize::BITS as usize - 5));
     }
 
     #[test]
     fn ctable_header_roundtrip() {
-        let mut ct = [0u64; 8];
+        let mut ct = [HUF_CElt::default(); 8];
         HUF_writeCTableHeader(&mut ct, 11, 255);
         let h = HUF_readCTableHeader(&ct);
         assert_eq!(h.tableLog, 11);
@@ -2146,7 +2255,7 @@ mod tests {
 
     #[test]
     fn get_nbbits_from_ctable_respects_max_symbol() {
-        let mut ct = [0u64; 260];
+        let mut ct = [HUF_CElt::default(); 260];
         HUF_writeCTableHeader(&mut ct, 8, 5);
         // Set nbBits=7 for symbol 3.
         HUF_setNbBits(&mut ct[1 + 3], 7);
@@ -2191,7 +2300,7 @@ mod tests {
         ];
         let maxSV = 3u32;
         let maxNbBits = 3u32;
-        let mut ct = vec![0u64; 1 + (maxSV + 1) as usize];
+        let mut ct = vec![HUF_CElt::default(); 1 + (maxSV + 1) as usize];
         HUF_buildCTableFromTree(&mut ct, &huffNode, 3, maxSV, maxNbBits);
 
         // Each symbol's nbBits should match.
@@ -2210,10 +2319,10 @@ mod tests {
         //   sym 1 (nb=2) = "01"     → value 1 → 1<<62
         //   sym 2 (nb=3) = "000"    → value 0 → 0<<61
         //   sym 3 (nb=3) = "001"    → value 1 → 1<<61
-        assert_eq!(HUF_getValue(ct[1]) >> 63, 1);
-        assert_eq!(HUF_getValue(ct[2]) >> 62, 1);
-        assert_eq!(HUF_getValue(ct[3]) >> 61, 0);
-        assert_eq!(HUF_getValue(ct[4]) >> 61, 1);
+        assert_eq!(HUF_getValue(ct[1]) >> (usize::BITS as usize - 1), 1);
+        assert_eq!(HUF_getValue(ct[2]) >> (usize::BITS as usize - 2), 1);
+        assert_eq!(HUF_getValue(ct[3]) >> (usize::BITS as usize - 3), 0);
+        assert_eq!(HUF_getValue(ct[4]) >> (usize::BITS as usize - 3), 1);
 
         // Header reflects the params.
         let h = HUF_readCTableHeader(&ct);
@@ -2303,7 +2412,7 @@ mod tests {
         count[1] = 1;
         count[2] = 1;
         count[3] = 1;
-        let mut ct = [0u64; 257];
+        let mut ct = [HUF_CElt::default(); 257];
         let rc = HUF_buildCTable(&mut ct, &count, 3, 8);
         assert!(!crate::common::error::ERR_isError(rc));
         let finalMaxBits = rc as u32;
@@ -2335,7 +2444,7 @@ mod tests {
         count[5] = 2;
         count[6] = 1;
         count[7] = 1;
-        let mut ct = [0u64; 257];
+        let mut ct = [HUF_CElt::default(); 257];
         let rc = HUF_buildCTable(&mut ct, &count, 7, 4);
         assert!(!crate::common::error::ERR_isError(rc));
         let finalMaxBits = rc as u32;
@@ -2360,7 +2469,7 @@ mod tests {
         count[1] = 50;
         count[2] = 10;
         count[3] = 5;
-        let mut ct = [0u64; 257];
+        let mut ct = [HUF_CElt::default(); 257];
         let rc = HUF_buildCTable(&mut ct, &count, 3, 8);
         assert!(!crate::common::error::ERR_isError(rc));
 
@@ -2380,7 +2489,7 @@ mod tests {
         let mut count = [0u32; 256];
         count[0] = 10;
         count[1] = 5;
-        let mut ct = [0u64; 257];
+        let mut ct = [HUF_CElt::default(); 257];
         HUF_buildCTable(&mut ct, &count, 1, 4);
         assert!(HUF_validateCTable(&ct, &count, 1));
 
@@ -2403,7 +2512,7 @@ mod tests {
         let mut count = [0u32; 256];
         let mut msv: u32 = 255;
         crate::compress::hist::HIST_count_simple(&mut count, &mut msv, src);
-        let mut ct = vec![0u64; 257];
+        let mut ct = vec![HUF_CElt::default(); 257];
         let tableLog = HUF_buildCTable(&mut ct, &count, msv, 8);
         assert!(!crate::common::error::ERR_isError(tableLog));
         assert!(HUF_validateCTable(&ct, &count, msv));
@@ -2441,7 +2550,7 @@ mod tests {
         count[2] = 15;
         count[3] = 5;
         let maxSV = 3u32;
-        let mut ct = [0u64; 257];
+        let mut ct = [HUF_CElt::default(); 257];
         let rc = HUF_buildCTable(&mut ct, &count, maxSV, 8);
         assert!(!crate::common::error::ERR_isError(rc));
         let tableLog = rc as u32;
@@ -2511,7 +2620,7 @@ mod tests {
         let mut count = [0u32; 256];
         let mut msv: u32 = 255;
         HIST_count_simple(&mut count, &mut msv, &src);
-        let mut ct = vec![0u64; 257];
+        let mut ct = vec![HUF_CElt::default(); 257];
         let tableLog = HUF_buildCTable(&mut ct, &count, msv, 8);
         assert!(!crate::common::error::ERR_isError(tableLog));
 
@@ -2592,7 +2701,7 @@ mod tests {
             .copied()
             .collect();
 
-        let mut seeded = vec![0u64; (HUF_SYMBOLVALUE_MAX + 2) as usize];
+        let mut seeded = vec![HUF_CElt::default(); (HUF_SYMBOLVALUE_MAX + 2) as usize];
         let mut repeat = HUF_repeat::HUF_repeat_none;
         let mut scratch = vec![0u8; HUF_compressBound(src.len())];
         let first = HUF_compress1X_repeat(
@@ -2634,9 +2743,85 @@ mod tests {
     }
 
     #[test]
+    fn huf_compress_repeat_saves_fresh_table_but_leaves_repeat_none() {
+        let src: Vec<u8> = b"fresh-table-repeat-contract"
+            .iter()
+            .cycle()
+            .take(256)
+            .copied()
+            .collect();
+        let mut huf_table = vec![HUF_CElt::default(); (HUF_SYMBOLVALUE_MAX + 2) as usize];
+        let mut repeat = HUF_repeat::HUF_repeat_none;
+        let mut dst = vec![0u8; HUF_compressBound(src.len())];
+
+        let written = HUF_compress1X_repeat(
+            &mut dst,
+            &src,
+            HUF_SYMBOLVALUE_MAX,
+            HUF_TABLELOG_DEFAULT,
+            Some(&mut huf_table),
+            Some(&mut repeat),
+            0,
+        );
+
+        assert!(!crate::common::error::ERR_isError(written));
+        assert!(written > 0);
+        assert_eq!(repeat, HUF_repeat::HUF_repeat_none);
+        assert_ne!(HUF_readCTableHeader(&huf_table).tableLog, 0);
+    }
+
+    #[test]
     fn compress_bound_exceeds_src() {
         assert!(HUF_compressBound(0) >= 129);
-        assert_eq!(HUF_compressBound(1024), 1024 + 129 + 4);
+        assert_eq!(HUF_compressBound(1024), 1024 + 129 + (1024 >> 8) + 8);
+    }
+
+    #[test]
+    fn huf_workspace_constants_match_upstream() {
+        assert_eq!(HUF_CTABLE_WORKSPACE_SIZE_U32, 4 * 256 + 192);
+        assert_eq!(HUF_CTABLE_WORKSPACE_SIZE, HUF_CTABLE_WORKSPACE_SIZE_U32 * 4);
+        assert_eq!(HUF_WRITE_CTABLE_WORKSPACE_SIZE, 748);
+    }
+
+    #[test]
+    fn huf_wksp_entry_points_reject_too_small_workspace() {
+        use crate::common::error::{ERR_getErrorCode, ErrorCode};
+
+        let count = [1u32, 1, 1, 1];
+        let mut ct = [HUF_CElt::default(); HUF_CTABLE_SIZE_ST(HUF_SYMBOLVALUE_MAX)];
+        let mut tiny_build = [0u32; 1];
+        let rc = HUF_buildCTable_wksp(&mut ct, &count, 3, 8, &mut tiny_build);
+        assert_eq!(ERR_getErrorCode(rc), ErrorCode::WorkSpaceTooSmall);
+
+        let mut build_wksp = [0u32; HUF_CTABLE_WORKSPACE_SIZE_U32];
+        let table_log = HUF_buildCTable_wksp(&mut ct, &count, 3, 8, &mut build_wksp);
+        assert!(!crate::common::error::ERR_isError(table_log));
+
+        let mut dst = [0u8; HUF_CTABLEBOUND];
+        let mut tiny_write = [0u8; 1];
+        let rc = HUF_writeCTable_wksp(&mut dst, &ct, 3, table_log as u32, &mut tiny_write);
+        assert_eq!(ERR_getErrorCode(rc), ErrorCode::Generic);
+    }
+
+    #[test]
+    fn huf_write_ctable_wksp_accepts_unaligned_workspace_with_slack() {
+        let count = [1u32, 1, 1, 1];
+        let mut ct = [HUF_CElt::default(); HUF_CTABLE_SIZE_ST(HUF_SYMBOLVALUE_MAX)];
+        let mut build_wksp = [0u32; HUF_CTABLE_WORKSPACE_SIZE_U32];
+        let table_log = HUF_buildCTable_wksp(&mut ct, &count, 3, 8, &mut build_wksp);
+        assert!(!crate::common::error::ERR_isError(table_log));
+
+        let mut dst = [0u8; HUF_CTABLEBOUND];
+        let mut backing = [0u8; HUF_WRITE_CTABLE_WORKSPACE_SIZE + HUF_WORKSPACE_MAX_ALIGNMENT];
+        let base = backing.as_ptr() as usize;
+        let offset = if base.is_multiple_of(4) { 1 } else { 0 };
+        let written =
+            HUF_writeCTable_wksp(&mut dst, &ct, 3, table_log as u32, &mut backing[offset..]);
+        assert!(
+            !crate::common::error::ERR_isError(written),
+            "writeCTable_wksp err: {}",
+            crate::common::error::ERR_getErrorName(written)
+        );
     }
 
     #[test]

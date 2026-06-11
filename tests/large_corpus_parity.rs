@@ -8,7 +8,9 @@ use std::process::{Command, Stdio};
 
 use zstd_pure_rs::common::error::{ERR_getErrorName, ERR_isError};
 use zstd_pure_rs::compress::zstd_compress::{ZSTD_compress, ZSTD_compressBound};
-use zstd_pure_rs::decompress::zstd_decompress::ZSTD_decompress;
+use zstd_pure_rs::decompress::zstd_decompress::{
+    ZSTD_decompress, ZSTD_findDecompressedSize, ZSTD_getFrameContentSize,
+};
 
 fn upstream_zstd() -> Option<PathBuf> {
     let out = Command::new("which").arg("zstd").output().ok()?;
@@ -85,6 +87,10 @@ fn decompress_with_rust(src: &[u8], expected_len: usize) -> Vec<u8> {
         "decompress failed: {}",
         ERR_getErrorName(out)
     );
+    assert_eq!(
+        out, expected_len,
+        "decompress returned {out} bytes, expected {expected_len}"
+    );
     dst.truncate(out);
     dst
 }
@@ -143,6 +149,18 @@ fn large_corpus_roundtrip_and_upstream_cross_parity() {
         );
         for &level in &[1, 3, 10, 19] {
             let compressed = compress_with_rust(&payload, level);
+            assert_eq!(
+                ZSTD_getFrameContentSize(&compressed),
+                payload.len() as u64,
+                "[{label} {} level {level}] rust frame should declare source size",
+                path.display()
+            );
+            assert_eq!(
+                ZSTD_findDecompressedSize(&compressed),
+                payload.len() as u64,
+                "[{label} {} level {level}] frame size discovery mismatch",
+                path.display()
+            );
             let roundtrip = decompress_with_rust(&compressed, payload.len());
             assert_eq!(
                 roundtrip,

@@ -8,53 +8,52 @@
 //! keeping it bit-identical means FFI consumers of the original C API
 //! could swap implementations without any source change.
 
-/// Sum of all ZSTD error codes. Values are fixed by upstream and must
-/// not drift; they are serialized indirectly through
-/// `(size_t)-code` return values from the C-compatible API.
-#[repr(i32)]
+/// ZSTD error code. Upstream uses a C enum, which can carry unnamed
+/// integer values after casts. `Unknown` preserves those raw values
+/// without creating invalid Rust enum discriminants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ErrorCode {
-    NoError = 0,
-    Generic = 1,
-    PrefixUnknown = 10,
-    VersionUnsupported = 12,
-    FrameParameterUnsupported = 14,
-    FrameParameterWindowTooLarge = 16,
-    CorruptionDetected = 20,
-    ChecksumWrong = 22,
-    LiteralsHeaderWrong = 24,
-    DictionaryCorrupted = 30,
-    DictionaryWrong = 32,
-    DictionaryCreationFailed = 34,
-    ParameterUnsupported = 40,
-    ParameterCombinationUnsupported = 41,
-    ParameterOutOfBound = 42,
-    TableLogTooLarge = 44,
-    MaxSymbolValueTooLarge = 46,
-    MaxSymbolValueTooSmall = 48,
-    CannotProduceUncompressedBlock = 49,
-    StabilityConditionNotRespected = 50,
-    StageWrong = 60,
-    InitMissing = 62,
-    MemoryAllocation = 64,
-    WorkSpaceTooSmall = 66,
-    DstSizeTooSmall = 70,
-    SrcSizeWrong = 72,
-    DstBufferNull = 74,
-    NoForwardProgressDestFull = 80,
-    NoForwardProgressInputEmpty = 82,
-    FrameIndexTooLarge = 100,
-    SeekableIO = 102,
-    DstBufferWrong = 104,
-    SrcBufferWrong = 105,
-    SequenceProducerFailed = 106,
-    ExternalSequencesInvalid = 107,
-    MaxCode = 120,
+    NoError,
+    Generic,
+    PrefixUnknown,
+    VersionUnsupported,
+    FrameParameterUnsupported,
+    FrameParameterWindowTooLarge,
+    CorruptionDetected,
+    ChecksumWrong,
+    LiteralsHeaderWrong,
+    DictionaryCorrupted,
+    DictionaryWrong,
+    DictionaryCreationFailed,
+    ParameterUnsupported,
+    ParameterCombinationUnsupported,
+    ParameterOutOfBound,
+    TableLogTooLarge,
+    MaxSymbolValueTooLarge,
+    MaxSymbolValueTooSmall,
+    CannotProduceUncompressedBlock,
+    StabilityConditionNotRespected,
+    StageWrong,
+    InitMissing,
+    MemoryAllocation,
+    WorkSpaceTooSmall,
+    DstSizeTooSmall,
+    SrcSizeWrong,
+    DstBufferNull,
+    NoForwardProgressDestFull,
+    NoForwardProgressInputEmpty,
+    FrameIndexTooLarge,
+    SeekableIO,
+    DstBufferWrong,
+    SrcBufferWrong,
+    SequenceProducerFailed,
+    ExternalSequencesInvalid,
+    MaxCode,
+    Unknown(i32),
 }
 
 impl ErrorCode {
-    /// Reverse lookup: map a raw numeric code back to the enum. Unknown
-    /// codes are clamped to `Generic`, matching upstream's tolerance.
+    /// Preserve the raw numeric value, matching a C enum cast.
     pub fn from_raw(code: i32) -> Self {
         match code {
             0 => Self::NoError,
@@ -93,17 +92,55 @@ impl ErrorCode {
             106 => Self::SequenceProducerFailed,
             107 => Self::ExternalSequencesInvalid,
             120 => Self::MaxCode,
-            _ => Self::Generic,
+            raw => Self::Unknown(raw),
         }
     }
 
     pub fn as_i32(self) -> i32 {
-        self as i32
+        match self {
+            Self::NoError => 0,
+            Self::Generic => 1,
+            Self::PrefixUnknown => 10,
+            Self::VersionUnsupported => 12,
+            Self::FrameParameterUnsupported => 14,
+            Self::FrameParameterWindowTooLarge => 16,
+            Self::CorruptionDetected => 20,
+            Self::ChecksumWrong => 22,
+            Self::LiteralsHeaderWrong => 24,
+            Self::DictionaryCorrupted => 30,
+            Self::DictionaryWrong => 32,
+            Self::DictionaryCreationFailed => 34,
+            Self::ParameterUnsupported => 40,
+            Self::ParameterCombinationUnsupported => 41,
+            Self::ParameterOutOfBound => 42,
+            Self::TableLogTooLarge => 44,
+            Self::MaxSymbolValueTooLarge => 46,
+            Self::MaxSymbolValueTooSmall => 48,
+            Self::CannotProduceUncompressedBlock => 49,
+            Self::StabilityConditionNotRespected => 50,
+            Self::StageWrong => 60,
+            Self::InitMissing => 62,
+            Self::MemoryAllocation => 64,
+            Self::WorkSpaceTooSmall => 66,
+            Self::DstSizeTooSmall => 70,
+            Self::SrcSizeWrong => 72,
+            Self::DstBufferNull => 74,
+            Self::NoForwardProgressDestFull => 80,
+            Self::NoForwardProgressInputEmpty => 82,
+            Self::FrameIndexTooLarge => 100,
+            Self::SeekableIO => 102,
+            Self::DstBufferWrong => 104,
+            Self::SrcBufferWrong => 105,
+            Self::SequenceProducerFailed => 106,
+            Self::ExternalSequencesInvalid => 107,
+            Self::MaxCode => 120,
+            Self::Unknown(raw) => raw,
+        }
     }
 }
 
 /// Rich error type for Rust-idiomatic APIs in this crate. The C-compatible
-/// layer still uses `size_t`-encoded codes via `to_code()` / `ERR_isError()`.
+/// layer still uses `size_t`-encoded codes via `ERROR()` / `ERR_isError()`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ZstdError(pub ErrorCode);
 
@@ -121,7 +158,7 @@ impl std::error::Error for ZstdError {}
 /// Counterpart to the `ZSTD_ERROR(name)` macro expansion.
 #[inline]
 pub fn ERROR(code: ErrorCode) -> usize {
-    (0usize).wrapping_sub(code as i32 as usize)
+    (0usize).wrapping_sub(code.as_i32() as usize)
 }
 
 /// Mirror of upstream `ERR_isError(size_t code)`: any numeric return value
@@ -154,54 +191,204 @@ pub fn ERR_getErrorName(code: usize) -> &'static str {
 /// label per error code. Strings are byte-for-byte the same as upstream's
 /// messages to preserve compatibility with tooling that scrapes them.
 pub fn ERR_getErrorString(code: ErrorCode) -> &'static str {
-    use ErrorCode::*;
     match code {
-        NoError => "No error detected",
-        Generic => "Error (generic)",
-        PrefixUnknown => "Unknown frame descriptor",
-        VersionUnsupported => "Version not supported",
-        FrameParameterUnsupported => "Unsupported frame parameter",
-        FrameParameterWindowTooLarge => "Frame requires too much memory for decoding",
-        CorruptionDetected => "Data corruption detected",
-        ChecksumWrong => "Restored data doesn't match checksum",
-        LiteralsHeaderWrong => "Header of Literals' block doesn't respect format specification",
-        ParameterUnsupported => "Unsupported parameter",
-        ParameterCombinationUnsupported => "Unsupported combination of parameters",
-        ParameterOutOfBound => "Parameter is out of bound",
-        InitMissing => "Context should be init first",
-        MemoryAllocation => "Allocation error : not enough memory",
-        WorkSpaceTooSmall => "workSpace buffer is not large enough",
-        StageWrong => "Operation not authorized at current processing stage",
-        TableLogTooLarge => "tableLog requires too much memory : unsupported",
-        MaxSymbolValueTooLarge => "Unsupported max Symbol Value : too large",
-        MaxSymbolValueTooSmall => "Specified maxSymbolValue is too small",
-        CannotProduceUncompressedBlock => "This mode cannot generate an uncompressed block",
-        StabilityConditionNotRespected => "pledged buffer stability condition is not respected",
-        DictionaryCorrupted => "Dictionary is corrupted",
-        DictionaryWrong => "Dictionary mismatch",
-        DictionaryCreationFailed => "Cannot create Dictionary from provided samples",
-        DstSizeTooSmall => "Destination buffer is too small",
-        SrcSizeWrong => "Src size is incorrect",
-        DstBufferNull => "Operation on NULL destination buffer",
-        NoForwardProgressDestFull => {
+        ErrorCode::NoError => "No error detected",
+        ErrorCode::Generic => "Error (generic)",
+        ErrorCode::PrefixUnknown => "Unknown frame descriptor",
+        ErrorCode::VersionUnsupported => "Version not supported",
+        ErrorCode::FrameParameterUnsupported => "Unsupported frame parameter",
+        ErrorCode::FrameParameterWindowTooLarge => "Frame requires too much memory for decoding",
+        ErrorCode::CorruptionDetected => "Data corruption detected",
+        ErrorCode::ChecksumWrong => "Restored data doesn't match checksum",
+        ErrorCode::LiteralsHeaderWrong => {
+            "Header of Literals' block doesn't respect format specification"
+        }
+        ErrorCode::ParameterUnsupported => "Unsupported parameter",
+        ErrorCode::ParameterCombinationUnsupported => "Unsupported combination of parameters",
+        ErrorCode::ParameterOutOfBound => "Parameter is out of bound",
+        ErrorCode::InitMissing => "Context should be init first",
+        ErrorCode::MemoryAllocation => "Allocation error : not enough memory",
+        ErrorCode::WorkSpaceTooSmall => "workSpace buffer is not large enough",
+        ErrorCode::StageWrong => "Operation not authorized at current processing stage",
+        ErrorCode::TableLogTooLarge => "tableLog requires too much memory : unsupported",
+        ErrorCode::MaxSymbolValueTooLarge => "Unsupported max Symbol Value : too large",
+        ErrorCode::MaxSymbolValueTooSmall => "Specified maxSymbolValue is too small",
+        ErrorCode::CannotProduceUncompressedBlock => {
+            "This mode cannot generate an uncompressed block"
+        }
+        ErrorCode::StabilityConditionNotRespected => {
+            "pledged buffer stability condition is not respected"
+        }
+        ErrorCode::DictionaryCorrupted => "Dictionary is corrupted",
+        ErrorCode::DictionaryWrong => "Dictionary mismatch",
+        ErrorCode::DictionaryCreationFailed => "Cannot create Dictionary from provided samples",
+        ErrorCode::DstSizeTooSmall => "Destination buffer is too small",
+        ErrorCode::SrcSizeWrong => "Src size is incorrect",
+        ErrorCode::DstBufferNull => "Operation on NULL destination buffer",
+        ErrorCode::NoForwardProgressDestFull => {
             "Operation made no progress over multiple calls, due to output buffer being full"
         }
-        NoForwardProgressInputEmpty => {
+        ErrorCode::NoForwardProgressInputEmpty => {
             "Operation made no progress over multiple calls, due to input being empty"
         }
-        FrameIndexTooLarge => "Frame index is too large",
-        SeekableIO => "An I/O error occurred when reading/seeking",
-        DstBufferWrong => "Destination buffer is wrong",
-        SrcBufferWrong => "Source buffer is wrong",
-        SequenceProducerFailed => "Block-level external sequence producer returned an error code",
-        ExternalSequencesInvalid => "External sequences are not valid",
-        MaxCode => "Unspecified error code",
+        ErrorCode::FrameIndexTooLarge => "Frame index is too large",
+        ErrorCode::SeekableIO => "An I/O error occurred when reading/seeking",
+        ErrorCode::DstBufferWrong => "Destination buffer is wrong",
+        ErrorCode::SrcBufferWrong => "Source buffer is wrong",
+        ErrorCode::SequenceProducerFailed => {
+            "Block-level external sequence producer returned an error code"
+        }
+        ErrorCode::ExternalSequencesInvalid => "External sequences are not valid",
+        _ => "Unspecified error code",
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const UPSTREAM_ERRORS: &[(ErrorCode, i32, &str)] = &[
+        (ErrorCode::NoError, 0, "No error detected"),
+        (ErrorCode::Generic, 1, "Error (generic)"),
+        (ErrorCode::PrefixUnknown, 10, "Unknown frame descriptor"),
+        (ErrorCode::VersionUnsupported, 12, "Version not supported"),
+        (
+            ErrorCode::FrameParameterUnsupported,
+            14,
+            "Unsupported frame parameter",
+        ),
+        (
+            ErrorCode::FrameParameterWindowTooLarge,
+            16,
+            "Frame requires too much memory for decoding",
+        ),
+        (
+            ErrorCode::CorruptionDetected,
+            20,
+            "Data corruption detected",
+        ),
+        (
+            ErrorCode::ChecksumWrong,
+            22,
+            "Restored data doesn't match checksum",
+        ),
+        (
+            ErrorCode::LiteralsHeaderWrong,
+            24,
+            "Header of Literals' block doesn't respect format specification",
+        ),
+        (
+            ErrorCode::DictionaryCorrupted,
+            30,
+            "Dictionary is corrupted",
+        ),
+        (ErrorCode::DictionaryWrong, 32, "Dictionary mismatch"),
+        (
+            ErrorCode::DictionaryCreationFailed,
+            34,
+            "Cannot create Dictionary from provided samples",
+        ),
+        (ErrorCode::ParameterUnsupported, 40, "Unsupported parameter"),
+        (
+            ErrorCode::ParameterCombinationUnsupported,
+            41,
+            "Unsupported combination of parameters",
+        ),
+        (
+            ErrorCode::ParameterOutOfBound,
+            42,
+            "Parameter is out of bound",
+        ),
+        (
+            ErrorCode::TableLogTooLarge,
+            44,
+            "tableLog requires too much memory : unsupported",
+        ),
+        (
+            ErrorCode::MaxSymbolValueTooLarge,
+            46,
+            "Unsupported max Symbol Value : too large",
+        ),
+        (
+            ErrorCode::MaxSymbolValueTooSmall,
+            48,
+            "Specified maxSymbolValue is too small",
+        ),
+        (
+            ErrorCode::CannotProduceUncompressedBlock,
+            49,
+            "This mode cannot generate an uncompressed block",
+        ),
+        (
+            ErrorCode::StabilityConditionNotRespected,
+            50,
+            "pledged buffer stability condition is not respected",
+        ),
+        (
+            ErrorCode::StageWrong,
+            60,
+            "Operation not authorized at current processing stage",
+        ),
+        (ErrorCode::InitMissing, 62, "Context should be init first"),
+        (
+            ErrorCode::MemoryAllocation,
+            64,
+            "Allocation error : not enough memory",
+        ),
+        (
+            ErrorCode::WorkSpaceTooSmall,
+            66,
+            "workSpace buffer is not large enough",
+        ),
+        (
+            ErrorCode::DstSizeTooSmall,
+            70,
+            "Destination buffer is too small",
+        ),
+        (ErrorCode::SrcSizeWrong, 72, "Src size is incorrect"),
+        (
+            ErrorCode::DstBufferNull,
+            74,
+            "Operation on NULL destination buffer",
+        ),
+        (
+            ErrorCode::NoForwardProgressDestFull,
+            80,
+            "Operation made no progress over multiple calls, due to output buffer being full",
+        ),
+        (
+            ErrorCode::NoForwardProgressInputEmpty,
+            82,
+            "Operation made no progress over multiple calls, due to input being empty",
+        ),
+        (
+            ErrorCode::FrameIndexTooLarge,
+            100,
+            "Frame index is too large",
+        ),
+        (
+            ErrorCode::SeekableIO,
+            102,
+            "An I/O error occurred when reading/seeking",
+        ),
+        (
+            ErrorCode::DstBufferWrong,
+            104,
+            "Destination buffer is wrong",
+        ),
+        (ErrorCode::SrcBufferWrong, 105, "Source buffer is wrong"),
+        (
+            ErrorCode::SequenceProducerFailed,
+            106,
+            "Block-level external sequence producer returned an error code",
+        ),
+        (
+            ErrorCode::ExternalSequencesInvalid,
+            107,
+            "External sequences are not valid",
+        ),
+        (ErrorCode::MaxCode, 120, "Unspecified error code"),
+    ];
 
     #[test]
     fn error_encoding_roundtrip() {
@@ -229,15 +416,9 @@ mod tests {
 
     #[test]
     fn error_strings_match_upstream_literals() {
-        assert_eq!(ERR_getErrorString(ErrorCode::NoError), "No error detected");
-        assert_eq!(
-            ERR_getErrorString(ErrorCode::CorruptionDetected),
-            "Data corruption detected"
-        );
-        assert_eq!(
-            ERR_getErrorString(ErrorCode::ChecksumWrong),
-            "Restored data doesn't match checksum"
-        );
+        for &(code, _raw, name) in UPSTREAM_ERRORS {
+            assert_eq!(ERR_getErrorString(code), name, "{code:?}");
+        }
     }
 
     #[test]
@@ -250,16 +431,14 @@ mod tests {
     }
 
     #[test]
-    fn from_raw_clamps_extreme_and_negative_inputs_to_Generic() {
-        // Callers that build an `ErrorCode` from an arbitrary i32
-        // (e.g. FFI return values from legacy APIs) must get a safe
-        // `Generic` fallback for values outside the enum, including
-        // i32::MIN / i32::MAX / negative / oversized.
-        assert_eq!(ErrorCode::from_raw(i32::MIN), ErrorCode::Generic);
-        assert_eq!(ErrorCode::from_raw(-1), ErrorCode::Generic);
-        assert_eq!(ErrorCode::from_raw(-42), ErrorCode::Generic);
-        assert_eq!(ErrorCode::from_raw(i32::MAX), ErrorCode::Generic);
-        assert_eq!(ErrorCode::from_raw(999_999), ErrorCode::Generic);
+    fn from_raw_preserves_extreme_and_negative_inputs() {
+        // C enum casts preserve the numeric value even when it isn't a
+        // named enumerator.
+        assert_eq!(ErrorCode::from_raw(i32::MIN).as_i32(), i32::MIN);
+        assert_eq!(ErrorCode::from_raw(-1).as_i32(), -1);
+        assert_eq!(ErrorCode::from_raw(-42).as_i32(), -42);
+        assert_eq!(ErrorCode::from_raw(i32::MAX).as_i32(), i32::MAX);
+        assert_eq!(ErrorCode::from_raw(999_999).as_i32(), 999_999);
         // Known-valid code still round-trips.
         assert_eq!(ErrorCode::from_raw(22), ErrorCode::ChecksumWrong);
     }
@@ -283,52 +462,38 @@ mod tests {
     fn from_raw_roundtrips_every_named_variant() {
         // Regression gate: if someone adds a new ErrorCode variant
         // but forgets to wire it up in `from_raw`, this catches it.
-        for code in [
-            ErrorCode::NoError,
-            ErrorCode::Generic,
-            ErrorCode::PrefixUnknown,
-            ErrorCode::VersionUnsupported,
-            ErrorCode::FrameParameterUnsupported,
-            ErrorCode::FrameParameterWindowTooLarge,
-            ErrorCode::CorruptionDetected,
-            ErrorCode::ChecksumWrong,
-            ErrorCode::LiteralsHeaderWrong,
-            ErrorCode::DictionaryCorrupted,
-            ErrorCode::DictionaryWrong,
-            ErrorCode::DictionaryCreationFailed,
-            ErrorCode::ParameterUnsupported,
-            ErrorCode::ParameterCombinationUnsupported,
-            ErrorCode::ParameterOutOfBound,
-            ErrorCode::TableLogTooLarge,
-            ErrorCode::MaxSymbolValueTooLarge,
-            ErrorCode::MaxSymbolValueTooSmall,
-            ErrorCode::CannotProduceUncompressedBlock,
-            ErrorCode::StabilityConditionNotRespected,
-            ErrorCode::StageWrong,
-            ErrorCode::InitMissing,
-            ErrorCode::MemoryAllocation,
-            ErrorCode::WorkSpaceTooSmall,
-            ErrorCode::DstSizeTooSmall,
-            ErrorCode::SrcSizeWrong,
-            ErrorCode::DstBufferNull,
-            ErrorCode::NoForwardProgressDestFull,
-            ErrorCode::NoForwardProgressInputEmpty,
-            ErrorCode::FrameIndexTooLarge,
-            ErrorCode::SeekableIO,
-            ErrorCode::DstBufferWrong,
-            ErrorCode::SrcBufferWrong,
-            ErrorCode::SequenceProducerFailed,
-            ErrorCode::ExternalSequencesInvalid,
-            ErrorCode::MaxCode,
-        ] {
-            let raw = code as i32;
+        for &(code, raw, _name) in UPSTREAM_ERRORS {
+            assert_eq!(code.as_i32(), raw, "raw value drifted for {code:?}");
             assert_eq!(
                 ErrorCode::from_raw(raw),
                 code,
                 "from_raw({raw}) did not round-trip for {code:?}"
             );
         }
-        // Unknown numeric codes clamp to Generic.
-        assert_eq!(ErrorCode::from_raw(99_999), ErrorCode::Generic);
+        // Unknown numeric codes preserve their raw C enum value.
+        assert_eq!(ErrorCode::from_raw(99_999).as_i32(), 99_999);
+    }
+
+    #[test]
+    fn unknown_encoded_error_name_matches_upstream_default() {
+        let encoded_unknown_error = (0usize).wrapping_sub(2);
+        assert!(ERR_isError(encoded_unknown_error));
+        assert_eq!(ERR_getErrorCode(encoded_unknown_error).as_i32(), 2);
+        assert_eq!(
+            ERR_getErrorString(ErrorCode::Unknown(2)),
+            "Unspecified error code"
+        );
+        assert_eq!(
+            ERR_getErrorName(encoded_unknown_error),
+            "Unspecified error code"
+        );
+    }
+
+    #[test]
+    fn size_t_error_threshold_matches_upstream() {
+        assert!(ERR_isError((0usize).wrapping_sub(1)));
+        assert!(ERR_isError((0usize).wrapping_sub(119)));
+        assert!(!ERR_isError(ERROR(ErrorCode::MaxCode)));
+        assert!(!ERR_isError((0usize).wrapping_sub(121)));
     }
 }

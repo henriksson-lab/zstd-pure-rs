@@ -41,11 +41,12 @@ fn avalanche(mut h: u64) -> u64 {
     h
 }
 
-/// Port of `XXH64_finalize`. Consumes any trailing bytes (less than 32)
-/// in 8/4/1-byte steps and runs avalanche to produce the final digest.
+/// Port of `XXH64_finalize`. Consumes `len & 31` trailing bytes in
+/// 8/4/1-byte steps and runs avalanche to produce the final digest.
 #[inline]
-fn finalize(mut h: u64, mut bytes: &[u8]) -> u64 {
-    while bytes.len() >= 8 {
+fn finalize(mut h: u64, mut bytes: &[u8], len: usize) -> u64 {
+    let mut remaining = len & 31;
+    while remaining >= 8 {
         let k1 = u64::from_le_bytes(bytes[..8].try_into().unwrap());
         h ^= round(0, k1);
         h = h
@@ -53,8 +54,9 @@ fn finalize(mut h: u64, mut bytes: &[u8]) -> u64 {
             .wrapping_mul(PRIME64_1)
             .wrapping_add(PRIME64_4);
         bytes = &bytes[8..];
+        remaining -= 8;
     }
-    if bytes.len() >= 4 {
+    if remaining >= 4 {
         let k1 = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as u64;
         h ^= k1.wrapping_mul(PRIME64_1);
         h = h
@@ -62,8 +64,9 @@ fn finalize(mut h: u64, mut bytes: &[u8]) -> u64 {
             .wrapping_mul(PRIME64_2)
             .wrapping_add(PRIME64_3);
         bytes = &bytes[4..];
+        remaining -= 4;
     }
-    for &b in bytes {
+    for &b in &bytes[..remaining] {
         h ^= (b as u64).wrapping_mul(PRIME64_5);
         h = h.rotate_left(11).wrapping_mul(PRIME64_1);
     }
@@ -109,9 +112,13 @@ pub fn XXH64(input: &[u8], seed: u64) -> u64 {
         h = merge_round(h, v4);
 
         let tail = &input[p..];
-        finalize(h.wrapping_add(len), tail)
+        finalize(h.wrapping_add(len), tail, input.len())
     } else {
-        finalize(seed.wrapping_add(PRIME64_5).wrapping_add(len), input)
+        finalize(
+            seed.wrapping_add(PRIME64_5).wrapping_add(len),
+            input,
+            input.len(),
+        )
     }
 }
 
@@ -131,11 +138,11 @@ pub struct XXH64_state_t {
 /// `XXH_OK` from upstream.
 pub const XXH_OK: u32 = 0;
 
-/// Port of `XXH64_createState` (xxhash.h:923). Upstream allocates a
-/// zeroed state via `XXH_malloc`. Our Rust port's `XXH64_state_t` is
-/// a simple `Default`-constructible struct — just box the default
-/// value. Returns `None` only on allocation failure (which Rust's
-/// `Box::new` panics on, so this effectively always returns `Some`).
+/// Port of `XXH64_createState`. Upstream allocates a state via
+/// `XXH_malloc`. Our Rust port's `XXH64_state_t` is a simple
+/// `Default`-constructible struct, so just box the default value.
+/// Returns `None` only on allocation failure (which Rust's `Box::new`
+/// panics on, so this effectively always returns `Some`).
 #[inline]
 pub fn XXH64_createState() -> Option<Box<XXH64_state_t>> {
     Some(Box::new(XXH64_state_t::default()))
@@ -254,7 +261,7 @@ pub fn XXH64_digest(state: &XXH64_state_t) -> u64 {
         state.v3.wrapping_add(PRIME64_5)
     };
     h = h.wrapping_add(state.total_len);
-    finalize(h, &state.mem64[..state.memsize as usize])
+    finalize(h, &state.mem64, state.total_len as usize)
 }
 
 #[cfg(test)]
@@ -314,6 +321,27 @@ mod tests {
     }
 
     #[test]
+    fn xxh64_streaming_boundaries_match_oneshot() {
+        let data: Vec<u8> = (0..96u8).map(|b| b.wrapping_mul(37)).collect();
+
+        for len in 0..=96 {
+            for split in 0..=len {
+                let input = &data[..len];
+                let mut st = XXH64_state_t::default();
+                XXH64_reset(&mut st, 0x0123_4567_89ab_cdef);
+                XXH64_update(&mut st, &input[..split]);
+                XXH64_update(&mut st, &input[split..]);
+
+                assert_eq!(
+                    XXH64_digest(&st),
+                    XXH64(input, 0x0123_4567_89ab_cdef),
+                    "len={len}, split={split}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn xxh64_incremental_matches_oneshot_small() {
         let data = b"The quick brown fox jumps over the lazy dog";
         let oneshot = XXH64(data, 42);
@@ -354,5 +382,19 @@ mod tests {
 
         let oneshot = XXH64(b"fresh", 42);
         assert_eq!(after_reset, oneshot);
+    }
+
+    #[test]
+    fn xxh64_digest_uses_total_len_for_tail_size() {
+        // Upstream XXH64_digest passes total_len to XXH64_finalize, which masks
+        // it to the last 0..31 buffered bytes. memsize is bookkeeping for
+        // updates, not the digest's source of truth for the final length.
+        let data = b"0123456789abcde";
+        let mut st = XXH64_state_t::default();
+        XXH64_reset(&mut st, 7);
+        XXH64_update(&mut st, data);
+        st.memsize = 31;
+
+        assert_eq!(XXH64_digest(&st), XXH64(data, 7));
     }
 }

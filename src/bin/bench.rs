@@ -9,6 +9,10 @@ fn main() {
     let path = env::args().nth(1).expect("path");
     let level: i32 = env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(3);
     let iterations: usize = env::args().nth(3).and_then(|s| s.parse().ok()).unwrap_or(3);
+    if iterations == 0 {
+        eprintln!("iterations must be greater than 0");
+        return;
+    }
 
     let payload = fs::read(&path).unwrap();
     eprintln!(
@@ -52,26 +56,67 @@ fn main() {
     let mut total_compressed = 0usize;
     for _ in 0..iterations {
         let n = ZSTD_compress(&mut compressed, &payload, level);
+        if ERR_isError(n) {
+            eprintln!("compress err: {}", ERR_getErrorName(n));
+            return;
+        }
         total_compressed = n;
+    }
+    if total_compressed == 0 {
+        eprintln!("compress err: produced empty frame");
+        return;
     }
     let elapsed = start.elapsed();
     let compress_speed = (payload.len() * iterations) as f64 / elapsed.as_secs_f64() / 1_000_000.0;
+    let ratio = payload.len() as f64 / total_compressed as f64;
     eprintln!(
         "compress L{}: {} -> {} ({:.2}x) | {:.1} MB/s",
         level,
         payload.len(),
         total_compressed,
-        payload.len() as f64 / total_compressed as f64,
+        ratio,
         compress_speed
     );
 
+    let d = ZSTD_decompress(&mut decoded, &compressed[..total_compressed]);
+    if ERR_isError(d) {
+        eprintln!("decompress err: {}", ERR_getErrorName(d));
+        return;
+    }
+    if d != payload.len() || decoded[..d] != payload {
+        eprintln!(
+            "decompress mismatch: decoded {} bytes, expected {}",
+            d,
+            payload.len()
+        );
+        return;
+    }
+
     // Decompress benchmark
     let start = Instant::now();
+    let mut total_decoded = 0usize;
     for _ in 0..iterations {
-        let _ = ZSTD_decompress(&mut decoded, &compressed[..total_compressed]);
+        let d = ZSTD_decompress(&mut decoded, &compressed[..total_compressed]);
+        if ERR_isError(d) {
+            eprintln!("decompress err: {}", ERR_getErrorName(d));
+            return;
+        }
+        if d != payload.len() {
+            eprintln!(
+                "decompress size mismatch: decoded {} bytes, expected {}",
+                d,
+                payload.len()
+            );
+            return;
+        }
+        total_decoded += d;
     }
     let elapsed = start.elapsed();
-    let decompress_speed =
-        (payload.len() * iterations) as f64 / elapsed.as_secs_f64() / 1_000_000.0;
+    if decoded != payload {
+        let first = decoded.iter().zip(payload.iter()).position(|(a, b)| a != b);
+        eprintln!("decompress mismatch after benchmark at: {:?}", first);
+        return;
+    }
+    let decompress_speed = total_decoded as f64 / elapsed.as_secs_f64() / 1_000_000.0;
     eprintln!("decompress: {:.1} MB/s", decompress_speed);
 }

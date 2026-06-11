@@ -32,12 +32,37 @@ pub fn ZSTD_prefetchL1<T>(ptr: *const T) {
     }
 }
 
+/// L2 prefetch hint used by upstream's `PREFETCH_AREA(ptr, size)` macro.
+#[inline(always)]
+fn ZSTD_prefetchL2<T>(ptr: *const T) {
+    #[cfg(all(target_arch = "x86_64", target_feature = "sse"))]
+    unsafe {
+        core::arch::x86_64::_mm_prefetch(ptr as *const i8, core::arch::x86_64::_MM_HINT_T1);
+    }
+    #[cfg(all(target_arch = "x86", target_feature = "sse"))]
+    unsafe {
+        core::arch::x86::_mm_prefetch(ptr as *const i8, core::arch::x86::_MM_HINT_T1);
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        core::arch::asm!("prfm pldl2keep, [{0}]", in(reg) ptr, options(nostack, readonly, preserves_flags));
+    }
+    #[cfg(not(any(
+        all(target_arch = "x86_64", target_feature = "sse"),
+        all(target_arch = "x86", target_feature = "sse"),
+        target_arch = "aarch64",
+    )))]
+    {
+        let _ = ptr;
+    }
+}
+
 /// Convenience: prefetch byte at `slice[off]` (or beyond — out-of-bound
 /// addresses are fine for a hint, the CPU just ignores them).
 #[inline(always)]
 pub fn prefetchSliceByte(slice: &[u8], off: usize) {
     let base = slice.as_ptr() as usize;
-    ZSTD_prefetchL1((base + off) as *const u8);
+    ZSTD_prefetchL1(base.wrapping_add(off) as *const u8);
 }
 
 pub const WILDCOPY_OVERLENGTH: usize = 32;
@@ -45,30 +70,23 @@ pub const WILDCOPY_VECLEN: usize = 16;
 pub const ZSTD_WORKSPACETOOLARGE_FACTOR: usize = 3;
 pub const ZSTD_WORKSPACETOOLARGE_MAXDURATION: usize = 128;
 
-/// Port of upstream's `PREFETCH_AREA` macro (`mem.h`). Upstream walks
-/// the region in cache-line strides and emits `__builtin_prefetch` /
-/// `_mm_prefetch` hints so the CPU pulls subsequent lines before the
-/// matcher reads them.
-///
-/// Pure stable Rust doesn't expose a safe prefetch intrinsic, and this
-/// crate caps itself at a single `unsafe` block (see lib.rs), so we
-/// implement a portable software-prefetch: touch one element per
-/// 64-byte stride and feed the value through `core::hint::black_box`
-/// so the optimizer can't elide the load. That forces the CPU's
-/// prefetcher to pull the next cache lines without needing any unsafe
-/// hardware intrinsic. Hint only — never affects compressed output.
+/// Port of upstream's `PREFETCH_AREA` macro (`compiler.h`). Upstream
+/// walks the region in byte cache-line strides and emits L2 prefetch
+/// hints. The hints are non-observing: they compute addresses but never
+/// load from the slice.
 #[inline]
-pub fn ZSTD_prefetchArea<T: Copy>(slice: &[T]) {
+pub fn ZSTD_prefetchArea<T>(slice: &[T]) {
     const CACHELINE_BYTES: usize = 64;
     let elem_bytes = core::mem::size_of::<T>();
     if slice.is_empty() || elem_bytes == 0 {
         return;
     }
-    let stride = (CACHELINE_BYTES / elem_bytes).max(1);
-    let mut i = 0usize;
-    while i < slice.len() {
-        core::hint::black_box(slice[i]);
-        i += stride;
+    let base = slice.as_ptr() as *const u8;
+    let size = slice.len().saturating_mul(elem_bytes);
+    let mut pos = 0usize;
+    while pos < size {
+        ZSTD_prefetchL2(base.wrapping_add(pos));
+        pos += CACHELINE_BYTES;
     }
 }
 
@@ -126,14 +144,16 @@ pub fn ZSTD_selectAddr<'a, T>(index: u32, lowLimit: u32, candidate: &'a T, backu
 }
 
 /// Port of `ZSTD_safecopyLiterals` (`zstd_compress_internal.h:700`).
-/// Copies bytes from `src[ip..iend]` to `dst[op..]`, using a fast
-/// non-overlapping bulk copy up to `ilimit_w` and a safe byte-by-byte
-/// tail past it. Only called when the sequence extends past
-/// `ilimit_w`, so the tail is the hot path.
+/// Copies bytes from `src[ip..iend]` to `dst[op..]`, using upstream's
+/// no-overlap wildcopy up to `ilimit_w` and a safe byte-by-byte tail
+/// past it. Only called when the sequence extends past `ilimit_w`, so
+/// the tail is the hot path.
 ///
 /// Rust-port note: upstream takes raw pointers; our port takes
 /// `(dst, op, src, ip, iend, ilimit_w)` as indices. Caller must
-/// guarantee `iend > ilimit_w`.
+/// guarantee `iend > ilimit_w` and enough source/destination headroom
+/// for the wildcopy prefix, which writes one 16-byte vector even when
+/// `ip == ilimit_w`.
 pub fn ZSTD_safecopyLiterals(
     dst: &mut [u8],
     op: usize,
@@ -147,7 +167,20 @@ pub fn ZSTD_safecopyLiterals(
     let mut ip_cur = ip;
     if ip_cur <= ilimit_w {
         let n = ilimit_w - ip_cur;
-        dst[op_cur..op_cur + n].copy_from_slice(&src[ip_cur..ip_cur + n]);
+        wild_copy16_from_slices(dst, op_cur, src, ip_cur);
+        if 16 < n {
+            let mut wild_op = op_cur + 16;
+            let mut wild_ip = ip_cur + 16;
+            let wild_oend = op_cur + n;
+            while wild_op < wild_oend {
+                wild_copy16_from_slices(dst, wild_op, src, wild_ip);
+                wild_op += 16;
+                wild_ip += 16;
+                wild_copy16_from_slices(dst, wild_op, src, wild_ip);
+                wild_op += 16;
+                wild_ip += 16;
+            }
+        }
         op_cur += n;
         ip_cur = ilimit_w;
     }
@@ -156,6 +189,17 @@ pub fn ZSTD_safecopyLiterals(
         op_cur += 1;
         ip_cur += 1;
     }
+}
+
+/// No-overlap slice form of the `ZSTD_wildcopy` fast path. Used by
+/// `ZSTD_safecopyLiterals`, whose source and destination are modeled
+/// as separate slices in this port.
+#[inline]
+fn wild_copy16_from_slices(dst: &mut [u8], op: usize, src: &[u8], ip: usize) {
+    let a = MEM_read64(&src[ip..ip + 8]);
+    let b = MEM_read64(&src[ip + 8..ip + 16]);
+    MEM_write64(&mut dst[op..op + 8], a);
+    MEM_write64(&mut dst[op + 8..op + 16], b);
 }
 
 /// Port of `ZSTD_copy8` — 8-byte memcpy via one 64-bit load/store.
@@ -199,11 +243,14 @@ pub fn ZSTD_wildcopy(
         // Short-offset self-overlap: advance by 8 bytes per step,
         // respecting the overlap invariant (`op - ip >= 8` is what
         // the caller of `ZSTD_wildcopy` promises in this branch).
-        while op < oend {
+        loop {
             let v = MEM_read64(&buf[ip..]);
             MEM_write64(&mut buf[op..], v);
             op += 8;
             ip += 8;
+            if op >= oend {
+                break;
+            }
         }
     } else {
         debug_assert!(diff >= WILDCOPY_VECLEN as isize || diff <= -(WILDCOPY_VECLEN as isize));
@@ -326,6 +373,18 @@ mod tests {
     }
 
     #[test]
+    fn workspace_too_large_constants_match_upstream() {
+        assert_eq!(ZSTD_WORKSPACETOOLARGE_FACTOR, 3);
+        assert_eq!(ZSTD_WORKSPACETOOLARGE_MAXDURATION, 128);
+    }
+
+    #[test]
+    fn prefetch_slice_byte_uses_wrapping_address_arithmetic() {
+        let src = [0u8; 1];
+        prefetchSliceByte(&src, usize::MAX);
+    }
+
+    #[test]
     fn invalidateRepCodes_zeros_all_slots() {
         let mut r = [5u32, 9, 17];
         ZSTD_invalidateRepCodes(&mut r);
@@ -384,6 +443,69 @@ mod tests {
         for i in 0..32 {
             assert_eq!(buf[i], b'A' + (i % 8) as u8, "pos {i}");
         }
+    }
+
+    #[test]
+    fn wildcopy_src_before_dst_zero_length_still_wildcopies_once() {
+        // Upstream's short-overlap branch is a do/while COPY8, even
+        // when length == 0.
+        let mut buf = [0u8; 32];
+        buf[..8].copy_from_slice(b"ABCDEFGH");
+        ZSTD_wildcopy(
+            &mut buf,
+            8,
+            0,
+            0,
+            ZSTD_overlap_e::ZSTD_overlap_src_before_dst,
+        );
+        assert_eq!(&buf[8..16], b"ABCDEFGH");
+    }
+
+    #[test]
+    fn wildcopy_no_overlap_zero_length_still_copies_16() {
+        // Upstream's no-overlap branch unconditionally performs the
+        // first COPY16 before checking the requested length.
+        let mut buf = [0u8; 48];
+        for (i, slot) in buf.iter_mut().enumerate().take(16) {
+            *slot = (0xA0 + i) as u8;
+        }
+        ZSTD_wildcopy(&mut buf, 24, 0, 0, ZSTD_overlap_e::ZSTD_no_overlap);
+        assert_eq!(
+            &buf[24..40],
+            &[
+                0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 0xA8, 0xA9, 0xAA, 0xAB, 0xAC, 0xAD,
+                0xAE, 0xAF
+            ]
+        );
+    }
+
+    #[test]
+    fn safecopy_literals_wildcopies_prefix_then_byte_copies_tail() {
+        let mut src = [0u8; 64];
+        for (i, slot) in src.iter_mut().enumerate() {
+            *slot = i as u8;
+        }
+        let mut dst = [0xFFu8; 64];
+
+        ZSTD_safecopyLiterals(&mut dst, 8, &src, 3, 11, 7);
+
+        assert_eq!(&dst[8..16], &src[3..11]);
+        assert_eq!(&dst[16..24], &src[11..19]);
+        assert_eq!(dst[24], 0xFF);
+    }
+
+    #[test]
+    fn safecopy_literals_zero_prefix_still_wildcopies_once() {
+        let mut src = [0u8; 32];
+        for (i, slot) in src.iter_mut().enumerate() {
+            *slot = (0x40 + i) as u8;
+        }
+        let mut dst = [0xEEu8; 32];
+
+        ZSTD_safecopyLiterals(&mut dst, 0, &src, 4, 5, 4);
+
+        assert_eq!(&dst[..16], &src[4..20]);
+        assert_eq!(dst[16], 0xEE);
     }
 
     #[test]

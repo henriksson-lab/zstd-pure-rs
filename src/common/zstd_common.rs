@@ -13,6 +13,7 @@ pub const ZSTD_VERSION_RELEASE: u32 = 0;
 pub const ZSTD_VERSION_NUMBER: u32 =
     ZSTD_VERSION_MAJOR * 100 * 100 + ZSTD_VERSION_MINOR * 100 + ZSTD_VERSION_RELEASE;
 pub const ZSTD_VERSION_STRING: &str = "1.6.0";
+pub const ZSTD_IS_DETERMINISTIC_BUILD: i32 = 1;
 
 /// Port of `ZSTD_versionNumber`. Returns the upstream version integer
 /// (`MAJOR*10000 + MINOR*100 + RELEASE`).
@@ -52,12 +53,21 @@ pub fn ZSTD_getErrorString(code: ErrorCode) -> &'static str {
     crate::common::error::ERR_getErrorString(code)
 }
 
-/// Upstream only returns `1` when the build was configured with
-/// `ZSTD_IS_DETERMINISTIC_BUILD`. We default to `0` here and flip it in
-/// a future config toggle if needed.
+#[inline]
+const fn deterministic_build_value(flag: i32) -> i32 {
+    if flag != 0 {
+        1
+    } else {
+        0
+    }
+}
+
+/// Port of `ZSTD_isDeterministicBuild`. Upstream's default build sets
+/// `ZSTD_IS_DETERMINISTIC_BUILD` unless output-affecting compile macros are
+/// enabled.
 #[inline]
 pub const fn ZSTD_isDeterministicBuild() -> i32 {
-    0
+    deterministic_build_value(ZSTD_IS_DETERMINISTIC_BUILD)
 }
 
 #[cfg(test)]
@@ -121,10 +131,38 @@ mod tests {
     }
 
     #[test]
+    fn non_error_results_decode_to_no_error() {
+        assert_eq!(ZSTD_getErrorCode(0), ErrorCode::NoError);
+        assert_eq!(
+            ZSTD_getErrorName(0),
+            ZSTD_getErrorString(ErrorCode::NoError)
+        );
+    }
+
+    #[test]
     fn isError_distinguishes_code_from_size() {
         // Small successful sizes must NOT be treated as errors.
         assert!(!ZSTD_isError(0));
         assert!(!ZSTD_isError(100));
         assert!(!ZSTD_isError(1_000_000));
+        assert!(!ZSTD_isError(crate::common::error::ERROR(
+            ErrorCode::MaxCode
+        )));
+        assert!(ZSTD_isError(
+            crate::common::error::ERROR(ErrorCode::MaxCode) + 1
+        ));
+    }
+
+    #[test]
+    fn deterministic_build_matches_upstream_default() {
+        assert_eq!(ZSTD_IS_DETERMINISTIC_BUILD, 1);
+        assert_eq!(ZSTD_isDeterministicBuild(), 1);
+    }
+
+    #[test]
+    fn deterministic_build_normalizes_macro_value() {
+        assert_eq!(deterministic_build_value(0), 0);
+        assert_eq!(deterministic_build_value(1), 1);
+        assert_eq!(deterministic_build_value(42), 1);
     }
 }

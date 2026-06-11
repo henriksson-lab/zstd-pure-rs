@@ -18,6 +18,7 @@ pub const BIT_DStream_overflow: u32 = 3;
 /// Bit-container width in bytes. `size_t` upstream; `usize` here.
 const CONTAINER_BYTES: usize = core::mem::size_of::<usize>();
 const CONTAINER_BITS: u32 = (CONTAINER_BYTES as u32) * 8;
+static BIT_DSTREAM_ZERO_FILLED: [u8; CONTAINER_BYTES] = [0; CONTAINER_BYTES];
 
 /// Rust-only helper: read one `size_t`-wide little-endian word from
 /// `src[ptr..]`. Used by `BIT_DStream_t` to refill its `bitContainer`.
@@ -220,10 +221,14 @@ pub fn BIT_initDStream<'a>(
         bitD.ptr = srcSize - CONTAINER_BYTES;
         bitD.bitContainer = BIT_readContainer(src, bitD.ptr);
         let lastByte = src[srcSize - 1];
+        bitD.bitsConsumed = if lastByte != 0 {
+            8 - ZSTD_highbit32(lastByte as u32)
+        } else {
+            0
+        };
         if lastByte == 0 {
             return ERROR(ErrorCode::Generic);
         }
-        bitD.bitsConsumed = 8 - ZSTD_highbit32(lastByte as u32);
     } else {
         bitD.ptr = 0;
         // Load src[0] and fill the rest of the container from the
@@ -267,10 +272,14 @@ pub fn BIT_initDStream<'a>(
         }
         bitD.bitContainer = c;
         let lastByte = src[srcSize - 1];
+        bitD.bitsConsumed = if lastByte != 0 {
+            8 - ZSTD_highbit32(lastByte as u32)
+        } else {
+            0
+        };
         if lastByte == 0 {
             return ERROR(ErrorCode::CorruptionDetected);
         }
-        bitD.bitsConsumed = 8 - ZSTD_highbit32(lastByte as u32);
         bitD.bitsConsumed += (CONTAINER_BYTES - srcSize) as u32 * 8;
     }
     srcSize
@@ -286,6 +295,7 @@ pub fn BIT_getUpperBits(bitContainer: usize, start: u32) -> usize {
 #[inline]
 pub fn BIT_getMiddleBits(bitContainer: usize, start: u32, nbBits: u32) -> usize {
     let reg_mask = CONTAINER_BITS - 1;
+    debug_assert!(nbBits < 32);
     let mask = (1usize << nbBits).wrapping_sub(1);
     (bitContainer >> (start & reg_mask)) & mask
 }
@@ -293,6 +303,7 @@ pub fn BIT_getMiddleBits(bitContainer: usize, start: u32, nbBits: u32) -> usize 
 /// Port of `BIT_getLowerBits`.
 #[inline(always)]
 pub fn BIT_getLowerBits(bitContainer: usize, nbBits: u32) -> usize {
+    debug_assert!(nbBits < 32);
     let mask = (1usize << nbBits).wrapping_sub(1);
     bitContainer & mask
 }
@@ -321,7 +332,7 @@ pub fn BIT_lookBitsFast(bitD: &BIT_DStream_t, nbBits: u32) -> usize {
 /// Port of `BIT_skipBits`.
 #[inline(always)]
 pub fn BIT_skipBits(bitD: &mut BIT_DStream_t, nbBits: u32) {
-    bitD.bitsConsumed += nbBits;
+    bitD.bitsConsumed = bitD.bitsConsumed.wrapping_add(nbBits);
 }
 
 /// Port of `BIT_readBits`.
@@ -365,9 +376,13 @@ pub fn BIT_reloadDStreamFast(bitD: &mut BIT_DStream_t) -> u32 {
 #[inline(always)]
 pub fn BIT_reloadDStream(bitD: &mut BIT_DStream_t) -> u32 {
     if bitD.bitsConsumed > CONTAINER_BITS {
-        // Mirror upstream's behaviour: on overflow, force ptr to a
-        // zero-filled region so subsequent reads return 0. In Rust we
-        // just mark the state and avoid further progress.
+        // Mirror upstream's overflow sentinel: move the backing pointer
+        // to a zero-filled container so later reload attempts don't
+        // rewind through the original input.
+        bitD.src = &BIT_DSTREAM_ZERO_FILLED;
+        bitD.start = 0;
+        bitD.limitPtr = CONTAINER_BYTES;
+        bitD.ptr = 0;
         return BIT_DStream_overflow;
     }
     debug_assert!(bitD.ptr >= bitD.start);
@@ -443,8 +458,21 @@ mod tests {
     fn init_rejects_zero_last_byte() {
         let buf = [0u8, 0u8];
         let mut d = BIT_DStream_t::default();
+        d.bitsConsumed = 13;
         let rc = BIT_initDStream(&mut d, &buf, buf.len());
         assert!(crate::common::error::ERR_isError(rc));
+        assert_eq!(d.bitsConsumed, 0);
+    }
+
+    #[test]
+    fn init_rejects_zero_last_byte_large_stream_clears_bits_consumed() {
+        let mut buf = [0u8; CONTAINER_BYTES];
+        buf[0] = 1;
+        let mut d = BIT_DStream_t::default();
+        d.bitsConsumed = 23;
+        let rc = BIT_initDStream(&mut d, &buf, buf.len());
+        assert!(crate::common::error::ERR_isError(rc));
+        assert_eq!(d.bitsConsumed, 0);
     }
 
     #[test]
@@ -493,6 +521,16 @@ mod tests {
         BIT_skipBits(&mut d, 5);
         assert_eq!(d.bitsConsumed, consumed_before + 5);
         assert_eq!(d.bitContainer, container_before);
+    }
+
+    #[test]
+    fn skipBits_wraps_like_unsigned_c() {
+        let mut d = BIT_DStream_t {
+            bitsConsumed: u32::MAX - 1,
+            ..BIT_DStream_t::default()
+        };
+        BIT_skipBits(&mut d, 3);
+        assert_eq!(d.bitsConsumed, 1);
     }
 
     // ---- encoder ---------------------------------------------------
@@ -554,6 +592,24 @@ mod tests {
         // Force an over-consumption state.
         bitD.bitsConsumed = CONTAINER_BITS + 1;
         assert_eq!(BIT_reloadDStream(&mut bitD), BIT_DStream_overflow);
+    }
+
+    #[test]
+    fn reloadDStream_overflow_keeps_fast_reload_in_overflow() {
+        let mut buf = [0u8; 16];
+        let cap = buf.len();
+        let (mut bitC, _) = BIT_initCStream(&mut buf, cap);
+        BIT_addBits(&mut bitC, 0xFF, 8);
+        BIT_flushBits(&mut bitC);
+        let written = BIT_closeCStream(&mut bitC);
+
+        let mut bitD = BIT_DStream_t::default();
+        BIT_initDStream(&mut bitD, &buf[..written], written);
+        bitD.ptr = bitD.limitPtr;
+        bitD.bitsConsumed = CONTAINER_BITS + 1;
+
+        assert_eq!(BIT_reloadDStream(&mut bitD), BIT_DStream_overflow);
+        assert_eq!(BIT_reloadDStreamFast(&mut bitD), BIT_DStream_overflow);
     }
 
     #[test]

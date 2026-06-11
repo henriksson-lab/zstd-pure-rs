@@ -28,6 +28,19 @@ pub const FSE_MAX_SYMBOL_VALUE: u32 = 255;
 pub const FSE_MIN_TABLELOG: u32 = 5;
 pub const FSE_TABLELOG_ABSOLUTE_MAX: u32 = 15;
 
+/// Rust-only helper for C macros of the form `1 << n`. Valid zstd
+/// callers keep `n` small; for invalid public inputs, saturating keeps
+/// the subsequent upstream-style size check on the error path instead
+/// of panicking on a Rust shift overflow.
+#[inline(always)]
+const fn fse_one_shift_saturating(n: u32) -> usize {
+    if n as usize >= usize::BITS as usize {
+        usize::MAX
+    } else {
+        1usize << n
+    }
+}
+
 /// Port of `FSE_TABLESTEP`. Stride used to spread normalized symbols
 /// across the decode table during table construction.
 #[inline(always)]
@@ -39,14 +52,17 @@ pub const fn FSE_TABLESTEP(tableSize: u32) -> u32 {
 /// of `maxTableLog` (1 header word + `1<<maxTableLog` decode entries).
 #[inline(always)]
 pub const fn FSE_DTABLE_SIZE_U32(maxTableLog: u32) -> usize {
-    1 + (1 << maxTableLog) as usize
+    1usize.saturating_add(fse_one_shift_saturating(maxTableLog))
 }
 
 /// Port of `FSE_BUILD_DTABLE_WKSP_SIZE`. Scratch byte count required by
 /// `FSE_buildDTable_wksp` for the given table parameters.
 #[inline(always)]
 pub const fn FSE_BUILD_DTABLE_WKSP_SIZE(maxTableLog: u32, maxSymbolValue: u32) -> usize {
-    2 * (maxSymbolValue as usize + 1) + (1 << maxTableLog as usize) + 8
+    2usize
+        .saturating_mul((maxSymbolValue as usize).saturating_add(1))
+        .saturating_add(fse_one_shift_saturating(maxTableLog))
+        .saturating_add(8)
 }
 
 /// Upstream `FSE_BUILD_DTABLE_WKSP_SIZE_U32`.
@@ -59,16 +75,16 @@ const fn FSE_BUILD_DTABLE_WKSP_SIZE_U32(maxTableLog: u32, maxSymbolValue: u32) -
 #[inline(always)]
 const fn FSE_DECOMPRESS_WKSP_SIZE_U32(maxTableLog: u32, maxSymbolValue: u32) -> usize {
     FSE_DTABLE_SIZE_U32(maxTableLog)
-        + 1
-        + FSE_BUILD_DTABLE_WKSP_SIZE_U32(maxTableLog, maxSymbolValue)
-        + ((FSE_MAX_SYMBOL_VALUE + 1) as usize) / 2
-        + 1
+        .saturating_add(1)
+        .saturating_add(FSE_BUILD_DTABLE_WKSP_SIZE_U32(maxTableLog, maxSymbolValue))
+        .saturating_add(((FSE_MAX_SYMBOL_VALUE + 1) as usize) / 2)
+        .saturating_add(1)
 }
 
 /// Upstream `FSE_DECOMPRESS_WKSP_SIZE`.
 #[inline(always)]
 const fn FSE_DECOMPRESS_WKSP_SIZE(maxTableLog: u32, maxSymbolValue: u32) -> usize {
-    FSE_DECOMPRESS_WKSP_SIZE_U32(maxTableLog, maxSymbolValue) * 4
+    FSE_DECOMPRESS_WKSP_SIZE_U32(maxTableLog, maxSymbolValue).saturating_mul(4)
 }
 
 pub type FSE_DTable = u32;
@@ -204,9 +220,6 @@ pub fn FSE_buildDTable_internal(
     _workSpace: &mut [u8],
     wkspSize: usize,
 ) -> usize {
-    let maxSV1 = maxSymbolValue + 1;
-    let tableSize = 1u32 << tableLog;
-
     if FSE_BUILD_DTABLE_WKSP_SIZE(tableLog, maxSymbolValue) > wkspSize {
         return ERROR(ErrorCode::MaxSymbolValueTooLarge);
     }
@@ -216,6 +229,12 @@ pub fn FSE_buildDTable_internal(
     if tableLog > FSE_MAX_TABLELOG {
         return ERROR(ErrorCode::TableLogTooLarge);
     }
+    if tableLog == 0 {
+        return ERROR(ErrorCode::TableLogTooLarge);
+    }
+
+    let maxSV1 = maxSymbolValue + 1;
+    let tableSize = 1u32 << tableLog;
 
     // Rust safety adaptation: upstream lays these arrays out inside
     // workSpace, while this port keeps typed scratch on the stack after
@@ -503,14 +522,13 @@ pub fn FSE_decompress_wksp(
     maxLog: u32,
     workSpace: &mut [u8],
 ) -> usize {
-    FSE_decompress_wksp_bmi2(dst, cSrc, maxLog, workSpace, 0)
+    FSE_decompress_wksp_body_default(dst, cSrc, maxLog, workSpace)
 }
 
-/// Port of `FSE_decompress_wksp_bmi2`. Reads the NCount header from
+/// Port of `FSE_decompress_wksp_body`. Reads the NCount header from
 /// `cSrc`, builds an FSE DTable, then decodes the remaining bytes into
-/// `dst`. `bmi2` is forwarded as a codegen hint; we have a single
-/// scalar path so it is currently ignored.
-pub fn FSE_decompress_wksp_bmi2(
+/// `dst`.
+fn FSE_decompress_wksp_body(
     dst: &mut [u8],
     cSrc: &[u8],
     maxLog: u32,
@@ -581,6 +599,30 @@ pub fn FSE_decompress_wksp_bmi2(
     }
 
     FSE_decompress_usingDTable(dst, remaining, dtable)
+}
+
+/// Port of `FSE_decompress_wksp_body_default`.
+fn FSE_decompress_wksp_body_default(
+    dst: &mut [u8],
+    cSrc: &[u8],
+    maxLog: u32,
+    workSpace: &mut [u8],
+) -> usize {
+    FSE_decompress_wksp_body(dst, cSrc, maxLog, workSpace, 0)
+}
+
+/// Port of `FSE_decompress_wksp_bmi2`. Upstream conditionally dispatches
+/// to a BMI2-attributed body when `DYNAMIC_BMI2` is enabled. This scalar
+/// Rust port has no separate BMI2 codegen path, so the public wrapper
+/// mirrors the default fallback.
+pub fn FSE_decompress_wksp_bmi2(
+    dst: &mut [u8],
+    cSrc: &[u8],
+    maxLog: u32,
+    workSpace: &mut [u8],
+    bmi2: i32,
+) -> usize {
+    FSE_decompress_wksp_body(dst, cSrc, maxLog, workSpace, bmi2)
 }
 
 #[cfg(test)]
@@ -691,6 +733,39 @@ mod tests {
     }
 
     #[test]
+    fn build_dtable_invalid_parameters_return_errors_without_overflow() {
+        let mut dt = vec![0u32; FSE_DTABLE_SIZE_U32(FSE_MAX_TABLELOG)];
+        let mut norm = [0i16; (FSE_MAX_SYMBOL_VALUE + 1) as usize];
+        norm[0] = 1;
+        let mut wksp =
+            vec![0u8; FSE_BUILD_DTABLE_WKSP_SIZE(FSE_MIN_TABLELOG, FSE_MAX_SYMBOL_VALUE)];
+
+        let rc = FSE_buildDTable_wksp(&mut dt, &norm, FSE_MAX_SYMBOL_VALUE, 0, &mut wksp);
+        assert_eq!(
+            crate::common::error::ERR_getErrorCode(rc),
+            ErrorCode::TableLogTooLarge
+        );
+
+        let rc = FSE_buildDTable_wksp(
+            &mut dt,
+            &norm,
+            FSE_MAX_SYMBOL_VALUE + 1,
+            FSE_MIN_TABLELOG,
+            &mut wksp,
+        );
+        assert_eq!(
+            crate::common::error::ERR_getErrorCode(rc),
+            ErrorCode::MaxSymbolValueTooLarge
+        );
+
+        let rc = FSE_buildDTable_wksp(&mut dt, &norm, FSE_MAX_SYMBOL_VALUE, usize::BITS, &mut []);
+        assert_eq!(
+            crate::common::error::ERR_getErrorCode(rc),
+            ErrorCode::MaxSymbolValueTooLarge
+        );
+    }
+
+    #[test]
     fn decompress_workspace_size_uses_build_dtable_u32_size() {
         assert_eq!(
             FSE_DECOMPRESS_WKSP_SIZE_U32(FSE_MIN_TABLELOG, FSE_MAX_SYMBOL_VALUE),
@@ -741,7 +816,7 @@ mod tests {
         use crate::compress::fse_compress::{
             FSE_NCountWriteBound, FSE_buildCTable_wksp, FSE_compressBound,
             FSE_compress_usingCTable, FSE_normalizeCount, FSE_optimalTableLog, FSE_writeNCount,
-            FSE_CTABLE_SIZE_U32,
+            FSE_BUILD_CTABLE_WORKSPACE_SIZE, FSE_CTABLE_SIZE_U32,
         };
         use crate::compress::hist::HIST_count_simple;
 
@@ -763,8 +838,7 @@ mod tests {
         ncount.truncate(ncount_len);
 
         let mut ctable = vec![0u32; FSE_CTABLE_SIZE_U32(tableLog, maxSymbolValue)];
-        let mut build_wksp =
-            vec![0u8; (maxSymbolValue as usize + 2) * 2 + (1usize << tableLog) + 8];
+        let mut build_wksp = vec![0u8; FSE_BUILD_CTABLE_WORKSPACE_SIZE(maxSymbolValue, tableLog)];
         assert_eq!(
             FSE_buildCTable_wksp(
                 &mut ctable,

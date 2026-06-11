@@ -68,7 +68,8 @@ pub fn ZSTD_rollingHash_compute(buf: &[u8]) -> u64 {
 /// bytes. Pass the result to `ZSTD_rollingHash_rotate`.
 #[inline]
 pub fn ZSTD_rollingHash_primePower(length: u32) -> u64 {
-    ZSTD_ipow(PRIME_8BYTES, length.saturating_sub(1) as u64)
+    debug_assert!(length > 0);
+    ZSTD_ipow(PRIME_8BYTES, length.wrapping_sub(1) as u64)
 }
 
 /// Port of `ZSTD_rollingHash_rotate` (zstd_compress_internal.h:1015).
@@ -343,30 +344,31 @@ pub fn ZSTD_count_2segments(
     let dict_remaining = mend_pos - match_pos;
     let vend_pos = (ip_pos + dict_remaining).min(iend_pos);
 
-    // Primary match-length counter across the ext-dict bytes.
-    let mut matchLength = 0usize;
-    while ip_pos + matchLength < vend_pos
-        && match_pos + matchLength < mend_pos
-        && input_buf[ip_pos + matchLength] == dict_buf[match_pos + matchLength]
-    {
-        matchLength += 1;
-    }
+    let matchLength =
+        ZSTD_count_two_slices(input_buf, ip_pos, vend_pos, dict_buf, match_pos, mend_pos);
 
     if match_pos + matchLength != mend_pos {
-        // Didn't hit the end of the dict segment — stop here.
         return matchLength;
     }
 
-    // Continue from iStart in the input buffer (the prefix of the
-    // current segment that wraps around to the dict).
-    let mut extra = 0usize;
-    while ip_pos + matchLength + extra < iend_pos
-        && istart_pos + extra < input_buf.len()
-        && input_buf[ip_pos + matchLength + extra] == input_buf[istart_pos + extra]
-    {
-        extra += 1;
+    matchLength + ZSTD_count(input_buf, ip_pos + matchLength, istart_pos, iend_pos)
+}
+
+#[inline]
+fn ZSTD_count_two_slices(
+    input_buf: &[u8],
+    mut ip_pos: usize,
+    ip_end: usize,
+    match_buf: &[u8],
+    mut match_pos: usize,
+    match_end: usize,
+) -> usize {
+    let start = ip_pos;
+    while ip_pos < ip_end && match_pos < match_end && input_buf[ip_pos] == match_buf[match_pos] {
+        ip_pos += 1;
+        match_pos += 1;
     }
-    matchLength + extra
+    ip_pos - start
 }
 
 /// Port of `ZSTD_count`. Returns the number of leading bytes that
@@ -472,47 +474,41 @@ mod tests {
     }
 
     #[test]
-    fn count_2segments_stays_within_dict_when_short() {
-        // dict = "HELLO"; input = "HELLOworld" starting at pos 0.
-        // Match length within dict = 5, never hits mEnd.
+    fn count_2segments_stops_before_dict_end_on_mismatch() {
+        // If the first segment mismatches before `mEnd`, upstream returns
+        // that count and must not continue from `iStart`.
         let input = b"HELLOworld";
-        let dict = b"HELLO";
+        let dict = b"HELxO";
         let n = ZSTD_count_2segments(input, 0, input.len(), 0, dict, 0, dict.len());
-        assert_eq!(n, 5);
+        assert_eq!(n, 3);
     }
 
     #[test]
-    fn count_2segments_wraps_into_prefix() {
-        // Dict ends with "WORLD", then input after ip also starts
-        // with "WORLD", then extra shared bytes "!!" from iStart.
-        //   dict:   "xxWORLD"     (mEnd = 7)
-        //   match starts at dict[2], mEnd=7 → 5 bytes in dict
-        //   input: "WORLD!!abc"   at ip=0
-        //   iStart points at "!!" location to continue matching
-        // After dict exhausts at ML=5, we try iStart="!!abc" vs
-        // input[5..] = "!!abc" → match 2 more bytes "!!".
-        let input = b"WORLD!!abc";
-        let dict = b"xxWORLD";
-        // The "continuation" at iStart: upstream's convention is
-        // iStart = start of prefix — pointing to bytes that match
-        // the post-dict continuation.
-        // For this test, iStart should index bytes starting with "!!".
-        // In our test buffer, "!!" lives at input[5]; but iStart is a
-        // position inside input_buf. Use input[5..] by setting istart=5.
-        let n = ZSTD_count_2segments(
-            input,
-            0,
-            input.len(),
-            5, // iStart = 5 → points at "!!abc"
-            dict,
-            2,
-            7, // match_pos=2, mEnd=7 → 5 bytes
-        );
-        // Primary = 5 (all of "WORLD" in dict);
-        // then iStart continuation matches 0 bytes (input[5..] vs input[5..] always matches).
-        // Wait — this is self-comparison. It'll match forever (until iend).
-        // Actually this test is muddled. Let me just check it's ≥ 5.
-        assert!(n >= 5);
+    fn count_2segments_wraps_into_prefix_exactly() {
+        // C convention:
+        //   first compare `ip` against the ext-dict match until `mEnd`;
+        //   if that reaches `mEnd`, continue with `ip + matchLength`
+        //   against `iStart` in the current prefix.
+        //
+        // input prefix at iStart=0: "def..."
+        // current ip=3:              "abcdefQ"
+        // dict match:                "abc"
+        // Result: 3 bytes from dict + 3 bytes from prefix.
+        let input = b"defabcdefQ";
+        let dict = b"abc";
+        let n = ZSTD_count_2segments(input, 3, input.len(), 0, dict, 0, dict.len());
+        assert_eq!(n, 6);
+    }
+
+    #[test]
+    fn count_2segments_treats_mend_as_hard_dict_boundary() {
+        // Upstream bounds the first leg with vEnd = min(ip + (mEnd - match), iEnd).
+        // Extra bytes present after mEnd in the dict buffer must not be consumed;
+        // after reaching mEnd, comparison resumes from iStart in the prefix.
+        let input = b"defabcdefQ";
+        let dict = b"abcXXX";
+        let n = ZSTD_count_2segments(input, 3, input.len(), 0, dict, 0, 3);
+        assert_eq!(n, 6);
     }
 
     #[test]
@@ -536,6 +532,23 @@ mod tests {
         //   (1 * 2654435761) >> 24 = 158 (0x9E).
         assert_eq!(ZSTD_hash4(1, 8, 0), 158);
         assert_eq!(ZSTD_hash4(0, 32, 0), 0);
+    }
+
+    #[test]
+    fn hash_family_matches_upstream_formula_vectors() {
+        let buf = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        let u32v = MEM_readLE32(&buf);
+        let u64v = MEM_readLE64(&buf);
+
+        assert_eq!(ZSTD_hash3(u32v, 16, 0), 48161);
+        assert_eq!(ZSTD_hash4(u32v, 16, 0), 15933);
+        assert_eq!(ZSTD_hash5(u64v, 16, 0), 22295);
+        assert_eq!(ZSTD_hash6(u64v, 16, 0), 4145);
+        assert_eq!(ZSTD_hash7(u64v, 16, 0), 951);
+        assert_eq!(ZSTD_hash8(u64v, 16, 0), 64852);
+
+        assert_eq!(ZSTD_hash4(u32v, 16, 0xDEAD_BEEF), 57488);
+        assert_eq!(ZSTD_hash8(u64v, 16, 0xDEAD_BEEF_CAFE_BABE), 9209);
     }
 
     #[test]

@@ -22,6 +22,7 @@ pub fn ZSTD_literalsCompressionIsDisabled(
     strategy: u32,
     targetLength: u32,
 ) -> bool {
+    use crate::compress::zstd_compress_sequences::ZSTD_fast;
     use crate::compress::zstd_ldm::ZSTD_ParamSwitch_e;
     match literalCompressionMode {
         ZSTD_ParamSwitch_e::ZSTD_ps_enable => false,
@@ -29,7 +30,7 @@ pub fn ZSTD_literalsCompressionIsDisabled(
         ZSTD_ParamSwitch_e::ZSTD_ps_auto => {
             // upstream: auto → disabled for fast strategy with non-zero
             // targetLength (flag set to accelerate compression).
-            strategy == 1 && targetLength > 0
+            strategy == ZSTD_fast && targetLength > 0
         }
     }
 }
@@ -93,10 +94,9 @@ pub fn ZSTD_noCompressLiterals(dst: &mut [u8], src: &[u8]) -> usize {
 
 /// Port of `allBytesIdentical` (file-private helper).
 fn allBytesIdentical(src: &[u8]) -> bool {
-    match src.split_first() {
-        None => true,
-        Some((first, rest)) => rest.iter().all(|b| b == first),
-    }
+    debug_assert!(!src.is_empty());
+    let first = src[0];
+    src[1..].iter().all(|b| *b == first)
 }
 
 /// Port of `ZSTD_compressRleLiteralsBlock`. Emits a `set_rle` literals
@@ -113,7 +113,11 @@ pub fn ZSTD_compressRleLiteralsBlock(dst: &mut [u8], src: &[u8]) -> usize {
         "ZSTD_compressRleLiteralsBlock requires all bytes identical"
     );
     let flSize: usize = 1 + ((srcSize > 31) as usize) + ((srcSize > 4095) as usize);
-    if dst.len() < flSize + 1 {
+    debug_assert!(
+        dst.len() >= 4,
+        "ZSTD_compressRleLiteralsBlock requires dstCapacity >= 4"
+    );
+    if dst.len() < 4 {
         return ERROR(ErrorCode::DstSizeTooSmall);
     }
     match flSize {
@@ -138,7 +142,7 @@ pub fn ZSTD_compressRleLiteralsBlock(dst: &mut [u8], src: &[u8]) -> usize {
 /// tightening as the strategy level rises.
 pub fn ZSTD_minLiteralsToCompress(strategy: ZSTD_strategy, huf_repeat: HUF_repeat) -> usize {
     debug_assert!(strategy <= 9);
-    let shift = (9i32 - strategy as i32).clamp(0, 3) as u32;
+    let shift = core::cmp::min(9i32 - strategy as i32, 3) as u32;
     if huf_repeat == HUF_repeat::HUF_repeat_valid {
         6
     } else {
@@ -211,8 +215,12 @@ pub fn ZSTD_compressLiterals(
     // overwrite the table even though we eventually emitted the block
     // as `set_basic`, leaving compressor and decoder with mismatched
     // tables for the next `set_repeat`.
-    let snapshot_huf_ctable: Option<Vec<crate::compress::huf_compress::HUF_CElt>> =
-        prevHufTable.as_deref().map(|t| t.to_vec());
+    let mut snapshot_huf_ctable = [crate::compress::huf_compress::HUF_CElt::default(); 257];
+    let snapshot_huf_ctable_len = prevHufTable.as_deref().map(|t| {
+        let n = t.len().min(snapshot_huf_ctable.len());
+        snapshot_huf_ctable[..n].copy_from_slice(&t[..n]);
+        n
+    });
     let mut prevHufTable = prevHufTable;
     // Literal block header length: 3, 4, or 5 bytes depending on size.
     let lhSize = 3 + (srcSize >= 1024) as usize + (srcSize >= 16384) as usize;
@@ -272,10 +280,8 @@ pub fn ZSTD_compressLiterals(
     // Snapshot the caller's initial repeat flag before handing
     // `prevRepeat` to `HUF_compress*_repeat` — the inner function
     // overwrites it with the post-compression state (none / valid).
-    // Upstream distinguishes `set_compressed` (fresh tree emitted)
-    // from `set_repeat` (prior tree reused) by checking this final
-    // state. We need both views: pre-call for gating, post-call for
-    // the header's hType.
+    // We need the pre-call value to restore `nextHuf` state on raw/RLE
+    // fallback paths, matching upstream's copy-back from `prevHuf`.
     let mut repeat_scratch = prevRepeat
         .as_deref()
         .copied()
@@ -314,6 +320,9 @@ pub fn ZSTD_compressLiterals(
     if let Some(r) = prevRepeat.as_deref_mut() {
         *r = repeat_scratch;
     }
+    if repeat_scratch != HUF_repeat::HUF_repeat_none {
+        hType = SymbolEncodingType_e::set_repeat;
+    }
     // Helper to restore the caller's CTable from the on-entry snapshot.
     // Mirrors upstream's `ZSTD_memcpy(nextHuf, prevHuf, ...)` reset on
     // noCompress fallback paths. Without this, a fresh HUF table built
@@ -322,12 +331,16 @@ pub fn ZSTD_compressLiterals(
     // the compressor and decoder then disagree on the "last table" the
     // following `set_repeat` should reuse.
     let restore_table = |slot: &mut Option<&mut [crate::compress::huf_compress::HUF_CElt]>| {
-        if let (Some(snap), Some(t)) = (snapshot_huf_ctable.as_ref(), slot.as_deref_mut()) {
-            let n = snap.len().min(t.len());
-            t[..n].copy_from_slice(&snap[..n]);
+        if let (Some(snap_len), Some(t)) = (snapshot_huf_ctable_len, slot.as_deref_mut()) {
+            let n = snap_len.min(t.len());
+            t[..n].copy_from_slice(&snapshot_huf_ctable[..n]);
         }
     };
-    if crate::common::error::ERR_isError(cLitSize) {
+    let minGain = ZSTD_minGain(srcSize, strategy);
+    if cLitSize == 0
+        || cLitSize >= srcSize.wrapping_sub(minGain)
+        || crate::common::error::ERR_isError(cLitSize)
+    {
         if let Some(r) = prevRepeat.as_deref_mut() {
             *r = initial_repeat;
         }
@@ -343,24 +356,6 @@ pub fn ZSTD_compressLiterals(
         }
         restore_table(&mut prevHufTable);
         return ZSTD_compressRleLiteralsBlock(dst, src);
-    }
-
-    // Compressed output must yield at least `minGain` savings over raw.
-    let minGain = ZSTD_minGain(srcSize, strategy);
-    if cLitSize == 0 || cLitSize + minGain >= srcSize {
-        if let Some(r) = prevRepeat.as_deref_mut() {
-            *r = initial_repeat;
-        }
-        restore_table(&mut prevHufTable);
-        return ZSTD_noCompressLiterals(dst, src);
-    }
-
-    // Differentiate set_repeat (HUF table was reused) vs set_compressed
-    // by consulting the repeat flag the compressor left behind in
-    // `repeat_scratch`. Upstream uses `repeat != HUF_repeat_none` here.
-    let used_repeat = repeat_scratch != HUF_repeat::HUF_repeat_none;
-    if used_repeat {
-        hType = SymbolEncodingType_e::set_repeat;
     }
 
     // Emit the literals-block header.
@@ -599,8 +594,78 @@ mod tests {
     }
 
     #[test]
+    fn literal_special_case_headers_match_upstream() {
+        let mut dst = vec![0u8; 8200];
+
+        let n = ZSTD_noCompressLiterals(&mut dst, &[0xAB; 31]);
+        assert_eq!(n, 32);
+        assert_eq!(dst[0], 31 << 3);
+
+        let n = ZSTD_noCompressLiterals(&mut dst, &[0xCD; 32]);
+        assert_eq!(n, 34);
+        assert_eq!(&dst[..2], &((1u16 << 2) + (32u16 << 4)).to_le_bytes());
+
+        let n = ZSTD_noCompressLiterals(&mut dst, &[0xEF; 4096]);
+        assert_eq!(n, 4099);
+        assert_eq!(
+            &dst[..3],
+            &((3u32 << 2) + (4096u32 << 4)).to_le_bytes()[..3]
+        );
+        assert_eq!(dst[3], 0xEF);
+
+        let n = ZSTD_compressRleLiteralsBlock(&mut dst, &[0x42; 31]);
+        assert_eq!(n, 2);
+        assert_eq!(dst[0], (SymbolEncodingType_e::set_rle as u8) + (31 << 3));
+        assert_eq!(dst[1], 0x42);
+
+        let n = ZSTD_compressRleLiteralsBlock(&mut dst, &[0x42; 4096]);
+        assert_eq!(n, 4);
+        assert_eq!(
+            &dst[..3],
+            &((SymbolEncodingType_e::set_rle as u32) + (3u32 << 2) + (4096u32 << 4)).to_le_bytes()
+                [..3]
+        );
+        assert_eq!(dst[3], 0x42);
+    }
+
+    #[test]
+    fn compress_literals_fallback_restores_repeat_and_table() {
+        let src: Vec<u8> = (0..2048u32).map(|i| i as u8).collect();
+        let mut dst = vec![0u8; src.len() + 16];
+        let mut table = vec![crate::compress::huf_compress::HUF_CElt::MAX; 257];
+        let original = table.clone();
+        let mut repeat = HUF_repeat::HUF_repeat_check;
+
+        let written = ZSTD_compressLiterals(
+            &mut dst,
+            &src,
+            0,
+            crate::compress::zstd_compress_sequences::ZSTD_lazy2,
+            Some(&mut table),
+            Some(&mut repeat),
+            1,
+            0,
+        );
+
+        assert!(!crate::common::error::ERR_isError(written));
+        assert_eq!(dst[0] & 3, SymbolEncodingType_e::set_basic as u8);
+        assert_eq!(repeat, HUF_repeat::HUF_repeat_check);
+        assert_eq!(table, original);
+    }
+
+    #[cfg_attr(debug_assertions, should_panic(expected = "dstCapacity >= 4"))]
+    #[test]
+    fn rle_literals_requires_upstream_minimum_capacity() {
+        let src = [b'A'; 20];
+        let mut dst = [0u8; 2];
+        let written = ZSTD_compressRleLiteralsBlock(&mut dst, &src);
+        if !cfg!(debug_assertions) {
+            assert!(crate::common::error::ERR_isError(written));
+        }
+    }
+
+    #[test]
     fn all_bytes_identical_helper() {
-        assert!(allBytesIdentical(b""));
         assert!(allBytesIdentical(b"A"));
         assert!(allBytesIdentical(b"AAAA"));
         assert!(!allBytesIdentical(b"AAAB"));

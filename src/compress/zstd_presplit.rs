@@ -134,10 +134,13 @@ unsafe fn addEvents_chunk_const<const SAMPLING_RATE: usize, const HASH_LOG: u32>
 ) -> usize {
     const HASHLENGTH: usize = 2;
     const LIMIT: usize = CHUNKSIZE - HASHLENGTH + 1;
+    let events = events.as_mut_ptr();
     let mut n = 0;
     while n < LIMIT {
         let h = unsafe { hash2_ptr_const::<HASH_LOG>(src.add(n)) };
-        events[h] += 1;
+        unsafe {
+            *events.add(h) += 1;
+        }
         n += SAMPLING_RATE;
     }
     LIMIT / SAMPLING_RATE
@@ -190,10 +193,14 @@ fn fpDistance(fp1: &Fingerprint, fp2: &Fingerprint, hashLog: u32) -> u64 {
 #[inline(always)]
 fn fpDistance_const<const HASH_LOG: u32>(fp1: &Fingerprint, fp2: &Fingerprint) -> u64 {
     let mut distance: u64 = 0;
+    let fp1_events = fp1.events.as_ptr();
+    let fp2_events = fp2.events.as_ptr();
+    let fp1_nb_events = fp1.nbEvents as u64;
+    let fp2_nb_events = fp2.nbEvents as u64;
     let mut n = 0;
     while n < (1usize << HASH_LOG) {
-        let a = (fp1.events[n] as u64) * (fp2.nbEvents as u64);
-        let b = (fp2.events[n] as u64) * (fp1.nbEvents as u64);
+        let a = unsafe { *fp1_events.add(n) as u64 } * fp2_nb_events;
+        let b = unsafe { *fp2_events.add(n) as u64 } * fp1_nb_events;
         distance = distance.wrapping_add(a.abs_diff(b));
         n += 1;
     }
@@ -243,9 +250,13 @@ fn mergeEvents(acc: &mut Fingerprint, newfp: &Fingerprint) {
 
 #[inline(always)]
 fn mergeEvents_const<const HASH_LOG: u32>(acc: &mut Fingerprint, newfp: &Fingerprint) {
+    let acc_events = acc.events.as_mut_ptr();
+    let new_events = newfp.events.as_ptr();
     let mut n = 0;
     while n < (1usize << HASH_LOG) {
-        acc.events[n] += newfp.events[n];
+        unsafe {
+            *acc_events.add(n) += *new_events.add(n);
+        }
         n += 1;
     }
     acc.nbEvents += newfp.nbEvents;
@@ -295,11 +306,12 @@ fn ZSTD_splitBlock_byChunks(block: &[u8], level: i32) -> usize {
 /// at a time, comparing the new chunk's fingerprint to the running
 /// past-fingerprint and returning the first split position where they
 /// diverge past threshold. Rust-only split.
-#[inline(never)]
+#[inline(always)]
 fn ZSTD_splitBlock_byChunks_specialized<const SAMPLING_RATE: usize, const HASH_LOG: u32>(
     block: &[u8],
 ) -> usize {
-    debug_assert_eq!(block.len(), 128 << 10);
+    const FULL_BLOCK: usize = 128 << 10;
+    debug_assert_eq!(block.len(), FULL_BLOCK);
 
     let mut fpstats = FPStats::new();
     let mut penalty = THRESHOLD_PENALTY;
@@ -313,7 +325,7 @@ fn ZSTD_splitBlock_byChunks_specialized<const SAMPLING_RATE: usize, const HASH_L
     }
 
     let mut pos = CHUNKSIZE;
-    while pos <= block.len() - CHUNKSIZE {
+    while pos <= FULL_BLOCK - CHUNKSIZE {
         unsafe {
             recordFingerprint_chunk_const::<SAMPLING_RATE, HASH_LOG>(
                 &mut fpstats.newEvents,
@@ -329,7 +341,7 @@ fn ZSTD_splitBlock_byChunks_specialized<const SAMPLING_RATE: usize, const HASH_L
         }
         pos += CHUNKSIZE;
     }
-    block.len()
+    FULL_BLOCK
 }
 
 /// Port of `ZSTD_splitBlock_fromBorders`. Cheap heuristic: compare

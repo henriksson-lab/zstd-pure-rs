@@ -12486,9 +12486,16 @@ fn zstd_stream_can_use_windowed_with_stable_one_shot(
     zcs: &ZSTD_CCtx,
     allow_stable_one_shot: bool,
 ) -> bool {
+    use crate::compress::zstd_compress_sequences::ZSTD_btopt;
+
     let level = zcs
         .stream_level
         .unwrap_or(zcs.requestedParams.compressionLevel);
+    let strategy = zcs
+        .appliedParams
+        .cParams
+        .strategy
+        .max(zcs.requestedParams.cParams.strategy);
     let buffered_modes = zcs.requestedParams.inBufferMode == ZSTD_bufferMode_e::ZSTD_bm_buffered
         && zcs.requestedParams.outBufferMode == ZSTD_bufferMode_e::ZSTD_bm_buffered;
     let stable_one_shot_modes = allow_stable_one_shot
@@ -12499,6 +12506,8 @@ fn zstd_stream_can_use_windowed_with_stable_one_shot(
         && zcs.stream_dict.is_empty()
         && !zcs.prefix_is_single_use
         && (1..=22).contains(&level)
+        && level < 16
+        && strategy < ZSTD_btopt
         && zcs.requestedParams.nbWorkers == 0
         && zcs.appliedParams.nbWorkers == 0
         && (buffered_modes || stable_one_shot_modes)

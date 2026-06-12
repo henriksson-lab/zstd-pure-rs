@@ -22,11 +22,11 @@ use zstd_pure_rs::compress::zstd_compress::{
 #[cfg(test)]
 use zstd_pure_rs::decompress::zstd_decompress::ZSTD_getFrameContentSize;
 use zstd_pure_rs::decompress::zstd_decompress::{
-    ZSTD_DCtx_setFormat, ZSTD_decodingBufferSize_internal, ZSTD_decompress,
+    ZSTD_DCtx_setFormat, ZSTD_FrameHeader, ZSTD_decodingBufferSize_internal, ZSTD_decompress,
     ZSTD_decompressContinue, ZSTD_decompressContinue_into_prefix, ZSTD_decompressDCtx,
-    ZSTD_decompress_usingDict, ZSTD_findFrameSizeInfo, ZSTD_format_e, ZSTD_nextInputType,
-    ZSTD_nextInputType_e, ZSTD_nextSrcSizeToDecompress, ZSTD_resetDStream, ZSTD_CONTENTSIZE_ERROR,
-    ZSTD_CONTENTSIZE_UNKNOWN, ZSTD_MAGICNUMBER, ZSTD_MAGIC_SKIPPABLE_MASK,
+    ZSTD_decompress_usingDict, ZSTD_findFrameSizeInfo, ZSTD_format_e, ZSTD_getFrameHeader,
+    ZSTD_nextInputType, ZSTD_nextInputType_e, ZSTD_nextSrcSizeToDecompress, ZSTD_resetDStream,
+    ZSTD_CONTENTSIZE_ERROR, ZSTD_CONTENTSIZE_UNKNOWN, ZSTD_MAGICNUMBER, ZSTD_MAGIC_SKIPPABLE_MASK,
     ZSTD_MAGIC_SKIPPABLE_START,
 };
 use zstd_pure_rs::decompress::zstd_decompress_block::{
@@ -36,6 +36,7 @@ use zstd_pure_rs::decompress::zstd_decompress_block::{
 const UPSTREAM_ZSTD_VERSION: &str = "1.6.0";
 const UPSTREAM_ZSTD_VERSION_BANNER: &str = "*** Zstandard CLI (64-bit) v1.6.0, by Yann Collet ***";
 const FILE_OUTPUT_BUFFER_SIZE: usize = 1 << 20;
+const STREAM_DECODE_WINDOW_LIMIT: u64 = 4 << 20;
 
 /// Mirror of the most-used `zstd` flags. The subset is kept small on
 /// purpose — we add flags as the matching features land.
@@ -1193,6 +1194,17 @@ fn configure_zstd_compressor(
     Ok(())
 }
 
+fn read_exact_vec<R: Read>(reader: &mut R, len: usize) -> io::Result<Vec<u8>> {
+    let mut buf = Vec::with_capacity(len);
+    let spare = buf.spare_capacity_mut();
+    let dst = unsafe { std::slice::from_raw_parts_mut(spare.as_mut_ptr() as *mut u8, len) };
+    reader.read_exact(dst)?;
+    unsafe {
+        buf.set_len(len);
+    }
+    Ok(buf)
+}
+
 fn stream_buffered_compress_zstd_file_to_writer<W: Write>(
     input: &Path,
     writer: &mut W,
@@ -1206,10 +1218,8 @@ fn stream_buffered_compress_zstd_file_to_writer<W: Write>(
         .map_err(|e| format!("{}: {e}", input.display()))?
         .len();
     let mut reader = BufReader::new(file);
-    if level >= 5 && src_size <= 256 << 20 {
-        let mut src = Vec::with_capacity(src_size as usize);
-        reader
-            .read_to_end(&mut src)
+    if level >= 3 && src_size <= 256 << 20 {
+        let src = read_exact_vec(&mut reader, src_size as usize)
             .map_err(|e| format!("{}: {e}", input.display()))?;
         let compressed = compress_bytes(
             &src,
@@ -1347,6 +1357,23 @@ fn stream_decompress_zstd_file_to_writer<W: Write>(
     writer: &mut W,
     ignore_checksum: bool,
 ) -> Result<(usize, usize), String> {
+    {
+        let mut header_prefix = [0u8; 18];
+        let mut probe = File::open(input).map_err(|e| format!("{}: {e}", input.display()))?;
+        let got = probe
+            .read(&mut header_prefix)
+            .map_err(|e| format!("{}: {e}", input.display()))?;
+        let mut frame_header = ZSTD_FrameHeader::default();
+        let header_rc = ZSTD_getFrameHeader(&mut frame_header, &header_prefix[..got]);
+        if header_rc == 0 && frame_header.windowSize > STREAM_DECODE_WINDOW_LIMIT {
+            let compressed = fs::read(input).map_err(|e| format!("{}: {e}", input.display()))?;
+            let decoded = decompress_bytes(&compressed, None, false, ignore_checksum)?;
+            writer.write_all(&decoded).map_err(|e| e.to_string())?;
+            writer.flush().map_err(|e| e.to_string())?;
+            return Ok((compressed.len(), decoded.len()));
+        }
+    }
+
     let file = File::open(input).map_err(|e| format!("{}: {e}", input.display()))?;
     let mut reader = BufReader::new(file);
     let mut dctx = ZSTD_DCtx::new();

@@ -245,12 +245,12 @@ pub fn ZSTD_resolveEnableLdm(
     if mode != ZSTD_ParamSwitch_e::ZSTD_ps_auto {
         return mode;
     }
-    // ZSTD_btopt = 7.
-    if cParams.strategy >= 7 && cParams.windowLog >= 27 {
-        ZSTD_ParamSwitch_e::ZSTD_ps_enable
-    } else {
-        ZSTD_ParamSwitch_e::ZSTD_ps_disable
-    }
+    // Upstream auto-enables LDM for btopt+ with windowLog >= 27.
+    // Keep the Rust auto mode disabled until the translated LDM
+    // sequence generator matches upstream; enabling it currently
+    // produces valid but much larger level-22 frames.
+    let _ = cParams;
+    ZSTD_ParamSwitch_e::ZSTD_ps_disable
 }
 
 /// Port of `ZSTD_resolveMaxBlockSize`. Returns `ZSTD_BLOCKSIZE_MAX` on
@@ -1718,7 +1718,7 @@ mod tests {
     }
 
     #[test]
-    fn resolveEnableLdm_auto_gates_on_wlog_27() {
+    fn resolveEnableLdm_auto_stays_disabled_until_ldm_parity() {
         use crate::compress::zstd_ldm::ZSTD_ParamSwitch_e;
         let cp_btopt_small = ZSTD_compressionParameters {
             strategy: 7,
@@ -1736,6 +1736,10 @@ mod tests {
         };
         assert_eq!(
             ZSTD_resolveEnableLdm(ZSTD_ParamSwitch_e::ZSTD_ps_auto, &cp_btopt_huge),
+            ZSTD_ParamSwitch_e::ZSTD_ps_disable,
+        );
+        assert_eq!(
+            ZSTD_resolveEnableLdm(ZSTD_ParamSwitch_e::ZSTD_ps_enable, &cp_btopt_huge),
             ZSTD_ParamSwitch_e::ZSTD_ps_enable,
         );
     }

@@ -422,17 +422,37 @@ pub fn ZSTD_row_getMatchMask(
         debug_assert!(tagRow.len() >= rowEntries as usize);
         let tagv = unsafe { _mm_set1_epi8(tag as i8) };
         let base = tagRow.as_ptr();
-        let mut matches = 0u64;
-        let chunks = rowEntries as usize / 16;
-        for chunk in 0..chunks {
-            let v = unsafe { _mm_loadu_si128(base.add(chunk * 16) as *const _) };
-            let eq = unsafe { _mm_cmpeq_epi8(v, tagv) };
-            matches |= (unsafe { _mm_movemask_epi8(eq) } as u32 as u64) << (chunk * 16);
-        }
         return match rowEntries {
-            16 => ZSTD_rotateRight_U16(matches as u16, headGrouped) as u64,
-            32 => ZSTD_rotateRight_U32(matches as u32, headGrouped) as u64,
-            _ => ZSTD_rotateRight_U64(matches, headGrouped),
+            16 => {
+                let v0 = unsafe { _mm_loadu_si128(base as *const _) };
+                let eq0 = unsafe { _mm_cmpeq_epi8(v0, tagv) };
+                let matches = unsafe { _mm_movemask_epi8(eq0) } as u16;
+                ZSTD_rotateRight_U16(matches, headGrouped) as u64
+            }
+            32 => {
+                let v0 = unsafe { _mm_loadu_si128(base as *const _) };
+                let v1 = unsafe { _mm_loadu_si128(base.add(16) as *const _) };
+                let eq0 = unsafe { _mm_cmpeq_epi8(v0, tagv) };
+                let eq1 = unsafe { _mm_cmpeq_epi8(v1, tagv) };
+                let matches = (unsafe { _mm_movemask_epi8(eq0) } as u32)
+                    | ((unsafe { _mm_movemask_epi8(eq1) } as u32) << 16);
+                ZSTD_rotateRight_U32(matches, headGrouped) as u64
+            }
+            _ => {
+                let v0 = unsafe { _mm_loadu_si128(base as *const _) };
+                let v1 = unsafe { _mm_loadu_si128(base.add(16) as *const _) };
+                let v2 = unsafe { _mm_loadu_si128(base.add(32) as *const _) };
+                let v3 = unsafe { _mm_loadu_si128(base.add(48) as *const _) };
+                let eq0 = unsafe { _mm_cmpeq_epi8(v0, tagv) };
+                let eq1 = unsafe { _mm_cmpeq_epi8(v1, tagv) };
+                let eq2 = unsafe { _mm_cmpeq_epi8(v2, tagv) };
+                let eq3 = unsafe { _mm_cmpeq_epi8(v3, tagv) };
+                let matches = (unsafe { _mm_movemask_epi8(eq0) } as u32 as u64)
+                    | ((unsafe { _mm_movemask_epi8(eq1) } as u32 as u64) << 16)
+                    | ((unsafe { _mm_movemask_epi8(eq2) } as u32 as u64) << 32)
+                    | ((unsafe { _mm_movemask_epi8(eq3) } as u32 as u64) << 48);
+                ZSTD_rotateRight_U64(matches, headGrouped)
+            }
         };
     }
     #[cfg(not(target_arch = "x86_64"))]

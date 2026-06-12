@@ -1206,12 +1206,33 @@ fn stream_buffered_compress_zstd_file_to_writer<W: Write>(
         .map_err(|e| format!("{}: {e}", input.display()))?
         .len();
     let mut reader = BufReader::new(file);
+    if level >= 5 && src_size <= 256 << 20 {
+        let mut src = Vec::with_capacity(src_size as usize);
+        reader
+            .read_to_end(&mut src)
+            .map_err(|e| format!("{}: {e}", input.display()))?;
+        let compressed = compress_bytes(
+            &src,
+            level,
+            None,
+            checksum,
+            content_size,
+            false,
+            false,
+            None,
+            true,
+        )?;
+        writer.write_all(&compressed).map_err(|e| e.to_string())?;
+        writer.flush().map_err(|e| e.to_string())?;
+        return Ok((src.len(), compressed.len()));
+    }
     let mut cctx = ZSTD_createCCtx().ok_or("cctx alloc failed")?;
     configure_zstd_compressor(&mut cctx, level, checksum, content_size, src_size)?;
 
     let file_chunk_size = ZSTD_CStreamInSize().max(1);
     let mut input_buf = vec![0u8; file_chunk_size];
-    let mut output_buf = vec![0u8; ZSTD_CStreamOutSize().max(32)];
+    let output_bound = ZSTD_compressBound(file_chunk_size).saturating_add(64);
+    let mut output_buf = vec![0u8; ZSTD_CStreamOutSize().max(output_bound).max(32)];
     let mut total_in = 0usize;
     let mut total_out = 0usize;
 

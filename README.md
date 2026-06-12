@@ -48,7 +48,7 @@ Features working:
 
 The main v1.6 `zstd.h` `ZSTD_` entry points and many experimental helpers, including translated helpers such as `ZSTD_compressSequencesAndLiterals`, are surfaced through `zstd_pure_rs::prelude::*`, but lower-level `HUF_` and `FSE_` helpers remain in their module namespaces unless explicitly re-exported there. Some parameter IDs and edge APIs remain intentionally unsupported and return the matching error codes. The current C→Rust function-name coverage backlog is closed for both compression and decompression under `code-complexity-comparator`; remaining gaps are mostly verification breadth, performance/shape differences from safe scalar factoring, unsupported parameter variants, and CLI flag completeness. Magic-prefix dictionary entropy **decode** is live via `ZSTD_DCtx_loadDictionary` / `ZSTD_decompress_insertDictionary` / `ZSTD_loadDEntropy`, and DDict full-dictionary entropy is copied into DCtx state when attached. Focused follow-up notes live in `TODO.md`; the full C → Rust function mapping lives in `FUNCTIONS.md`.
 
-Test suite status as of the latest local CLI audit run: `cargo test --features cli --test cli_roundtrip` passes the focused CLI integration suite. That CLI suite covers file/stdin/stdout behavior, cross-compatibility cases that run only when upstream `zstd` is on `PATH`, boundary-size and multi-block regressions, end-to-end `--magicless` roundtrips, last-wins `-c`/`-o` and `--check`/`--no-check`, `-N` and clustered level flags, decode-side `--no-check`, no-suffix output rejection before decode, attached `-Ddict` rejection, `-d -c -f` stdout pass-through for unrecognized input, and multi-input `-o` rejection. Broader library/API coverage lives in the regular unit and integration tests, not only this CLI audit suite.
+Test suite status as of the latest local audit run: `cargo test --features cli` passes. That includes the focused CLI integration suite, regular library/API unit tests, doc tests, and integration tests. The CLI suite covers file/stdin/stdout behavior, cross-compatibility cases that run only when upstream `zstd` is on `PATH`, boundary-size and multi-block regressions, end-to-end `--magicless` roundtrips, last-wins `-c`/`-o` and `--check`/`--no-check`, `-N` and clustered level flags, decode-side `--no-check`, no-suffix output rejection before decode, attached `-Ddict` rejection, `-d -c -f` stdout pass-through for unrecognized input, and multi-input `-o` rejection.
 
 ## Local benchmark snapshot
 
@@ -56,28 +56,28 @@ Measured 2026-06-12 on Linux 6.8 x86_64, Intel Xeon Gold 6138, `rustc 1.92.0`, r
 
 | Level | Rust speed | Original speed | Rust / original | Rust RSS | Original RSS | Rust size | Original size | Cross-decode |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :---: |
-| 1 | 2332.2 MB/s | 1166.1 MB/s | 2.00x | 4.1 MiB | 16.6 MiB | 55,980 | 759,188 | pass |
-| 2 | 1554.8 MB/s | 1166.1 MB/s | 1.33x | 4.7 MiB | 31.2 MiB | 54,977 | 198,821 | pass |
-| 3 | 932.9 MB/s | 932.9 MB/s | 1.00x | 6.2 MiB | 48.8 MiB | 52,121 | 52,213 | pass |
-| 4 | 666.3 MB/s | 777.4 MB/s | 0.86x | 7.5 MiB | 52.5 MiB | 52,051 | 52,141 | pass |
-| 5 | 583.0 MB/s | 932.9 MB/s | 0.62x | 7.8 MiB | 56.6 MiB | 49,921 | 49,970 | pass |
-| 6 | 583.0 MB/s | 777.4 MB/s | 0.75x | 8.1 MiB | 56.6 MiB | 48,660 | 48,692 | pass |
-| 7 | 666.3 MB/s | 777.4 MB/s | 0.86x | 10.6 MiB | 66.6 MiB | 48,257 | 48,279 | pass |
-| 8 | 518.3 MB/s | 666.3 MB/s | 0.78x | 50.6 MiB | 66.6 MiB | 47,530 | 47,550 | pass |
-| 9 | 466.4 MB/s | 466.4 MB/s | 1.00x | 53.8 MiB | 76.6 MiB | 47,524 | 47,539 | pass |
-| 10 | 466.4 MB/s | 388.7 MB/s | 1.20x | 63.8 MiB | 106.6 MiB | 47,277 | 47,287 | pass |
-| 11 | 466.4 MB/s | 388.7 MB/s | 1.20x | 63.4 MiB | 106.6 MiB | 47,108 | 47,112 | pass |
-| 12 | 424.0 MB/s | 311.0 MB/s | 1.36x | 83.8 MiB | 166.9 MiB | 47,108 | 47,112 | pass |
-| 13 | 424.0 MB/s | 333.2 MB/s | 1.27x | 75.6 MiB | 142.5 MiB | 46,899 | 46,906 | pass |
-| 14 | 333.2 MB/s | 291.5 MB/s | 1.14x | 91.9 MiB | 190.3 MiB | 46,808 | 46,815 | pass |
-| 15 | 311.0 MB/s | 274.4 MB/s | 1.13x | 107.8 MiB | 238.1 MiB | 46,795 | 46,802 | pass |
-| 16 | 311.0 MB/s | 311.0 MB/s | 1.00x | 76.2 MiB | 142.5 MiB | 44,993 | 45,018 | pass |
-| 17 | 233.2 MB/s | 245.5 MB/s | 0.95x | 88.1 MiB | 142.5 MiB | 44,704 | 44,708 | pass |
-| 18 | 233.2 MB/s | 222.1 MB/s | 1.05x | 88.8 MiB | 143.8 MiB | 44,488 | 44,492 | pass |
-| 19 | 194.3 MB/s | 179.4 MB/s | 1.08x | 120.6 MiB | 207.5 MiB | 44,430 | 44,365 | pass |
-| 20 | 103.7 MB/s | 141.3 MB/s | 0.73x | 196.6 MiB | 207.2 MiB | 44,430 | 44,361 | pass |
-| 21 | 126.1 MB/s | 106.0 MB/s | 1.19x | 368.8 MiB | 367.2 MiB | 44,429 | 44,360 | pass |
-| 22 | 76.5 MB/s | 74.0 MB/s | 1.03x | 688.8 MiB | 687.2 MiB | 44,429 | 44,360 | pass |
+| 1 | 1554.8 MB/s | 1166.1 MB/s | 1.33x | 4.1 MiB | 16.6 MiB | 55,980 | 759,188 | pass |
+| 2 | 932.9 MB/s | 932.9 MB/s | 1.00x | 4.7 MiB | 31.2 MiB | 54,977 | 198,821 | pass |
+| 3 | 666.3 MB/s | 777.4 MB/s | 0.86x | 6.2 MiB | 48.8 MiB | 52,121 | 52,213 | pass |
+| 4 | 777.4 MB/s | 777.4 MB/s | 1.00x | 7.5 MiB | 52.5 MiB | 52,051 | 52,141 | pass |
+| 5 | 777.4 MB/s | 777.4 MB/s | 1.00x | 50.3 MiB | 54.4 MiB | 49,778 | 49,970 | pass |
+| 6 | 583.0 MB/s | 777.4 MB/s | 0.75x | 50.3 MiB | 56.6 MiB | 48,517 | 48,692 | pass |
+| 7 | 583.0 MB/s | 666.3 MB/s | 0.88x | 52.8 MiB | 66.6 MiB | 48,114 | 48,279 | pass |
+| 8 | 666.3 MB/s | 583.0 MB/s | 1.14x | 52.5 MiB | 66.6 MiB | 47,530 | 47,550 | pass |
+| 9 | 518.3 MB/s | 424.0 MB/s | 1.22x | 57.5 MiB | 76.6 MiB | 47,524 | 47,539 | pass |
+| 10 | 466.4 MB/s | 358.8 MB/s | 1.30x | 67.5 MiB | 106.6 MiB | 47,277 | 47,287 | pass |
+| 11 | 466.4 MB/s | 358.8 MB/s | 1.30x | 67.5 MiB | 106.6 MiB | 47,108 | 47,112 | pass |
+| 12 | 424.0 MB/s | 311.0 MB/s | 1.36x | 87.5 MiB | 166.6 MiB | 47,108 | 47,112 | pass |
+| 13 | 466.4 MB/s | 333.2 MB/s | 1.40x | 79.7 MiB | 142.5 MiB | 46,899 | 46,906 | pass |
+| 14 | 333.2 MB/s | 274.4 MB/s | 1.21x | 95.6 MiB | 190.3 MiB | 46,808 | 46,815 | pass |
+| 15 | 259.1 MB/s | 245.5 MB/s | 1.06x | 111.6 MiB | 238.1 MiB | 46,795 | 46,802 | pass |
+| 16 | 274.4 MB/s | 291.5 MB/s | 0.94x | 80.0 MiB | 142.5 MiB | 44,993 | 45,018 | pass |
+| 17 | 245.5 MB/s | 222.1 MB/s | 1.11x | 95.9 MiB | 142.5 MiB | 44,704 | 44,708 | pass |
+| 18 | 222.1 MB/s | 202.8 MB/s | 1.10x | 96.6 MiB | 143.8 MiB | 44,488 | 44,492 | pass |
+| 19 | 186.6 MB/s | 155.5 MB/s | 1.20x | 128.8 MiB | 207.5 MiB | 44,430 | 44,365 | pass |
+| 20 | 166.6 MB/s | 133.3 MB/s | 1.25x | 208.8 MiB | 207.2 MiB | 44,430 | 44,361 | pass |
+| 21 | 103.7 MB/s | 89.7 MB/s | 1.16x | 368.8 MiB | 367.2 MiB | 44,429 | 44,360 | pass |
+| 22 | 66.6 MB/s | 63.9 MB/s | 1.04x | 688.8 MiB | 687.2 MiB | 44,429 | 44,360 | pass |
 
 Rust-compressed and original-compressed frames are generally **not byte-identical**, but cross-decode parity passed at every level 1-22: upstream decoded each Rust frame back to the original corpus, and Rust decoded each upstream frame back to the original corpus. A larger 466,432,000-byte repeat corpus gives a less noisy decompression comparison: Rust file-output median 1665.8 MB/s / 5.0 MiB RSS versus original median 1504.6 MB/s / 4.4 MiB RSS. In test mode (`-t`, no output), Rust now streams at 6663.3 MB/s / 5.0 MiB RSS versus original 5830.4 MB/s / 4.4 MiB RSS; before the streaming test-mode fix, Rust `-t` staged the whole 466 MB output and reached about 458 MiB RSS. The CLI decompression path now decodes into an upstream-style output ring and borrows the wrapped tail as external history, removing the previous 1.5 MiB rolling-history slack allocation while preserving cross-decode parity.
 

@@ -5784,45 +5784,49 @@ pub fn ZSTD_resetCCtx_internal(
         }
     }
 
-    let needsIndexReset = match zc.ms.as_ref() {
-        None => ZSTD_indexResetPolicy_e::ZSTDirp_reset,
-        Some(ms) => {
-            let chainSize = if ZSTD_allocateChainTable(
-                params.cParams.strategy,
-                zc.appliedParams.useRowMatchFinder,
-                0,
-            ) {
-                1usize << params.cParams.chainLog
-            } else {
-                0
-            };
-            let hashSize = 1usize << params.cParams.hashLog;
-            let hashLog3 = if params.cParams.minMatch == 3 {
-                ZSTD_HASHLOG3_MAX.min(params.cParams.windowLog)
-            } else {
-                0
-            };
-            let hash3Size = if hashLog3 != 0 { 1usize << hashLog3 } else { 0 };
-            let tagTableSize = if ZSTD_rowMatchFinderUsed(
-                params.cParams.strategy,
-                zc.appliedParams.useRowMatchFinder,
-            ) {
-                hashSize
-            } else {
-                0
-            };
-            let tableLayoutChanged = ms.hashTable.len() != hashSize
-                || ms.hashTable3.len() != hash3Size
-                || ms.chainTable.len() != chainSize
-                || ms.tagTable.len() != tagTableSize;
-            if ZSTD_indexTooCloseToMax(&ms.window)
-                || ZSTD_dictTooBig(loadedDictSize)
-                || !zc.initialized
-                || tableLayoutChanged
-            {
-                ZSTD_indexResetPolicy_e::ZSTDirp_reset
-            } else {
-                ZSTD_indexResetPolicy_e::ZSTDirp_continue
+    let needsIndexReset = if crp == ZSTD_compResetPolicy_e::ZSTDcrp_makeClean {
+        ZSTD_indexResetPolicy_e::ZSTDirp_reset
+    } else {
+        match zc.ms.as_ref() {
+            None => ZSTD_indexResetPolicy_e::ZSTDirp_reset,
+            Some(ms) => {
+                let chainSize = if ZSTD_allocateChainTable(
+                    params.cParams.strategy,
+                    zc.appliedParams.useRowMatchFinder,
+                    0,
+                ) {
+                    1usize << params.cParams.chainLog
+                } else {
+                    0
+                };
+                let hashSize = 1usize << params.cParams.hashLog;
+                let hashLog3 = if params.cParams.minMatch == 3 {
+                    ZSTD_HASHLOG3_MAX.min(params.cParams.windowLog)
+                } else {
+                    0
+                };
+                let hash3Size = if hashLog3 != 0 { 1usize << hashLog3 } else { 0 };
+                let tagTableSize = if ZSTD_rowMatchFinderUsed(
+                    params.cParams.strategy,
+                    zc.appliedParams.useRowMatchFinder,
+                ) {
+                    hashSize
+                } else {
+                    0
+                };
+                let tableLayoutChanged = ms.hashTable.len() != hashSize
+                    || ms.hashTable3.len() != hash3Size
+                    || ms.chainTable.len() != chainSize
+                    || ms.tagTable.len() != tagTableSize;
+                if ZSTD_indexTooCloseToMax(&ms.window)
+                    || ZSTD_dictTooBig(loadedDictSize)
+                    || !zc.initialized
+                    || tableLayoutChanged
+                {
+                    ZSTD_indexResetPolicy_e::ZSTDirp_reset
+                } else {
+                    ZSTD_indexResetPolicy_e::ZSTDirp_continue
+                }
             }
         }
     };
@@ -11718,6 +11722,15 @@ pub fn ZSTD_compressStream_generic(
         return ERROR(ErrorCode::SrcSizeWrong);
     }
     let remaining_src = src_end - input.pos;
+    if flushMode == ZSTD_e_end
+        && remaining_src == 0
+        && zcs.stream_frame_completed
+        && zcs.stream_in_buffer.is_empty()
+        && zcs.stream_out_buffer.is_empty()
+    {
+        ZSTD_setBufferExpectations(zcs, output, input);
+        return 0;
+    }
     let first_call_end_with_known_size = flushMode == ZSTD_e_end
         && zcs.stage == ZSTD_compressionStage_e::ZSTDcs_created
         && zcs.stream_in_buffer.is_empty()
@@ -11730,6 +11743,9 @@ pub fn ZSTD_compressStream_generic(
     }
     if flushMode == ZSTD_e_end
         && zcs.stream_in_buffer.is_empty()
+        && zcs.stream_dict.is_empty()
+        && zcs.stream_cdict.is_none()
+        && !zcs.prefix_is_single_use
         && (dst_end.saturating_sub(output.pos) >= ZSTD_compressBound(remaining_src)
             || zcs.requestedParams.outBufferMode == ZSTD_bufferMode_e::ZSTD_bm_stable)
     {
@@ -12447,6 +12463,11 @@ fn zstd_init_stream_from_snapshot(
     zcs.param_contentSize = future_param_contentSize;
     zcs.param_dictID = future_param_dictID;
     zcs.format = future_format;
+    zcs.stream_params_snapshot = if end_op == ZSTD_EndDirective::ZSTD_e_end {
+        None
+    } else {
+        Some(snapshot)
+    };
     rc
 }
 

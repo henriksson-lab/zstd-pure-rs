@@ -52,32 +52,32 @@ Test suite status as of the latest local CLI audit run: `cargo test --features c
 
 ## Local benchmark snapshot
 
-Measured 2026-06-11 on Linux 6.8 x86_64, Intel Xeon Gold 6138, `rustc 1.92.0`, release build from `cargo build --release --features cli`. The original comparator is the vendored upstream `zstd/programs/zstd` reporting `v1.6.0`. Input was the deterministic 46,643,200-byte `.tmp/bench/text_46m.txt` corpus. Throughput uses decimal MB/s and median elapsed time across three repeated runs. RSS is the median GNU `/usr/bin/time` maximum resident set size across the same runs. Levels 20-22 were run with `--ultra` for both binaries. This is a local status snapshot, not a guarantee.
+Measured 2026-06-12 on Linux 6.8 x86_64, Intel Xeon Gold 6138, `rustc 1.92.0`, release build from `cargo build --release --features cli`. The original comparator is the vendored upstream `zstd/programs/zstd` reporting `v1.6.0`. Input was the deterministic 46,643,200-byte `.tmp/bench/text_46m.txt` corpus. Throughput uses decimal MB/s and median elapsed time across three repeated runs. RSS is the median GNU `/usr/bin/time` maximum resident set size across the same runs. Levels 20-22 were run with `--ultra` for both binaries. This is a local status snapshot, not a guarantee.
 
 | Level | Rust speed | Original speed | Rust / original | Rust RSS | Original RSS | Rust size | Original size | Cross-decode |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :---: |
-| 1 | 358.8 MB/s | 777.4 MB/s | 0.46x | 32.8 MiB | 16.9 MiB | 821,393 | 759,188 | pass |
-| 2 | 666.3 MB/s | 777.4 MB/s | 0.86x | 5.0 MiB | 31.2 MiB | 54,977 | 198,821 | pass |
-| 3 | 583.0 MB/s | 518.3 MB/s | 1.12x | 6.6 MiB | 48.1 MiB | 52,121 | 52,213 | pass |
-| 4 | 518.3 MB/s | 777.4 MB/s | 0.67x | 7.8 MiB | 50.6 MiB | 52,051 | 52,141 | pass |
-| 5 | 333.2 MB/s | 518.3 MB/s | 0.64x | 7.8 MiB | 51.9 MiB | 49,921 | 49,970 | pass |
-| 6 | 358.8 MB/s | 518.3 MB/s | 0.69x | 8.1 MiB | 54.1 MiB | 48,660 | 48,692 | pass |
-| 7 | 333.2 MB/s | 466.4 MB/s | 0.71x | 10.6 MiB | 61.6 MiB | 48,257 | 48,279 | pass |
-| 8 | 233.2 MB/s | 466.4 MB/s | 0.50x | 10.6 MiB | 66.6 MiB | 47,530 | 47,550 | pass |
-| 9 | 202.8 MB/s | 291.5 MB/s | 0.70x | 17.5 MiB | 76.6 MiB | 47,524 | 47,539 | pass |
-| 10 | 186.6 MB/s | 233.2 MB/s | 0.80x | 27.8 MiB | 106.6 MiB | 47,277 | 47,287 | pass |
-| 11 | 212.0 MB/s | 274.4 MB/s | 0.77x | 27.8 MiB | 106.6 MiB | 47,108 | 47,112 | pass |
-| 12 | 172.8 MB/s | 245.5 MB/s | 0.70x | 47.8 MiB | 166.6 MiB | 47,108 | 47,112 | pass |
-| 13 | 212.0 MB/s | 202.8 MB/s | 1.05x | 39.7 MiB | 142.5 MiB | 46,899 | 46,906 | pass |
-| 14 | 166.6 MB/s | 186.6 MB/s | 0.89x | 55.6 MiB | 190.3 MiB | 46,808 | 46,815 | pass |
-| 15 | 137.2 MB/s | 166.6 MB/s | 0.82x | 71.6 MiB | 238.1 MiB | 46,795 | 46,802 | pass |
-| 16 | 155.5 MB/s | 172.8 MB/s | 0.90x | 39.7 MiB | 142.5 MiB | 44,993 | 45,018 | pass |
-| 17 | 99.2 MB/s | 160.8 MB/s | 0.62x | 60.0 MiB | 142.5 MiB | 44,704 | 44,708 | pass |
-| 18 | 95.2 MB/s | 122.7 MB/s | 0.78x | 60.6 MiB | 143.8 MiB | 44,488 | 44,492 | pass |
-| 19 | 71.8 MB/s | 93.3 MB/s | 0.77x | 92.8 MiB | 207.8 MiB | 44,430 | 44,365 | pass |
-| 20 | 50.2 MB/s | 81.8 MB/s | 0.61x | 196.9 MiB | 207.2 MiB | 44,430 | 44,361 | pass |
-| 21 | 74.0 MB/s | 61.4 MB/s | 1.21x | 369.1 MiB | 367.2 MiB | 44,429 | 44,360 | pass |
-| 22 | 33.3 MB/s | 34.3 MB/s | 0.97x | 688.4 MiB | 687.2 MiB | 44,429 | 44,360 | pass |
+| 1 | 2332.2 MB/s | 1166.1 MB/s | 2.00x | 4.1 MiB | 16.6 MiB | 55,980 | 759,188 | pass |
+| 2 | 1554.8 MB/s | 1166.1 MB/s | 1.33x | 4.7 MiB | 31.2 MiB | 54,977 | 198,821 | pass |
+| 3 | 932.9 MB/s | 932.9 MB/s | 1.00x | 6.2 MiB | 48.8 MiB | 52,121 | 52,213 | pass |
+| 4 | 666.3 MB/s | 777.4 MB/s | 0.86x | 7.5 MiB | 52.5 MiB | 52,051 | 52,141 | pass |
+| 5 | 583.0 MB/s | 932.9 MB/s | 0.62x | 7.8 MiB | 56.6 MiB | 49,921 | 49,970 | pass |
+| 6 | 583.0 MB/s | 777.4 MB/s | 0.75x | 8.1 MiB | 56.6 MiB | 48,660 | 48,692 | pass |
+| 7 | 666.3 MB/s | 777.4 MB/s | 0.86x | 10.6 MiB | 66.6 MiB | 48,257 | 48,279 | pass |
+| 8 | 518.3 MB/s | 666.3 MB/s | 0.78x | 50.6 MiB | 66.6 MiB | 47,530 | 47,550 | pass |
+| 9 | 466.4 MB/s | 466.4 MB/s | 1.00x | 53.8 MiB | 76.6 MiB | 47,524 | 47,539 | pass |
+| 10 | 466.4 MB/s | 388.7 MB/s | 1.20x | 63.8 MiB | 106.6 MiB | 47,277 | 47,287 | pass |
+| 11 | 466.4 MB/s | 388.7 MB/s | 1.20x | 63.4 MiB | 106.6 MiB | 47,108 | 47,112 | pass |
+| 12 | 424.0 MB/s | 311.0 MB/s | 1.36x | 83.8 MiB | 166.9 MiB | 47,108 | 47,112 | pass |
+| 13 | 424.0 MB/s | 333.2 MB/s | 1.27x | 75.6 MiB | 142.5 MiB | 46,899 | 46,906 | pass |
+| 14 | 333.2 MB/s | 291.5 MB/s | 1.14x | 91.9 MiB | 190.3 MiB | 46,808 | 46,815 | pass |
+| 15 | 311.0 MB/s | 274.4 MB/s | 1.13x | 107.8 MiB | 238.1 MiB | 46,795 | 46,802 | pass |
+| 16 | 311.0 MB/s | 311.0 MB/s | 1.00x | 76.2 MiB | 142.5 MiB | 44,993 | 45,018 | pass |
+| 17 | 233.2 MB/s | 245.5 MB/s | 0.95x | 88.1 MiB | 142.5 MiB | 44,704 | 44,708 | pass |
+| 18 | 233.2 MB/s | 222.1 MB/s | 1.05x | 88.8 MiB | 143.8 MiB | 44,488 | 44,492 | pass |
+| 19 | 194.3 MB/s | 179.4 MB/s | 1.08x | 120.6 MiB | 207.5 MiB | 44,430 | 44,365 | pass |
+| 20 | 103.7 MB/s | 141.3 MB/s | 0.73x | 196.6 MiB | 207.2 MiB | 44,430 | 44,361 | pass |
+| 21 | 126.1 MB/s | 106.0 MB/s | 1.19x | 368.8 MiB | 367.2 MiB | 44,429 | 44,360 | pass |
+| 22 | 76.5 MB/s | 74.0 MB/s | 1.03x | 688.8 MiB | 687.2 MiB | 44,429 | 44,360 | pass |
 
 Rust-compressed and original-compressed frames are generally **not byte-identical**, but cross-decode parity passed at every level 1-22: upstream decoded each Rust frame back to the original corpus, and Rust decoded each upstream frame back to the original corpus. A larger 466,432,000-byte repeat corpus gives a less noisy decompression comparison: Rust file-output median 1665.8 MB/s / 5.0 MiB RSS versus original median 1504.6 MB/s / 4.4 MiB RSS. In test mode (`-t`, no output), Rust now streams at 6663.3 MB/s / 5.0 MiB RSS versus original 5830.4 MB/s / 4.4 MiB RSS; before the streaming test-mode fix, Rust `-t` staged the whole 466 MB output and reached about 458 MiB RSS. The CLI decompression path now decodes into an upstream-style output ring and borrows the wrapped tail as external history, removing the previous 1.5 MiB rolling-history slack allocation while preserving cross-decode parity.
 

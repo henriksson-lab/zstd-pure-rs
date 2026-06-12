@@ -13537,6 +13537,16 @@ pub fn ZSTD_CCtx_init_compressStream2(
     } else {
         (1usize << params.cParams.windowLog).min(ZSTD_BLOCKSIZE_MAX)
     };
+    if params.compressionLevel >= 8 && params.inBufferMode == ZSTD_bufferMode_e::ZSTD_bm_buffered {
+        let pledged = cctx.pledgedSrcSizePlusOne.wrapping_sub(1);
+        if pledged != crate::decompress::zstd_decompress::ZSTD_CONTENTSIZE_UNKNOWN {
+            let reserve = (pledged as usize).min(64 << 20);
+            if cctx.stream_in_buffer.capacity() < reserve {
+                cctx.stream_in_buffer
+                    .reserve_exact(reserve - cctx.stream_in_buffer.capacity());
+            }
+        }
+    }
     cctx.stream_in_to_compress = 0;
     cctx.stream_in_target = if params.inBufferMode == ZSTD_bufferMode_e::ZSTD_bm_buffered {
         let pledged = cctx.pledgedSrcSizePlusOne.wrapping_sub(1);

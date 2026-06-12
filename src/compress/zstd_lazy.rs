@@ -31,6 +31,7 @@ use crate::compress::zstd_hashes::{
     ZSTD_hashPtrSalted_at_unchecked,
 };
 use crate::compress::zstd_ldm::ZSTD_ParamSwitch_e;
+use core::mem::MaybeUninit;
 
 pub const ZSTD_ROW_HASH_TAG_BITS: u32 = 8;
 pub const ZSTD_ROW_HASH_TAG_MASK: u32 = (1u32 << ZSTD_ROW_HASH_TAG_BITS) - 1;
@@ -402,39 +403,6 @@ fn ZSTD_row_getMatchMask_scalar(
     }
 }
 
-/// SSE2 fast path for `ZSTD_row_getMatchMask` — runs `pcmpeqb` over
-/// 16-byte chunks of the tag row, packs the per-chunk `pmovmskb` bits
-/// into one 64-bit mask, then rotates by `headGrouped` to align with
-/// the row's logical head. Requires SSE2; `unsafe` is gated by
-/// `#[target_feature]`.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "sse2")]
-unsafe fn ZSTD_row_getMatchMask_sse2(
-    src: &[u8],
-    tag: u8,
-    headGrouped: u32,
-    rowEntries: u32,
-) -> ZSTD_VecMask {
-    use std::arch::x86_64::{_mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8, _mm_set1_epi8};
-
-    debug_assert!(matches!(rowEntries, 16 | 32 | 64));
-    debug_assert!(src.len() >= rowEntries as usize);
-    let tagv = _mm_set1_epi8(tag as i8);
-    let base = src.as_ptr();
-    let mut matches = 0u64;
-    let chunks = rowEntries as usize / 16;
-    for chunk in 0..chunks {
-        let v = _mm_loadu_si128(base.add(chunk * 16) as *const _);
-        let eq = _mm_cmpeq_epi8(v, tagv);
-        matches |= (_mm_movemask_epi8(eq) as u32 as u64) << (chunk * 16);
-    }
-    match rowEntries {
-        16 => ZSTD_rotateRight_U16(matches as u16, headGrouped) as u64,
-        32 => ZSTD_rotateRight_U32(matches as u32, headGrouped) as u64,
-        _ => ZSTD_rotateRight_U64(matches, headGrouped),
-    }
-}
-
 /// Port of `ZSTD_row_getMatchMask`.
 #[inline(always)]
 pub fn ZSTD_row_getMatchMask(
@@ -447,7 +415,25 @@ pub fn ZSTD_row_getMatchMask(
     debug_assert!(rowEntries <= ZSTD_ROW_HASH_MAX_ENTRIES);
     #[cfg(target_arch = "x86_64")]
     {
-        return unsafe { ZSTD_row_getMatchMask_sse2(tagRow, tag, headGrouped, rowEntries) };
+        use std::arch::x86_64::{
+            _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8, _mm_set1_epi8,
+        };
+
+        debug_assert!(tagRow.len() >= rowEntries as usize);
+        let tagv = unsafe { _mm_set1_epi8(tag as i8) };
+        let base = tagRow.as_ptr();
+        let mut matches = 0u64;
+        let chunks = rowEntries as usize / 16;
+        for chunk in 0..chunks {
+            let v = unsafe { _mm_loadu_si128(base.add(chunk * 16) as *const _) };
+            let eq = unsafe { _mm_cmpeq_epi8(v, tagv) };
+            matches |= (unsafe { _mm_movemask_epi8(eq) } as u32 as u64) << (chunk * 16);
+        }
+        return match rowEntries {
+            16 => ZSTD_rotateRight_U16(matches as u16, headGrouped) as u64,
+            32 => ZSTD_rotateRight_U32(matches as u32, headGrouped) as u64,
+            _ => ZSTD_rotateRight_U64(matches, headGrouped),
+        };
     }
     #[cfg(not(target_arch = "x86_64"))]
     ZSTD_row_getMatchMask_scalar(tagRow, tag, headGrouped, rowEntries)
@@ -785,7 +771,8 @@ pub fn ZSTD_RowFindBestMatch(
         // so row state and candidate attempt consumption stay identical.
         if dictMode == ZSTD_dictMode_e::ZSTD_noDict {
             let hash_row = unsafe { ms.hashTable.as_ptr().add(relRow) };
-            let mut matchBuffer = [0u32; ZSTD_ROW_HASH_MAX_ENTRIES as usize];
+            let mut matchBuffer: [MaybeUninit<u32>; ZSTD_ROW_HASH_MAX_ENTRIES as usize] =
+                unsafe { MaybeUninit::uninit().assume_init() };
             let mut numMatches = 0usize;
             let mut mask = matches;
 
@@ -800,7 +787,9 @@ pub fn ZSTD_RowFindBestMatch(
                     if off < input_buf.len() {
                         crate::common::zstd_internal::prefetchSliceByte(input_buf, off);
                     }
-                    matchBuffer[numMatches] = matchIndex;
+                    unsafe {
+                        matchBuffer.get_unchecked_mut(numMatches).write(matchIndex);
+                    }
                     numMatches += 1;
                     nbAttempts -= 1;
                 }
@@ -820,7 +809,8 @@ pub fn ZSTD_RowFindBestMatch(
             }
             ms.nextToUpdate = ms.nextToUpdate.wrapping_add(1);
 
-            for &matchIndex in &matchBuffer[..numMatches] {
+            for match_num in 0..numMatches {
+                let matchIndex = unsafe { matchBuffer.get_unchecked(match_num).assume_init() };
                 let matchBytePos = matchIndex.wrapping_sub(base_off) as usize;
                 let prefilter_valid = matchBytePos + ml < input_buf.len() && ip + ml < iLimit;
                 let m_ptr = if prefilter_valid {
@@ -849,7 +839,8 @@ pub fn ZSTD_RowFindBestMatch(
             return ml;
         }
 
-        let mut matchBuffer = [0u32; ZSTD_ROW_HASH_MAX_ENTRIES as usize];
+        let mut matchBuffer: [MaybeUninit<u32>; ZSTD_ROW_HASH_MAX_ENTRIES as usize] =
+            unsafe { MaybeUninit::uninit().assume_init() };
         let mut numMatches = 0usize;
         let mut mask = matches;
         // Hoist the row sub-slice and `dictBase_offset` read out of the
@@ -882,7 +873,9 @@ pub fn ZSTD_RowFindBestMatch(
                         crate::common::zstd_internal::prefetchSliceByte(dict_buf, off);
                     }
                 }
-                matchBuffer[numMatches] = matchIndex;
+                unsafe {
+                    matchBuffer.get_unchecked_mut(numMatches).write(matchIndex);
+                }
                 numMatches += 1;
                 nbAttempts -= 1;
             }
@@ -908,7 +901,8 @@ pub fn ZSTD_RowFindBestMatch(
         }
         ms.nextToUpdate = ms.nextToUpdate.wrapping_add(1);
 
-        for &matchIndex in &matchBuffer[..numMatches] {
+        for match_num in 0..numMatches {
+            let matchIndex = unsafe { matchBuffer.get_unchecked(match_num).assume_init() };
             let mut currentMl = 0usize;
             if dictMode != ZSTD_dictMode_e::ZSTD_extDict || matchIndex >= dictLimit {
                 // Absolute matchIndex → slice offset.
@@ -1004,7 +998,8 @@ pub fn ZSTD_RowFindBestMatch(
                 headGrouped,
                 rowEntries,
             );
-            let mut matchBuffer = [0u32; ZSTD_ROW_HASH_MAX_ENTRIES as usize];
+            let mut matchBuffer: [MaybeUninit<u32>; ZSTD_ROW_HASH_MAX_ENTRIES as usize] =
+                unsafe { MaybeUninit::uninit().assume_init() };
             let mut numMatches = 0usize;
             let mut mask = matches;
             while mask > 0 && nbAttempts > 0 {
@@ -1014,13 +1009,16 @@ pub fn ZSTD_RowFindBestMatch(
                     if matchIndex < dmsLowestIndex {
                         break;
                     }
-                    matchBuffer[numMatches] = matchIndex;
+                    unsafe {
+                        matchBuffer.get_unchecked_mut(numMatches).write(matchIndex);
+                    }
                     numMatches += 1;
                     nbAttempts -= 1;
                 }
                 mask &= mask - 1;
             }
-            for &matchIndex in &matchBuffer[..numMatches] {
+            for match_num in 0..numMatches {
+                let matchIndex = unsafe { matchBuffer.get_unchecked(match_num).assume_init() };
                 let matchPos = matchIndex.saturating_sub(dms.window.base_offset) as usize;
                 let mut currentMl = 0usize;
                 if matchPos + 4 <= dict_buf.len()

@@ -180,9 +180,9 @@ fn fpDistance(fp1: &Fingerprint, fp2: &Fingerprint, hashLog: u32) -> u64 {
     let size = 1usize << hashLog;
     let mut distance: u64 = 0;
     for n in 0..size {
-        let a = (fp1.events[n] as i64) * (fp2.nbEvents as i64);
-        let b = (fp2.events[n] as i64) * (fp1.nbEvents as i64);
-        distance = distance.wrapping_add(abs64(a - b));
+        let a = (fp1.events[n] as u64) * (fp2.nbEvents as u64);
+        let b = (fp2.events[n] as u64) * (fp1.nbEvents as u64);
+        distance = distance.wrapping_add(a.abs_diff(b));
     }
     distance
 }
@@ -192,9 +192,9 @@ fn fpDistance_const<const HASH_LOG: u32>(fp1: &Fingerprint, fp2: &Fingerprint) -
     let mut distance: u64 = 0;
     let mut n = 0;
     while n < (1usize << HASH_LOG) {
-        let a = (fp1.events[n] as i64) * (fp2.nbEvents as i64);
-        let b = (fp2.events[n] as i64) * (fp1.nbEvents as i64);
-        distance = distance.wrapping_add(abs64(a - b));
+        let a = (fp1.events[n] as u64) * (fp2.nbEvents as u64);
+        let b = (fp2.events[n] as u64) * (fp1.nbEvents as u64);
+        distance = distance.wrapping_add(a.abs_diff(b));
         n += 1;
     }
     distance

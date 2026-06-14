@@ -1553,6 +1553,13 @@ pub fn HUF_compress1X_usingCTable_internal_body_loop(
 }
 
 /// Port of `HUF_compress1X_usingCTable_internal_body`.
+///
+/// Upstream marks this `FORCE_INLINE_TEMPLATE` so it monomorphizes into
+/// both the scalar `_default` and BMI2-targeted `_bmi2` callers;
+/// `#[inline(always)]` is the faithful mapping and is what lets the
+/// `#[target_feature(enable = "bmi1,bmi2,lzcnt")]` wrapper emit BZHI/SHLX
+/// codegen for the `HUF_addBits` bit packing.
+#[inline(always)]
 pub fn HUF_compress1X_usingCTable_internal_body(
     dst: &mut [u8],
     src: &[u8],
@@ -1659,15 +1666,46 @@ pub fn HUF_compress1X_usingCTable_internal_default(
     HUF_compress1X_usingCTable_internal_body(dst, src, ctable)
 }
 
-/// Exact-name wrapper for upstream's
-/// `HUF_compress1X_usingCTable_internal_bmi2`. The current Rust port
-/// uses the same scalar encoder regardless of the BMI2 flag.
-#[inline]
+/// Rust-only helper: BMI2-targeted body of the HUF block encoder.
+/// Upstream's `BMI2_TARGET_ATTRIBUTE` compiles the inlined
+/// `HUF_compress1X_usingCTable_internal_body` with `bmi2` enabled so the
+/// per-symbol `HUF_addBits` packing (mask + variable shift) lowers to
+/// BZHI/SHLX. Because the body and the `HUF_*`/`BIT_*` callees it touches
+/// are `#[inline(always)]`/`#[inline]`, the whole inner loop is
+/// monomorphized under the enabled features.
+///
+/// SAFETY: caller must have verified `bmi1`+`bmi2`+`lzcnt` are present at
+/// runtime (the `HUF_compress1X_usingCTable_internal_bmi2` dispatcher does).
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+#[target_feature(enable = "bmi1,bmi2,lzcnt")]
+unsafe fn HUF_compress1X_usingCTable_internal_bmi2_impl(
+    dst: &mut [u8],
+    src: &[u8],
+    ctable: &[HUF_CElt],
+) -> usize {
+    HUF_compress1X_usingCTable_internal_body(dst, src, ctable)
+}
+
+/// Port of `HUF_compress1X_usingCTable_internal_bmi2`
+/// (`huf_compress.c:1123`). Guarded by `DYNAMIC_BMI2` upstream; here it
+/// runtime-dispatches to the `#[target_feature(enable = "bmi1,bmi2,lzcnt")]`
+/// body when the CPU supports it, else falls back to the scalar body.
+/// Output is bitwise-identical either way — only instruction selection
+/// differs.
 pub fn HUF_compress1X_usingCTable_internal_bmi2(
     dst: &mut [u8],
     src: &[u8],
     ctable: &[HUF_CElt],
 ) -> usize {
+    #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+    {
+        if std::is_x86_feature_detected!("bmi1")
+            && std::is_x86_feature_detected!("bmi2")
+            && std::is_x86_feature_detected!("lzcnt")
+        {
+            return unsafe { HUF_compress1X_usingCTable_internal_bmi2_impl(dst, src, ctable) };
+        }
+    }
     HUF_compress1X_usingCTable_internal_body(dst, src, ctable)
 }
 
@@ -1681,14 +1719,19 @@ pub fn HUF_compress1X_usingCTable(
     HUF_compress1X_usingCTable_internal(dst, src, ctable, flags)
 }
 
-/// Port of `HUF_compress1X_usingCTable_internal`.
+/// Port of `HUF_compress1X_usingCTable_internal`. Dispatches to the
+/// BMI2-targeted body when `flags & HUF_flags_bmi2` is set (the CCtx
+/// sets it from `ZSTD_cpuSupportsBmi2`), else the scalar default.
+/// Mirrors upstream's `DYNAMIC_BMI2` branch.
 pub fn HUF_compress1X_usingCTable_internal(
     dst: &mut [u8],
     src: &[u8],
     ctable: &[HUF_CElt],
     flags: i32,
 ) -> usize {
-    let _ = flags;
+    if (flags & crate::decompress::huf_decompress::HUF_flags_bmi2) != 0 {
+        return HUF_compress1X_usingCTable_internal_bmi2(dst, src, ctable);
+    }
     HUF_compress1X_usingCTable_internal_default(dst, src, ctable, flags)
 }
 
@@ -1710,7 +1753,6 @@ pub fn HUF_compress4X_usingCTable_internal(
     use crate::common::mem::MEM_writeLE16;
     let srcSize = src.len();
     let dstSize = dst.len();
-    let _ = flags;
     if dstSize < 6 + 1 + 1 + 1 + 8 {
         return 0;
     }
@@ -1724,7 +1766,7 @@ pub fn HUF_compress4X_usingCTable_internal(
     // Segment 1.
     let ip = 0;
     let (_, tail) = dst.split_at_mut(op);
-    let c1 = HUF_compress1X_usingCTable_internal_body(tail, &src[ip..ip + segmentSize], ctable);
+    let c1 = HUF_compress1X_usingCTable_internal(tail, &src[ip..ip + segmentSize], ctable, flags);
     if c1 == 0 || c1 > 65535 {
         return 0;
     }
@@ -1734,7 +1776,7 @@ pub fn HUF_compress4X_usingCTable_internal(
     // Segment 2.
     let ip = segmentSize;
     let (_, tail) = dst.split_at_mut(op);
-    let c2 = HUF_compress1X_usingCTable_internal_body(tail, &src[ip..ip + segmentSize], ctable);
+    let c2 = HUF_compress1X_usingCTable_internal(tail, &src[ip..ip + segmentSize], ctable, flags);
     if c2 == 0 || c2 > 65535 {
         return 0;
     }
@@ -1744,7 +1786,7 @@ pub fn HUF_compress4X_usingCTable_internal(
     // Segment 3.
     let ip = 2 * segmentSize;
     let (_, tail) = dst.split_at_mut(op);
-    let c3 = HUF_compress1X_usingCTable_internal_body(tail, &src[ip..ip + segmentSize], ctable);
+    let c3 = HUF_compress1X_usingCTable_internal(tail, &src[ip..ip + segmentSize], ctable, flags);
     if c3 == 0 || c3 > 65535 {
         return 0;
     }
@@ -1754,7 +1796,7 @@ pub fn HUF_compress4X_usingCTable_internal(
     // Segment 4 (implied size = remainder).
     let ip = 3 * segmentSize;
     let (_, tail) = dst.split_at_mut(op);
-    let c4 = HUF_compress1X_usingCTable_internal_body(tail, &src[ip..srcSize], ctable);
+    let c4 = HUF_compress1X_usingCTable_internal(tail, &src[ip..srcSize], ctable, flags);
     if c4 == 0 || c4 > 65535 {
         return 0;
     }

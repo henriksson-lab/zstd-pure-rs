@@ -22,26 +22,9 @@ use crate::compress::zstd_fast::{
     ZSTD_getLowestPrefixIndex, ZSTD_tableFillPurpose_e, HASH_READ_SIZE,
 };
 use crate::compress::zstd_hashes::{
-    ZSTD_count, ZSTD_count_2segments, ZSTD_hashPtr, ZSTD_hashPtr_at_unchecked,
+    ZSTD_count, ZSTD_count_2segments, ZSTD_hash4, ZSTD_hash5, ZSTD_hash6, ZSTD_hash7, ZSTD_hash8,
+    ZSTD_hashPtr,
 };
-
-/// Rust-only helper: unaligned 4-byte read at `src[pos..pos+4]` via a
-/// raw pointer to avoid the slice bounds check in the hot loop. Caller
-/// must uphold the asserted invariant `pos + 4 <= src.len()`.
-#[inline(always)]
-unsafe fn read32_at(src: &[u8], pos: usize) -> u32 {
-    debug_assert!(pos + 4 <= src.len());
-    (src.as_ptr().add(pos) as *const u32).read_unaligned()
-}
-
-/// Rust-only helper: unaligned 8-byte read at `src[pos..pos+8]`,
-/// counterpart to `read32_at` for the long-hash compares. Caller must
-/// uphold `pos + 8 <= src.len()`.
-#[inline(always)]
-unsafe fn read64_at(src: &[u8], pos: usize) -> u64 {
-    debug_assert!(pos + 8 <= src.len());
-    (src.as_ptr().add(pos) as *const u64).read_unaligned()
-}
 
 /// Port of `ZSTD_fillDoubleHashTableForCCtx`. Seeds both the long
 /// (`hashTable`, hashed on 8 bytes) and short (`chainTable`, hashed
@@ -69,13 +52,11 @@ pub fn ZSTD_fillDoubleHashTableForCCtx(
         ms.chainTable.resize(chainSize, 0);
     }
 
-    let mut ip = ms.nextToUpdate.saturating_sub(ms.window.base_offset) as usize;
+    debug_assert!(ms.nextToUpdate >= ms.window.base_offset);
+    let mut ip = ms.nextToUpdate.wrapping_sub(ms.window.base_offset) as usize;
     while ip + fastHashFillStep <= iend + 1 {
         let curr = ms.window.base_offset.wrapping_add(ip as u32);
         for i in 0..fastHashFillStep {
-            if ip + i + 8 > src.len() {
-                break;
-            }
             let smHash = ZSTD_hashPtr(&src[ip + i..], hBitsS, mls);
             let lgHash = ZSTD_hashPtr(&src[ip + i..], hBitsL, 8);
             if i == 0 {
@@ -116,13 +97,11 @@ pub fn ZSTD_fillDoubleHashTableForCDict(
     }
 
     let iend = src.len() - HASH_READ_SIZE;
-    let mut ip = ms.nextToUpdate.saturating_sub(ms.window.base_offset) as usize;
+    debug_assert!(ms.nextToUpdate >= ms.window.base_offset);
+    let mut ip = ms.nextToUpdate.wrapping_sub(ms.window.base_offset) as usize;
     while ip + fastHashFillStep <= iend + 1 {
         let curr = ms.window.base_offset.wrapping_add(ip as u32);
         for i in 0..fastHashFillStep {
-            if ip + i + 8 > src.len() {
-                break;
-            }
             let smHashAndTag = ZSTD_hashPtr(&src[ip + i..], hBitsS, mls);
             let lgHashAndTag = ZSTD_hashPtr(&src[ip + i..], hBitsL, 8);
             if i == 0 {
@@ -188,7 +167,7 @@ pub fn ZSTD_compressBlock_doubleFast_noDict_generic(
 /// MLS-monomorphized core of `ZSTD_compressBlock_doubleFast_noDict_generic`.
 /// Mirrors upstream's `ZSTD_GEN_DOUBLEFAST_FN(noDict, mml)` template
 /// expansions; the const generic lets LLVM fold the short-table hash
-/// width per specialization. Rust-only split.
+/// width for the same generated specialization set.
 #[inline(never)]
 fn ZSTD_compressBlock_doubleFast_noDict_generic_mls<const MLS: u32>(
     ms: &mut ZSTD_MatchState_t,
@@ -212,7 +191,8 @@ fn ZSTD_compressBlock_doubleFast_noDict_generic_mls<const MLS: u32>(
     let srcSize = src.len();
     let endIndex = base_off.wrapping_add(srcSize as u32);
     let prefixStartIndex = ZSTD_getLowestPrefixIndex(ms, endIndex, windowLog);
-    let prefixStart = prefixStartIndex.saturating_sub(base_off) as usize;
+    debug_assert!(prefixStartIndex >= base_off);
+    let prefixStart = prefixStartIndex.wrapping_sub(base_off) as usize;
     let iend = srcSize;
     let ilimit = iend.saturating_sub(HASH_READ_SIZE);
 
@@ -255,19 +235,31 @@ fn ZSTD_compressBlock_doubleFast_noDict_generic_mls<const MLS: u32>(
         // SAFETY: outer-loop check `ip1 > ilimit` (= iend - 8) gives
         // `ip < ilimit, so ip + 8 ≤ iend = src.len()`. Both hashes
         // need at most 8 bytes.
-        let mut hl0 = unsafe { ZSTD_hashPtr_at_unchecked(src, ip, hBitsL, 8) };
+        let mut hl0 = unsafe {
+            let p = src.as_ptr().wrapping_add(ip);
+            ZSTD_hash8((p as *const u64).read_unaligned().to_le(), hBitsL, 0)
+        };
         // SAFETY: hl0 < (1 << hBitsL) == ms.hashTable.len() by hash construction.
         let mut idxl0 = unsafe { *hashTable.add(hl0) };
-        let mut matchl0 = idxl0.saturating_sub(base_off) as usize;
+        let mut matchl0 = idxl0.wrapping_sub(base_off) as usize;
 
         let (mLength, offset, curr) = 'search: loop {
             // SAFETY: same bound as above (`ip < ilimit`).
-            let hs0 = unsafe { ZSTD_hashPtr_at_unchecked(src, ip, hBitsS, MLS) };
+            let hs0 = unsafe {
+                let p = src.as_ptr().wrapping_add(ip);
+                match MLS {
+                    5 => ZSTD_hash5((p as *const u64).read_unaligned().to_le(), hBitsS, 0),
+                    6 => ZSTD_hash6((p as *const u64).read_unaligned().to_le(), hBitsS, 0),
+                    7 => ZSTD_hash7((p as *const u64).read_unaligned().to_le(), hBitsS, 0),
+                    8 => ZSTD_hash8((p as *const u64).read_unaligned().to_le(), hBitsS, 0),
+                    _ => ZSTD_hash4((p as *const u32).read_unaligned().to_le(), hBitsS, 0) as usize,
+                }
+            };
             // SAFETY: hs0 < (1 << hBitsS) == ms.chainTable.len() (chainTable was resized
             // to at least chainSize=1<<hBitsS at function entry).
             let idxs0 = unsafe { *chainTable.add(hs0) };
             let curr = base_off.wrapping_add(ip as u32);
-            let matchs0 = idxs0.saturating_sub(base_off) as usize;
+            let matchs0 = idxs0.wrapping_sub(base_off) as usize;
 
             unsafe {
                 *hashTable.add(hl0) = curr;
@@ -275,10 +267,14 @@ fn ZSTD_compressBlock_doubleFast_noDict_generic_mls<const MLS: u32>(
             }
 
             if rep_offset1 > 0
-                && ip + 1 >= rep_offset1 as usize
-                && ip + 1 + 4 <= iend
-                && unsafe { read32_at(src, ip + 1 - rep_offset1 as usize) }
-                    == unsafe { read32_at(src, ip + 1) }
+                && unsafe {
+                    (src.as_ptr()
+                        .wrapping_add((ip + 1).wrapping_sub(rep_offset1 as usize))
+                        as *const u32)
+                        .read_unaligned()
+                } == unsafe {
+                    (src.as_ptr().wrapping_add(ip + 1) as *const u32).read_unaligned()
+                }
             {
                 let mLength =
                     ZSTD_count(src, ip + 1 + 4, ip + 1 + 4 - rep_offset1 as usize, iend) + 4;
@@ -295,13 +291,16 @@ fn ZSTD_compressBlock_doubleFast_noDict_generic_mls<const MLS: u32>(
 
             // SAFETY: `ip1 = ip + step ≤ ilimit = iend - 8`, so
             // `ip1 + 8 ≤ iend = src.len()`.
-            let hl1 = unsafe { ZSTD_hashPtr_at_unchecked(src, ip1, hBitsL, 8) };
+            let hl1 = unsafe {
+                let p = src.as_ptr().wrapping_add(ip1);
+                ZSTD_hash8((p as *const u64).read_unaligned().to_le(), hBitsL, 0)
+            };
 
             // Long-match check via CMOV-friendly pointer select.
             // Mirrors upstream's `ZSTD_selectAddr(idxl0, prefixLow,
             // matchl0, dummy)` — the slice-indexing version emits a
             // bounds-check `cmp/jb` per read, defeating CMOV.
-            let long_match_valid = idxl0 > prefixStartIndex && idxl0 < curr && matchl0 + 8 <= iend;
+            let long_match_valid = idxl0 > prefixStartIndex;
             let real_long_ptr = src.as_ptr().wrapping_add(matchl0);
             let dummy_long_ptr = dummy.as_ptr();
             let m_long_ptr = if long_match_valid {
@@ -316,6 +315,7 @@ fn ZSTD_compressBlock_doubleFast_noDict_generic_mls<const MLS: u32>(
             let m_long = unsafe { (m_long_ptr as *const u64).read_unaligned() };
             let ip_long = unsafe { (src.as_ptr().wrapping_add(ip) as *const u64).read_unaligned() };
             if long_match_valid && m_long == ip_long {
+                debug_assert!(matchl0 + 8 <= iend);
                 let mut mLength = ZSTD_count(src, ip + 8, matchl0 + 8, iend) + 8;
                 let offset = (ip - matchl0) as u32;
                 while ip > anchor && matchl0 > prefixStart && src[ip - 1] == src[matchl0 - 1] {
@@ -328,13 +328,13 @@ fn ZSTD_compressBlock_doubleFast_noDict_generic_mls<const MLS: u32>(
 
             // SAFETY: hl1 < (1 << hBitsL) == ms.hashTable.len() by hash construction.
             let idxl1 = unsafe { *hashTable.add(hl1) };
-            let matchl1 = idxl1.saturating_sub(base_off) as usize;
+            let matchl1 = idxl1.wrapping_sub(base_off) as usize;
 
             // Short-match check via CMOV-friendly pointer select. Same
             // pattern as the long-match above — bypasses the slice
             // bounds check on `&src[matchs0..]` so both reads can issue
             // unconditionally.
-            let short_match_valid = idxs0 > prefixStartIndex && idxs0 < curr && matchs0 + 4 <= iend;
+            let short_match_valid = idxs0 > prefixStartIndex;
             let real_short_ptr = src.as_ptr().wrapping_add(matchs0);
             let dummy_short_ptr = dummy.as_ptr();
             let m_short_ptr = if short_match_valid {
@@ -349,14 +349,17 @@ fn ZSTD_compressBlock_doubleFast_noDict_generic_mls<const MLS: u32>(
             let ip_short =
                 unsafe { (src.as_ptr().wrapping_add(ip) as *const u32).read_unaligned() };
             if short_match_valid && m_short == ip_short {
+                debug_assert!(matchs0 + 4 <= iend);
                 let mut mLength = ZSTD_count(src, ip + 4, matchs0 + 4, iend) + 4;
                 let mut offset = (ip - matchs0) as u32;
                 let mut match_pos = matchs0;
 
                 if idxl1 > prefixStartIndex
-                    && idxl1 < base_off.wrapping_add(ip1 as u32)
-                    && matchl1 + 8 <= iend
-                    && unsafe { read64_at(src, matchl1) } == unsafe { read64_at(src, ip1) }
+                    && unsafe {
+                        (src.as_ptr().wrapping_add(matchl1) as *const u64).read_unaligned()
+                    } == unsafe {
+                        (src.as_ptr().wrapping_add(ip1) as *const u64).read_unaligned()
+                    }
                 {
                     let l1len = ZSTD_count(src, ip1 + 8, matchl1 + 8, iend) + 8;
                     if l1len > mLength {
@@ -416,42 +419,65 @@ fn ZSTD_compressBlock_doubleFast_noDict_generic_mls<const MLS: u32>(
 
         if ip <= ilimit {
             let indexToInsert = curr.wrapping_add(2);
-            let indexToInsertPos = indexToInsert.saturating_sub(base_off) as usize;
+            debug_assert!(indexToInsert >= base_off);
+            let indexToInsertPos = indexToInsert.wrapping_sub(base_off) as usize;
             // SAFETY: `ip ≤ ilimit = iend - 8`, and `indexToInsertPos
             // = curr - base + 2 = ip_at_match + 2 ≤ ip ≤ ilimit`, so
             // both positions have ≥ 8 bytes available.
-            if indexToInsertPos + 8 <= src.len() {
-                let h = unsafe { ZSTD_hashPtr_at_unchecked(src, indexToInsertPos, hBitsL, 8) };
-                // SAFETY: h < (1<<hBitsL) == ms.hashTable.len().
-                unsafe {
-                    *hashTable.add(h) = indexToInsert;
-                }
-                let h = unsafe { ZSTD_hashPtr_at_unchecked(src, indexToInsertPos, hBitsS, MLS) };
-                // SAFETY: h < (1<<hBitsS) == ms.chainTable.len().
-                unsafe {
-                    *chainTable.add(h) = indexToInsert;
-                }
+            let h = unsafe {
+                let p = src.as_ptr().wrapping_add(indexToInsertPos);
+                ZSTD_hash8((p as *const u64).read_unaligned().to_le(), hBitsL, 0)
+            };
+            // SAFETY: h < (1<<hBitsL) == ms.hashTable.len().
+            unsafe {
+                *hashTable.add(h) = indexToInsert;
             }
-            if ip >= 2 && ip - 2 + 8 <= src.len() {
-                let h = unsafe { ZSTD_hashPtr_at_unchecked(src, ip - 2, hBitsL, 8) };
-                unsafe {
-                    *hashTable.add(h) = base_off.wrapping_add((ip - 2) as u32);
+            let h = unsafe {
+                let p = src.as_ptr().wrapping_add(indexToInsertPos);
+                match MLS {
+                    5 => ZSTD_hash5((p as *const u64).read_unaligned().to_le(), hBitsS, 0),
+                    6 => ZSTD_hash6((p as *const u64).read_unaligned().to_le(), hBitsS, 0),
+                    7 => ZSTD_hash7((p as *const u64).read_unaligned().to_le(), hBitsS, 0),
+                    8 => ZSTD_hash8((p as *const u64).read_unaligned().to_le(), hBitsS, 0),
+                    _ => ZSTD_hash4((p as *const u32).read_unaligned().to_le(), hBitsS, 0) as usize,
                 }
+            };
+            // SAFETY: h < (1<<hBitsS) == ms.chainTable.len().
+            unsafe {
+                *chainTable.add(h) = indexToInsert;
             }
-            if ip >= 1 && ip - 1 + 8 <= src.len() {
-                let h = unsafe { ZSTD_hashPtr_at_unchecked(src, ip - 1, hBitsS, MLS) };
-                unsafe {
-                    *chainTable.add(h) = base_off.wrapping_add((ip - 1) as u32);
+            let h = unsafe {
+                let p = src.as_ptr().wrapping_add(ip - 2);
+                ZSTD_hash8((p as *const u64).read_unaligned().to_le(), hBitsL, 0)
+            };
+            // SAFETY: `ip <= ilimit` implies `ip - 2 + 8 <= iend`.
+            unsafe {
+                *hashTable.add(h) = base_off.wrapping_add((ip - 2) as u32);
+            }
+            let h = unsafe {
+                let p = src.as_ptr().wrapping_add(ip - 1);
+                match MLS {
+                    5 => ZSTD_hash5((p as *const u64).read_unaligned().to_le(), hBitsS, 0),
+                    6 => ZSTD_hash6((p as *const u64).read_unaligned().to_le(), hBitsS, 0),
+                    7 => ZSTD_hash7((p as *const u64).read_unaligned().to_le(), hBitsS, 0),
+                    8 => ZSTD_hash8((p as *const u64).read_unaligned().to_le(), hBitsS, 0),
+                    _ => ZSTD_hash4((p as *const u32).read_unaligned().to_le(), hBitsS, 0) as usize,
                 }
+            };
+            // SAFETY: `ip <= ilimit` implies `ip - 1 + 8 <= iend`.
+            unsafe {
+                *chainTable.add(h) = base_off.wrapping_add((ip - 1) as u32);
             }
 
-            while ip <= ilimit && rep_offset2 > 0 && ip >= rep_offset2 as usize {
+            while ip <= ilimit && rep_offset2 > 0 {
                 // SAFETY: `ip ≤ ilimit = iend - 8` so `ip + 4 ≤ iend
                 // = src.len()`; `ip - rep_offset2 ≤ ip` so safe.
                 let cval =
                     unsafe { (src.as_ptr().wrapping_add(ip) as *const u32).read_unaligned() };
                 let rval = unsafe {
-                    (src.as_ptr().wrapping_add(ip - rep_offset2 as usize) as *const u32)
+                    (src.as_ptr()
+                        .wrapping_add(ip.wrapping_sub(rep_offset2 as usize))
+                        as *const u32)
                         .read_unaligned()
                 };
                 if cval != rval {
@@ -459,8 +485,21 @@ fn ZSTD_compressBlock_doubleFast_noDict_generic_mls<const MLS: u32>(
                 }
                 let rLength = ZSTD_count(src, ip + 4, ip + 4 - rep_offset2 as usize, iend) + 4;
                 std::mem::swap(&mut rep_offset1, &mut rep_offset2);
-                let hs = unsafe { ZSTD_hashPtr_at_unchecked(src, ip, hBitsS, MLS) };
-                let hl = unsafe { ZSTD_hashPtr_at_unchecked(src, ip, hBitsL, 8) };
+                let hs = unsafe {
+                    let p = src.as_ptr().wrapping_add(ip);
+                    match MLS {
+                        5 => ZSTD_hash5((p as *const u64).read_unaligned().to_le(), hBitsS, 0),
+                        6 => ZSTD_hash6((p as *const u64).read_unaligned().to_le(), hBitsS, 0),
+                        7 => ZSTD_hash7((p as *const u64).read_unaligned().to_le(), hBitsS, 0),
+                        8 => ZSTD_hash8((p as *const u64).read_unaligned().to_le(), hBitsS, 0),
+                        _ => ZSTD_hash4((p as *const u32).read_unaligned().to_le(), hBitsS, 0)
+                            as usize,
+                    }
+                };
+                let hl = unsafe {
+                    let p = src.as_ptr().wrapping_add(ip);
+                    ZSTD_hash8((p as *const u64).read_unaligned().to_le(), hBitsL, 0)
+                };
                 // SAFETY: hs < ms.chainTable.len(), hl < ms.hashTable.len().
                 unsafe {
                     *chainTable.add(hs) = base_off.wrapping_add(ip as u32);
@@ -546,16 +585,18 @@ pub fn ZSTD_compressBlock_doubleFast_dictMatchState_generic(
     let dictStartIndex = dms.window.dictLimit;
     let dictEndIndex = dms.window.nextSrc;
     let dictBaseOff = dms.window.base_offset;
-    let dictStart = dictStartIndex.saturating_sub(dictBaseOff) as usize;
-    let dictEnd = dictEndIndex.saturating_sub(dictBaseOff) as usize;
+    debug_assert!(dictStartIndex >= dictBaseOff);
+    debug_assert!(dictEndIndex >= dictBaseOff);
+    let dictStart = dictStartIndex.wrapping_sub(dictBaseOff) as usize;
+    let dictEnd = dictEndIndex.wrapping_sub(dictBaseOff) as usize;
     let dictIndexDelta = prefixLowestIndex.wrapping_sub(dictEndIndex);
     let dictHBitsL = dms.cParams.hashLog + ZSTD_SHORT_CACHE_TAG_BITS;
     let dictHBitsS = dms.cParams.chainLog + ZSTD_SHORT_CACHE_TAG_BITS;
     let parseStart = 0usize;
     let istartIndex = base_off.wrapping_add(parseStart as u32);
     let dictAndPrefixLength = istartIndex
-        .saturating_sub(prefixLowestIndex)
-        .wrapping_add(dictEndIndex.saturating_sub(dictStartIndex));
+        .wrapping_sub(prefixLowestIndex)
+        .wrapping_add(dictEndIndex.wrapping_sub(dictStartIndex));
     let maxDistance = if cParams.windowLog >= 31 {
         u32::MAX
     } else {
@@ -598,18 +639,13 @@ pub fn ZSTD_compressBlock_doubleFast_dictMatchState_generic(
             if ip <= ilimit {
                 let indexToInsert = $curr.wrapping_add(2);
                 let ins = indexToInsert.wrapping_sub(base_off) as usize;
-                if ins + 8 <= src.len() {
-                    ms.hashTable[ZSTD_hashPtr(&src[ins..], hBitsL, 8)] = indexToInsert;
-                    ms.chainTable[ZSTD_hashPtr(&src[ins..], hBitsS, mls)] = indexToInsert;
-                }
-                if ip >= 2 {
-                    ms.hashTable[ZSTD_hashPtr(&src[ip - 2..], hBitsL, 8)] =
-                        base_off.wrapping_add((ip - 2) as u32);
-                }
-                if ip >= 1 {
-                    ms.chainTable[ZSTD_hashPtr(&src[ip - 1..], hBitsS, mls)] =
-                        base_off.wrapping_add((ip - 1) as u32);
-                }
+                debug_assert!(ins + 8 <= src.len());
+                ms.hashTable[ZSTD_hashPtr(&src[ins..], hBitsL, 8)] = indexToInsert;
+                ms.chainTable[ZSTD_hashPtr(&src[ins..], hBitsS, mls)] = indexToInsert;
+                ms.hashTable[ZSTD_hashPtr(&src[ip - 2..], hBitsL, 8)] =
+                    base_off.wrapping_add((ip - 2) as u32);
+                ms.chainTable[ZSTD_hashPtr(&src[ip - 1..], hBitsS, mls)] =
+                    base_off.wrapping_add((ip - 1) as u32);
                 while ip <= ilimit {
                     let current2 = base_off.wrapping_add(ip as u32);
                     let repIndex2 = current2.wrapping_sub(offset_2);
@@ -619,7 +655,7 @@ pub fn ZSTD_compressBlock_doubleFast_dictMatchState_generic(
                             .wrapping_sub(dictIndexDelta)
                             .wrapping_sub(dictBaseOff) as usize
                     } else {
-                        repIndex2.saturating_sub(base_off) as usize
+                        repIndex2.wrapping_sub(base_off) as usize
                     };
                     if ZSTD_index_overlap_check(prefixLowestIndex, repIndex2)
                         && if repInDict2 {
@@ -685,7 +721,7 @@ pub fn ZSTD_compressBlock_doubleFast_dictMatchState_generic(
                 .wrapping_sub(dictIndexDelta)
                 .wrapping_sub(dictBaseOff) as usize
         } else {
-            repIndex.saturating_sub(base_off) as usize
+            repIndex.wrapping_sub(base_off) as usize
         };
         if ZSTD_index_overlap_check(prefixLowestIndex, repIndex)
             && if repInDict {
@@ -719,7 +755,7 @@ pub fn ZSTD_compressBlock_doubleFast_dictMatchState_generic(
         }
 
         if matchIndexL >= prefixLowestIndex {
-            let matchLong = matchIndexL.saturating_sub(base_off) as usize;
+            let matchLong = matchIndexL.wrapping_sub(base_off) as usize;
             if matchLong + 8 <= src.len() && MEM_read64(&src[matchLong..]) == MEM_read64(&src[ip..])
             {
                 let mut mLength = ZSTD_count(src, ip + 8, matchLong + 8, iend) + 8;
@@ -751,7 +787,7 @@ pub fn ZSTD_compressBlock_doubleFast_dictMatchState_generic(
             }
         } else if dictTagsMatchL {
             let dictMatchIndexL = dictMatchIndexAndTagL >> ZSTD_SHORT_CACHE_TAG_BITS;
-            let mut dictMatchL = dictMatchIndexL.saturating_sub(dictBaseOff) as usize;
+            let mut dictMatchL = dictMatchIndexL.wrapping_sub(dictBaseOff) as usize;
             if dictMatchL < dictEnd
                 && dictMatchL > dictStart
                 && dictMatchL + 8 <= dictEnd
@@ -789,11 +825,11 @@ pub fn ZSTD_compressBlock_doubleFast_dictMatchState_generic(
         }
 
         let short_match = if matchIndexS > prefixLowestIndex {
-            let match_pos = matchIndexS.saturating_sub(base_off) as usize;
+            let match_pos = matchIndexS.wrapping_sub(base_off) as usize;
             match_pos + 4 <= src.len() && MEM_read32(&src[match_pos..]) == MEM_read32(&src[ip..])
         } else if dictTagsMatchS {
             let dictMatchIndexS = dictMatchIndexAndTagS >> ZSTD_SHORT_CACHE_TAG_BITS;
-            let match_pos = dictMatchIndexS.saturating_sub(dictBaseOff) as usize;
+            let match_pos = dictMatchIndexS.wrapping_sub(dictBaseOff) as usize;
             matchIndexS = dictMatchIndexS.wrapping_add(dictIndexDelta);
             match_pos > dictStart
                 && match_pos + 4 <= dictEnd
@@ -813,7 +849,7 @@ pub fn ZSTD_compressBlock_doubleFast_dictMatchState_generic(
             ms.hashTable[hl3] = curr.wrapping_add(1);
 
             if matchIndexL3 >= prefixLowestIndex {
-                let mut matchL3 = matchIndexL3.saturating_sub(base_off) as usize;
+                let mut matchL3 = matchIndexL3.wrapping_sub(base_off) as usize;
                 if matchL3 + 8 <= src.len()
                     && MEM_read64(&src[matchL3..]) == MEM_read64(&src[ip + 1..])
                 {
@@ -841,7 +877,7 @@ pub fn ZSTD_compressBlock_doubleFast_dictMatchState_generic(
                 }
             } else if dictTagsMatchL3 {
                 let dictMatchIndexL3 = dictMatchIndexAndTagL3 >> ZSTD_SHORT_CACHE_TAG_BITS;
-                let mut dictMatchL3 = dictMatchIndexL3.saturating_sub(dictBaseOff) as usize;
+                let mut dictMatchL3 = dictMatchIndexL3.wrapping_sub(dictBaseOff) as usize;
                 if dictMatchL3 < dictEnd
                     && dictMatchL3 > dictStart
                     && dictMatchL3 + 8 <= dictEnd
@@ -905,7 +941,7 @@ pub fn ZSTD_compressBlock_doubleFast_dictMatchState_generic(
                     mLength += 1;
                 }
             } else {
-                let mut match_pos = matchIndexS.saturating_sub(base_off) as usize;
+                let mut match_pos = matchIndexS.wrapping_sub(base_off) as usize;
                 mLength = ZSTD_count(src, ip + 4, match_pos + 4, iend) + 4;
                 offset = curr.wrapping_sub(matchIndexS);
                 while ip > anchor && match_pos > prefixLowest && src[ip - 1] == src[match_pos - 1] {
@@ -1030,11 +1066,17 @@ pub fn ZSTD_compressBlock_doubleFast_extDict_generic(
         if offset_1 <= curr.wrapping_add(1).wrapping_sub(dictStartIndex)
             && ZSTD_index_overlap_check(prefixStartIndex, repIndex)
             && if repInDict {
-                repMatch + 4 <= dictEnd
-                    && MEM_read32(&dict[repMatch..]) == MEM_read32(&src[ip + 1..])
+                debug_assert!(repMatch + 4 <= dictEnd);
+                unsafe {
+                    (dict.as_ptr().wrapping_add(repMatch) as *const u32).read_unaligned()
+                        == (src.as_ptr().wrapping_add(ip + 1) as *const u32).read_unaligned()
+                }
             } else {
-                repMatch + 4 <= src.len()
-                    && MEM_read32(&src[repMatch..]) == MEM_read32(&src[ip + 1..])
+                debug_assert!(repMatch + 4 <= src.len());
+                unsafe {
+                    (src.as_ptr().wrapping_add(repMatch) as *const u32).read_unaligned()
+                        == (src.as_ptr().wrapping_add(ip + 1) as *const u32).read_unaligned()
+                }
             }
         {
             let repMatchEnd = if repInDict { dictEnd } else { iend };
@@ -1055,14 +1097,21 @@ pub fn ZSTD_compressBlock_doubleFast_extDict_generic(
                 REPCODE_TO_OFFBASE(1),
                 mLength,
             );
-        } else if matchLongIndex > dictStartIndex
-            && matchLong + 8 <= if matchLongInDict { dictEnd } else { src.len() }
-            && if matchLongInDict {
-                MEM_read64(&dict[matchLong..]) == MEM_read64(&src[ip..])
+        } else if matchLongIndex > dictStartIndex && {
+            if matchLongInDict {
+                debug_assert!(matchLong + 8 <= dictEnd);
+                unsafe {
+                    (dict.as_ptr().wrapping_add(matchLong) as *const u64).read_unaligned()
+                        == (src.as_ptr().wrapping_add(ip) as *const u64).read_unaligned()
+                }
             } else {
-                MEM_read64(&src[matchLong..]) == MEM_read64(&src[ip..])
+                debug_assert!(matchLong + 8 <= src.len());
+                unsafe {
+                    (src.as_ptr().wrapping_add(matchLong) as *const u64).read_unaligned()
+                        == (src.as_ptr().wrapping_add(ip) as *const u64).read_unaligned()
+                }
             }
-        {
+        } {
             let matchEnd = if matchLongInDict { dictEnd } else { iend };
             let lowMatchPtr = if matchLongInDict {
                 dictStart
@@ -1102,14 +1151,21 @@ pub fn ZSTD_compressBlock_doubleFast_extDict_generic(
                 OFFSET_TO_OFFBASE(offset),
                 mLength,
             );
-        } else if matchIndex > dictStartIndex
-            && match_pos + 4 <= if matchInDict { dictEnd } else { src.len() }
-            && if matchInDict {
-                MEM_read32(&dict[match_pos..]) == MEM_read32(&src[ip..])
+        } else if matchIndex > dictStartIndex && {
+            if matchInDict {
+                debug_assert!(match_pos + 4 <= dictEnd);
+                unsafe {
+                    (dict.as_ptr().wrapping_add(match_pos) as *const u32).read_unaligned()
+                        == (src.as_ptr().wrapping_add(ip) as *const u32).read_unaligned()
+                }
             } else {
-                MEM_read32(&src[match_pos..]) == MEM_read32(&src[ip..])
+                debug_assert!(match_pos + 4 <= src.len());
+                unsafe {
+                    (src.as_ptr().wrapping_add(match_pos) as *const u32).read_unaligned()
+                        == (src.as_ptr().wrapping_add(ip) as *const u32).read_unaligned()
+                }
             }
-        {
+        } {
             let h3 = ZSTD_hashPtr(&src[ip + 1..], hBitsL, 8);
             let matchIndex3 = ms.hashTable[h3];
             let match3InDict = matchIndex3 < prefixStartIndex;
@@ -1121,11 +1177,18 @@ pub fn ZSTD_compressBlock_doubleFast_extDict_generic(
             let offset;
             ms.hashTable[h3] = curr.wrapping_add(1);
             if matchIndex3 > dictStartIndex
-                && match3 + 8 <= if match3InDict { dictEnd } else { src.len() }
                 && if match3InDict {
-                    MEM_read64(&dict[match3..]) == MEM_read64(&src[ip + 1..])
+                    debug_assert!(match3 + 8 <= dictEnd);
+                    unsafe {
+                        (dict.as_ptr().wrapping_add(match3) as *const u64).read_unaligned()
+                            == (src.as_ptr().wrapping_add(ip + 1) as *const u64).read_unaligned()
+                    }
                 } else {
-                    MEM_read64(&src[match3..]) == MEM_read64(&src[ip + 1..])
+                    debug_assert!(match3 + 8 <= src.len());
+                    unsafe {
+                        (src.as_ptr().wrapping_add(match3) as *const u64).read_unaligned()
+                            == (src.as_ptr().wrapping_add(ip + 1) as *const u64).read_unaligned()
+                    }
                 }
             {
                 let matchEnd = if match3InDict { dictEnd } else { iend };
@@ -1228,11 +1291,17 @@ pub fn ZSTD_compressBlock_doubleFast_extDict_generic(
                 if offset_2 <= current2.wrapping_sub(dictStartIndex)
                     && ZSTD_index_overlap_check(prefixStartIndex, repIndex2)
                     && if repInDict2 {
-                        repMatch2 + 4 <= dictEnd
-                            && MEM_read32(&dict[repMatch2..]) == MEM_read32(&src[ip..])
+                        debug_assert!(repMatch2 + 4 <= dictEnd);
+                        unsafe {
+                            (dict.as_ptr().wrapping_add(repMatch2) as *const u32).read_unaligned()
+                                == (src.as_ptr().wrapping_add(ip) as *const u32).read_unaligned()
+                        }
                     } else {
-                        repMatch2 + 4 <= src.len()
-                            && MEM_read32(&src[repMatch2..]) == MEM_read32(&src[ip..])
+                        debug_assert!(repMatch2 + 4 <= src.len());
+                        unsafe {
+                            (src.as_ptr().wrapping_add(repMatch2) as *const u32).read_unaligned()
+                                == (src.as_ptr().wrapping_add(ip) as *const u32).read_unaligned()
+                        }
                     }
                 {
                     let repEnd2 = if repInDict2 { dictEnd } else { iend };
@@ -1267,20 +1336,6 @@ pub fn ZSTD_compressBlock_doubleFast_extDict_generic(
     rep[0] = offset_1;
     rep[1] = offset_2;
     iend - anchor
-}
-
-/// Cross-block-history variant. Treats `src[..istart]` as prior
-/// content; hashTable / chainTable entries from earlier blocks stay
-/// valid as back-references.
-pub fn ZSTD_compressBlock_doubleFast_with_history(
-    ms: &mut ZSTD_MatchState_t,
-    seqStore: &mut SeqStore_t,
-    rep: &mut [u32; ZSTD_REP_NUM],
-    src: &[u8],
-    istart: usize,
-) -> usize {
-    let mml = ms.cParams.minMatch;
-    ZSTD_compressBlock_doubleFast_noDict_generic(ms, seqStore, rep, src, istart, mml)
 }
 
 #[cfg(test)]

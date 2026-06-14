@@ -465,24 +465,6 @@ pub struct ZSTD_optLdm_t {
     pub offset: u32,
 }
 
-/// Rust-only helper: snapshot the active LDM `RawSeqStore_t` (or an
-/// empty one when none is attached) so the optimal parser can advance
-/// `pos` without mutating shared state.
-#[inline]
-fn ZSTD_cloneActiveRawSeqStore(src: Option<&RawSeqStore_t>) -> RawSeqStore_t {
-    let Some(src) = src else {
-        return RawSeqStore_t::default();
-    };
-    let end = src.size.min(src.seq.len());
-    RawSeqStore_t {
-        seq: src.seq[..end].to_vec(),
-        pos: src.pos.min(end),
-        posInSequence: src.posInSequence,
-        size: end,
-        capacity: end,
-    }
-}
-
 /// Port of `ZSTD_optLdm_skipRawSeqStoreBytes`. Advances both `pos`
 /// and `posInSequence` forward by `nbBytes`, popping full sequences
 /// as they're consumed. Symmetric to LDM's `skipSequences` but treats
@@ -725,15 +707,12 @@ pub fn ZSTD_insertBt1(
 
         // Compare the byte after the common prefix to decide direction.
         let match_byte = if extDict {
-            ZSTD_extDictOrderingByte(
-                buf,
-                ms.window.base_offset,
-                dict,
-                dictBaseOffset,
-                dictLimit,
-                matchIndex,
-                matchLength,
-            )
+            let nextIndex = matchIndex.wrapping_add(matchLength as u32);
+            if nextIndex < dictLimit {
+                dict[nextIndex.saturating_sub(dictBaseOffset) as usize]
+            } else {
+                buf[nextIndex.saturating_sub(ms.window.base_offset) as usize]
+            }
         } else {
             buf[match_pos + matchLength]
         };
@@ -824,20 +803,6 @@ pub fn ZSTD_fWeight(rawStat: u32) -> f64 {
     ZSTD_fracWeight(rawStat) as f64 / BITCOST_MULTIPLIER as f64
 }
 
-/// Rust-only helper: returns the maximum encoded bit-width for
-/// `symbol` under FSE compression table `ctable`. Used to bound symbol
-/// prices when seeding from dictionary entropy tables.
-#[inline]
-fn fse_max_nb_bits_from_ctable(ctable: &[u32], symbol: u32) -> u32 {
-    let mut state = FSE_CState_t {
-        value: 0,
-        stateLog: 0,
-    };
-    FSE_initCState(&mut state, ctable);
-    let tt = symbolTT_read(ctable, state.stateLog, symbol as usize);
-    ((tt.deltaNbBits + ((1 << 16) - 1)) as u32) >> 16
-}
-
 /// Port of `ZSTD_rescaleFreqs`. Initializes the
 /// per-block frequency tables:
 ///   * First block (`litLengthSum == 0`):
@@ -889,10 +854,15 @@ pub fn ZSTD_rescaleFreqs(
             }
 
             optPtr.litLengthSum = 0;
+            let mut llstate = FSE_CState_t {
+                value: 0,
+                stateLog: 0,
+            };
+            FSE_initCState(&mut llstate, &symbolCosts.fse.litlengthCTable);
             for ll in 0..=MaxLL as usize {
                 let scaleLog = 10u32;
-                let bitCost =
-                    fse_max_nb_bits_from_ctable(&symbolCosts.fse.litlengthCTable, ll as u32);
+                let lltt = symbolTT_read(&symbolCosts.fse.litlengthCTable, llstate.stateLog, ll);
+                let bitCost = (lltt.deltaNbBits + ((1 << 16) - 1)) >> 16;
                 debug_assert!(bitCost < scaleLog);
                 optPtr.litLengthFreq[ll] = if bitCost != 0 {
                     1u32 << (scaleLog - bitCost)
@@ -903,10 +873,15 @@ pub fn ZSTD_rescaleFreqs(
             }
 
             optPtr.matchLengthSum = 0;
+            let mut mlstate = FSE_CState_t {
+                value: 0,
+                stateLog: 0,
+            };
+            FSE_initCState(&mut mlstate, &symbolCosts.fse.matchlengthCTable);
             for ml in 0..=MaxML as usize {
                 let scaleLog = 10u32;
-                let bitCost =
-                    fse_max_nb_bits_from_ctable(&symbolCosts.fse.matchlengthCTable, ml as u32);
+                let mltt = symbolTT_read(&symbolCosts.fse.matchlengthCTable, mlstate.stateLog, ml);
+                let bitCost = (mltt.deltaNbBits + ((1 << 16) - 1)) >> 16;
                 debug_assert!(bitCost < scaleLog);
                 optPtr.matchLengthFreq[ml] = if bitCost != 0 {
                     1u32 << (scaleLog - bitCost)
@@ -917,10 +892,15 @@ pub fn ZSTD_rescaleFreqs(
             }
 
             optPtr.offCodeSum = 0;
+            let mut ofstate = FSE_CState_t {
+                value: 0,
+                stateLog: 0,
+            };
+            FSE_initCState(&mut ofstate, &symbolCosts.fse.offcodeCTable);
             for of in 0..=MaxOff as usize {
                 let scaleLog = 10u32;
-                let bitCost =
-                    fse_max_nb_bits_from_ctable(&symbolCosts.fse.offcodeCTable, of as u32);
+                let oftt = symbolTT_read(&symbolCosts.fse.offcodeCTable, ofstate.stateLog, of);
+                let bitCost = (oftt.deltaNbBits + ((1 << 16) - 1)) >> 16;
                 debug_assert!(bitCost < scaleLog);
                 optPtr.offCodeFreq[of] = if bitCost != 0 {
                     1u32 << (scaleLog - bitCost)
@@ -1097,24 +1077,32 @@ pub fn ZSTD_insertBtAndGetAllMatches(
                 let repMatch = repIndex.saturating_sub(dictBaseOffset) as usize;
                 if repOffset.wrapping_sub(1) < curr.wrapping_sub(windowLow)
                     && ZSTD_index_overlap_check(dictLimit, repIndex)
-                    && ZSTD_minMatchEquals_2segments(
-                        buf,
-                        ip_pos,
-                        prefixStart,
-                        extDict(),
-                        repMatch,
-                        minMatch,
-                    )
                 {
-                    repLen = ZSTD_count_2segments(
-                        buf,
-                        ip_pos + minMatch as usize,
-                        ilimit_pos,
-                        prefixStart,
-                        extDict(),
-                        repMatch + minMatch as usize,
-                        extDictEnd,
-                    ) + minMatch as usize;
+                    let dict = extDict();
+                    let dict_remaining = dict.len().saturating_sub(repMatch);
+                    let mut minMatchEquals = true;
+                    for i in 0..minMatch as usize {
+                        let dict_byte = if i < dict_remaining {
+                            dict[repMatch + i]
+                        } else {
+                            buf[prefixStart + (i - dict_remaining)]
+                        };
+                        if buf[ip_pos + i] != dict_byte {
+                            minMatchEquals = false;
+                            break;
+                        }
+                    }
+                    if minMatchEquals {
+                        repLen = ZSTD_count_2segments(
+                            buf,
+                            ip_pos + minMatch as usize,
+                            ilimit_pos,
+                            prefixStart,
+                            dict,
+                            repMatch + minMatch as usize,
+                            extDictEnd,
+                        ) + minMatch as usize;
+                    }
                 }
             } else if let Some(dms) = dms_ref() {
                 let repMatch = repIndex
@@ -1123,24 +1111,31 @@ pub fn ZSTD_insertBtAndGetAllMatches(
                 if repOffset.wrapping_sub(1)
                     < curr.wrapping_sub(dmsLowLimit.wrapping_add(dmsIndexDelta))
                     && ZSTD_index_overlap_check(dictLimit, repIndex)
-                    && ZSTD_minMatchEquals_2segments(
-                        buf,
-                        ip_pos,
-                        prefixStart,
-                        &dms.dictContent,
-                        repMatch,
-                        minMatch,
-                    )
                 {
-                    repLen = ZSTD_count_2segments(
-                        buf,
-                        ip_pos + minMatch as usize,
-                        ilimit_pos,
-                        prefixStart,
-                        &dms.dictContent,
-                        repMatch + minMatch as usize,
-                        dms.dictContent.len(),
-                    ) + minMatch as usize;
+                    let dict_remaining = dms.dictContent.len().saturating_sub(repMatch);
+                    let mut minMatchEquals = true;
+                    for i in 0..minMatch as usize {
+                        let dict_byte = if i < dict_remaining {
+                            dms.dictContent[repMatch + i]
+                        } else {
+                            buf[prefixStart + (i - dict_remaining)]
+                        };
+                        if buf[ip_pos + i] != dict_byte {
+                            minMatchEquals = false;
+                            break;
+                        }
+                    }
+                    if minMatchEquals {
+                        repLen = ZSTD_count_2segments(
+                            buf,
+                            ip_pos + minMatch as usize,
+                            ilimit_pos,
+                            prefixStart,
+                            &dms.dictContent,
+                            repMatch + minMatch as usize,
+                            dms.dictContent.len(),
+                        ) + minMatch as usize;
+                    }
                 }
             }
             if repLen > bestLength {
@@ -1237,15 +1232,12 @@ pub fn ZSTD_insertBtAndGetAllMatches(
         }
 
         let matchByte = if dictMode == ZSTD_dictMode_e::ZSTD_extDict {
-            ZSTD_extDictOrderingByte(
-                buf,
-                ms.window.base_offset,
-                extDict(),
-                dictBaseOffset,
-                dictLimit,
-                matchIndex,
-                matchLength,
-            )
+            let nextIndex = matchIndex.wrapping_add(matchLength as u32);
+            if nextIndex < dictLimit {
+                extDict()[nextIndex.saturating_sub(dictBaseOffset) as usize]
+            } else {
+                buf[nextIndex.saturating_sub(ms.window.base_offset) as usize]
+            }
         } else {
             buf[match_pos + matchLength]
         };
@@ -1330,14 +1322,12 @@ pub fn ZSTD_insertBtAndGetAllMatches(
                 }
                 let crossedIntoPrefix =
                     dictMatchIndex.wrapping_add(matchLength as u32) >= dmsHighLimit;
-                let matchByte = ZSTD_dmsOrderingByte(
-                    buf,
-                    match_pos,
-                    &dms.dictContent,
-                    dictMatchIndex.saturating_sub(dmsBaseOff) as usize,
-                    matchLength,
-                    crossedIntoPrefix,
-                );
+                let matchByte = if crossedIntoPrefix {
+                    buf[match_pos + matchLength]
+                } else {
+                    dms.dictContent
+                        [dictMatchIndex.saturating_sub(dmsBaseOff) as usize + matchLength]
+                };
                 if matchByte < buf[ip_pos + matchLength] {
                     commonLengthSmaller = matchLength;
                     dictMatchIndex = dms.chainTable[nextBase + 1];
@@ -1353,73 +1343,6 @@ pub fn ZSTD_insertBtAndGetAllMatches(
     debug_assert!(matchEndIdx > curr.wrapping_add(8));
     ms.nextToUpdate = matchEndIdx.wrapping_sub(8);
     mnum
-}
-
-/// Rust-only helper: returns the byte at `matchLength` past the
-/// candidate's start, choosing either the prefix or the dict-match-
-/// state buffer based on whether the candidate has crossed back into
-/// the prefix. Used as a tiebreak when ranking equal-length matches.
-#[inline]
-fn ZSTD_dmsOrderingByte(
-    prefix_buf: &[u8],
-    prefix_match_pos: usize,
-    dms_buf: &[u8],
-    dms_match_pos: usize,
-    matchLength: usize,
-    crossedIntoPrefix: bool,
-) -> u8 {
-    if crossedIntoPrefix {
-        prefix_buf[prefix_match_pos + matchLength]
-    } else {
-        dms_buf[dms_match_pos + matchLength]
-    }
-}
-
-/// Rust-only helper: byte at `matchLength` past an ext-dict candidate,
-/// using the external dictionary until `dictLimit`, then the prefix.
-#[inline]
-fn ZSTD_extDictOrderingByte(
-    prefix_buf: &[u8],
-    base_off: u32,
-    dict_buf: &[u8],
-    dict_base_off: u32,
-    dict_limit: u32,
-    match_index: u32,
-    matchLength: usize,
-) -> u8 {
-    let nextIndex = match_index.wrapping_add(matchLength as u32);
-    if nextIndex < dict_limit {
-        dict_buf[nextIndex.saturating_sub(dict_base_off) as usize]
-    } else {
-        prefix_buf[nextIndex.saturating_sub(base_off) as usize]
-    }
-}
-
-/// Rust-only helper: byte-wise equality check across the dictionary→
-/// prefix boundary for `min_match` bytes. Returns true when the
-/// candidate at `prefix_pos` matches `dict_pos` and then continues
-/// into the prefix once the dict buffer is exhausted.
-#[inline]
-fn ZSTD_minMatchEquals_2segments(
-    prefix_buf: &[u8],
-    prefix_pos: usize,
-    prefix_start: usize,
-    dict_buf: &[u8],
-    dict_pos: usize,
-    min_match: u32,
-) -> bool {
-    let dict_remaining = dict_buf.len().saturating_sub(dict_pos);
-    for i in 0..min_match as usize {
-        let dict_byte = if i < dict_remaining {
-            dict_buf[dict_pos + i]
-        } else {
-            prefix_buf[prefix_start + (i - dict_remaining)]
-        };
-        if prefix_buf[prefix_pos + i] != dict_byte {
-            return false;
-        }
-    }
-    true
 }
 
 /// Port of `ZSTD_btGetAllMatches_internal` — no-dict variant. Thin
@@ -1648,8 +1571,20 @@ fn ZSTD_compressBlock_opt_generic_window(
     // while match finding mutates the surrounding match state. Mirror
     // that layout directly: the BT matcher never touches `ms.opt`.
     let optState: &mut optState_t = unsafe { &mut *core::ptr::addr_of_mut!(ms.opt) };
+    let activeLdmSeqStore = if let Some(src) = ms.ldmSeqStore.as_ref() {
+        let end = src.size.min(src.seq.len());
+        RawSeqStore_t {
+            seq: src.seq[..end].to_vec(),
+            pos: src.pos.min(end),
+            posInSequence: src.posInSequence,
+            size: end,
+            capacity: end,
+        }
+    } else {
+        RawSeqStore_t::default()
+    };
     let mut optLdm = ZSTD_optLdm_t {
-        seqStore: ZSTD_cloneActiveRawSeqStore(ms.ldmSeqStore.as_ref()),
+        seqStore: activeLdmSeqStore,
         ..Default::default()
     };
     let src = &window_buf[src_pos..src_end];
@@ -2170,7 +2105,9 @@ pub fn ZSTD_compressBlock_btultra2(
     src: &[u8],
 ) -> usize {
     let curr = ms.window.nextSrc;
-    if opt_state_is_fresh(ms, seqStore)
+    if ms.opt.litLengthSum == 0
+        && seqStore.sequences.is_empty()
+        && ms.window.dictLimit == ms.window.lowLimit
         && curr == ms.window.dictLimit
         && src.len() > ZSTD_PREDEF_THRESHOLD as usize
     {
@@ -2202,20 +2139,6 @@ pub fn ZSTD_compressBlock_btultra2_window(
         2,
         ZSTD_dictMode_e::ZSTD_noDict,
     )
-}
-
-/// Rust-only helper: encapsulates the four assertions upstream's
-/// `ZSTD_compressBlock_btultra2` uses to gate `ZSTD_initStats_ultra`
-/// (first block, empty seqStore, no dictionary, no prefix).
-#[inline]
-fn opt_state_is_fresh(
-    ms: &ZSTD_MatchState_t,
-    seqStore: &crate::compress::seq_store::SeqStore_t,
-) -> bool {
-    ms.opt.litLengthSum == 0
-        && seqStore.sequences.is_empty()
-        && ms.window.dictLimit == ms.window.lowLimit
-        && ms.window.dictLimit.wrapping_sub(ms.nextToUpdate) <= 1
 }
 
 /// Port of `ZSTD_compressBlock_btopt_dictMatchState` (`zstd_opt.c:1539`).
@@ -3035,24 +2958,6 @@ mod tests {
     }
 
     #[test]
-    fn dms_ordering_byte_uses_prefix_after_crossing_dms_high_limit() {
-        let prefix = b"aaaaZsuffix";
-        let dms = b"aaaaY";
-
-        assert_eq!(ZSTD_dmsOrderingByte(prefix, 0, dms, 0, 4, true), b'Z');
-        assert_eq!(ZSTD_dmsOrderingByte(prefix, 0, dms, 0, 4, false), b'Y');
-    }
-
-    #[test]
-    fn minmatch_equals_2segments_allows_dict_prefix_boundary_match() {
-        let prefix = b"abcdWXYZ";
-        let dict = b"ab";
-
-        assert!(ZSTD_minMatchEquals_2segments(prefix, 0, 2, dict, 0, 4));
-        assert!(!ZSTD_minMatchEquals_2segments(prefix, 1, 2, dict, 0, 4));
-    }
-
-    #[test]
     fn dms_index_delta_uses_upstream_wrapping_arithmetic() {
         let window_low = 5u32;
         let dms_high = 11u32;
@@ -3338,37 +3243,6 @@ mod tests {
                 "variant {idx} regressed into a dead wrapper"
             );
         }
-    }
-
-    #[test]
-    fn opt_state_is_fresh_requires_zero_litlengthsum_and_nearby_next_to_update() {
-        use crate::compress::match_state::ZSTD_compressionParameters;
-        use crate::compress::seq_store::SeqStore_t;
-
-        let cp = ZSTD_compressionParameters {
-            windowLog: 18,
-            chainLog: 15,
-            hashLog: 14,
-            searchLog: 4,
-            minMatch: 4,
-            targetLength: 32,
-            strategy: 9,
-        };
-        let mut ms = ZSTD_MatchState_t::new(cp);
-        let seq_store = SeqStore_t::with_capacity(16, 256);
-
-        ms.window.dictLimit = 1000;
-        ms.window.lowLimit = 1000;
-        ms.nextToUpdate = 999;
-        ms.opt.litLengthSum = 0;
-        assert!(opt_state_is_fresh(&ms, &seq_store));
-
-        ms.opt.litLengthSum = 1;
-        assert!(!opt_state_is_fresh(&ms, &seq_store));
-
-        ms.opt.litLengthSum = 0;
-        ms.nextToUpdate = 997;
-        assert!(!opt_state_is_fresh(&ms, &seq_store));
     }
 
     #[test]

@@ -19,18 +19,19 @@ use zstd_pure_rs::compress::zstd_compress::{
     ZSTD_compressStream, ZSTD_createCCtx, ZSTD_endStream, ZSTD_forceIgnoreChecksum_e,
     ZSTD_maxCLevel, ZSTD_minCLevel,
 };
-#[cfg(test)]
-use zstd_pure_rs::decompress::zstd_decompress::ZSTD_getFrameContentSize;
 use zstd_pure_rs::decompress::zstd_decompress::{
-    ZSTD_DCtx_setFormat, ZSTD_FrameHeader, ZSTD_decodingBufferSize_internal, ZSTD_decompress,
-    ZSTD_decompressContinue, ZSTD_decompressContinue_into_prefix, ZSTD_decompressDCtx,
-    ZSTD_decompress_usingDict, ZSTD_findFrameSizeInfo, ZSTD_format_e, ZSTD_getFrameHeader,
-    ZSTD_nextInputType, ZSTD_nextInputType_e, ZSTD_nextSrcSizeToDecompress, ZSTD_resetDStream,
-    ZSTD_CONTENTSIZE_ERROR, ZSTD_CONTENTSIZE_UNKNOWN, ZSTD_MAGICNUMBER, ZSTD_MAGIC_SKIPPABLE_MASK,
+    ZSTD_DCtx_setFormat, ZSTD_FrameHeader, ZSTD_decompress, ZSTD_decompressContinue_into_history,
+    ZSTD_decompressDCtx, ZSTD_decompress_usingDict, ZSTD_findFrameSizeInfo, ZSTD_format_e,
+    ZSTD_getFrameHeader, ZSTD_initDStream, ZSTD_nextSrcSizeToDecompress, ZSTD_resetDStream,
+    ZSTD_CONTENTSIZE_ERROR, ZSTD_MAGICNUMBER, ZSTD_MAGIC_SKIPPABLE_MASK,
     ZSTD_MAGIC_SKIPPABLE_START,
 };
+#[cfg(test)]
+use zstd_pure_rs::decompress::zstd_decompress::{
+    ZSTD_getFrameContentSize, ZSTD_CONTENTSIZE_UNKNOWN,
+};
 use zstd_pure_rs::decompress::zstd_decompress_block::{
-    ZSTD_DCtx, ZSTD_buildDefaultSeqTables, ZSTD_decoder_entropy_rep, WILDCOPY_OVERLENGTH,
+    ZSTD_DCtx, ZSTD_buildDefaultSeqTables, ZSTD_decoder_entropy_rep,
 };
 
 const UPSTREAM_ZSTD_VERSION: &str = "1.6.0";
@@ -1377,23 +1378,17 @@ fn stream_decompress_zstd_file_to_writer<W: Write>(
     let file = File::open(input).map_err(|e| format!("{}: {e}", input.display()))?;
     let mut reader = BufReader::new(file);
     let mut dctx = ZSTD_DCtx::new();
+    ZSTD_initDStream(&mut dctx);
     if ignore_checksum {
         dctx.forceIgnoreChecksum = ZSTD_forceIgnoreChecksum_e::ZSTD_d_ignoreChecksum;
     }
     let mut total_in = 0usize;
     let mut total_out = 0usize;
     let mut chunk = Vec::new();
-    let mut out_ring = Vec::new();
-    let mut out_pos = 0usize;
-    let mut tail_start = 0usize;
-    let mut tail_len = 0usize;
 
     loop {
         let at_frame_boundary = total_in > 0 && ZSTD_nextSrcSizeToDecompress(&dctx) == 0;
         let expected = if at_frame_boundary {
-            out_pos = 0;
-            tail_start = 0;
-            tail_len = 0;
             ZSTD_resetDStream(&mut dctx)
         } else {
             ZSTD_nextSrcSizeToDecompress(&dctx)
@@ -1413,78 +1408,11 @@ fn stream_decompress_zstd_file_to_writer<W: Write>(
         }
         total_in = total_in.saturating_add(chunk.len());
 
-        let input_type = ZSTD_nextInputType(&dctx);
-        if matches!(
-            input_type,
-            ZSTD_nextInputType_e::ZSTDnit_block | ZSTD_nextInputType_e::ZSTDnit_lastBlock
-        ) {
-            if out_ring.is_empty() {
-                let ring_size = ZSTD_decodingBufferSize_internal(
-                    dctx.fParams.windowSize,
-                    ZSTD_CONTENTSIZE_UNKNOWN,
-                    dctx.fParams.blockSizeMax as usize,
-                );
-                if ERR_isError(ring_size) {
-                    return Err(ERR_getErrorName(ring_size).to_string());
-                }
-                out_ring.resize(ring_size, 0);
-            }
-
-            let window = if dctx.fParams.windowSize > 0 {
-                dctx.fParams.windowSize as usize
-            } else {
-                dctx.fParams.blockSizeMax as usize
-            };
-            let max_block = dctx.fParams.blockSizeMax as usize;
-            let needed = max_block.saturating_add(WILDCOPY_OVERLENGTH);
-            if out_pos.saturating_add(needed) > out_ring.len() {
-                tail_len = out_pos.min(window);
-                tail_start = out_pos - tail_len;
-                out_pos = 0;
-            }
-
-            let needed_tail = tail_len.min(window.saturating_sub(out_pos));
-            let produced_len = if needed_tail == 0 {
-                tail_len = 0;
-                ZSTD_decompressContinue_into_prefix(&mut dctx, &chunk, &mut out_ring, out_pos, &[])
-                    .map_err(|e| ERR_getErrorName(e).to_string())?
-            } else {
-                let tail_end = tail_start + tail_len;
-                let ext_start = tail_end - needed_tail;
-                let (dst_prefix, tail_and_after) = out_ring.split_at_mut(ext_start);
-                let ext_history = &tail_and_after[..needed_tail];
-                if out_pos.saturating_add(needed) > dst_prefix.len() {
-                    return Err(format!(
-                        "{}: internal output ring is too small",
-                        input.display()
-                    ));
-                }
-                ZSTD_decompressContinue_into_prefix(
-                    &mut dctx,
-                    &chunk,
-                    dst_prefix,
-                    out_pos,
-                    ext_history,
-                )
-                .map_err(|e| ERR_getErrorName(e).to_string())?
-            };
-
-            if produced_len != 0 {
-                writer
-                    .write_all(&out_ring[out_pos..out_pos + produced_len])
-                    .map_err(|e| e.to_string())?;
-                total_out = total_out.saturating_add(produced_len);
-                out_pos += produced_len;
-                if out_pos >= window {
-                    tail_len = 0;
-                }
-            }
-        } else {
-            let mut empty = [];
-            let produced = ZSTD_decompressContinue(&mut dctx, &mut empty, &chunk);
-            if ERR_isError(produced) {
-                return Err(ERR_getErrorName(produced).to_string());
-            }
+        let produced = ZSTD_decompressContinue_into_history(&mut dctx, &chunk)
+            .map_err(|e| ERR_getErrorName(e).to_string())?;
+        if !produced.is_empty() {
+            writer.write_all(produced).map_err(|e| e.to_string())?;
+            total_out = total_out.saturating_add(produced.len());
         }
     }
 

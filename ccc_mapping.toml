@@ -162,6 +162,27 @@ rust  = "ZSTD_insertBtAndGetAllMatches_prefixOnly"
 other = "ZSTD_insertBtAndGetAllMatches"
 other_path = "zstd/lib/compress/zstd_opt.c"
 
+# Rust's `_window` body is the live parser over an explicit history
+# buffer; the plain Rust `ZSTD_compressBlock_opt_generic` is only the
+# contiguous-slice adapter for upstream's function.
+[[entries]]
+rust  = "ZSTD_compressBlock_opt_generic_window"
+other = "ZSTD_compressBlock_opt_generic"
+other_path = "zstd/lib/compress/zstd_opt.c"
+
+# Rust splits upstream `ZSTDMT_serialState_genSequences()` into a
+# preparation step and a small serial-state advance helper so LDM
+# sequence generation can happen before Rust job dispatch.
+[[entries]]
+rust  = "ZSTDMT_prepareJobSequences"
+other = "ZSTDMT_serialState_genSequences"
+other_path = "zstd/lib/compress/zstdmt_compress.c"
+
+[[entries]]
+rust  = "ZSTDMT_serialState_noteSequencesFinished"
+other = "ZSTDMT_serialState_genSequences"
+other_path = "zstd/lib/compress/zstdmt_compress.c"
+
 # HUF_buildCTable / HUF_writeCTable were renamed upstream to add
 # explicit `_wksp` suffixes — Rust keeps the historical plain names.
 [[entries]]

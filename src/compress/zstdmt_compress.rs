@@ -151,9 +151,9 @@ impl Range {
     }
 }
 
-/// Rust-only helper: reinterpret a `Range` as a borrowed byte slice
-/// pointing at MT-context-owned memory. Returns an empty slice when
-/// `range.size == 0`. Caller must guarantee lifetime.
+/// Pointer-view adapter for upstream MT `Range { start, size }`
+/// buffers. Returns an empty slice when `range.size == 0`. Caller
+/// must guarantee lifetime.
 #[inline]
 fn range_as_slice(range: Range) -> &'static [u8] {
     if range.size == 0 {
@@ -595,8 +595,9 @@ pub fn ZSTDMT_serialState_free(serialState: &mut SerialState) {
     serialState.ldmNextSrc = ZSTD_WINDOW_START_INDEX;
 }
 
-/// Rust-only helper: advances the serial job-order gate after this
-/// file has prepared (or intentionally skipped) external sequences.
+/// Serial-state step used by the upstream `ZSTDMT_serialState_genSequences`
+/// flow after this file has prepared (or intentionally skipped)
+/// external sequences.
 fn ZSTDMT_serialState_noteSequencesFinished(
     serialState: &mut SerialState,
     _seqStore: &mut RawSeqStore_t,
@@ -795,21 +796,10 @@ pub fn ZSTDMT_waitForAllJobsCompleted(mtctx: &mut ZSTDMT_CCtx) {
     mtctx.doneJobID = mtctx.nextJobID;
 }
 
-/// Rust-only helper: returns the active `POOL_ctx`, preferring the
-/// owned `threadPool` over any externally-borrowed `threadPoolRef`.
-fn ZSTDMT_getThreadPool(mtctx: &ZSTDMT_CCtx) -> Option<&POOL_ctx> {
-    if let Some(pool) = mtctx.threadPool.as_ref() {
-        Some(pool)
-    } else if mtctx.threadPoolRef != 0 {
-        Some(unsafe { &*(mtctx.threadPoolRef as *const POOL_ctx) })
-    } else {
-        None
-    }
-}
-
-/// Rust-only helper: binds an externally-owned `POOL_ctx` to the MT
-/// context, freeing any previously-owned pool. Passing `None` falls
-/// back to lazily creating an internal pool sized to `params.nbWorkers`.
+/// Port of the MT thread-pool attachment path. Binds an
+/// externally-owned `POOL_ctx` to the MT context, freeing any
+/// previously-owned pool. Passing `None` falls back to lazily creating
+/// an internal pool sized to `params.nbWorkers`.
 pub fn ZSTDMT_setThreadPool(mtctx: &mut ZSTDMT_CCtx, pool: Option<&POOL_ctx>) {
     if let Some(pool) = pool {
         POOL_free(mtctx.threadPool.take());
@@ -862,10 +852,10 @@ fn ZSTDMT_runQueuedJob(opaque: *mut core::ffi::c_void) {
     let _ = queued.tx.send(ZSTDMT_completedJob { job, cctx });
 }
 
-/// Rust-only helper: drives LDM sequence generation for job `wJobID`,
-/// substituting for the upstream worker-side LDM loop. When LDM is
-/// disabled, only advances `serial.nextJobID`; otherwise builds the
-/// `rawSeqStore` over `prefix ++ src` and parks it on the job slot.
+/// Serial LDM generation step corresponding to upstream
+/// `ZSTDMT_serialState_genSequences`. When LDM is disabled, only
+/// advances `serial.nextJobID`; otherwise builds the `rawSeqStore`
+/// over `prefix ++ src` and parks it on the job slot.
 fn ZSTDMT_prepareJobSequences(mtctx: &mut ZSTDMT_CCtx, wJobID: usize) -> usize {
     let Some(job) = mtctx.jobs.get(wJobID) else {
         return crate::common::error::ERROR(crate::common::error::ErrorCode::Generic);
@@ -1939,7 +1929,13 @@ pub fn ZSTDMT_sizeof_CCtx(mtctx: &ZSTDMT_CCtx) -> usize {
             .as_ref()
             .map(|p| ZSTDMT_sizeof_seqPool(p))
             .unwrap_or(0)
-        + ZSTDMT_getThreadPool(mtctx).map(POOL_sizeof).unwrap_or(0)
+        + if let Some(pool) = mtctx.threadPool.as_ref() {
+            POOL_sizeof(pool)
+        } else if mtctx.threadPoolRef != 0 {
+            POOL_sizeof(unsafe { &*(mtctx.threadPoolRef as *const POOL_ctx) })
+        } else {
+            0
+        }
         + mtctx.roundBuff.capacity
 }
 

@@ -1632,7 +1632,7 @@ impl Default for ZSTD_DCtx {
             litSize: 0,
             litEntropy: 0,
             dictID: 0,
-            ddict_rep: [0; 3],
+            ddict_rep: crate::common::zstd_internal::repStartValue,
             previousDstEnd: None,
             prefixStart: None,
             virtualStart: None,

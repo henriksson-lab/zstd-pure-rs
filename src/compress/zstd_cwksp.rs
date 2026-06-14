@@ -53,21 +53,6 @@ impl Default for ZSTD_cwksp_static_alloc_e {
     }
 }
 
-/// Rust-only internal helper: unsigned `<=` compare of two raw pointers
-/// via their addresses, mirroring C's pointer ordering used throughout
-/// `zstd_cwksp.h`'s consistency asserts.
-#[inline]
-fn ptr_le(a: *mut u8, b: *mut u8) -> bool {
-    (a as usize) <= (b as usize)
-}
-
-/// Rust-only internal helper: unsigned `<` compare of two raw pointers
-/// via their addresses, used by the reserve / overflow checks.
-#[inline]
-fn ptr_lt(a: *mut u8, b: *mut u8) -> bool {
-    (a as usize) < (b as usize)
-}
-
 #[inline]
 fn ptr_add(ptr: *mut u8, bytes: usize) -> Option<*mut u8> {
     (ptr as usize)
@@ -84,14 +69,14 @@ fn ptr_sub(ptr: *mut u8, bytes: usize) -> Option<*mut u8> {
 
 /// Port of `ZSTD_cwksp_assert_internal_consistency`.
 pub fn ZSTD_cwksp_assert_internal_consistency(ws: &ZSTD_cwksp) {
-    debug_assert!(ptr_le(ws.workspace, ws.objectEnd));
-    debug_assert!(ptr_le(ws.objectEnd, ws.tableEnd));
-    debug_assert!(ptr_le(ws.objectEnd, ws.tableValidEnd));
-    debug_assert!(ptr_le(ws.tableEnd, ws.allocStart));
-    debug_assert!(ptr_le(ws.tableValidEnd, ws.allocStart));
-    debug_assert!(ptr_le(ws.allocStart, ws.workspaceEnd));
-    debug_assert!(ptr_le(ws.initOnceStart, ZSTD_cwksp_initialAllocStart(ws)));
-    debug_assert!(ptr_le(ws.workspace, ws.initOnceStart));
+    debug_assert!((ws.workspace as usize) <= (ws.objectEnd as usize));
+    debug_assert!((ws.objectEnd as usize) <= (ws.tableEnd as usize));
+    debug_assert!((ws.objectEnd as usize) <= (ws.tableValidEnd as usize));
+    debug_assert!((ws.tableEnd as usize) <= (ws.allocStart as usize));
+    debug_assert!((ws.tableValidEnd as usize) <= (ws.allocStart as usize));
+    debug_assert!((ws.allocStart as usize) <= (ws.workspaceEnd as usize));
+    debug_assert!((ws.initOnceStart as usize) <= (ZSTD_cwksp_initialAllocStart(ws) as usize));
+    debug_assert!((ws.workspace as usize) <= (ws.initOnceStart as usize));
 }
 
 /// Port of `ZSTD_cwksp_align`.
@@ -145,12 +130,12 @@ pub fn ZSTD_cwksp_reserve_internal_buffer_space(ws: &mut ZSTD_cwksp, bytes: usiz
     };
     let bottom = ws.tableEnd;
     ZSTD_cwksp_assert_internal_consistency(ws);
-    debug_assert!(ptr_le(bottom, alloc));
-    if ptr_lt(alloc, bottom) {
+    debug_assert!((bottom as usize) <= (alloc as usize));
+    if (alloc as usize) < (bottom as usize) {
         ws.allocFailed = 1;
         return null_mut();
     }
-    if ptr_lt(alloc, ws.tableValidEnd) {
+    if (alloc as usize) < (ws.tableValidEnd as usize) {
         ws.tableValidEnd = alloc;
     }
     ws.allocStart = alloc;
@@ -175,12 +160,12 @@ pub fn ZSTD_cwksp_internal_advance_phase(
             let Some(objectEnd) = ptr_add(alloc, bytesToAlign) else {
                 return ERROR(ErrorCode::MemoryAllocation);
             };
-            if ptr_lt(ws.workspaceEnd, objectEnd) {
+            if (ws.workspaceEnd as usize) < (objectEnd as usize) {
                 return ERROR(ErrorCode::MemoryAllocation);
             }
             ws.objectEnd = objectEnd;
             ws.tableEnd = objectEnd;
-            if ptr_lt(ws.tableValidEnd, ws.tableEnd) {
+            if (ws.tableValidEnd as usize) < (ws.tableEnd as usize) {
                 ws.tableValidEnd = ws.tableEnd;
             }
         }
@@ -228,7 +213,7 @@ pub fn ZSTD_cwksp_reserve_aligned_init_once(ws: &mut ZSTD_cwksp, bytes: usize) -
         ZSTD_cwksp_alloc_phase_e::ZSTD_cwksp_alloc_aligned_init_once,
     );
     debug_assert_eq!((ptr as usize) & (ZSTD_CWKSP_ALIGNMENT_BYTES - 1), 0);
-    if !ptr.is_null() && ptr_lt(ptr, ws.initOnceStart) {
+    if !ptr.is_null() && (ptr as usize) < (ws.initOnceStart as usize) {
         let zero_len = ((ws.initOnceStart as usize) - (ptr as usize)).min(alignedBytes);
         unsafe { core::ptr::write_bytes(ptr, 0, zero_len) };
         ws.initOnceStart = ptr;
@@ -265,8 +250,8 @@ pub fn ZSTD_cwksp_reserve_table(ws: &mut ZSTD_cwksp, bytes: usize) -> *mut u8 {
     let top = ws.allocStart;
     debug_assert_eq!(bytes & (core::mem::size_of::<u32>() - 1), 0);
     ZSTD_cwksp_assert_internal_consistency(ws);
-    debug_assert!(ptr_le(end, top));
-    if ptr_lt(top, end) {
+    debug_assert!((end as usize) <= (top as usize));
+    if (top as usize) < (end as usize) {
         ws.allocFailed = 1;
         return null_mut();
     }
@@ -286,7 +271,7 @@ pub fn ZSTD_cwksp_reserve_object(ws: &mut ZSTD_cwksp, bytes: usize) -> *mut u8 {
     ZSTD_cwksp_assert_internal_consistency(ws);
     if ws.phase != ZSTD_cwksp_alloc_phase_e::ZSTD_cwksp_alloc_objects
         || end.is_none()
-        || ptr_lt(ws.workspaceEnd, end.unwrap())
+        || (ws.workspaceEnd as usize) < (end.unwrap() as usize)
     {
         ws.allocFailed = 1;
         return null_mut();
@@ -321,17 +306,17 @@ pub fn ZSTD_cwksp_reserve_object_aligned(
 
 /// Port of `ZSTD_cwksp_mark_tables_dirty`.
 pub fn ZSTD_cwksp_mark_tables_dirty(ws: &mut ZSTD_cwksp) {
-    debug_assert!(ptr_le(ws.objectEnd, ws.tableValidEnd));
-    debug_assert!(ptr_le(ws.tableValidEnd, ws.allocStart));
+    debug_assert!((ws.objectEnd as usize) <= (ws.tableValidEnd as usize));
+    debug_assert!((ws.tableValidEnd as usize) <= (ws.allocStart as usize));
     ws.tableValidEnd = ws.objectEnd;
     ZSTD_cwksp_assert_internal_consistency(ws);
 }
 
 /// Port of `ZSTD_cwksp_mark_tables_clean`.
 pub fn ZSTD_cwksp_mark_tables_clean(ws: &mut ZSTD_cwksp) {
-    debug_assert!(ptr_le(ws.objectEnd, ws.tableValidEnd));
-    debug_assert!(ptr_le(ws.tableValidEnd, ws.allocStart));
-    if ptr_lt(ws.tableValidEnd, ws.tableEnd) {
+    debug_assert!((ws.objectEnd as usize) <= (ws.tableValidEnd as usize));
+    debug_assert!((ws.tableValidEnd as usize) <= (ws.allocStart as usize));
+    if (ws.tableValidEnd as usize) < (ws.tableEnd as usize) {
         ws.tableValidEnd = ws.tableEnd;
     }
     ZSTD_cwksp_assert_internal_consistency(ws);
@@ -339,9 +324,9 @@ pub fn ZSTD_cwksp_mark_tables_clean(ws: &mut ZSTD_cwksp) {
 
 /// Port of `ZSTD_cwksp_clean_tables`.
 pub fn ZSTD_cwksp_clean_tables(ws: &mut ZSTD_cwksp) {
-    debug_assert!(ptr_le(ws.objectEnd, ws.tableValidEnd));
-    debug_assert!(ptr_le(ws.tableValidEnd, ws.allocStart));
-    if ptr_lt(ws.tableValidEnd, ws.tableEnd) {
+    debug_assert!((ws.objectEnd as usize) <= (ws.tableValidEnd as usize));
+    debug_assert!((ws.tableValidEnd as usize) <= (ws.allocStart as usize));
+    if (ws.tableValidEnd as usize) < (ws.tableEnd as usize) {
         let len = (ws.tableEnd as usize) - (ws.tableValidEnd as usize);
         unsafe { core::ptr::write_bytes(ws.tableValidEnd, 0, len) };
     }

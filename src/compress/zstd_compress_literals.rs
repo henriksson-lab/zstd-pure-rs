@@ -73,16 +73,16 @@ pub fn ZSTD_noCompressLiterals(dst: &mut [u8], src: &[u8]) -> usize {
     match flSize {
         1 => {
             // 2-bit set | 1-bit lhl | 5-bit size
-            dst[0] = set_basic_bits() + ((srcSize as u8) << 3);
+            dst[0] = SymbolEncodingType_e::set_basic as u8 + ((srcSize as u8) << 3);
         }
         2 => {
             // 2 | 2 | 12
-            let v = set_basic_bits() as u16 + (1u16 << 2) + ((srcSize as u16) << 4);
+            let v = SymbolEncodingType_e::set_basic as u16 + (1u16 << 2) + ((srcSize as u16) << 4);
             MEM_writeLE16(&mut dst[..2], v);
         }
         _ => {
             // flSize == 3: 2 | 2 | 20
-            let v = (set_basic_bits() as u32)
+            let v = (SymbolEncodingType_e::set_basic as u32)
                 .wrapping_add(3u32 << 2)
                 .wrapping_add((srcSize as u32) << 4);
             MEM_writeLE32(&mut dst[..4], v);
@@ -121,13 +121,13 @@ pub fn ZSTD_compressRleLiteralsBlock(dst: &mut [u8], src: &[u8]) -> usize {
         return ERROR(ErrorCode::DstSizeTooSmall);
     }
     match flSize {
-        1 => dst[0] = set_rle_bits() + ((srcSize as u8) << 3),
+        1 => dst[0] = SymbolEncodingType_e::set_rle as u8 + ((srcSize as u8) << 3),
         2 => {
-            let v = set_rle_bits() as u16 + (1u16 << 2) + ((srcSize as u16) << 4);
+            let v = SymbolEncodingType_e::set_rle as u16 + (1u16 << 2) + ((srcSize as u16) << 4);
             MEM_writeLE16(&mut dst[..2], v);
         }
         _ => {
-            let v = (set_rle_bits() as u32)
+            let v = (SymbolEncodingType_e::set_rle as u32)
                 .wrapping_add(3u32 << 2)
                 .wrapping_add((srcSize as u32) << 4);
             MEM_writeLE32(&mut dst[..4], v);
@@ -387,19 +387,6 @@ pub fn ZSTD_compressLiterals(
         }
     }
     lhSize + cLitSize
-}
-
-/// Rust-only helper: returns the `set_basic` discriminant as a `u8` for
-/// shifting into the literals-block header low bits.
-#[inline]
-fn set_basic_bits() -> u8 {
-    SymbolEncodingType_e::set_basic as u8
-}
-/// Rust-only helper: returns the `set_rle` discriminant as a `u8` for
-/// shifting into the literals-block header low bits.
-#[inline]
-fn set_rle_bits() -> u8 {
-    SymbolEncodingType_e::set_rle as u8
 }
 
 #[cfg(test)]

@@ -224,45 +224,6 @@ pub fn ZSTD_hashPtr(p: &[u8], hBits: u32, mls: u32) -> usize {
     }
 }
 
-/// Bounds-check-free variant of `ZSTD_hashPtr`. Used on the matcher
-/// inner-loop hot paths where the caller's loop invariant proves that
-/// at least 8 bytes (for `mls >= 5`) or 4 bytes (for `mls == 4`) are
-/// available at `buf[pos..]`. The slice-based `ZSTD_hashPtr` emits a
-/// bounds check inside `MEM_readLE{32,64}` that the compiler can't
-/// elide through the safe-Rust slice interface, defeating CMOV
-/// codegen on per-byte hash computations.
-///
-/// # Safety
-/// `pos + bytes_needed(mls) <= buf.len()` where
-/// `bytes_needed = 4 if mls == 4 else 8`.
-#[inline(always)]
-pub unsafe fn ZSTD_hashPtr_at_unchecked(buf: &[u8], pos: usize, hBits: u32, mls: u32) -> usize {
-    debug_assert!(hBits <= 32);
-    let p = buf.as_ptr().wrapping_add(pos);
-    match mls {
-        5 => {
-            let u = unsafe { (p as *const u64).read_unaligned() }.to_le();
-            ZSTD_hash5(u, hBits, 0)
-        }
-        6 => {
-            let u = unsafe { (p as *const u64).read_unaligned() }.to_le();
-            ZSTD_hash6(u, hBits, 0)
-        }
-        7 => {
-            let u = unsafe { (p as *const u64).read_unaligned() }.to_le();
-            ZSTD_hash7(u, hBits, 0)
-        }
-        8 => {
-            let u = unsafe { (p as *const u64).read_unaligned() }.to_le();
-            ZSTD_hash8(u, hBits, 0)
-        }
-        _ => {
-            let u = unsafe { (p as *const u32).read_unaligned() }.to_le();
-            ZSTD_hash4(u, hBits, 0) as usize
-        }
-    }
-}
-
 /// Port of `ZSTD_hashPtrSalted`.
 #[inline]
 pub fn ZSTD_hashPtrSalted(p: &[u8], hBits: u32, mls: u32, hashSalt: u64) -> usize {
@@ -273,47 +234,6 @@ pub fn ZSTD_hashPtrSalted(p: &[u8], hBits: u32, mls: u32, hashSalt: u64) -> usiz
         7 => ZSTD_hash7PtrS(p, hBits, hashSalt),
         8 => ZSTD_hash8PtrS(p, hBits, hashSalt),
         _ => ZSTD_hash4PtrS(p, hBits, hashSalt as u32),
-    }
-}
-
-/// Bounds-check-free variant of `ZSTD_hashPtrSalted`. Used in the
-/// row-hash matcher's per-byte inner loops where the loop invariant
-/// proves the read is in-range.
-///
-/// # Safety
-/// `pos + bytes_needed(mls) <= buf.len()` where
-/// `bytes_needed = 4 if mls == 4 else 8`.
-#[inline(always)]
-pub unsafe fn ZSTD_hashPtrSalted_at_unchecked(
-    buf: &[u8],
-    pos: usize,
-    hBits: u32,
-    mls: u32,
-    hashSalt: u64,
-) -> usize {
-    debug_assert!(hBits <= 32);
-    let p = buf.as_ptr().wrapping_add(pos);
-    match mls {
-        5 => {
-            let u = unsafe { (p as *const u64).read_unaligned() }.to_le();
-            ZSTD_hash5(u, hBits, hashSalt)
-        }
-        6 => {
-            let u = unsafe { (p as *const u64).read_unaligned() }.to_le();
-            ZSTD_hash6(u, hBits, hashSalt)
-        }
-        7 => {
-            let u = unsafe { (p as *const u64).read_unaligned() }.to_le();
-            ZSTD_hash7(u, hBits, hashSalt)
-        }
-        8 => {
-            let u = unsafe { (p as *const u64).read_unaligned() }.to_le();
-            ZSTD_hash8(u, hBits, hashSalt)
-        }
-        _ => {
-            let u = unsafe { (p as *const u32).read_unaligned() }.to_le();
-            ZSTD_hash4(u, hBits, hashSalt as u32) as usize
-        }
     }
 }
 
@@ -344,31 +264,19 @@ pub fn ZSTD_count_2segments(
     let dict_remaining = mend_pos - match_pos;
     let vend_pos = (ip_pos + dict_remaining).min(iend_pos);
 
-    let matchLength =
-        ZSTD_count_two_slices(input_buf, ip_pos, vend_pos, dict_buf, match_pos, mend_pos);
+    let mut matchLength = 0usize;
+    while ip_pos + matchLength < vend_pos
+        && match_pos + matchLength < mend_pos
+        && input_buf[ip_pos + matchLength] == dict_buf[match_pos + matchLength]
+    {
+        matchLength += 1;
+    }
 
     if match_pos + matchLength != mend_pos {
         return matchLength;
     }
 
     matchLength + ZSTD_count(input_buf, ip_pos + matchLength, istart_pos, iend_pos)
-}
-
-#[inline]
-fn ZSTD_count_two_slices(
-    input_buf: &[u8],
-    mut ip_pos: usize,
-    ip_end: usize,
-    match_buf: &[u8],
-    mut match_pos: usize,
-    match_end: usize,
-) -> usize {
-    let start = ip_pos;
-    while ip_pos < ip_end && match_pos < match_end && input_buf[ip_pos] == match_buf[match_pos] {
-        ip_pos += 1;
-        match_pos += 1;
-    }
-    ip_pos - start
 }
 
 /// Port of `ZSTD_count`. Returns the number of leading bytes that
@@ -393,7 +301,8 @@ pub fn ZSTD_count(buf: &[u8], in_pos: usize, match_pos: usize, in_limit: usize) 
     let start = in_pos;
     let mut pIn = in_pos;
     let mut pMatch = match_pos;
-    let inLoopLimit = in_limit.saturating_sub(word - 1);
+    debug_assert!(in_limit >= word - 1);
+    let inLoopLimit = in_limit - (word - 1);
     let base = buf.as_ptr();
 
     if pIn < inLoopLimit {

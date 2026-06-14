@@ -232,6 +232,9 @@ pub struct ZSTD_CCtx {
 
 impl Default for ZSTD_CCtx {
     fn default() -> Self {
+        let mut requestedParams = ZSTD_CCtx_params::default();
+        let _ = ZSTD_CCtxParams_init(&mut requestedParams, ZSTD_CLEVEL_DEFAULT);
+        let appliedParams = requestedParams;
         Self {
             ms: None,
             seqStore: None,
@@ -277,8 +280,8 @@ impl Default for ZSTD_CCtx {
             stream_closed: false,
             stream_frame_completed: false,
             requested_cParams: None,
-            requestedParams: ZSTD_CCtx_params::default(),
-            appliedParams: ZSTD_CCtx_params::default(),
+            requestedParams,
+            appliedParams,
             stage: ZSTD_compressionStage_e::default(),
             dictID: 0,
             dictContentSize: 0,
@@ -549,7 +552,16 @@ pub fn ZSTD_cParam_getBounds(param: ZSTD_cParameter) -> ZSTD_bounds {
         }
         ZSTD_cParameter::ZSTD_c_nbWorkers => {
             bounds.lowerBound = 0;
-            bounds.upperBound = zstd_mt_nbworkers_upper_bound();
+            bounds.upperBound = {
+                #[cfg(feature = "mt")]
+                {
+                    200
+                }
+                #[cfg(not(feature = "mt"))]
+                {
+                    0
+                }
+            };
             return bounds;
         }
         ZSTD_cParameter::ZSTD_c_rsyncable
@@ -584,12 +596,30 @@ pub fn ZSTD_cParam_getBounds(param: ZSTD_cParameter) -> ZSTD_bounds {
         }
         ZSTD_cParameter::ZSTD_c_jobSize => {
             bounds.lowerBound = 0;
-            bounds.upperBound = zstd_mt_jobsize_upper_bound();
+            bounds.upperBound = {
+                #[cfg(feature = "mt")]
+                {
+                    crate::compress::zstdmt_compress::ZSTDMT_JOBSIZE_MAX as i32
+                }
+                #[cfg(not(feature = "mt"))]
+                {
+                    0
+                }
+            };
             return bounds;
         }
         ZSTD_cParameter::ZSTD_c_overlapLog => {
             bounds.lowerBound = 0;
-            bounds.upperBound = zstd_mt_overlaplog_upper_bound();
+            bounds.upperBound = {
+                #[cfg(feature = "mt")]
+                {
+                    9
+                }
+                #[cfg(not(feature = "mt"))]
+                {
+                    0
+                }
+            };
             return bounds;
         }
         ZSTD_cParameter::ZSTD_c_srcSizeHint => {
@@ -602,49 +632,6 @@ pub fn ZSTD_cParam_getBounds(param: ZSTD_cParameter) -> ZSTD_bounds {
             bounds.upperBound = ZSTD_BLOCKSIZE_MAX as i32;
             return bounds;
         }
-    }
-}
-
-/// Rust-only helper: upper bound for `ZSTD_c_nbWorkers`. Returns 200 when the
-/// `mt` feature is enabled, 0 otherwise — matches upstream's
-/// `ZSTDMT_NBWORKERS_MAX` gate.
-#[inline]
-fn zstd_mt_nbworkers_upper_bound() -> i32 {
-    #[cfg(feature = "mt")]
-    {
-        200
-    }
-    #[cfg(not(feature = "mt"))]
-    {
-        0
-    }
-}
-
-/// Rust-only helper: upper bound for `ZSTD_c_jobSize`. Returns
-/// `ZSTDMT_JOBSIZE_MAX` when the `mt` feature is enabled, 0 otherwise.
-#[inline]
-fn zstd_mt_jobsize_upper_bound() -> i32 {
-    #[cfg(feature = "mt")]
-    {
-        crate::compress::zstdmt_compress::ZSTDMT_JOBSIZE_MAX as i32
-    }
-    #[cfg(not(feature = "mt"))]
-    {
-        0
-    }
-}
-
-/// Rust-only helper: upper bound for `ZSTD_c_overlapLog`. Returns 9 when the
-/// `mt` feature is enabled, 0 otherwise.
-#[inline]
-fn zstd_mt_overlaplog_upper_bound() -> i32 {
-    #[cfg(feature = "mt")]
-    {
-        9
-    }
-    #[cfg(not(feature = "mt"))]
-    {
-        0
     }
 }
 
@@ -3184,27 +3171,6 @@ pub enum ZSTD_cParameter {
     ZSTD_c_blockSplitterLevel = 1017,
 }
 
-/// Port of `ZSTD_isUpdateAuthorized` (`zstd_compress.c:674`). Tells
-/// `ZSTD_CCtx_setParameter` which parameters can be updated mid-
-/// session (as opposed to only during the init stage). Upstream lets
-/// cParams-only tweaks through so a long-running streaming compressor
-/// can adjust level / strategy / logs between frames; the frame flags
-/// and format cannot change once a frame is in flight.
-#[inline]
-fn is_update_authorized(param: ZSTD_cParameter) -> bool {
-    matches!(
-        param,
-        ZSTD_cParameter::ZSTD_c_compressionLevel
-            | ZSTD_cParameter::ZSTD_c_hashLog
-            | ZSTD_cParameter::ZSTD_c_chainLog
-            | ZSTD_cParameter::ZSTD_c_searchLog
-            | ZSTD_cParameter::ZSTD_c_minMatch
-            | ZSTD_cParameter::ZSTD_c_targetLength
-            | ZSTD_cParameter::ZSTD_c_strategy
-            | ZSTD_cParameter::ZSTD_c_blockSplitterLevel
-    )
-}
-
 #[inline]
 fn ZSTD_cParam_acceptsDefaultZero(param: ZSTD_cParameter) -> bool {
     matches!(
@@ -3241,34 +3207,6 @@ fn ZSTD_validateCParamSetterValue(param: ZSTD_cParameter, value: i32) -> usize {
     0
 }
 
-#[inline]
-fn zstd_param_switch_from_i32(value: i32) -> crate::compress::zstd_ldm::ZSTD_ParamSwitch_e {
-    use crate::compress::zstd_ldm::ZSTD_ParamSwitch_e;
-    match value {
-        1 => ZSTD_ParamSwitch_e::ZSTD_ps_enable,
-        2 => ZSTD_ParamSwitch_e::ZSTD_ps_disable,
-        _ => ZSTD_ParamSwitch_e::ZSTD_ps_auto,
-    }
-}
-
-#[inline]
-fn zstd_dict_attach_pref_from_i32(value: i32) -> ZSTD_dictAttachPref_e {
-    match value {
-        1 => ZSTD_dictAttachPref_e::ZSTD_dictForceAttach,
-        2 => ZSTD_dictAttachPref_e::ZSTD_dictForceCopy,
-        3 => ZSTD_dictAttachPref_e::ZSTD_dictForceLoad,
-        _ => ZSTD_dictAttachPref_e::ZSTD_dictDefaultAttach,
-    }
-}
-
-#[inline]
-fn zstd_sequence_format_from_i32(value: i32) -> ZSTD_SequenceFormat_e {
-    match value {
-        1 => ZSTD_SequenceFormat_e::ZSTD_sf_explicitBlockDelimiters,
-        _ => ZSTD_SequenceFormat_e::ZSTD_sf_noBlockDelimiters,
-    }
-}
-
 /// Port of `ZSTD_CCtx_setParameter`. Stashes the value on the CCtx
 /// for subsequent calls. For `compressionLevel`, behavior matches
 /// `ZSTD_initCStream(level)`. For the frame flags, the next
@@ -3278,7 +3216,7 @@ pub fn ZSTD_CCtx_setParameter(cctx: &mut ZSTD_CCtx, param: ZSTD_cParameter, valu
     // updates: only the `ZSTD_isUpdateAuthorized` subset can change
     // once input has been staged. Everything else — format, frame
     // flags, nbWorkers — rejects with `StageWrong`.
-    if !cctx_is_in_init_stage(cctx) && !is_update_authorized(param) {
+    if !cctx_is_in_init_stage(cctx) && !ZSTD_isUpdateAuthorized(param) {
         return ERROR(ErrorCode::StageWrong);
     }
     match param {
@@ -3338,7 +3276,11 @@ pub fn ZSTD_CCtx_setParameter(cctx: &mut ZSTD_CCtx, param: ZSTD_cParameter, valu
             if ERR_isError(rc) {
                 return rc;
             }
-            cctx.requestedParams.ldmEnable = zstd_param_switch_from_i32(value);
+            cctx.requestedParams.ldmEnable = match value {
+                1 => crate::compress::zstd_ldm::ZSTD_ParamSwitch_e::ZSTD_ps_enable,
+                2 => crate::compress::zstd_ldm::ZSTD_ParamSwitch_e::ZSTD_ps_disable,
+                _ => crate::compress::zstd_ldm::ZSTD_ParamSwitch_e::ZSTD_ps_auto,
+            };
             cctx.requestedParams.ldmParams.enableLdm = cctx.requestedParams.ldmEnable;
             cctx.requestedParams.ldmEnable as usize
         }
@@ -3448,7 +3390,12 @@ pub fn ZSTD_CCtx_setParameter(cctx: &mut ZSTD_CCtx, param: ZSTD_cParameter, valu
             if ERR_isError(rc) {
                 return rc;
             }
-            cctx.requestedParams.attachDictPref = zstd_dict_attach_pref_from_i32(value);
+            cctx.requestedParams.attachDictPref = match value {
+                1 => ZSTD_dictAttachPref_e::ZSTD_dictForceAttach,
+                2 => ZSTD_dictAttachPref_e::ZSTD_dictForceCopy,
+                3 => ZSTD_dictAttachPref_e::ZSTD_dictForceLoad,
+                _ => ZSTD_dictAttachPref_e::ZSTD_dictDefaultAttach,
+            };
             cctx.requestedParams.attachDictPref as usize
         }
         ZSTD_cParameter::ZSTD_c_literalCompressionMode => {
@@ -3456,7 +3403,11 @@ pub fn ZSTD_CCtx_setParameter(cctx: &mut ZSTD_CCtx, param: ZSTD_cParameter, valu
             if ERR_isError(rc) {
                 return rc;
             }
-            cctx.requestedParams.literalCompressionMode = zstd_param_switch_from_i32(value);
+            cctx.requestedParams.literalCompressionMode = match value {
+                1 => crate::compress::zstd_ldm::ZSTD_ParamSwitch_e::ZSTD_ps_enable,
+                2 => crate::compress::zstd_ldm::ZSTD_ParamSwitch_e::ZSTD_ps_disable,
+                _ => crate::compress::zstd_ldm::ZSTD_ParamSwitch_e::ZSTD_ps_auto,
+            };
             cctx.requestedParams.literalCompressionMode as usize
         }
         ZSTD_cParameter::ZSTD_c_srcSizeHint => {
@@ -3476,7 +3427,10 @@ pub fn ZSTD_CCtx_setParameter(cctx: &mut ZSTD_CCtx, param: ZSTD_cParameter, valu
             if ERR_isError(rc) {
                 return rc;
             }
-            cctx.requestedParams.blockDelimiters = zstd_sequence_format_from_i32(value);
+            cctx.requestedParams.blockDelimiters = match value {
+                1 => ZSTD_SequenceFormat_e::ZSTD_sf_explicitBlockDelimiters,
+                _ => ZSTD_SequenceFormat_e::ZSTD_sf_noBlockDelimiters,
+            };
             cctx.requestedParams.blockDelimiters as usize
         }
         ZSTD_cParameter::ZSTD_c_validateSequences => {
@@ -3492,7 +3446,11 @@ pub fn ZSTD_CCtx_setParameter(cctx: &mut ZSTD_CCtx, param: ZSTD_cParameter, valu
             if ERR_isError(rc) {
                 return rc;
             }
-            cctx.requestedParams.postBlockSplitter = zstd_param_switch_from_i32(value);
+            cctx.requestedParams.postBlockSplitter = match value {
+                1 => crate::compress::zstd_ldm::ZSTD_ParamSwitch_e::ZSTD_ps_enable,
+                2 => crate::compress::zstd_ldm::ZSTD_ParamSwitch_e::ZSTD_ps_disable,
+                _ => crate::compress::zstd_ldm::ZSTD_ParamSwitch_e::ZSTD_ps_auto,
+            };
             cctx.requestedParams.postBlockSplitter as usize
         }
         ZSTD_cParameter::ZSTD_c_useRowMatchFinder => {
@@ -3500,7 +3458,11 @@ pub fn ZSTD_CCtx_setParameter(cctx: &mut ZSTD_CCtx, param: ZSTD_cParameter, valu
             if ERR_isError(rc) {
                 return rc;
             }
-            cctx.requestedParams.useRowMatchFinder = zstd_param_switch_from_i32(value);
+            cctx.requestedParams.useRowMatchFinder = match value {
+                1 => crate::compress::zstd_ldm::ZSTD_ParamSwitch_e::ZSTD_ps_enable,
+                2 => crate::compress::zstd_ldm::ZSTD_ParamSwitch_e::ZSTD_ps_disable,
+                _ => crate::compress::zstd_ldm::ZSTD_ParamSwitch_e::ZSTD_ps_auto,
+            };
             cctx.requestedParams.useRowMatchFinder as usize
         }
         ZSTD_cParameter::ZSTD_c_deterministicRefPrefix => {
@@ -3516,7 +3478,11 @@ pub fn ZSTD_CCtx_setParameter(cctx: &mut ZSTD_CCtx, param: ZSTD_cParameter, valu
             if ERR_isError(rc) {
                 return rc;
             }
-            cctx.requestedParams.prefetchCDictTables = zstd_param_switch_from_i32(value);
+            cctx.requestedParams.prefetchCDictTables = match value {
+                1 => crate::compress::zstd_ldm::ZSTD_ParamSwitch_e::ZSTD_ps_enable,
+                2 => crate::compress::zstd_ldm::ZSTD_ParamSwitch_e::ZSTD_ps_disable,
+                _ => crate::compress::zstd_ldm::ZSTD_ParamSwitch_e::ZSTD_ps_auto,
+            };
             cctx.requestedParams.prefetchCDictTables as usize
         }
         ZSTD_cParameter::ZSTD_c_maxBlockSize => {
@@ -3532,7 +3498,11 @@ pub fn ZSTD_CCtx_setParameter(cctx: &mut ZSTD_CCtx, param: ZSTD_cParameter, valu
             if ERR_isError(rc) {
                 return rc;
             }
-            cctx.requestedParams.searchForExternalRepcodes = zstd_param_switch_from_i32(value);
+            cctx.requestedParams.searchForExternalRepcodes = match value {
+                1 => crate::compress::zstd_ldm::ZSTD_ParamSwitch_e::ZSTD_ps_enable,
+                2 => crate::compress::zstd_ldm::ZSTD_ParamSwitch_e::ZSTD_ps_disable,
+                _ => crate::compress::zstd_ldm::ZSTD_ParamSwitch_e::ZSTD_ps_auto,
+            };
             cctx.requestedParams.searchForExternalRepcodes as usize
         }
         ZSTD_cParameter::ZSTD_c_checksumFlag => {
@@ -3647,95 +3617,7 @@ pub fn ZSTD_CCtx_setParameter(cctx: &mut ZSTD_CCtx, param: ZSTD_cParameter, valu
 
 /// Port of `ZSTD_CCtx_getParameter`. Reads a previously-set parameter.
 pub fn ZSTD_CCtx_getParameter(cctx: &ZSTD_CCtx, param: ZSTD_cParameter, value: &mut i32) -> usize {
-    *value = match param {
-        ZSTD_cParameter::ZSTD_c_compressionLevel => {
-            cctx.stream_level.unwrap_or(ZSTD_CLEVEL_DEFAULT)
-        }
-        ZSTD_cParameter::ZSTD_c_windowLog => cctx.requestedParams.cParams.windowLog as i32,
-        ZSTD_cParameter::ZSTD_c_hashLog => cctx.requestedParams.cParams.hashLog as i32,
-        ZSTD_cParameter::ZSTD_c_chainLog => cctx.requestedParams.cParams.chainLog as i32,
-        ZSTD_cParameter::ZSTD_c_searchLog => cctx.requestedParams.cParams.searchLog as i32,
-        ZSTD_cParameter::ZSTD_c_minMatch => cctx.requestedParams.cParams.minMatch as i32,
-        ZSTD_cParameter::ZSTD_c_targetLength => cctx.requestedParams.cParams.targetLength as i32,
-        ZSTD_cParameter::ZSTD_c_strategy => cctx.requestedParams.cParams.strategy as i32,
-        ZSTD_cParameter::ZSTD_c_targetCBlockSize => cctx.requestedParams.targetCBlockSize as i32,
-        ZSTD_cParameter::ZSTD_c_enableLongDistanceMatching => {
-            cctx.requestedParams.ldmParams.enableLdm as i32
-        }
-        ZSTD_cParameter::ZSTD_c_ldmHashLog => cctx.requestedParams.ldmParams.hashLog as i32,
-        ZSTD_cParameter::ZSTD_c_ldmMinMatch => cctx.requestedParams.ldmParams.minMatchLength as i32,
-        ZSTD_cParameter::ZSTD_c_ldmBucketSizeLog => {
-            cctx.requestedParams.ldmParams.bucketSizeLog as i32
-        }
-        ZSTD_cParameter::ZSTD_c_ldmHashRateLog => cctx.requestedParams.ldmParams.hashRateLog as i32,
-        ZSTD_cParameter::ZSTD_c_stableInBuffer => cctx.requestedParams.inBufferMode as i32,
-        ZSTD_cParameter::ZSTD_c_stableOutBuffer => cctx.requestedParams.outBufferMode as i32,
-        ZSTD_cParameter::ZSTD_c_rsyncable => {
-            #[cfg(not(feature = "mt"))]
-            {
-                return ERROR(ErrorCode::ParameterUnsupported);
-            }
-            #[cfg(feature = "mt")]
-            {
-                cctx.requestedParams.rsyncable
-            }
-        }
-        ZSTD_cParameter::ZSTD_c_forceMaxWindow => cctx.requestedParams.forceWindow,
-        ZSTD_cParameter::ZSTD_c_forceAttachDict => cctx.requestedParams.attachDictPref as i32,
-        ZSTD_cParameter::ZSTD_c_literalCompressionMode => {
-            cctx.requestedParams.literalCompressionMode as i32
-        }
-        ZSTD_cParameter::ZSTD_c_srcSizeHint => cctx.requestedParams.srcSizeHint,
-        ZSTD_cParameter::ZSTD_c_enableDedicatedDictSearch => {
-            cctx.requestedParams.enableDedicatedDictSearch
-        }
-        ZSTD_cParameter::ZSTD_c_blockDelimiters => cctx.requestedParams.blockDelimiters as i32,
-        ZSTD_cParameter::ZSTD_c_validateSequences => cctx.requestedParams.validateSequences,
-        ZSTD_cParameter::ZSTD_c_splitAfterSequences => {
-            cctx.requestedParams.postBlockSplitter as i32
-        }
-        ZSTD_cParameter::ZSTD_c_useRowMatchFinder => cctx.requestedParams.useRowMatchFinder as i32,
-        ZSTD_cParameter::ZSTD_c_deterministicRefPrefix => {
-            cctx.requestedParams.deterministicRefPrefix
-        }
-        ZSTD_cParameter::ZSTD_c_prefetchCDictTables => {
-            cctx.requestedParams.prefetchCDictTables as i32
-        }
-        ZSTD_cParameter::ZSTD_c_enableSeqProducerFallback => {
-            cctx.requestedParams.enableMatchFinderFallback
-        }
-        ZSTD_cParameter::ZSTD_c_maxBlockSize => cctx.requestedParams.maxBlockSize as i32,
-        ZSTD_cParameter::ZSTD_c_repcodeResolution => {
-            cctx.requestedParams.searchForExternalRepcodes as i32
-        }
-        ZSTD_cParameter::ZSTD_c_blockSplitterLevel => cctx.requestedParams.preBlockSplitter_level,
-        ZSTD_cParameter::ZSTD_c_checksumFlag => cctx.param_checksum as i32,
-        ZSTD_cParameter::ZSTD_c_contentSizeFlag => cctx.param_contentSize as i32,
-        ZSTD_cParameter::ZSTD_c_dictIDFlag => cctx.param_dictID as i32,
-        ZSTD_cParameter::ZSTD_c_format => cctx.format as i32,
-        ZSTD_cParameter::ZSTD_c_nbWorkers => cctx.requestedParams.nbWorkers,
-        ZSTD_cParameter::ZSTD_c_jobSize => {
-            #[cfg(not(feature = "mt"))]
-            {
-                return ERROR(ErrorCode::ParameterUnsupported);
-            }
-            #[cfg(feature = "mt")]
-            {
-                cctx.requestedParams.jobSize as i32
-            }
-        }
-        ZSTD_cParameter::ZSTD_c_overlapLog => {
-            #[cfg(not(feature = "mt"))]
-            {
-                return ERROR(ErrorCode::ParameterUnsupported);
-            }
-            #[cfg(feature = "mt")]
-            {
-                cctx.requestedParams.overlapLog
-            }
-        }
-    };
-    0
+    ZSTD_CCtxParams_getParameter(&cctx.requestedParams, param, value)
 }
 
 /// Port of `ZSTD_CCtx_reset`. Matches upstream's three modes:
@@ -4475,29 +4357,9 @@ pub fn ZSTD_copyBlockSequences(
     0
 }
 
-/// Rust-only helper: replays repcode history through a slice of sequences
-/// (`startIdx..endIdx`) in `seqStore`, mutating `repcodes` to reflect the
-/// post-block state. Used by `ZSTD_copySuperBlockSequences` so each
-/// emitted sub-block sees the correct prior repcode triple.
-fn ZSTD_advanceRepcodesForSeqStoreRange(
-    seqStore: &SeqStore_t,
-    startIdx: usize,
-    endIdx: usize,
-    repcodes: &mut [u32; crate::compress::seq_store::ZSTD_REP_NUM],
-) {
-    use crate::compress::seq_store::ZSTD_updateRep;
-
-    for seqIdx in startIdx..endIdx {
-        let ll0 = (seqStore.sequences[seqIdx].litLength == 0) as u32;
-        ZSTD_updateRep(repcodes, seqStore.sequences[seqIdx].offBase, ll0);
-    }
-}
-
 /// Rust-only helper: mirrors `ZSTD_copyBlockSequences` for the
 /// superblock/targetCBlockSize path, which subdivides a single block's
-/// `seqStore` into multiple sub-block delimiter entries. Replays repcodes
-/// across each sub-block via `ZSTD_advanceRepcodesForSeqStoreRange` to
-/// keep the emitted `ZSTD_Sequence[]` representation faithful.
+/// `seqStore` into multiple sub-block delimiter entries.
 fn ZSTD_copySuperBlockSequences(
     seqCollector: &mut SeqCollector,
     outSeqs: &mut [ZSTD_Sequence],
@@ -4508,7 +4370,7 @@ fn ZSTD_copySuperBlockSequences(
     appliedParams: &ZSTD_CCtx_params,
     scratch: &mut ZSTD_entropyScratch,
 ) -> usize {
-    use crate::compress::seq_store::ZSTD_deriveSeqStoreChunk;
+    use crate::compress::seq_store::{ZSTD_deriveSeqStoreChunk, ZSTD_updateRep};
     use crate::compress::zstd_compress_superblock::{
         sizeBlockSequences, ZSTD_estimateSubBlockSize,
     };
@@ -4583,7 +4445,14 @@ fn ZSTD_copySuperBlockSequences(
             return rc;
         }
 
-        ZSTD_advanceRepcodesForSeqStoreRange(seqStore, sp, sp + seqCount, &mut currentRepcodes);
+        for seqIdx in sp..sp + seqCount {
+            let ll0 = (seqStore.sequences[seqIdx].litLength == 0) as u32;
+            ZSTD_updateRep(
+                &mut currentRepcodes,
+                seqStore.sequences[seqIdx].offBase,
+                ll0,
+            );
+        }
         sp += seqCount;
     }
 
@@ -5144,62 +5013,91 @@ fn ZSTD_buildSeqStore_selectMatches_with_window(
             (s, ZSTD_dictMode_e::ZSTD_noDict)
                 if s == crate::compress::zstd_compress_sequences::ZSTD_fast =>
             {
-                crate::compress::zstd_fast::ZSTD_compressBlock_fast_with_history(
+                crate::compress::zstd_fast::ZSTD_compressBlock_fast_noDict_generic(
                     ms,
                     seqStore,
                     &mut cctx.next_rep,
                     window_to_block_end,
                     src_pos,
+                    ms.cParams.minMatch,
                 )
             }
             (s, ZSTD_dictMode_e::ZSTD_noDict)
                 if s == crate::compress::zstd_compress_sequences::ZSTD_dfast =>
             {
-                crate::compress::zstd_double_fast::ZSTD_compressBlock_doubleFast_with_history(
+                crate::compress::zstd_double_fast::ZSTD_compressBlock_doubleFast_noDict_generic(
                     ms,
                     seqStore,
                     &mut cctx.next_rep,
                     window_to_block_end,
                     src_pos,
+                    ms.cParams.minMatch,
                 )
             }
             (s, ZSTD_dictMode_e::ZSTD_noDict)
                 if s == crate::compress::zstd_compress_sequences::ZSTD_greedy =>
             {
-                crate::compress::zstd_lazy::ZSTD_compressBlock_lazy_with_history(
+                let searchMethod = if crate::compress::match_state::ZSTD_rowMatchFinderUsed(
+                    ms.cParams.strategy,
+                    resolvedUseRowMatchFinder,
+                ) {
+                    crate::compress::zstd_lazy::searchMethod_e::search_rowHash
+                } else {
+                    crate::compress::zstd_lazy::searchMethod_e::search_hashChain
+                };
+                crate::compress::zstd_lazy::ZSTD_compressBlock_lazy_generic_with_istart(
                     ms,
                     seqStore,
                     &mut cctx.next_rep,
                     window_to_block_end,
                     src_pos,
+                    searchMethod,
                     0,
-                    resolvedUseRowMatchFinder,
+                    ZSTD_dictMode_e::ZSTD_noDict,
                 )
             }
             (s, ZSTD_dictMode_e::ZSTD_noDict)
                 if s == crate::compress::zstd_compress_sequences::ZSTD_lazy =>
             {
-                crate::compress::zstd_lazy::ZSTD_compressBlock_lazy_with_history(
+                let searchMethod = if crate::compress::match_state::ZSTD_rowMatchFinderUsed(
+                    ms.cParams.strategy,
+                    resolvedUseRowMatchFinder,
+                ) {
+                    crate::compress::zstd_lazy::searchMethod_e::search_rowHash
+                } else {
+                    crate::compress::zstd_lazy::searchMethod_e::search_hashChain
+                };
+                crate::compress::zstd_lazy::ZSTD_compressBlock_lazy_generic_with_istart(
                     ms,
                     seqStore,
                     &mut cctx.next_rep,
                     window_to_block_end,
                     src_pos,
+                    searchMethod,
                     1,
-                    resolvedUseRowMatchFinder,
+                    ZSTD_dictMode_e::ZSTD_noDict,
                 )
             }
             (s, ZSTD_dictMode_e::ZSTD_noDict)
                 if s == crate::compress::zstd_compress_sequences::ZSTD_lazy2 =>
             {
-                crate::compress::zstd_lazy::ZSTD_compressBlock_lazy_with_history(
+                let searchMethod = if crate::compress::match_state::ZSTD_rowMatchFinderUsed(
+                    ms.cParams.strategy,
+                    resolvedUseRowMatchFinder,
+                ) {
+                    crate::compress::zstd_lazy::searchMethod_e::search_rowHash
+                } else {
+                    crate::compress::zstd_lazy::searchMethod_e::search_hashChain
+                };
+                crate::compress::zstd_lazy::ZSTD_compressBlock_lazy_generic_with_istart(
                     ms,
                     seqStore,
                     &mut cctx.next_rep,
                     window_to_block_end,
                     src_pos,
+                    searchMethod,
                     2,
-                    resolvedUseRowMatchFinder,
+                    ZSTD_dictMode_e::ZSTD_noDict,
                 )
             }
             (s, ZSTD_dictMode_e::ZSTD_noDict)
@@ -5427,23 +5325,25 @@ pub fn ZSTD_buildSeqStore(cctx: &mut ZSTD_CCtx, src: &[u8]) -> usize {
             (s, ZSTD_dictMode_e::ZSTD_noDict)
                 if s == crate::compress::zstd_compress_sequences::ZSTD_fast =>
             {
-                crate::compress::zstd_fast::ZSTD_compressBlock_fast_with_history(
+                crate::compress::zstd_fast::ZSTD_compressBlock_fast_noDict_generic(
                     ms,
                     seqStore,
                     &mut cctx.next_rep,
                     src,
                     0,
+                    ms.cParams.minMatch,
                 )
             }
             (s, ZSTD_dictMode_e::ZSTD_noDict)
                 if s == crate::compress::zstd_compress_sequences::ZSTD_dfast =>
             {
-                crate::compress::zstd_double_fast::ZSTD_compressBlock_doubleFast_with_history(
+                crate::compress::zstd_double_fast::ZSTD_compressBlock_doubleFast_noDict_generic(
                     ms,
                     seqStore,
                     &mut cctx.next_rep,
                     src,
                     0,
+                    ms.cParams.minMatch,
                 )
             }
             (s, ZSTD_dictMode_e::ZSTD_noDict)
@@ -8223,45 +8123,7 @@ pub fn ZSTD_rleCompressBlock(dst: &mut [u8], rleByte: u8, srcSize: usize, lastBl
 
 /// Strategy-dispatching match-finder + entropy stage over a
 /// cumulative-src buffer. Scans `src[istart..]`, treats `src[..istart]`
-/// as prior-block content. Dispatches on `strategy` to the matching
-/// with-history match finder; lazy2+ fall back to the lazy generic.
-#[allow(clippy::too_many_arguments)]
-pub fn ZSTD_compressBlock_any_then_entropy_with_history(
-    dst: &mut [u8],
-    src: &[u8],
-    istart: usize,
-    ms: &mut crate::compress::match_state::ZSTD_MatchState_t,
-    seqStore: &mut SeqStore_t,
-    rep: &mut [u32; crate::compress::seq_store::ZSTD_REP_NUM],
-    prevEntropy: &ZSTD_entropyCTables_t,
-    nextEntropy: &mut ZSTD_entropyCTables_t,
-    strategy: u32,
-    useRowMatchFinder: crate::compress::zstd_ldm::ZSTD_ParamSwitch_e,
-    disableLiteralCompression: i32,
-    bmi2: i32,
-    allowRle: bool,
-) -> usize {
-    let mut scratch = ZSTD_entropyScratch::default();
-    ZSTD_compressBlock_any_then_entropy_with_history_wksp(
-        dst,
-        src,
-        istart,
-        ms,
-        seqStore,
-        rep,
-        prevEntropy,
-        nextEntropy,
-        strategy,
-        useRowMatchFinder,
-        disableLiteralCompression,
-        bmi2,
-        allowRle,
-        &mut scratch,
-    )
-}
-
-/// Workspace-backed variant of
-/// `ZSTD_compressBlock_any_then_entropy_with_history`.
+/// as prior-block content.
 #[allow(clippy::too_many_arguments)]
 pub fn ZSTD_compressBlock_any_then_entropy_with_history_wksp(
     dst: &mut [u8],
@@ -8288,41 +8150,82 @@ pub fn ZSTD_compressBlock_any_then_entropy_with_history_wksp(
     ZSTD_setEntropySeed_if_needed(ms, prevEntropy, strategy);
 
     let lastLits = match strategy {
-        s if s == ZSTD_fast => crate::compress::zstd_fast::ZSTD_compressBlock_fast_with_history(
-            ms, seqStore, rep, src, istart,
+        s if s == ZSTD_fast => crate::compress::zstd_fast::ZSTD_compressBlock_fast_noDict_generic(
+            ms,
+            seqStore,
+            rep,
+            src,
+            istart,
+            ms.cParams.minMatch,
         ),
         s if s == ZSTD_dfast => {
-            crate::compress::zstd_double_fast::ZSTD_compressBlock_doubleFast_with_history(
-                ms, seqStore, rep, src, istart,
-            )
-        }
-        s if s == ZSTD_greedy => crate::compress::zstd_lazy::ZSTD_compressBlock_lazy_with_history(
-            ms,
-            seqStore,
-            rep,
-            src,
-            istart,
-            0,
-            useRowMatchFinder,
-        ),
-        s if s == ZSTD_lazy => crate::compress::zstd_lazy::ZSTD_compressBlock_lazy_with_history(
-            ms,
-            seqStore,
-            rep,
-            src,
-            istart,
-            1,
-            useRowMatchFinder,
-        ),
-        s if s == ZSTD_lazy2 || s == ZSTD_btlazy2 => {
-            crate::compress::zstd_lazy::ZSTD_compressBlock_lazy_with_history(
+            crate::compress::zstd_double_fast::ZSTD_compressBlock_doubleFast_noDict_generic(
                 ms,
                 seqStore,
                 rep,
                 src,
                 istart,
-                2,
+                ms.cParams.minMatch,
+            )
+        }
+        s if s == ZSTD_greedy => {
+            let searchMethod = if crate::compress::match_state::ZSTD_rowMatchFinderUsed(
+                strategy,
                 useRowMatchFinder,
+            ) {
+                crate::compress::zstd_lazy::searchMethod_e::search_rowHash
+            } else {
+                crate::compress::zstd_lazy::searchMethod_e::search_hashChain
+            };
+            crate::compress::zstd_lazy::ZSTD_compressBlock_lazy_generic_with_istart(
+                ms,
+                seqStore,
+                rep,
+                src,
+                istart,
+                searchMethod,
+                0,
+                crate::compress::match_state::ZSTD_dictMode_e::ZSTD_noDict,
+            )
+        }
+        s if s == ZSTD_lazy => {
+            let searchMethod = if crate::compress::match_state::ZSTD_rowMatchFinderUsed(
+                strategy,
+                useRowMatchFinder,
+            ) {
+                crate::compress::zstd_lazy::searchMethod_e::search_rowHash
+            } else {
+                crate::compress::zstd_lazy::searchMethod_e::search_hashChain
+            };
+            crate::compress::zstd_lazy::ZSTD_compressBlock_lazy_generic_with_istart(
+                ms,
+                seqStore,
+                rep,
+                src,
+                istart,
+                searchMethod,
+                1,
+                crate::compress::match_state::ZSTD_dictMode_e::ZSTD_noDict,
+            )
+        }
+        s if s == ZSTD_lazy2 || s == ZSTD_btlazy2 => {
+            let searchMethod = if crate::compress::match_state::ZSTD_rowMatchFinderUsed(
+                strategy,
+                useRowMatchFinder,
+            ) {
+                crate::compress::zstd_lazy::searchMethod_e::search_rowHash
+            } else {
+                crate::compress::zstd_lazy::searchMethod_e::search_hashChain
+            };
+            crate::compress::zstd_lazy::ZSTD_compressBlock_lazy_generic_with_istart(
+                ms,
+                seqStore,
+                rep,
+                src,
+                istart,
+                searchMethod,
+                2,
+                crate::compress::match_state::ZSTD_dictMode_e::ZSTD_noDict,
             )
         }
         s if s == ZSTD_btopt => crate::compress::zstd_opt::ZSTD_compressBlock_btopt_window(
@@ -8349,8 +8252,13 @@ pub fn ZSTD_compressBlock_any_then_entropy_with_history_wksp(
             istart,
             src.len(),
         ),
-        _ => crate::compress::zstd_fast::ZSTD_compressBlock_fast_with_history(
-            ms, seqStore, rep, src, istart,
+        _ => crate::compress::zstd_fast::ZSTD_compressBlock_fast_noDict_generic(
+            ms,
+            seqStore,
+            rep,
+            src,
+            istart,
+            ms.cParams.minMatch,
         ),
     };
 
@@ -8383,46 +8291,7 @@ pub fn ZSTD_compressBlock_any_then_entropy_with_history_wksp(
     cSize
 }
 
-/// Frame-wrapped variant that adds a 3-byte block header + final
-/// block-type selection.
-#[allow(clippy::too_many_arguments)]
-pub fn ZSTD_compressBlock_any_framed_with_history(
-    dst: &mut [u8],
-    src: &[u8],
-    istart: usize,
-    ms: &mut crate::compress::match_state::ZSTD_MatchState_t,
-    seqStore: &mut SeqStore_t,
-    rep: &mut [u32; crate::compress::seq_store::ZSTD_REP_NUM],
-    prevEntropy: &ZSTD_entropyCTables_t,
-    nextEntropy: &mut ZSTD_entropyCTables_t,
-    strategy: u32,
-    useRowMatchFinder: crate::compress::zstd_ldm::ZSTD_ParamSwitch_e,
-    disableLiteralCompression: i32,
-    bmi2: i32,
-    lastBlock: u32,
-    isFirstBlock: bool,
-) -> usize {
-    let mut scratch = ZSTD_entropyScratch::default();
-    ZSTD_compressBlock_any_framed_with_history_wksp(
-        dst,
-        src,
-        istart,
-        ms,
-        seqStore,
-        rep,
-        prevEntropy,
-        nextEntropy,
-        strategy,
-        useRowMatchFinder,
-        disableLiteralCompression,
-        bmi2,
-        lastBlock,
-        isFirstBlock,
-        &mut scratch,
-    )
-}
-
-/// Workspace-backed frame-wrapped history compressor.
+/// Frame-wrapped history compressor.
 #[allow(clippy::too_many_arguments)]
 pub fn ZSTD_compressBlock_any_framed_with_history_wksp(
     dst: &mut [u8],
@@ -8478,115 +8347,6 @@ pub fn ZSTD_compressBlock_any_framed_with_history_wksp(
         .wrapping_add((cBodySize as u32) << 3);
     MEM_writeLE24(header_slot, header);
     ZSTD_blockHeaderSize + cBodySize
-}
-
-/// Fast-strategy variant of `ZSTD_compressBlock_fast_then_entropy`
-/// that supports cross-block history. Kept for backwards-compat in
-/// tests that predate the `_any_` dispatcher.
-#[allow(clippy::too_many_arguments)]
-pub fn ZSTD_compressBlock_fast_then_entropy_with_history(
-    dst: &mut [u8],
-    src: &[u8],
-    istart: usize,
-    ms: &mut crate::compress::match_state::ZSTD_MatchState_t,
-    seqStore: &mut SeqStore_t,
-    rep: &mut [u32; crate::compress::seq_store::ZSTD_REP_NUM],
-    prevEntropy: &ZSTD_entropyCTables_t,
-    nextEntropy: &mut ZSTD_entropyCTables_t,
-    strategy: u32,
-    disableLiteralCompression: i32,
-    bmi2: i32,
-) -> usize {
-    let mut scratch = ZSTD_entropyScratch::default();
-    ZSTD_compressBlock_fast_then_entropy_with_history_wksp(
-        dst,
-        src,
-        istart,
-        ms,
-        seqStore,
-        rep,
-        prevEntropy,
-        nextEntropy,
-        strategy,
-        disableLiteralCompression,
-        bmi2,
-        &mut scratch,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn ZSTD_compressBlock_fast_then_entropy_with_history_wksp(
-    dst: &mut [u8],
-    src: &[u8],
-    istart: usize,
-    ms: &mut crate::compress::match_state::ZSTD_MatchState_t,
-    seqStore: &mut SeqStore_t,
-    rep: &mut [u32; crate::compress::seq_store::ZSTD_REP_NUM],
-    prevEntropy: &ZSTD_entropyCTables_t,
-    nextEntropy: &mut ZSTD_entropyCTables_t,
-    strategy: u32,
-    disableLiteralCompression: i32,
-    bmi2: i32,
-    scratch: &mut ZSTD_entropyScratch,
-) -> usize {
-    let useRowMatchFinder = crate::compress::match_state::ZSTD_resolveRowMatchFinderMode(
-        crate::compress::zstd_ldm::ZSTD_ParamSwitch_e::ZSTD_ps_auto,
-        &ms.cParams,
-    );
-    ZSTD_compressBlock_any_then_entropy_with_history_wksp(
-        dst,
-        src,
-        istart,
-        ms,
-        seqStore,
-        rep,
-        prevEntropy,
-        nextEntropy,
-        strategy,
-        useRowMatchFinder,
-        disableLiteralCompression,
-        bmi2,
-        true,
-        scratch,
-    )
-}
-
-/// Legacy alias → forwards to the strategy-dispatching variant.
-#[allow(clippy::too_many_arguments)]
-pub fn ZSTD_compressBlock_fast_framed_with_history(
-    dst: &mut [u8],
-    src: &[u8],
-    istart: usize,
-    ms: &mut crate::compress::match_state::ZSTD_MatchState_t,
-    seqStore: &mut SeqStore_t,
-    rep: &mut [u32; crate::compress::seq_store::ZSTD_REP_NUM],
-    prevEntropy: &ZSTD_entropyCTables_t,
-    nextEntropy: &mut ZSTD_entropyCTables_t,
-    strategy: u32,
-    disableLiteralCompression: i32,
-    bmi2: i32,
-    lastBlock: u32,
-) -> usize {
-    let useRowMatchFinder = crate::compress::match_state::ZSTD_resolveRowMatchFinderMode(
-        crate::compress::zstd_ldm::ZSTD_ParamSwitch_e::ZSTD_ps_auto,
-        &ms.cParams,
-    );
-    ZSTD_compressBlock_any_framed_with_history(
-        dst,
-        src,
-        istart,
-        ms,
-        seqStore,
-        rep,
-        prevEntropy,
-        nextEntropy,
-        strategy,
-        useRowMatchFinder,
-        disableLiteralCompression,
-        bmi2,
-        lastBlock,
-        false,
-    )
 }
 
 /// Simplified port of `ZSTD_compressBlock_internal`'s control flow.
@@ -9058,29 +8818,51 @@ pub fn ZSTD_blockSplitterEnabled(cctxParams: &ZSTD_CCtx_params) -> bool {
 /// Port of `ZSTD_isUpdateAuthorized` (zstd_compress.c:674). Returns
 /// true if a given `ZSTD_cParameter` is safe to update mid-session
 /// (i.e. after `compressStream` has started), false if changing it
-/// would require resetting the CCtx. Upstream's full allow-list is
-/// long; of the ids currently surfaced in `ZSTD_cParameter`, only
-/// `ZSTD_c_compressionLevel` qualifies — header toggles
-/// (`checksumFlag`, `contentSizeFlag`, `dictIDFlag`, `format`) and
-/// worker-count changes all require re-init.
+/// would require resetting the CCtx.
 #[inline]
 pub fn ZSTD_isUpdateAuthorized(param: ZSTD_cParameter) -> bool {
-    // Mirrors the switch in upstream `ZSTD_isUpdateAuthorized`
-    // (zstd_compress.c). Returns true for cParam-tweaks that are safe
-    // to apply mid-stream (cParamsChanged sentinel triggers re-derive),
-    // false for everything else (which forces stage_wrong errors when
-    // the user tries to set them outside the init stage).
-    matches!(
-        param,
+    match param {
         ZSTD_cParameter::ZSTD_c_compressionLevel
-            | ZSTD_cParameter::ZSTD_c_hashLog
-            | ZSTD_cParameter::ZSTD_c_chainLog
-            | ZSTD_cParameter::ZSTD_c_searchLog
-            | ZSTD_cParameter::ZSTD_c_minMatch
-            | ZSTD_cParameter::ZSTD_c_targetLength
-            | ZSTD_cParameter::ZSTD_c_strategy
-            | ZSTD_cParameter::ZSTD_c_blockSplitterLevel
-    )
+        | ZSTD_cParameter::ZSTD_c_hashLog
+        | ZSTD_cParameter::ZSTD_c_chainLog
+        | ZSTD_cParameter::ZSTD_c_searchLog
+        | ZSTD_cParameter::ZSTD_c_minMatch
+        | ZSTD_cParameter::ZSTD_c_targetLength
+        | ZSTD_cParameter::ZSTD_c_strategy
+        | ZSTD_cParameter::ZSTD_c_blockSplitterLevel => true,
+
+        ZSTD_cParameter::ZSTD_c_format
+        | ZSTD_cParameter::ZSTD_c_windowLog
+        | ZSTD_cParameter::ZSTD_c_contentSizeFlag
+        | ZSTD_cParameter::ZSTD_c_checksumFlag
+        | ZSTD_cParameter::ZSTD_c_dictIDFlag
+        | ZSTD_cParameter::ZSTD_c_forceMaxWindow
+        | ZSTD_cParameter::ZSTD_c_nbWorkers
+        | ZSTD_cParameter::ZSTD_c_jobSize
+        | ZSTD_cParameter::ZSTD_c_overlapLog
+        | ZSTD_cParameter::ZSTD_c_rsyncable
+        | ZSTD_cParameter::ZSTD_c_enableDedicatedDictSearch
+        | ZSTD_cParameter::ZSTD_c_enableLongDistanceMatching
+        | ZSTD_cParameter::ZSTD_c_ldmHashLog
+        | ZSTD_cParameter::ZSTD_c_ldmMinMatch
+        | ZSTD_cParameter::ZSTD_c_ldmBucketSizeLog
+        | ZSTD_cParameter::ZSTD_c_ldmHashRateLog
+        | ZSTD_cParameter::ZSTD_c_forceAttachDict
+        | ZSTD_cParameter::ZSTD_c_literalCompressionMode
+        | ZSTD_cParameter::ZSTD_c_targetCBlockSize
+        | ZSTD_cParameter::ZSTD_c_srcSizeHint
+        | ZSTD_cParameter::ZSTD_c_stableInBuffer
+        | ZSTD_cParameter::ZSTD_c_stableOutBuffer
+        | ZSTD_cParameter::ZSTD_c_blockDelimiters
+        | ZSTD_cParameter::ZSTD_c_validateSequences
+        | ZSTD_cParameter::ZSTD_c_splitAfterSequences
+        | ZSTD_cParameter::ZSTD_c_useRowMatchFinder
+        | ZSTD_cParameter::ZSTD_c_deterministicRefPrefix
+        | ZSTD_cParameter::ZSTD_c_prefetchCDictTables
+        | ZSTD_cParameter::ZSTD_c_enableSeqProducerFallback
+        | ZSTD_cParameter::ZSTD_c_maxBlockSize
+        | ZSTD_cParameter::ZSTD_c_repcodeResolution => false,
+    }
 }
 
 /// Port of `ZSTD_freeCCtxContent` (zstd_compress.c:178). Drops the
@@ -10658,7 +10440,11 @@ pub fn ZSTD_CCtxParams_setParameter(
             if ERR_isError(rc) {
                 return rc;
             }
-            params.ldmEnable = zstd_param_switch_from_i32(value);
+            params.ldmEnable = match value {
+                1 => crate::compress::zstd_ldm::ZSTD_ParamSwitch_e::ZSTD_ps_enable,
+                2 => crate::compress::zstd_ldm::ZSTD_ParamSwitch_e::ZSTD_ps_disable,
+                _ => crate::compress::zstd_ldm::ZSTD_ParamSwitch_e::ZSTD_ps_auto,
+            };
             params.ldmParams.enableLdm = params.ldmEnable;
             params.ldmEnable as usize
         }
@@ -10764,7 +10550,12 @@ pub fn ZSTD_CCtxParams_setParameter(
             if ERR_isError(rc) {
                 return rc;
             }
-            params.attachDictPref = zstd_dict_attach_pref_from_i32(value);
+            params.attachDictPref = match value {
+                1 => ZSTD_dictAttachPref_e::ZSTD_dictForceAttach,
+                2 => ZSTD_dictAttachPref_e::ZSTD_dictForceCopy,
+                3 => ZSTD_dictAttachPref_e::ZSTD_dictForceLoad,
+                _ => ZSTD_dictAttachPref_e::ZSTD_dictDefaultAttach,
+            };
             params.attachDictPref as usize
         }
         ZSTD_cParameter::ZSTD_c_literalCompressionMode => {
@@ -10772,7 +10563,11 @@ pub fn ZSTD_CCtxParams_setParameter(
             if ERR_isError(rc) {
                 return rc;
             }
-            params.literalCompressionMode = zstd_param_switch_from_i32(value);
+            params.literalCompressionMode = match value {
+                1 => crate::compress::zstd_ldm::ZSTD_ParamSwitch_e::ZSTD_ps_enable,
+                2 => crate::compress::zstd_ldm::ZSTD_ParamSwitch_e::ZSTD_ps_disable,
+                _ => crate::compress::zstd_ldm::ZSTD_ParamSwitch_e::ZSTD_ps_auto,
+            };
             params.literalCompressionMode as usize
         }
         ZSTD_cParameter::ZSTD_c_srcSizeHint => {
@@ -10792,7 +10587,10 @@ pub fn ZSTD_CCtxParams_setParameter(
             if ERR_isError(rc) {
                 return rc;
             }
-            params.blockDelimiters = zstd_sequence_format_from_i32(value);
+            params.blockDelimiters = match value {
+                1 => ZSTD_SequenceFormat_e::ZSTD_sf_explicitBlockDelimiters,
+                _ => ZSTD_SequenceFormat_e::ZSTD_sf_noBlockDelimiters,
+            };
             params.blockDelimiters as usize
         }
         ZSTD_cParameter::ZSTD_c_validateSequences => {
@@ -10808,7 +10606,11 @@ pub fn ZSTD_CCtxParams_setParameter(
             if ERR_isError(rc) {
                 return rc;
             }
-            params.postBlockSplitter = zstd_param_switch_from_i32(value);
+            params.postBlockSplitter = match value {
+                1 => crate::compress::zstd_ldm::ZSTD_ParamSwitch_e::ZSTD_ps_enable,
+                2 => crate::compress::zstd_ldm::ZSTD_ParamSwitch_e::ZSTD_ps_disable,
+                _ => crate::compress::zstd_ldm::ZSTD_ParamSwitch_e::ZSTD_ps_auto,
+            };
             params.postBlockSplitter as usize
         }
         ZSTD_cParameter::ZSTD_c_useRowMatchFinder => {
@@ -10816,7 +10618,11 @@ pub fn ZSTD_CCtxParams_setParameter(
             if ERR_isError(rc) {
                 return rc;
             }
-            params.useRowMatchFinder = zstd_param_switch_from_i32(value);
+            params.useRowMatchFinder = match value {
+                1 => crate::compress::zstd_ldm::ZSTD_ParamSwitch_e::ZSTD_ps_enable,
+                2 => crate::compress::zstd_ldm::ZSTD_ParamSwitch_e::ZSTD_ps_disable,
+                _ => crate::compress::zstd_ldm::ZSTD_ParamSwitch_e::ZSTD_ps_auto,
+            };
             params.useRowMatchFinder as usize
         }
         ZSTD_cParameter::ZSTD_c_deterministicRefPrefix => {
@@ -10832,7 +10638,11 @@ pub fn ZSTD_CCtxParams_setParameter(
             if ERR_isError(rc) {
                 return rc;
             }
-            params.prefetchCDictTables = zstd_param_switch_from_i32(value);
+            params.prefetchCDictTables = match value {
+                1 => crate::compress::zstd_ldm::ZSTD_ParamSwitch_e::ZSTD_ps_enable,
+                2 => crate::compress::zstd_ldm::ZSTD_ParamSwitch_e::ZSTD_ps_disable,
+                _ => crate::compress::zstd_ldm::ZSTD_ParamSwitch_e::ZSTD_ps_auto,
+            };
             params.prefetchCDictTables as usize
         }
         ZSTD_cParameter::ZSTD_c_maxBlockSize => {
@@ -10848,7 +10658,11 @@ pub fn ZSTD_CCtxParams_setParameter(
             if ERR_isError(rc) {
                 return rc;
             }
-            params.searchForExternalRepcodes = zstd_param_switch_from_i32(value);
+            params.searchForExternalRepcodes = match value {
+                1 => crate::compress::zstd_ldm::ZSTD_ParamSwitch_e::ZSTD_ps_enable,
+                2 => crate::compress::zstd_ldm::ZSTD_ParamSwitch_e::ZSTD_ps_disable,
+                _ => crate::compress::zstd_ldm::ZSTD_ParamSwitch_e::ZSTD_ps_auto,
+            };
             params.searchForExternalRepcodes as usize
         }
         ZSTD_cParameter::ZSTD_c_checksumFlag => {
@@ -11466,57 +11280,87 @@ pub fn ZSTD_compressFrame_fast_with_prefix_advanced(
         let mut p = 0usize;
         while p < prefix_len {
             let end = (p + ZSTD_BLOCKSIZE_MAX).min(prefix_len);
+            let minMatch = carry_ms.cParams.minMatch;
             throwaway.reset();
             let _ = match cParams.strategy {
                 crate::compress::zstd_compress_sequences::ZSTD_greedy => {
-                    crate::compress::zstd_lazy::ZSTD_compressBlock_lazy_with_history(
+                    let searchMethod = if crate::compress::match_state::ZSTD_rowMatchFinderUsed(
+                        carry_ms.cParams.strategy,
+                        useRowMatchFinder,
+                    ) {
+                        crate::compress::zstd_lazy::searchMethod_e::search_rowHash
+                    } else {
+                        crate::compress::zstd_lazy::searchMethod_e::search_hashChain
+                    };
+                    crate::compress::zstd_lazy::ZSTD_compressBlock_lazy_generic_with_istart(
                         &mut carry_ms,
                         &mut throwaway,
                         &mut throwaway_rep,
                         &combined[..end],
                         p,
+                        searchMethod,
                         0,
-                        useRowMatchFinder,
+                        crate::compress::match_state::ZSTD_dictMode_e::ZSTD_noDict,
                     )
                 }
                 crate::compress::zstd_compress_sequences::ZSTD_lazy => {
-                    crate::compress::zstd_lazy::ZSTD_compressBlock_lazy_with_history(
+                    let searchMethod = if crate::compress::match_state::ZSTD_rowMatchFinderUsed(
+                        carry_ms.cParams.strategy,
+                        useRowMatchFinder,
+                    ) {
+                        crate::compress::zstd_lazy::searchMethod_e::search_rowHash
+                    } else {
+                        crate::compress::zstd_lazy::searchMethod_e::search_hashChain
+                    };
+                    crate::compress::zstd_lazy::ZSTD_compressBlock_lazy_generic_with_istart(
                         &mut carry_ms,
                         &mut throwaway,
                         &mut throwaway_rep,
                         &combined[..end],
                         p,
+                        searchMethod,
                         1,
-                        useRowMatchFinder,
+                        crate::compress::match_state::ZSTD_dictMode_e::ZSTD_noDict,
                     )
                 }
                 crate::compress::zstd_compress_sequences::ZSTD_lazy2
                 | crate::compress::zstd_compress_sequences::ZSTD_btlazy2 => {
-                    crate::compress::zstd_lazy::ZSTD_compressBlock_lazy_with_history(
+                    let searchMethod = if crate::compress::match_state::ZSTD_rowMatchFinderUsed(
+                        carry_ms.cParams.strategy,
+                        useRowMatchFinder,
+                    ) {
+                        crate::compress::zstd_lazy::searchMethod_e::search_rowHash
+                    } else {
+                        crate::compress::zstd_lazy::searchMethod_e::search_hashChain
+                    };
+                    crate::compress::zstd_lazy::ZSTD_compressBlock_lazy_generic_with_istart(
                         &mut carry_ms,
                         &mut throwaway,
                         &mut throwaway_rep,
                         &combined[..end],
                         p,
+                        searchMethod,
                         2,
-                        useRowMatchFinder,
+                        crate::compress::match_state::ZSTD_dictMode_e::ZSTD_noDict,
                     )
                 }
                 crate::compress::zstd_compress_sequences::ZSTD_dfast => {
-                    crate::compress::zstd_double_fast::ZSTD_compressBlock_doubleFast_with_history(
+                    crate::compress::zstd_double_fast::ZSTD_compressBlock_doubleFast_noDict_generic(
                         &mut carry_ms,
                         &mut throwaway,
                         &mut throwaway_rep,
                         &combined[..end],
                         p,
+                        minMatch,
                     )
                 }
-                _ => crate::compress::zstd_fast::ZSTD_compressBlock_fast_with_history(
+                _ => crate::compress::zstd_fast::ZSTD_compressBlock_fast_noDict_generic(
                     &mut carry_ms,
                     &mut throwaway,
                     &mut throwaway_rep,
                     &combined[..end],
                     p,
+                    minMatch,
                 ),
             };
             p = end;
@@ -12874,13 +12718,6 @@ pub fn ZSTD_flushStream(zcs: &mut ZSTD_CCtx, output: &mut [u8], output_pos: &mut
     result
 }
 
-/// Rust-only helper: extracts the raw pointer address of the input
-/// buffer's backing slice for stable-buffer tracking (or 0 when unset).
-#[inline]
-fn zstd_inbuffer_src_ptr(input: &ZSTD_inBuffer<'_>) -> usize {
-    input.src.map_or(0, |src| src.as_ptr() as usize)
-}
-
 #[inline]
 fn zstd_effective_in_buffer_mode(cctx: &ZSTD_CCtx) -> ZSTD_bufferMode_e {
     if cctx.stage == ZSTD_compressionStage_e::ZSTDcs_created {
@@ -12969,7 +12806,7 @@ pub fn ZSTD_setBufferExpectations(
     input: &ZSTD_inBuffer<'_>,
 ) {
     if zstd_effective_in_buffer_mode(cctx) == ZSTD_bufferMode_e::ZSTD_bm_stable {
-        cctx.expected_in_src = zstd_inbuffer_src_ptr(input);
+        cctx.expected_in_src = input.src.map_or(0, |src| src.as_ptr() as usize);
         cctx.expected_in_size = input.size;
         cctx.expected_in_pos = input.pos;
     }
@@ -12990,7 +12827,7 @@ pub fn ZSTD_checkBufferStability(
         return 0;
     }
     if zstd_effective_in_buffer_mode(cctx) == ZSTD_bufferMode_e::ZSTD_bm_stable {
-        let same_src = cctx.expected_in_src == zstd_inbuffer_src_ptr(input);
+        let same_src = cctx.expected_in_src == input.src.map_or(0, |src| src.as_ptr() as usize);
         let synthetic_end_flush = input.src.is_none()
             && endOp != ZSTD_EndDirective::ZSTD_e_continue
             && cctx.expected_in_size == input.size

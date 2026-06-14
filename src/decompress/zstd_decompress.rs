@@ -1833,7 +1833,7 @@ mod tests {
         );
         assert!(dctx.stream_dict.is_empty());
         assert_eq!(dctx.dictID, 0);
-        assert_eq!(dctx.ddict_rep, [0u32; 3]);
+        assert_eq!(dctx.ddict_rep, [1, 4, 8]);
         assert_eq!(dctx.dictUses, ZSTD_dictUses_e::ZSTD_dont_use);
     }
 
@@ -4123,7 +4123,7 @@ mod tests {
         assert_eq!(dctx.dictID, 0);
         assert_eq!(dctx.litEntropy, 0);
         assert_eq!(dctx.fseEntropy, 0);
-        assert_eq!(dctx.ddict_rep, [0; 3]);
+        assert_eq!(dctx.ddict_rep, [1, 4, 8]);
         assert_eq!(dctx.dictUses, ZSTD_dictUses_e::ZSTD_dont_use);
     }
 
@@ -6307,7 +6307,7 @@ pub fn ZSTD_DCtx_trace_end(
 pub fn ZSTD_clearDict(dctx: &mut ZSTD_DCtx) {
     dctx.stream_dict.clear();
     dctx.dictID = 0;
-    dctx.ddict_rep = [0; 3];
+    dctx.ddict_rep = crate::common::zstd_internal::repStartValue;
     dctx.litEntropy = 0;
     dctx.fseEntropy = 0;
     // Reset the dict-lifecycle tracker so the next loadDictionary /

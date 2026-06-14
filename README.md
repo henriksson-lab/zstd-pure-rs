@@ -2,6 +2,7 @@
 
 A pure-Rust port of the [Zstandard (`zstd`)](https://github.com/facebook/zstd) compression library
 
+* 2026-06-14: Cut MT compression memory use — `ZSTDMT_spawnCompressionJob` no longer deep-copies each job's multi-MB source/dest buffers (it moves the output buffer to the worker and keeps the source buffer in place). Output stays bitwise-identical and deterministic; default level-2 peak RSS on the 311 MB corpus dropped ~104→72 MiB. The benchmark table below predates this change.
 * 2026-06-14: Restored the upstream BMI2 sequence-encoder path (`ZSTD_encodeSequences` now runtime-dispatches to a `#[target_feature(enable = "bmi1,bmi2,lzcnt")]` body when supported). Output stays bitwise-identical; level-2 compression of the 311 MB corpus rose ~503→567 MB/s (best-of-3). The benchmark table below is the prior single-run snapshot and predates this change.
 * 2026-06-14: Another big audit. Getting closer to being a trustworthy but more testing needed
 * 2026-06-02: Big audit

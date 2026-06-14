@@ -958,9 +958,32 @@ fn ZSTDMT_prepareJobSequences(mtctx: &mut ZSTDMT_CCtx, wJobID: usize) -> usize {
 /// pool, wires a oneshot `mpsc` channel for completion, and stores the
 /// receiver in `jobReceivers[wJobID]`.
 fn ZSTDMT_spawnCompressionJob(mtctx: &mut ZSTDMT_CCtx, wJobID: usize) -> usize {
-    let Some(job) = mtctx.jobs.get(wJobID).cloned() else {
+    // Detach both large buffers before cloning the table entry so neither
+    // is memcpy'd into the worker's job — the original `.cloned()` deep-
+    // copied a `ZSTD_compressBound(targetSectionSize)`-sized `dstBuff`
+    // plus (in the owned path) an equally large `srcBuff`, per job.
+    //
+    //  - `dstBuff` is MOVED to the worker: it writes its output there and
+    //    returns it via the channel, and `ZSTDMT_joinPendingJob` overwrites
+    //    this slot with the returned job, so the table's `dstBuff` is never
+    //    read between spawn and join.
+    //  - `srcBuff` is detached only to skip the copy, then RESTORED to the
+    //    table at its original heap address (a Vec move does not realloc).
+    //    The worker reads `job.src` / `job.prefix` by raw pointer (see
+    //    `ZSTDMT_compressionJob`), never `job.srcBuff.data`, so its own
+    //    `srcBuff` can stay empty. The table must keep `srcBuff` alive and
+    //    unmoved because `job.src.start` and the *next* job's prefix
+    //    (`mtctx.inBuff.prefix`) point into it; freeing it early is a
+    //    use-after-free that yields non-deterministic output. Restoring it
+    //    reproduces the exact lifetime the previous `.cloned()` gave.
+    let Some(slot) = mtctx.jobs.get_mut(wJobID) else {
         return crate::common::error::ERROR(crate::common::error::ErrorCode::Generic);
     };
+    let dstBuff = core::mem::take(&mut slot.dstBuff);
+    let srcBuff = core::mem::take(&mut slot.srcBuff);
+    let mut job = slot.clone();
+    slot.srcBuff = srcBuff;
+    job.dstBuff = dstBuff;
     if mtctx.jobReceivers.len() <= wJobID {
         mtctx.jobReceivers.resize_with(wJobID + 1, || None);
     }

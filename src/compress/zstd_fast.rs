@@ -418,26 +418,26 @@ fn ZSTD_compressBlock_fast_noDict_generic_mls<const MLS: u32, const USE_CMOV: bo
                 *hashTable.add(hash0) = current0;
             }
 
-            // Repcode check at ip2 — branch-light: both reads issued
-            // unconditionally via raw-pointer loads so the compiler
-            // can CMOV. When `rep_offset1` is invalid we substitute
-            // `ip2` for the read source; the compare-against-self is
-            // masked off by `rep_safe`. Slice-indexed `MEM_read32`
-            // would emit a bounds-check `cmp/jb` per read, defeating
-            // CMOV codegen.
+            // Repcode check at ip2. Mirror upstream's
+            // `const U32 rval = MEM_read32(ip2 - rep_offset1);` exactly:
+            // a single unconditional pointer subtract, no address select.
+            // When `rep_offset1 == 0` this reads `ip2` itself (harmless —
+            // the compare result is masked off by `& (rep_offset1 > 0)`);
+            // when `rep_offset1 > 0` it was clamped to `<= maxRep` in the
+            // preamble so `ip2 - rep_offset1 >= prefixStart`. Dropping the
+            // `if rep_safe { … } else { ip2 }` select removes a CMOV from
+            // the hottest loop body (this check runs every search step).
             // SAFETY: loop invariant `ip3 < ilimit = iend - 8` gives
-            // `ip2 + 4 < iend - 4 ≤ src.len()`; `rep_read_pos ≤ ip2`.
-            let rep_safe = rep_offset1 > 0;
-            let rep_read_pos = if rep_safe {
-                ip2.wrapping_sub(rep_offset1 as usize)
-            } else {
-                ip2
-            };
+            // `ip2 + 4 < iend - 4 ≤ src.len()`; `ip2.wrapping_sub(
+            // rep_offset1) ≤ ip2` for the in-window cases above, so the
+            // 4-byte read stays in-bounds (identical to the address the
+            // prior `rep_safe` branch already read from).
+            let rep_read_pos = ip2.wrapping_sub(rep_offset1 as usize);
             let rep_rval =
                 unsafe { (src.as_ptr().wrapping_add(rep_read_pos) as *const u32).read_unaligned() };
             let rep_cval =
                 unsafe { (src.as_ptr().wrapping_add(ip2) as *const u32).read_unaligned() };
-            if rep_safe & (rep_rval == rep_cval) {
+            if (rep_rval == rep_cval) & (rep_offset1 > 0) {
                 ip0 = ip2;
                 let mut match0 = ip0 - rep_offset1 as usize;
                 let back = usize::from(ip0 > 0 && match0 > 0 && src[ip0 - 1] == src[match0 - 1]);

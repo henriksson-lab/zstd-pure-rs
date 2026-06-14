@@ -1,7 +1,8 @@
 [package]
 name = "zstd-pure-rs"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
+rust-version = "1.85"
 autoexamples = false
 description = "Pure-Rust port of the Zstandard (zstd) compression library"
 license = "BSD-3-Clause OR GPL-2.0-only"
@@ -34,6 +35,7 @@ required-features = ["cli"]
 [[bin]]
 name = "bench"
 path = "src/bin/bench.rs"
+required-features = ["cli"]
 
 [features]
 default = ["std"]

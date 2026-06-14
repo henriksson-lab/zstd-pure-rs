@@ -1642,8 +1642,6 @@ pub fn ZSTDMT_initCStream_internal(
 /// Port of `ZSTDMT_compressionJob`.
 pub fn ZSTDMT_compressionJob(job: &mut ZSTDMT_jobDescription, cctx: &mut Box<ZSTD_CCtx>) {
     let mut jobParams = job.params;
-    let mut lastCBlockSize = 0usize;
-
     if job.jobID != 0 {
         jobParams.fParams.checksumFlag = 0;
     }
@@ -1716,7 +1714,7 @@ pub fn ZSTDMT_compressionJob(job: &mut ZSTDMT_jobDescription, cctx: &mut Box<ZST
         &job.rawSeqStore,
     );
 
-    let mut op = 0usize;
+    let op = 0usize;
     if job.firstJob == 0 {
         let hSize = ZSTD_compressContinue_public(cctx, &mut job.dstBuff.data[op..], &[]);
         if crate::common::error::ERR_isError(hSize) {
@@ -1726,38 +1724,18 @@ pub fn ZSTDMT_compressionJob(job: &mut ZSTDMT_jobDescription, cctx: &mut Box<ZST
         ZSTD_invalidateRepCodes(cctx);
     }
 
-    let chunkSize = 4 * ZSTD_BLOCKSIZE_MAX;
-    let nbChunks = src.len().div_ceil(chunkSize);
-    for chunkNb in 1..nbChunks {
-        let start = (chunkNb - 1) * chunkSize;
-        let end = start + chunkSize;
-        let cSize =
-            ZSTD_compressContinue_public(cctx, &mut job.dstBuff.data[op..], &src[start..end]);
-        if crate::common::error::ERR_isError(cSize) {
-            job.cSize = cSize;
-            return;
-        }
-        op += cSize;
-        job.cSize += cSize;
-        job.consumed = end;
-    }
-
-    if nbChunks > 0 || job.lastJob != 0 {
-        let start = chunkSize.saturating_mul(nbChunks.saturating_sub(1));
-        let lastSrc = &src[start..];
-        lastCBlockSize = if job.lastJob != 0 {
-            ZSTD_compressEnd_public(cctx, &mut job.dstBuff.data[op..], lastSrc)
-        } else {
-            ZSTD_compressContinue_public(cctx, &mut job.dstBuff.data[op..], lastSrc)
-        };
-        if crate::common::error::ERR_isError(lastCBlockSize) {
-            job.cSize = lastCBlockSize;
-            return;
-        }
+    let cSize = if job.lastJob != 0 {
+        ZSTD_compressEnd_public(cctx, &mut job.dstBuff.data[op..], src)
+    } else {
+        ZSTD_compressContinue_public(cctx, &mut job.dstBuff.data[op..], src)
+    };
+    if crate::common::error::ERR_isError(cSize) {
+        job.cSize = cSize;
+        return;
     }
 
     ZSTD_CCtx_trace(cctx, 0);
-    job.cSize += lastCBlockSize;
+    job.cSize += cSize;
     job.consumed = job.src.size;
 }
 

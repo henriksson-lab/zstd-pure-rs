@@ -5,6 +5,7 @@
 //! ratio reporting via `-v`, and buffered stdin/stdout via `-`.
 
 use clap::{error::ErrorKind, ArgAction, CommandFactory, Parser};
+use std::env;
 use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, BufWriter, ErrorKind as IoErrorKind, Read, Write};
@@ -196,6 +197,22 @@ struct Cli {
 
     #[arg(long = "format", require_equals = true, hide = true)]
     format: Option<String>,
+
+    /// Spawn worker threads for compression. `-T0` selects the upstream-style automatic default.
+    #[arg(short = 'T', long = "threads", value_name = "THREADS", hide = true)]
+    threads: Option<u32>,
+
+    /// Disable worker threads and run compression in the caller thread.
+    #[arg(long = "single-thread", hide = true)]
+    single_thread: bool,
+
+    /// Multithreaded job size. Hidden to match upstream's advanced option surface.
+    #[arg(long = "jobsize", value_name = "SIZE", hide = true)]
+    jobsize: Option<String>,
+
+    /// Advanced zstd compression parameters.
+    #[arg(long = "zstd", require_equals = true, hide = true)]
+    zstd_params: Option<String>,
 
     /// Emit / expect magicless-format frames (`ZSTD_f_zstd1_magicless`):
     /// skip the 4-byte magic prefix on compression, and require the
@@ -412,33 +429,60 @@ where
             } else if s.len() > 2
                 && s.starts_with('-')
                 && !s.starts_with("--")
-                && s[1..].chars().any(|c| matches!(c, 'D' | 'o'))
+                && s[1..].char_indices().any(|(idx, c)| {
+                    matches!(c, 'D' | 'o' | 'T')
+                        || (c == 'B'
+                            && (idx == 0
+                                || s[1..][..idx].chars().last().is_some_and(|prev| {
+                                    !prev.is_ascii_digit() && !matches!(prev, 'K' | 'M' | 'G' | 'i')
+                                })))
+                })
             {
                 let mut chars = s[1..].chars().peekable();
                 while let Some(c) = chars.next() {
                     match c {
-                        'D' | 'o' => {
+                        'D' | 'o' | 'T' | 'B' => {
                             if chars.peek() == Some(&'=') {
                                 chars.next();
-                                let value = chars.collect::<String>();
-                                let long = if c == 'D' {
-                                    "--__zstd_pure_internal_dict"
-                                } else {
-                                    "--__zstd_pure_internal_output_file"
+                                let value = chars.by_ref().collect::<String>();
+                                let long = match c {
+                                    'D' => "--__zstd_pure_internal_dict",
+                                    'o' => "--__zstd_pure_internal_output_file",
+                                    'T' => "--threads",
+                                    'B' => "--jobsize",
+                                    _ => unreachable!(),
                                 };
                                 normalized.push(OsString::from(format!("{long}={value}")));
                                 break;
                             }
-                            normalized.push(OsString::from(format!("-{c}")));
-                            let value = iter
-                                .next()
-                                .ok_or_else(|| "error: missing command argument ".to_string())?;
+                            let normalized_field = if c == 'B' {
+                                "--jobsize".to_string()
+                            } else {
+                                format!("-{c}")
+                            };
+                            normalized.push(OsString::from(normalized_field));
+                            let value = if matches!(c, 'T' | 'B') {
+                                let value = chars.by_ref().collect::<String>();
+                                if value.is_empty() {
+                                    iter.next().ok_or_else(|| {
+                                        "error: missing command argument ".to_string()
+                                    })?
+                                } else {
+                                    OsString::from(value)
+                                }
+                            } else {
+                                iter.next()
+                                    .ok_or_else(|| "error: missing command argument ".to_string())?
+                            };
                             if value.to_str().is_some_and(|value| value.starts_with('-')) {
                                 return Err(
                                     "error: command cannot be separated from its argument by another command ".into(),
                                 );
                             }
                             normalized.push(value);
+                            if matches!(c, 'T' | 'B') {
+                                break;
+                            }
                         }
                         '-' => return Err("Incorrect parameter: --".into()),
                         _ => normalized.push(OsString::from(format!("-{c}"))),
@@ -1166,6 +1210,9 @@ fn configure_zstd_compressor(
     checksum: bool,
     content_size: bool,
     pledged_size: u64,
+    nb_workers: i32,
+    job_size: usize,
+    overlap_log: Option<i32>,
 ) -> Result<(), String> {
     for (param, value) in [
         (ZSTD_cParameter::ZSTD_c_compressionLevel, level),
@@ -1182,8 +1229,19 @@ fn configure_zstd_compressor(
             ZSTD_cParameter::ZSTD_c_format,
             ZSTD_format_e::ZSTD_f_zstd1 as i32,
         ),
+        (ZSTD_cParameter::ZSTD_c_nbWorkers, nb_workers),
+        (
+            ZSTD_cParameter::ZSTD_c_jobSize,
+            job_size.min(i32::MAX as usize) as i32,
+        ),
     ] {
         let rc = ZSTD_CCtx_setParameter(cctx, param, value);
+        if ERR_isError(rc) {
+            return Err(ERR_getErrorName(rc).to_string());
+        }
+    }
+    if let Some(overlap_log) = overlap_log {
+        let rc = ZSTD_CCtx_setParameter(cctx, ZSTD_cParameter::ZSTD_c_overlapLog, overlap_log);
         if ERR_isError(rc) {
             return Err(ERR_getErrorName(rc).to_string());
         }
@@ -1193,6 +1251,83 @@ fn configure_zstd_compressor(
         return Err(ERR_getErrorName(rc).to_string());
     }
     Ok(())
+}
+
+fn upstream_default_nb_workers() -> u32 {
+    let cores = std::thread::available_parallelism()
+        .map(|cores| cores.get())
+        .unwrap_or(1);
+    ((cores / 4).clamp(1, 4)) as u32
+}
+
+fn parse_nb_workers_value(value: &str) -> Result<u32, String> {
+    let (threads, rest) = read_unsigned_prefix_checked(value)?;
+    if !rest.is_empty() {
+        return Err(format!("Incorrect parameter: -T{value}"));
+    }
+    Ok(threads)
+}
+
+fn parse_job_size_value(value: &str) -> Result<usize, String> {
+    let (job_size, rest) = read_unsigned_prefix_checked(value)?;
+    if !rest.is_empty() {
+        return Err(format!("Incorrect parameter: --jobsize={value}"));
+    }
+    Ok(job_size as usize)
+}
+
+fn parse_zstd_overlap_log(value: &str) -> Result<Option<i32>, String> {
+    let mut rest = value;
+    loop {
+        let Some((key, after_key)) = rest.split_once('=') else {
+            return Err(format!("Incorrect parameter: --zstd={value}"));
+        };
+        if !matches!(key, "overlapLog" | "ovlog") {
+            return Err(format!("Incorrect parameter: --zstd={value}"));
+        }
+        let value_end = after_key
+            .bytes()
+            .position(|byte| byte == b',')
+            .unwrap_or(after_key.len());
+        let param_value = &after_key[..value_end];
+        let (parsed, unused) = read_unsigned_prefix_checked(param_value)?;
+        if param_value.is_empty() || !unused.is_empty() {
+            return Err(format!("Incorrect parameter: --zstd={value}"));
+        }
+        let overlap_log = parsed.min(i32::MAX as u32) as i32;
+        if value_end == after_key.len() {
+            return Ok(Some(overlap_log));
+        }
+        rest = &after_key[value_end + 1..];
+        if rest.is_empty() {
+            return Err(format!("Incorrect parameter: --zstd={value}"));
+        }
+    }
+}
+
+fn env_nb_workers() -> Result<Option<u32>, String> {
+    let Ok(value) = env::var("ZSTD_NBTHREADS") else {
+        return Ok(None);
+    };
+    if value.is_empty() {
+        return Ok(None);
+    }
+    parse_nb_workers_value(&value).map(Some)
+}
+
+fn resolve_nb_workers(cli: &Cli, decompress: bool) -> Result<i32, String> {
+    if decompress {
+        return Ok(0);
+    }
+    if cli.single_thread {
+        return Ok(0);
+    }
+    let workers = match cli.threads {
+        Some(0) => upstream_default_nb_workers(),
+        Some(workers) => workers,
+        None => env_nb_workers()?.unwrap_or_else(upstream_default_nb_workers),
+    };
+    Ok(workers.min(i32::MAX as u32) as i32)
 }
 
 fn read_exact_vec<R: Read>(reader: &mut R, len: usize) -> io::Result<Vec<u8>> {
@@ -1212,6 +1347,9 @@ fn stream_buffered_compress_zstd_file_to_writer<W: Write>(
     level: i32,
     checksum: bool,
     content_size: bool,
+    nb_workers: i32,
+    job_size: usize,
+    overlap_log: Option<i32>,
 ) -> Result<(usize, usize), String> {
     let file = File::open(input).map_err(|e| format!("{}: {e}", input.display()))?;
     let src_size = file
@@ -1219,7 +1357,12 @@ fn stream_buffered_compress_zstd_file_to_writer<W: Write>(
         .map_err(|e| format!("{}: {e}", input.display()))?
         .len();
     let mut reader = BufReader::new(file);
-    if level >= 3 && src_size <= 256 << 20 {
+    if level >= 3
+        && src_size <= 256 << 20
+        && nb_workers == 0
+        && job_size == 0
+        && overlap_log.is_none()
+    {
         let src = read_exact_vec(&mut reader, src_size as usize)
             .map_err(|e| format!("{}: {e}", input.display()))?;
         let compressed = compress_bytes(
@@ -1238,7 +1381,16 @@ fn stream_buffered_compress_zstd_file_to_writer<W: Write>(
         return Ok((src.len(), compressed.len()));
     }
     let mut cctx = ZSTD_createCCtx().ok_or("cctx alloc failed")?;
-    configure_zstd_compressor(&mut cctx, level, checksum, content_size, src_size)?;
+    configure_zstd_compressor(
+        &mut cctx,
+        level,
+        checksum,
+        content_size,
+        src_size,
+        nb_workers,
+        job_size,
+        overlap_log,
+    )?;
 
     let file_chunk_size = ZSTD_CStreamInSize().max(1);
     let mut input_buf = vec![0u8; file_chunk_size];
@@ -1307,6 +1459,9 @@ fn stream_buffered_compress_zstd_file(
     level: i32,
     checksum: bool,
     content_size: bool,
+    nb_workers: i32,
+    job_size: usize,
+    overlap_log: Option<i32>,
 ) -> Result<(usize, usize), String> {
     match out_path {
         Some(path) => {
@@ -1326,6 +1481,9 @@ fn stream_buffered_compress_zstd_file(
                 level,
                 checksum,
                 content_size,
+                nb_workers,
+                job_size,
+                overlap_log,
             ) {
                 Ok(sizes) => {
                     drop(writer);
@@ -1348,6 +1506,9 @@ fn stream_buffered_compress_zstd_file(
                 level,
                 checksum,
                 content_size,
+                nb_workers,
+                job_size,
+                overlap_log,
             )
         }
     }
@@ -2253,6 +2414,19 @@ fn run() -> Result<(), String> {
     let window_log = long_window_log(cli.long.as_deref())?;
     let content_size = content_size_directive.unwrap_or(!cli.no_content_size);
     let dict_id = dict_id_directive.unwrap_or(!cli.no_dict_id);
+    let nb_workers = resolve_nb_workers(&cli, decompress)?;
+    let job_size = cli
+        .jobsize
+        .as_deref()
+        .map(parse_job_size_value)
+        .transpose()?
+        .unwrap_or(0);
+    let overlap_log = cli
+        .zstd_params
+        .as_deref()
+        .map(parse_zstd_overlap_log)
+        .transpose()?
+        .flatten();
 
     // Load the dict once (if provided) — used by every file.
     let parsed_dict = last_path_field(&raw_args, "-D", "--__zstd_pure_internal_dict")
@@ -2308,6 +2482,9 @@ fn run() -> Result<(), String> {
                     effective_level,
                     checksum,
                     content_size,
+                    nb_workers,
+                    job_size,
+                    overlap_log,
                 )?;
                 total_src_size = total_src_size.saturating_add(src_len);
                 total_dst_size = total_dst_size.saturating_add(dst_len);
@@ -2465,6 +2642,9 @@ fn run() -> Result<(), String> {
                 effective_level,
                 checksum,
                 content_size,
+                nb_workers,
+                job_size,
+                overlap_log,
             )?;
             if should_remove_source(remove_src_file, out_path.as_deref()) {
                 remove_source_file(input)?;
@@ -2714,6 +2894,41 @@ mod tests {
             normalize_attached_field_args(args(&["zstd", "-o-", "in"])).unwrap_err(),
             "Incorrect parameter: --"
         );
+        assert_eq!(
+            normalize_attached_field_args(args(&["zstd", "-T1", "in"])).unwrap(),
+            args(&["zstd", "-T", "1", "in"])
+        );
+        assert_eq!(
+            normalize_attached_field_args(args(&["zstd", "-T=2", "in"])).unwrap(),
+            args(&["zstd", "--threads=2", "in"])
+        );
+        assert_eq!(
+            normalize_attached_field_args(args(&["zstd", "-B1M", "in"])).unwrap(),
+            args(&["zstd", "--jobsize", "1M", "in"])
+        );
+        assert_eq!(
+            normalize_attached_field_args(args(&["zstd", "-B=2M", "in"])).unwrap(),
+            args(&["zstd", "--jobsize=2M", "in"])
+        );
+        let cli = Cli::try_parse_from(
+            normalize_level_short_args(
+                normalize_attached_field_args(args(&["zstd", "-T1", "-c", "in"])).unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(cli.threads, Some(1));
+        assert_eq!(cli.level, 3);
+        let cli = Cli::try_parse_from(
+            normalize_level_short_args(
+                normalize_attached_field_args(args(&["zstd", "-B1M", "--zstd=ovlog=5", "in"]))
+                    .unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(cli.jobsize.as_deref(), Some("1M"));
+        assert_eq!(cli.zstd_params.as_deref(), Some("ovlog=5"));
 
         assert_eq!(
             reject_long_equals_field_args(&args(&["zstd", "--dict=dict"])).unwrap_err(),
@@ -2730,6 +2945,26 @@ mod tests {
         assert_eq!(
             reject_long_field_alias_args(&args(&["zstd", "--output-file", "out"])).unwrap_err(),
             "Incorrect parameter: --output-file"
+        );
+    }
+
+    #[test]
+    fn mt_advanced_parameters_parse_like_upstream_cli_surface() {
+        assert_eq!(parse_job_size_value("1M").unwrap(), 1 << 20);
+        assert_eq!(parse_job_size_value("512KiB").unwrap(), 512 << 10);
+        assert_eq!(
+            parse_job_size_value("1MBx").unwrap_err(),
+            "Incorrect parameter: --jobsize=1MBx"
+        );
+        assert_eq!(parse_zstd_overlap_log("overlapLog=7").unwrap(), Some(7));
+        assert_eq!(parse_zstd_overlap_log("ovlog=6").unwrap(), Some(6));
+        assert_eq!(
+            parse_zstd_overlap_log("overlapLog=6,ovlog=8").unwrap(),
+            Some(8)
+        );
+        assert_eq!(
+            parse_zstd_overlap_log("windowLog=23").unwrap_err(),
+            "Incorrect parameter: --zstd=windowLog=23"
         );
     }
 

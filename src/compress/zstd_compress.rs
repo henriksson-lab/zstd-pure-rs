@@ -41,7 +41,6 @@ use crate::decompress::zstd_decompress_block::{
 /// allocation. Also backs the simple streaming API — `initCStream`
 /// captures the level, `compressStream` buffers input, `endStream`
 /// compresses the buffered input and drains the result.
-#[derive(Debug, Clone)]
 pub struct ZSTD_CCtx {
     /// Match state carried across blocks inside a single frame. Lazy
     /// initialized on first `ZSTD_compressCCtx` call.
@@ -83,6 +82,9 @@ pub struct ZSTD_CCtx {
     pub rayonThreadPoolRef: usize,
     /// Cached size hint for the attached thread pool / MT surface.
     pub mtctxSizeHint: usize,
+    /// Owned multithreaded stream context for `ZSTD_c_nbWorkers > 0`.
+    #[cfg(feature = "mt")]
+    pub mtctx: Option<Box<crate::compress::zstdmt_compress::ZSTDMT_CCtx>>,
 
     // ---- Streaming-mode state (initCStream / compressStream / endStream) ----
     /// Compression level set by `ZSTD_initCStream`. `None` until init.
@@ -230,6 +232,94 @@ pub struct ZSTD_CCtx {
     pub staticSize: usize,
 }
 
+impl core::fmt::Debug for ZSTD_CCtx {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ZSTD_CCtx")
+            .field("stream_level", &self.stream_level)
+            .field("requestedParams", &self.requestedParams)
+            .field("appliedParams", &self.appliedParams)
+            .field("stage", &self.stage)
+            .field("stream_stage", &self.stream_stage)
+            .field("consumedSrcSize", &self.consumedSrcSize)
+            .field("producedCSize", &self.producedCSize)
+            .field("dictContentSize", &self.dictContentSize)
+            .field("blockSizeMax", &self.blockSizeMax)
+            .field("initialized", &self.initialized)
+            .finish()
+    }
+}
+
+impl Clone for ZSTD_CCtx {
+    fn clone(&self) -> Self {
+        Self {
+            ms: self.ms.clone(),
+            seqStore: self.seqStore.clone(),
+            prevEntropy: self.prevEntropy.clone(),
+            nextEntropy: self.nextEntropy.clone(),
+            prev_rep: self.prev_rep,
+            next_rep: self.next_rep,
+            blockSplitCtx: self.blockSplitCtx.clone(),
+            entropyScratch: self.entropyScratch.clone(),
+            externalMatchStore: self.externalMatchStore.clone(),
+            ldmState: self.ldmState.clone(),
+            ldmSequences: self.ldmSequences.clone(),
+            threadPoolRef: self.threadPoolRef,
+            rayonThreadPoolRef: self.rayonThreadPoolRef,
+            mtctxSizeHint: self.mtctxSizeHint,
+            #[cfg(feature = "mt")]
+            mtctx: None,
+            stream_level: self.stream_level,
+            pledged_src_size: self.pledged_src_size,
+            stream_dict: self.stream_dict.clone(),
+            stream_dict_original: self.stream_dict_original.clone(),
+            stream_dict_content_type: self.stream_dict_content_type,
+            stream_cdict: self.stream_cdict.clone(),
+            param_checksum: self.param_checksum,
+            param_contentSize: self.param_contentSize,
+            param_dictID: self.param_dictID,
+            stream_in_buffer: self.stream_in_buffer.clone(),
+            stream_params_snapshot: self.stream_params_snapshot,
+            stream_out_buffer: self.stream_out_buffer.clone(),
+            stream_out_drained: self.stream_out_drained,
+            stream_stage: self.stream_stage,
+            stream_in_to_compress: self.stream_in_to_compress,
+            stream_in_target: self.stream_in_target,
+            stream_frame_ended: self.stream_frame_ended,
+            stream_window_base: self.stream_window_base,
+            stream_disable_windowed: self.stream_disable_windowed,
+            expected_in_src: self.expected_in_src,
+            expected_in_size: self.expected_in_size,
+            expected_in_pos: self.expected_in_pos,
+            expected_out_buffer_size: self.expected_out_buffer_size,
+            buffer_expectations_set: self.buffer_expectations_set,
+            stream_closed: self.stream_closed,
+            stream_frame_completed: self.stream_frame_completed,
+            requested_cParams: self.requested_cParams,
+            requestedParams: self.requestedParams,
+            appliedParams: self.appliedParams,
+            stage: self.stage,
+            dictID: self.dictID,
+            dictContentSize: self.dictContentSize,
+            consumedSrcSize: self.consumedSrcSize,
+            producedCSize: self.producedCSize,
+            pledgedSrcSizePlusOne: self.pledgedSrcSizePlusOne,
+            isFirstBlock: self.isFirstBlock,
+            bmi2: self.bmi2,
+            initialized: self.initialized,
+            blockSizeMax: self.blockSizeMax,
+            xxhState: self.xxhState.clone(),
+            format: self.format,
+            prefix_is_single_use: self.prefix_is_single_use,
+            customMem: self.customMem,
+            staticSize: self.staticSize,
+        }
+    }
+
+    fn clone_from(&mut self, source: &Self) {
+        *self = source.clone();
+    }
+}
+
 impl Default for ZSTD_CCtx {
     fn default() -> Self {
         let mut requestedParams = ZSTD_CCtx_params::default();
@@ -252,6 +342,8 @@ impl Default for ZSTD_CCtx {
             threadPoolRef: 0,
             rayonThreadPoolRef: 0,
             mtctxSizeHint: 0,
+            #[cfg(feature = "mt")]
+            mtctx: None,
             stream_level: None,
             pledged_src_size: None,
             stream_dict: Vec::new(),
@@ -1169,6 +1261,10 @@ fn cctx_mark_stream_frame_completed(cctx: &mut ZSTD_CCtx) {
     cctx.stream_window_base = crate::compress::match_state::ZSTD_WINDOW_START_INDEX;
     cctx.stream_closed = false;
     cctx.stream_frame_completed = true;
+    #[cfg(feature = "mt")]
+    {
+        cctx.mtctx = None;
+    }
     cctx.pledgedSrcSizePlusOne = 0;
     cctx.pledged_src_size = None;
     cctx.consumedSrcSize = 0;
@@ -2175,6 +2271,20 @@ pub fn ZSTD_compressContinue_internal(
 
     if frame == 0 {
         let srcEndAbs = srcAbs.wrapping_add(src.len() as u32);
+        if cctx.consumedSrcSize != 0 {
+            ms.window.base_offset = srcAbs;
+            ms.window.dictBase_offset = srcAbs;
+            ms.window.dictLimit = srcAbs;
+            ms.window.lowLimit = srcAbs;
+            ms.window.nextSrc = srcEndAbs;
+            ms.nextToUpdate = srcAbs;
+            ms.hashTable.fill(0);
+            ms.chainTable.fill(0);
+            ms.hashTable3.fill(0);
+            ms.tagTable.fill(0);
+            ms.dictMatchState = None;
+            ms.loadedDictEnd = 0;
+        }
         ZSTD_overflowCorrectIfNeeded(
             ms,
             cctx.appliedParams.useRowMatchFinder,
@@ -5860,21 +5970,17 @@ pub fn ZSTD_resetCCtx_byAttachingCDict(
         return rc;
     }
     if let Some(ms) = cctx.ms.as_mut() {
-        let cdict_end = cdict
-            .matchState
-            .window
-            .nextSrc
-            .saturating_sub(cdict.matchState.window.base_offset);
-        let cdict_len = cdict_end.saturating_sub(cdict.matchState.window.dictLimit);
+        let cdict_end_index = cdict.matchState.window.nextSrc;
+        let cdict_len = cdict_end_index.saturating_sub(cdict.matchState.window.dictLimit);
         if cdict_len != 0 {
             ms.dictMatchState = Some(Box::new(cdict.matchState.clone()));
             ms.dictContent.clear();
-            let cdict_end_index = cdict.matchState.window.nextSrc;
             if ms.window.dictLimit < cdict_end_index {
                 ms.window.nextSrc = cdict_end_index;
                 crate::compress::match_state::ZSTD_window_clear(&mut ms.window);
                 ms.window.base_offset = cdict_end_index;
             }
+            ms.nextToUpdate = cdict_end_index;
             ms.loadedDictEnd = ms.window.dictLimit;
         }
     }
@@ -8879,6 +8985,10 @@ pub fn ZSTD_freeCCtxContent(cctx: &mut ZSTD_CCtx) {
     cctx.stream_params_snapshot = None;
     cctx.stream_out_buffer.clear();
     cctx.stream_out_drained = 0;
+    #[cfg(feature = "mt")]
+    {
+        cctx.mtctx = None;
+    }
 }
 
 /// Port of `ZSTD_CCtx_trace` (zstd_compress.c:5407). Upstream
@@ -11585,6 +11695,22 @@ pub fn ZSTD_compressStream_generic(
         zcs.pledged_src_size = Some(pledged);
         zcs.pledgedSrcSizePlusOne = pledged.wrapping_add(1);
     }
+    #[cfg(feature = "mt")]
+    if zstd_stream_can_use_mt(zcs) {
+        let result = zstd_compressStream_mt(
+            zcs,
+            &mut dst[..dst_end],
+            &mut output.pos,
+            &src[..src_end],
+            &mut input.pos,
+            flushMode,
+        );
+        if ERR_isError(result) {
+            return result;
+        }
+        ZSTD_setBufferExpectations(zcs, output, input);
+        return result;
+    }
     if flushMode == ZSTD_e_end
         && zcs.stream_in_buffer.is_empty()
         && zcs.stream_dict.is_empty()
@@ -12357,6 +12483,101 @@ fn zstd_stream_can_use_windowed_with_stable_one_shot(
         && (buffered_modes || stable_one_shot_modes)
 }
 
+#[cfg(feature = "mt")]
+fn zstd_stream_can_use_mt(zcs: &ZSTD_CCtx) -> bool {
+    zcs.requestedParams.nbWorkers > 0
+        && zcs.stream_cdict.is_none()
+        && zcs.stream_dict.is_empty()
+        && !zcs.prefix_is_single_use
+        && zcs.requestedParams.inBufferMode == ZSTD_bufferMode_e::ZSTD_bm_buffered
+        && zcs.requestedParams.outBufferMode == ZSTD_bufferMode_e::ZSTD_bm_buffered
+}
+
+#[cfg(feature = "mt")]
+fn zstd_compressStream_mt(
+    zcs: &mut ZSTD_CCtx,
+    output: &mut [u8],
+    output_pos: &mut usize,
+    input: &[u8],
+    input_pos: &mut usize,
+    flushMode: ZSTD_EndDirective,
+) -> usize {
+    use crate::compress::zstdmt_compress::{
+        ZSTDMT_compressStream_generic, ZSTDMT_createCCtx, ZSTDMT_initCStream_internal,
+        ZSTDMT_setRayonThreadPool, ZSTDMT_setThreadPool,
+    };
+    use crate::decompress::zstd_decompress::ZSTD_CONTENTSIZE_UNKNOWN;
+
+    if zcs.mtctx.is_none() {
+        if zcs.stream_params_snapshot.is_none() {
+            zcs.stream_params_snapshot = Some(zstd_snapshot_stream_params(zcs));
+        }
+        let stream_params = zcs
+            .stream_params_snapshot
+            .unwrap_or_else(|| zstd_snapshot_stream_params(zcs));
+        let mut params = stream_params.requestedParams;
+        params.compressionLevel = stream_params.stream_level;
+        params.format = stream_params.format;
+        params.fParams = ZSTD_FrameParameters {
+            contentSizeFlag: if stream_params.param_contentSize && zcs.pledged_src_size.is_some() {
+                1
+            } else {
+                0
+            },
+            checksumFlag: if stream_params.param_checksum { 1 } else { 0 },
+            noDictIDFlag: if stream_params.param_dictID { 0 } else { 1 },
+        };
+        let nb_workers = params.nbWorkers.max(1) as u32;
+        let Some(mut mtctx) = ZSTDMT_createCCtx(nb_workers) else {
+            return ERROR(ErrorCode::MemoryAllocation);
+        };
+        let pledged = zcs.pledged_src_size.unwrap_or(ZSTD_CONTENTSIZE_UNKNOWN);
+        let init = ZSTDMT_initCStream_internal(&mut mtctx, params, pledged);
+        if ERR_isError(init) {
+            return init;
+        }
+        if zcs.rayonThreadPoolRef != 0 {
+            let pool = unsafe { &*(zcs.rayonThreadPoolRef as *const rayon::ThreadPool) };
+            ZSTDMT_setRayonThreadPool(&mut mtctx, Some(pool));
+        } else if zcs.threadPoolRef != 0 {
+            let pool = unsafe { &*(zcs.threadPoolRef as *const crate::common::pool::POOL_ctx) };
+            ZSTDMT_setThreadPool(&mut mtctx, Some(pool));
+        }
+        zcs.mtctx = Some(mtctx);
+        zcs.stream_frame_completed = false;
+        zcs.stream_closed = false;
+    }
+
+    let mtctx = zcs.mtctx.as_mut().expect("mtctx initialized above");
+    let mut result =
+        ZSTDMT_compressStream_generic(mtctx, output, output_pos, input, input_pos, flushMode);
+    if ERR_isError(result) {
+        return result;
+    }
+    if flushMode == ZSTD_EndDirective::ZSTD_e_end && result != 0 && *input_pos == input.len() {
+        let empty = [];
+        let mut empty_pos = 0usize;
+        while result != 0 && *output_pos < output.len() {
+            result = ZSTDMT_compressStream_generic(
+                mtctx,
+                output,
+                output_pos,
+                &empty,
+                &mut empty_pos,
+                flushMode,
+            );
+            if ERR_isError(result) {
+                return result;
+            }
+            empty_pos = 0;
+        }
+    }
+    if flushMode == ZSTD_EndDirective::ZSTD_e_end && result == 0 {
+        cctx_mark_stream_frame_completed(zcs);
+    }
+    result
+}
+
 fn zstd_stream_compress_windowed_block(
     zcs: &mut ZSTD_CCtx,
     output: &mut [u8],
@@ -12908,12 +13129,11 @@ fn zstd_endStream_buffered(
         #[cfg(feature = "mt")]
         let maybe_mt = if stream_params.requestedParams.nbWorkers > 0
             && src.len() > crate::compress::zstdmt_compress::ZSTDMT_JOBSIZE_MIN
+            && prefix_snapshot.is_none()
+            && zcs.stream_cdict.is_none()
+            && zcs.stream_dict.is_empty()
         {
             let pledged_is_known = zcs.pledged_src_size.is_some();
-            let effective_prefix: &[u8] = prefix_snapshot
-                .as_ref()
-                .map(|(content, _, _)| content.as_slice())
-                .unwrap_or(zcs.stream_dict.as_slice());
             let fp = ZSTD_FrameParameters {
                 contentSizeFlag: if stream_params.param_contentSize && pledged_is_known {
                     1
@@ -12932,7 +13152,6 @@ fn zstd_endStream_buffered(
                 zcs.pledged_src_size
                     .unwrap_or(crate::decompress::zstd_decompress::ZSTD_CONTENTSIZE_UNKNOWN),
                 &src,
-                effective_prefix,
                 fp,
             ))
         } else {
@@ -13183,6 +13402,27 @@ pub fn ZSTD_endStream(zcs: &mut ZSTD_CCtx, output: &mut [u8], output_pos: &mut u
         ZSTD_setBufferExpectations(zcs, &output_buffer, &input_buffer);
         return result;
     }
+    #[cfg(feature = "mt")]
+    if zstd_stream_can_use_mt(zcs) {
+        let mut mt_output_buffer = ZSTD_outBuffer {
+            dst: Some(output),
+            size: output_buffer.size,
+            pos: *output_pos,
+        };
+        let mut mt_input_buffer = input_buffer;
+        let result = ZSTD_compressStream_generic(
+            zcs,
+            &mut mt_output_buffer,
+            &mut mt_input_buffer,
+            ZSTD_EndDirective::ZSTD_e_end,
+        );
+        *output_pos = mt_output_buffer.pos;
+        if ERR_isError(result) {
+            return result;
+        }
+        ZSTD_setBufferExpectations(zcs, &mt_output_buffer, &mt_input_buffer);
+        return result;
+    }
     let result = zstd_endStream_buffered(zcs, output, output_pos);
     if ERR_isError(result) {
         return result;
@@ -13205,11 +13445,10 @@ fn zstd_endstream_mt_compress(
     level: i32,
     pledged_src_size: u64,
     src: &[u8],
-    effective_prefix: &[u8],
     fp: ZSTD_FrameParameters,
 ) -> Result<Vec<u8>, usize> {
     use crate::compress::zstdmt_compress::{
-        Range, ZSTDMT_compressStream_generic, ZSTDMT_createCCtx, ZSTDMT_freeCCtx,
+        ZSTDMT_compressStream_generic, ZSTDMT_createCCtx, ZSTDMT_freeCCtx,
         ZSTDMT_initCStream_internal, ZSTDMT_setRayonThreadPool, ZSTDMT_setThreadPool,
     };
 
@@ -13234,12 +13473,6 @@ fn zstd_endstream_mt_compress(
     } else if thread_pool_ref != 0 {
         let pool = unsafe { &*(thread_pool_ref as *const crate::common::pool::POOL_ctx) };
         ZSTDMT_setThreadPool(&mut mtctx, Some(pool));
-    }
-    if !effective_prefix.is_empty() {
-        mtctx.inBuff.prefix = Range {
-            start: effective_prefix.as_ptr() as usize,
-            size: effective_prefix.len(),
-        };
     }
 
     let bound = ZSTD_compressBound(src.len()).max(32);
@@ -14106,7 +14339,6 @@ mod local_streaming_static_tests {
             3,
             ZSTD_CONTENTSIZE_UNKNOWN,
             &src,
-            &[],
             ZSTD_FrameParameters {
                 contentSizeFlag: 0,
                 checksumFlag: 0,
@@ -14129,7 +14361,6 @@ mod local_streaming_static_tests {
             3,
             src.len() as u64,
             &src,
-            &[],
             ZSTD_FrameParameters {
                 contentSizeFlag: 1,
                 checksumFlag: 0,

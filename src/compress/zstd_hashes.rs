@@ -276,6 +276,9 @@ pub fn ZSTD_count_2segments(
         return matchLength;
     }
 
+    if istart_pos >= input_buf.len() || ip_pos + matchLength >= iend_pos {
+        return matchLength;
+    }
     matchLength + ZSTD_count(input_buf, ip_pos + matchLength, istart_pos, iend_pos)
 }
 
@@ -301,13 +304,12 @@ pub fn ZSTD_count(buf: &[u8], in_pos: usize, match_pos: usize, in_limit: usize) 
     let start = in_pos;
     let mut pIn = in_pos;
     let mut pMatch = match_pos;
+    let in_limit = in_limit.min(buf.len());
     debug_assert!(in_limit >= word - 1);
-    let inLoopLimit = in_limit - (word - 1);
+    let inLoopLimit = in_limit.saturating_sub(word - 1);
     let base = buf.as_ptr();
 
-    if pIn < inLoopLimit {
-        debug_assert!(pMatch + word <= buf.len());
-        debug_assert!(pIn + word <= buf.len());
+    if pIn < inLoopLimit && pIn + word <= buf.len() && pMatch + word <= buf.len() {
         let diff = unsafe {
             (base.add(pMatch) as *const usize).read_unaligned()
                 ^ (base.add(pIn) as *const usize).read_unaligned()
@@ -317,9 +319,7 @@ pub fn ZSTD_count(buf: &[u8], in_pos: usize, match_pos: usize, in_limit: usize) 
         }
         pIn += word;
         pMatch += word;
-        while pIn < inLoopLimit {
-            debug_assert!(pMatch + word <= buf.len());
-            debug_assert!(pIn + word <= buf.len());
+        while pIn < inLoopLimit && pIn + word <= buf.len() && pMatch + word <= buf.len() {
             let diff = unsafe {
                 (base.add(pMatch) as *const usize).read_unaligned()
                     ^ (base.add(pIn) as *const usize).read_unaligned()
@@ -336,6 +336,8 @@ pub fn ZSTD_count(buf: &[u8], in_pos: usize, match_pos: usize, in_limit: usize) 
     unsafe {
         if MEM_64bits() != 0
             && pIn + 3 < in_limit
+            && pIn + 4 <= buf.len()
+            && pMatch + 4 <= buf.len()
             && (base.add(pMatch) as *const u32).read_unaligned()
                 == (base.add(pIn) as *const u32).read_unaligned()
         {
@@ -343,13 +345,19 @@ pub fn ZSTD_count(buf: &[u8], in_pos: usize, match_pos: usize, in_limit: usize) 
             pMatch += 4;
         }
         if pIn + 1 < in_limit
+            && pIn + 2 <= buf.len()
+            && pMatch + 2 <= buf.len()
             && (base.add(pMatch) as *const u16).read_unaligned()
                 == (base.add(pIn) as *const u16).read_unaligned()
         {
             pIn += 2;
             pMatch += 2;
         }
-        if pIn < in_limit && *base.add(pMatch) == *base.add(pIn) {
+        if pIn < in_limit
+            && pIn < buf.len()
+            && pMatch < buf.len()
+            && *base.add(pMatch) == *base.add(pIn)
+        {
             pIn += 1;
         }
     }

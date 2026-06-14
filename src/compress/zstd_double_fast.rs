@@ -300,7 +300,10 @@ fn ZSTD_compressBlock_doubleFast_noDict_generic_mls<const MLS: u32>(
             // Mirrors upstream's `ZSTD_selectAddr(idxl0, prefixLow,
             // matchl0, dummy)` — the slice-indexing version emits a
             // bounds-check `cmp/jb` per read, defeating CMOV.
-            let long_match_valid = idxl0 > prefixStartIndex;
+            let long_match_valid = idxl0 > prefixStartIndex
+                && matchl0
+                    .checked_add(8)
+                    .is_some_and(|end| end <= iend && end <= src.len());
             let real_long_ptr = src.as_ptr().wrapping_add(matchl0);
             let dummy_long_ptr = dummy.as_ptr();
             let m_long_ptr = if long_match_valid {
@@ -334,7 +337,10 @@ fn ZSTD_compressBlock_doubleFast_noDict_generic_mls<const MLS: u32>(
             // pattern as the long-match above — bypasses the slice
             // bounds check on `&src[matchs0..]` so both reads can issue
             // unconditionally.
-            let short_match_valid = idxs0 > prefixStartIndex;
+            let short_match_valid = idxs0 > prefixStartIndex
+                && matchs0
+                    .checked_add(4)
+                    .is_some_and(|end| end <= iend && end <= src.len());
             let real_short_ptr = src.as_ptr().wrapping_add(matchs0);
             let dummy_short_ptr = dummy.as_ptr();
             let m_short_ptr = if short_match_valid {
@@ -355,6 +361,9 @@ fn ZSTD_compressBlock_doubleFast_noDict_generic_mls<const MLS: u32>(
                 let mut match_pos = matchs0;
 
                 if idxl1 > prefixStartIndex
+                    && matchl1
+                        .checked_add(8)
+                        .is_some_and(|end| end <= iend && end <= src.len())
                     && unsafe {
                         (src.as_ptr().wrapping_add(matchl1) as *const u64).read_unaligned()
                     } == unsafe {

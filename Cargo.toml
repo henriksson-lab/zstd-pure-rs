@@ -38,7 +38,7 @@ path = "src/bin/bench.rs"
 [features]
 default = ["std"]
 std = []
-cli = ["std", "dep:clap"]
+cli = ["std", "dep:clap", "mt"]
 # Enables multi-threaded compression path (zstdmt).
 mt = ["std", "dep:rayon"]
 

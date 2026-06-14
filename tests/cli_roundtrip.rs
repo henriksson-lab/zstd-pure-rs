@@ -737,6 +737,65 @@ fn cli_file_to_file_compress_then_decompress_roundtrip() {
 }
 
 #[test]
+fn cli_multithreaded_file_roundtrips_for_one_and_two_workers() {
+    use std::fs;
+
+    for (label, worker_args) in [
+        ("t1", vec!["-T1"]),
+        ("t2", vec!["-T2"]),
+        (
+            "t2_job_ovlog",
+            vec!["-T2", "--jobsize=512K", "--zstd=overlapLog=1"],
+        ),
+        ("t2_b_ovlog", vec!["-T2", "-B512K", "--zstd=ovlog=1"]),
+    ] {
+        let input_path = temp_path(&format!("mt_{label}_in"), "bin");
+        let compressed_path = temp_path(&format!("mt_{label}"), "zst");
+        let decompressed_path = temp_path(&format!("mt_{label}_out"), "bin");
+        let payload: Vec<u8> = (0usize..(2 * 1024 * 1024 + 333))
+            .map(|i| {
+                let mixed = i ^ (i >> 7) ^ (i.wrapping_mul(31));
+                b'A' + (mixed % 23) as u8
+            })
+            .collect();
+        fs::write(&input_path, &payload).expect("write mt input");
+
+        let comp = Command::new(bin_path())
+            .args(["-q", "-f"])
+            .args(worker_args)
+            .args(["-1", "-o"])
+            .arg(&compressed_path)
+            .arg(&input_path)
+            .stderr(Stdio::piped())
+            .output()
+            .unwrap();
+        assert!(
+            comp.status.success(),
+            "{label} compress stderr: {}",
+            String::from_utf8_lossy(&comp.stderr)
+        );
+
+        let dec = Command::new(bin_path())
+            .args(["-d", "-q", "-f", "-o"])
+            .arg(&decompressed_path)
+            .arg(&compressed_path)
+            .stderr(Stdio::piped())
+            .output()
+            .unwrap();
+        assert!(
+            dec.status.success(),
+            "{label} decompress stderr: {}",
+            String::from_utf8_lossy(&dec.stderr)
+        );
+        assert_eq!(fs::read(&decompressed_path).unwrap(), payload);
+
+        let _ = fs::remove_file(&input_path);
+        let _ = fs::remove_file(&compressed_path);
+        let _ = fs::remove_file(&decompressed_path);
+    }
+}
+
+#[test]
 fn cli_decompress_file_with_unknown_suffix_requires_explicit_output() {
     let tmp = std::env::temp_dir().join(format!("zstd_pure_unknown_suffix_{}", std::process::id()));
     let _ = fs::remove_dir_all(&tmp);
@@ -1185,12 +1244,7 @@ fn cli_existing_output_prompt_refuses_when_input_is_stdin() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(b"y\npayload")
-        .unwrap();
+    let _ = child.stdin.as_mut().unwrap().write_all(b"y\npayload");
     let out = child.wait_with_output().unwrap();
 
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -1872,12 +1926,7 @@ fn cli_multi_input_output_file_refuses_prompt_when_any_input_is_stdin() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(b"y\nsecond")
-        .unwrap();
+    let _ = child.stdin.as_mut().unwrap().write_all(b"y\nsecond");
     let out = child.wait_with_output().unwrap();
 
     let stderr = String::from_utf8_lossy(&out.stderr);

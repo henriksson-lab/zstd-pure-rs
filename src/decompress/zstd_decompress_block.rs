@@ -3625,7 +3625,7 @@ pub fn ZSTD_decompressBlock_internal_with_ext_history(
             history
         } else {
             let history_len = history.len().min(cap);
-            let dict_len = dctx.stream_dict.len().min(cap.saturating_sub(history_len));
+            let dict_len = dctx.stream_dict.len();
             let mut v = Vec::with_capacity(dict_len + history_len);
             v.extend_from_slice(&dctx.stream_dict[dctx.stream_dict.len() - dict_len..]);
             v.extend_from_slice(&history[history.len() - history_len..]);
@@ -3648,7 +3648,7 @@ pub fn ZSTD_decompressBlock_internal_with_ext_history(
         }
     } else {
         let history_len = dctx.historyBuffer.len().min(cap);
-        let dict_len = dctx.stream_dict.len().min(cap.saturating_sub(history_len));
+        let dict_len = dctx.stream_dict.len();
         let mut v = Vec::with_capacity(dict_len + history_len);
         v.extend_from_slice(&dctx.stream_dict[dctx.stream_dict.len() - dict_len..]);
         v.extend_from_slice(&dctx.historyBuffer[dctx.historyBuffer.len() - history_len..]);

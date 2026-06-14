@@ -763,7 +763,15 @@ pub fn ZSTD_ldm_generateSequences_internal(
                     } else {
                         cur.offset.saturating_sub(base_offset) as usize
                     };
+                    if (!match_in_dict && pMatch >= split_pos)
+                        || pMatch.saturating_add(minMatchLength) > window_buf.len()
+                    {
+                        continue;
+                    }
                     let matchEnd = if match_in_dict { dictEnd } else { iend_pos };
+                    if matchEnd > window_buf.len() || pMatch >= matchEnd {
+                        continue;
+                    }
                     let lowMatchPtr = if match_in_dict {
                         dictStart
                     } else {
@@ -795,6 +803,11 @@ pub fn ZSTD_ldm_generateSequences_internal(
                     (cur_fwd, cur_bwd)
                 } else {
                     let pMatch = cur.offset.saturating_sub(base_offset) as usize;
+                    if pMatch >= split_pos
+                        || pMatch.saturating_add(minMatchLength) > window_buf.len()
+                    {
+                        continue;
+                    }
                     let cur_fwd = ZSTD_count(window_buf, split_pos, pMatch, iend_pos);
                     if cur_fwd < minMatchLength {
                         continue;
@@ -1068,22 +1081,28 @@ pub fn ZSTD_ldm_blockCompress(
     src: &[u8],
     useRowMatchFinder: ZSTD_ParamSwitch_e,
 ) -> usize {
-    use crate::compress::match_state::ZSTD_matchState_dictMode;
+    use crate::compress::match_state::{
+        ZSTD_dictMode_e, ZSTD_matchState_dictMode, ZSTD_resolveRowMatchFinderMode,
+        ZSTD_rowMatchFinderUsed,
+    };
     use crate::compress::seq_store::{ZSTD_storeSeq, OFFSET_TO_OFFBASE};
     use crate::compress::zstd_compress::ZSTD_selectBlockCompressor;
+    use crate::compress::zstd_compress_sequences::{
+        ZSTD_btlazy2, ZSTD_dfast, ZSTD_fast, ZSTD_greedy, ZSTD_lazy, ZSTD_lazy2,
+    };
 
     let cParams = ms.cParams;
     let minMatch = cParams.minMatch;
-    let blockCompressor = ZSTD_selectBlockCompressor(
-        cParams.strategy,
-        useRowMatchFinder,
-        ZSTD_matchState_dictMode(ms),
-    );
     let istart = 0usize;
     let iend = src.len();
     let mut ip = istart;
 
     if cParams.strategy >= ZSTD_btopt {
+        let blockCompressor = ZSTD_selectBlockCompressor(
+            cParams.strategy,
+            useRowMatchFinder,
+            ZSTD_matchState_dictMode(ms),
+        );
         ms.ldmSeqStore = Some(rawSeqStore.clone());
         let lastLLSize = blockCompressor(ms, seqStore, rep, src);
         ms.ldmSeqStore = None;
@@ -1109,9 +1128,78 @@ pub fn ZSTD_ldm_blockCompress(
 
         let literal_start = ip;
         let literal_end = ip + sequence.litLength as usize;
-        ms.window.base_offset = block_base.wrapping_add(literal_start as u32);
-        let newLitLength = blockCompressor(ms, seqStore, rep, &src[literal_start..literal_end]);
-        ms.window.base_offset = block_base;
+        let newLitLength = match ZSTD_matchState_dictMode(ms) {
+            ZSTD_dictMode_e::ZSTD_noDict if cParams.strategy == ZSTD_fast => {
+                crate::compress::zstd_fast::ZSTD_compressBlock_fast_noDict_generic(
+                    ms,
+                    seqStore,
+                    rep,
+                    &src[..literal_end],
+                    literal_start,
+                    cParams.minMatch,
+                )
+            }
+            ZSTD_dictMode_e::ZSTD_noDict if cParams.strategy == ZSTD_dfast => {
+                crate::compress::zstd_double_fast::ZSTD_compressBlock_doubleFast_noDict_generic(
+                    ms,
+                    seqStore,
+                    rep,
+                    &src[..literal_end],
+                    literal_start,
+                    cParams.minMatch,
+                )
+            }
+            ZSTD_dictMode_e::ZSTD_noDict
+                if cParams.strategy == ZSTD_greedy
+                    || cParams.strategy == ZSTD_lazy
+                    || cParams.strategy == ZSTD_lazy2 =>
+            {
+                let searchMethod = if ZSTD_rowMatchFinderUsed(cParams.strategy, useRowMatchFinder) {
+                    crate::compress::zstd_lazy::searchMethod_e::search_rowHash
+                } else {
+                    crate::compress::zstd_lazy::searchMethod_e::search_hashChain
+                };
+                let depth = if cParams.strategy == ZSTD_greedy {
+                    0
+                } else if cParams.strategy == ZSTD_lazy {
+                    1
+                } else {
+                    2
+                };
+                crate::compress::zstd_lazy::ZSTD_compressBlock_lazy_generic_with_istart(
+                    ms,
+                    seqStore,
+                    rep,
+                    &src[..literal_end],
+                    literal_start,
+                    searchMethod,
+                    depth,
+                    ZSTD_dictMode_e::ZSTD_noDict,
+                )
+            }
+            ZSTD_dictMode_e::ZSTD_noDict if cParams.strategy == ZSTD_btlazy2 => {
+                crate::compress::zstd_lazy::ZSTD_compressBlock_btlazy2_window(
+                    ms,
+                    seqStore,
+                    rep,
+                    &src[..literal_end],
+                    literal_start,
+                    literal_end,
+                )
+            }
+            dictMode => {
+                let blockCompressor = ZSTD_selectBlockCompressor(
+                    cParams.strategy,
+                    ZSTD_resolveRowMatchFinderMode(useRowMatchFinder, &cParams),
+                    dictMode,
+                );
+                let saved_base = ms.window.base_offset;
+                ms.window.base_offset = block_base.wrapping_add(literal_start as u32);
+                let rc = blockCompressor(ms, seqStore, rep, &src[literal_start..literal_end]);
+                ms.window.base_offset = saved_base;
+                rc
+            }
+        };
         if crate::common::error::ERR_isError(newLitLength) {
             return newLitLength;
         }
@@ -1131,10 +1219,73 @@ pub fn ZSTD_ldm_blockCompress(
 
     ZSTD_ldm_limitTableUpdate(ms, block_base.wrapping_add(ip as u32));
     ZSTD_ldm_fillFastTables(ms, &src[..ip]);
-    ms.window.base_offset = block_base.wrapping_add(ip as u32);
-    let lastLLSize = blockCompressor(ms, seqStore, rep, &src[ip..]);
-    ms.window.base_offset = block_base;
-    lastLLSize
+    match ZSTD_matchState_dictMode(ms) {
+        ZSTD_dictMode_e::ZSTD_noDict if cParams.strategy == ZSTD_fast => {
+            crate::compress::zstd_fast::ZSTD_compressBlock_fast_noDict_generic(
+                ms,
+                seqStore,
+                rep,
+                src,
+                ip,
+                cParams.minMatch,
+            )
+        }
+        ZSTD_dictMode_e::ZSTD_noDict if cParams.strategy == ZSTD_dfast => {
+            crate::compress::zstd_double_fast::ZSTD_compressBlock_doubleFast_noDict_generic(
+                ms,
+                seqStore,
+                rep,
+                src,
+                ip,
+                cParams.minMatch,
+            )
+        }
+        ZSTD_dictMode_e::ZSTD_noDict
+            if cParams.strategy == ZSTD_greedy
+                || cParams.strategy == ZSTD_lazy
+                || cParams.strategy == ZSTD_lazy2 =>
+        {
+            let searchMethod = if ZSTD_rowMatchFinderUsed(cParams.strategy, useRowMatchFinder) {
+                crate::compress::zstd_lazy::searchMethod_e::search_rowHash
+            } else {
+                crate::compress::zstd_lazy::searchMethod_e::search_hashChain
+            };
+            let depth = if cParams.strategy == ZSTD_greedy {
+                0
+            } else if cParams.strategy == ZSTD_lazy {
+                1
+            } else {
+                2
+            };
+            crate::compress::zstd_lazy::ZSTD_compressBlock_lazy_generic_with_istart(
+                ms,
+                seqStore,
+                rep,
+                src,
+                ip,
+                searchMethod,
+                depth,
+                ZSTD_dictMode_e::ZSTD_noDict,
+            )
+        }
+        ZSTD_dictMode_e::ZSTD_noDict if cParams.strategy == ZSTD_btlazy2 => {
+            crate::compress::zstd_lazy::ZSTD_compressBlock_btlazy2_window(
+                ms, seqStore, rep, src, ip, iend,
+            )
+        }
+        dictMode => {
+            let blockCompressor = ZSTD_selectBlockCompressor(
+                cParams.strategy,
+                ZSTD_resolveRowMatchFinderMode(useRowMatchFinder, &cParams),
+                dictMode,
+            );
+            let saved_base = ms.window.base_offset;
+            ms.window.base_offset = block_base.wrapping_add(ip as u32);
+            let rc = blockCompressor(ms, seqStore, rep, &src[ip..]);
+            ms.window.base_offset = saved_base;
+            rc
+        }
+    }
 }
 
 #[cfg(test)]

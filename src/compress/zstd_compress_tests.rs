@@ -875,6 +875,53 @@ fn endstream_roundtrip_with_nbworkers_and_refprefix() {
 
 #[cfg(feature = "mt")]
 #[test]
+fn endstream_with_nbworkers_and_refcdict_preserves_cdict_binding() {
+    use crate::decompress::zstd_ddict::ZSTD_createDDict;
+    use crate::decompress::zstd_decompress::{ZSTD_decompress, ZSTD_decompress_usingDDict};
+    use crate::decompress::zstd_decompress_block::ZSTD_DCtx;
+
+    let dict = b"mt-cdict-required-history token alpha beta gamma delta ".repeat(64);
+    let cdict = ZSTD_createCDict(&dict, 3).expect("cdict");
+    let ddict = ZSTD_createDDict(&dict).expect("ddict");
+    let src = b"token alpha beta gamma delta mt-cdict-required-history ".repeat(4000);
+
+    let mut cctx = ZSTD_createCCtx().unwrap();
+    assert_eq!(
+        ZSTD_CCtx_setParameter(&mut cctx, ZSTD_cParameter::ZSTD_c_nbWorkers, 2),
+        2
+    );
+    assert_eq!(ZSTD_initCStream_usingCDict(&mut cctx, &cdict), 0);
+
+    let mut compressed = vec![0u8; ZSTD_compressBound(src.len())];
+    let mut cp = 0usize;
+    let mut ip = 0usize;
+    let rc = ZSTD_compressStream2(
+        &mut cctx,
+        &mut compressed,
+        &mut cp,
+        &src,
+        &mut ip,
+        ZSTD_EndDirective::ZSTD_e_end,
+    );
+    assert_eq!(rc, 0);
+    compressed.truncate(cp);
+
+    let mut no_dict_decoded = vec![0u8; src.len() + 16];
+    let no_dict = ZSTD_decompress(&mut no_dict_decoded, &compressed);
+    assert!(
+        ERR_isError(no_dict),
+        "MT endStream fallback dropped the referenced CDict; frame decoded without a dictionary"
+    );
+
+    let mut dctx = ZSTD_DCtx::new();
+    let mut decoded = vec![0u8; src.len() + 16];
+    let d = ZSTD_decompress_usingDDict(&mut dctx, &mut decoded, &compressed, &ddict);
+    assert!(!ERR_isError(d), "decompress err={d:#x}");
+    assert_eq!(&decoded[..d], &src[..]);
+}
+
+#[cfg(feature = "mt")]
+#[test]
 fn compresscctx_roundtrip_with_nbworkers_and_attached_pool() {
     use crate::decompress::zstd_decompress::ZSTD_decompress;
 

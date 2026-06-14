@@ -39,45 +39,45 @@ Features working:
 - One-shot compression: `ZSTD_compress(level)`, `ZSTD_compressCCtx`, `ZSTD_compressBound`.
 - One-shot decompression: `ZSTD_decompress`, `ZSTD_decompressDCtx`, `ZSTD_findFrameCompressedSize`, `ZSTD_getFrameContentSize`.
 - Raw-content dictionaries: `ZSTD_compress_usingDict` / `ZSTD_decompress_usingDict` + CDict/DDict wrappers.
-- Buffered streaming compatibility wrappers: `ZSTD_initCStream` / `ZSTD_compressStream` / `ZSTD_endStream`, unified `ZSTD_compressStream2` + `ZSTD_EndDirective`, symmetric decompression, `ZSTD_CCtx_setPledgedSrcSize`, dict variants (`ZSTD_initCStream_usingDict` + `ZSTD_initDStream_usingDict`). Compression buffers input until `endStream`; block-by-block flush semantics are not yet equivalent to upstream.
+- Buffered streaming compatibility wrappers: `ZSTD_initCStream` / `ZSTD_compressStream` / `ZSTD_endStream`, unified `ZSTD_compressStream2` + `ZSTD_EndDirective`, symmetric decompression, `ZSTD_CCtx_setPledgedSrcSize`, dict variants (`ZSTD_initCStream_usingDict` + `ZSTD_initDStream_usingDict`). No-dictionary multithreaded compression feeds the translated zstdmt scheduler incrementally when `ZSTD_c_nbWorkers > 0`; dictionary/prefix MT streaming still falls back to the existing buffered-compatible paths until those boundaries are audited.
 - Parametric API: `ZSTD_cParameter` / `ZSTD_dParameter` + `ZSTD_CCtx_setParameter` / `ZSTD_DCtx_setParameter`, reset directives, parameter-bounds queries (`ZSTD_cParam_getBounds` / `ZSTD_dParam_getBounds`).
 - Memory estimation: `ZSTD_estimateCCtxSize{,_usingCParams}`, `ZSTD_estimateDCtxSize`, `ZSTD_estimateDStreamSize{,_fromFrame}`, `ZSTD_sizeof_CCtx` / `ZSTD_sizeof_DCtx`.
 - Frame parameters: content-size flag, XXH64 checksum trailer, multi-block frames crossing the 128 KB boundary.
 - Strategies 1–9 (fast, dfast, greedy, lazy, lazy2, btlazy2, btopt, btultra, btultra2), including no-dict, ext-dict, dict-match-state, row-hash, and LDM-assisted optimal-parser paths.
-- CLI (`cargo build --release --features cli`) with `-d/-c/-f/-q/-v/-o/-D/--check/--no-check/--magicless` flags, upstream-style level flags such as `-1` and `-19`, local `-L/--level` level selection, buffered stdin/stdout support, file-argument handling with `.zst`/`.zstd` extension inference and unknown-suffix rejection unless `-c`/`-o` is explicit, last-wins `-c`/`-o` and `--check`/`--no-check` handling, decode-side checksum validation when present, decode-side `--no-check`, `-d -c -f` stdout pass-through for unrecognized input, and multi-input `-o` rejection.
+- CLI (`cargo build --release --features cli`) with `-d/-c/-f/-q/-v/-o/-D/-T/--threads/--single-thread/--jobsize/-B/--zstd=overlapLog=/--zstd=ovlog=/--check/--no-check/--magicless` flags, upstream-style level flags such as `-1` and `-19`, local `-L/--level` level selection, buffered stdin/stdout support, file-argument handling with `.zst`/`.zstd` extension inference and unknown-suffix rejection unless `-c`/`-o` is explicit, last-wins `-c`/`-o` and `--check`/`--no-check` handling, decode-side checksum validation when present, decode-side `--no-check`, `-d -c -f` stdout pass-through for unrecognized input, and multi-input `-o` rejection.
 
 The main v1.6 `zstd.h` `ZSTD_` entry points and many experimental helpers, including translated helpers such as `ZSTD_compressSequencesAndLiterals`, are surfaced through `zstd_pure_rs::prelude::*`, but lower-level `HUF_` and `FSE_` helpers remain in their module namespaces unless explicitly re-exported there. Some parameter IDs and edge APIs remain intentionally unsupported and return the matching error codes. The current C→Rust function-name coverage backlog is closed for both compression and decompression under `code-complexity-comparator`; remaining gaps are mostly verification breadth, performance/shape differences from safe scalar factoring, unsupported parameter variants, and CLI flag completeness. Magic-prefix dictionary entropy **decode** is live via `ZSTD_DCtx_loadDictionary` / `ZSTD_decompress_insertDictionary` / `ZSTD_loadDEntropy`, and DDict full-dictionary entropy is copied into DCtx state when attached. Focused follow-up notes live in `TODO.md`; the full C → Rust function mapping lives in `FUNCTIONS.md`.
 
-Test suite status as of the latest local audit run: `cargo test --features cli` passes. That includes the focused CLI integration suite, regular library/API unit tests, doc tests, and integration tests. The CLI suite covers file/stdin/stdout behavior, cross-compatibility cases that run only when upstream `zstd` is on `PATH`, boundary-size and multi-block regressions, end-to-end `--magicless` roundtrips, last-wins `-c`/`-o` and `--check`/`--no-check`, `-N` and clustered level flags, decode-side `--no-check`, no-suffix output rejection before decode, attached `-Ddict` rejection, `-d -c -f` stdout pass-through for unrecognized input, and multi-input `-o` rejection.
+Test suite status as of the latest local audit run: `cargo test --features cli` passes. That includes 1117 library tests, the 26-test zstd binary suite, 100 CLI roundtrip tests, integration fixtures, real-data and upstream-golden suites, and doctests. The CLI suite covers file/stdin/stdout behavior, cross-compatibility cases that run only when upstream `zstd` is on `PATH`, boundary-size and multi-block regressions, end-to-end `--magicless` roundtrips, last-wins `-c`/`-o` and `--check`/`--no-check`, `-N` and clustered level flags, decode-side `--no-check`, no-suffix output rejection before decode, attached `-Ddict` rejection, `-d -c -f` stdout pass-through for unrecognized input, multithreaded `-T1`/`-T2` file roundtrips, hidden MT `--jobsize`/`-B` and `--zstd=overlapLog`/`--zstd=ovlog` parsing, and multi-input `-o` rejection.
 
 ## Local benchmark snapshot
 
-Measured 2026-06-13 on Linux 6.8 x86_64, Intel Xeon Gold 6138, `rustc 1.92.0`, release build from `cargo build --release --features cli`. The original comparator is the vendored upstream `zstd/programs/zstd` reporting `v1.6.0`. Input was the deterministic 311,951,360-byte `.tmp/bench/realistic_5x.tar` corpus, built from the public Silesia corpus plus enwik8 Wikipedia text as distinct files in a tar archive. Throughput uses decimal MB/s and elapsed time from one run per level. RSS is GNU `/usr/bin/time` maximum resident set size from the same run. Levels 20-22 were run with `--ultra` for both binaries. This is a local status snapshot, not a guarantee.
+Measured 2026-06-14 on Linux 6.8 x86_64, Intel Xeon Gold 6138, `rustc 1.92.0`, release build from `cargo build --release --features cli`. The original comparator is the vendored upstream `zstd/programs/zstd` reporting `v1.6.0`. Input was the deterministic 311,951,360-byte `.tmp/bench/realistic_5x.tar` corpus, built from the public Silesia corpus plus enwik8 Wikipedia text as distinct files in a tar archive. Throughput uses decimal MB/s and elapsed time from one run per level. RSS is GNU `/usr/bin/time` maximum resident set size from the same run. Levels 20-22 were run with `--ultra` for both binaries. This is a local status snapshot, not a guarantee.
 
 | Level | Rust speed | Original speed | Rust / original | Rust RSS | Original RSS | Rust size | Original size | Two-way decode |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :---: |
-| 1 | 130.0 MB/s | 820.9 MB/s | 0.16x | 5.3 MiB | 25.9 MiB | 113,894,156 | 113,945,914 | pass |
-| 2 | 112.2 MB/s | 649.9 MB/s | 0.17x | 5.9 MiB | 46.9 MiB | 106,672,917 | 106,796,772 | pass |
-| 3 | 92.6 MB/s | 465.6 MB/s | 0.20x | 7.5 MiB | 81.6 MiB | 101,719,022 | 101,676,160 | pass |
-| 4 | 81.4 MB/s | 399.9 MB/s | 0.20x | 8.8 MiB | 85.6 MiB | 99,809,816 | 99,857,954 | pass |
-| 5 | 54.9 MB/s | 271.3 MB/s | 0.20x | 9.1 MiB | 87.2 MiB | 96,611,606 | 96,617,715 | pass |
-| 6 | 42.8 MB/s | 203.9 MB/s | 0.21x | 9.1 MiB | 88.8 MiB | 94,019,853 | 94,043,466 | pass |
-| 7 | 37.7 MB/s | 153.7 MB/s | 0.25x | 11.6 MiB | 96.9 MiB | 92,398,290 | 92,516,005 | pass |
-| 8 | 29.2 MB/s | 136.8 MB/s | 0.21x | 71.6 MiB | 96.2 MiB | 91,470,937 | 91,491,427 | pass |
-| 9 | 27.7 MB/s | 113.4 MB/s | 0.24x | 74.4 MiB | 188.1 MiB | 90,325,984 | 90,301,620 | pass |
-| 10 | 20.3 MB/s | 83.0 MB/s | 0.24x | 84.7 MiB | 227.8 MiB | 89,181,962 | 89,194,111 | pass |
-| 11 | 15.2 MB/s | 61.2 MB/s | 0.25x | 84.4 MiB | 227.5 MiB | 88,556,940 | 88,580,173 | pass |
-| 12 | 14.4 MB/s | 57.9 MB/s | 0.25x | 104.7 MiB | 307.2 MiB | 88,422,454 | 88,456,447 | pass |
-| 13 | 8.0 MB/s | 25.2 MB/s | 0.32x | 96.6 MiB | 274.4 MiB | 87,825,668 | 87,827,852 | pass |
-| 14 | 6.2 MB/s | 19.1 MB/s | 0.32x | 112.5 MiB | 338.8 MiB | 87,239,542 | 87,254,148 | pass |
-| 15 | 4.5 MB/s | 15.2 MB/s | 0.30x | 128.4 MiB | 402.2 MiB | 86,470,305 | 86,569,224 | pass |
-| 16 | 3.1 MB/s | 12.2 MB/s | 0.26x | 413.4 MiB | 274.4 MiB | 83,699,846 | 83,765,173 | pass |
-| 17 | 2.3 MB/s | 7.6 MB/s | 0.30x | 427.2 MiB | 462.5 MiB | 81,880,391 | 81,931,719 | pass |
-| 18 | 2.0 MB/s | 7.0 MB/s | 0.29x | 427.5 MiB | 466.9 MiB | 80,594,281 | 80,635,069 | pass |
-| 19 | 1.8 MB/s | 5.6 MB/s | 0.32x | 459.1 MiB | 593.8 MiB | 79,759,165 | 79,773,363 | pass |
-| 20 | 1.6 MB/s | 3.7 MB/s | 0.45x | 537.8 MiB | 857.2 MiB | 78,338,451 | 78,354,300 | pass |
-| 21 | 1.5 MB/s | 2.0 MB/s | 0.75x | 697.2 MiB | 1015.3 MiB | 77,743,280 | 77,754,755 | pass |
-| 22 | 1.3 MB/s | 1.5 MB/s | 0.89x | 1017.2 MiB | 1089.7 MiB | 77,500,010 | 77,506,752 | pass |
+| 1 | 678.2 MB/s | 866.5 MB/s | 0.78x | 56.3 MiB | 25.3 MiB | 113,940,911 | 113,945,914 | pass |
+| 2 | 503.1 MB/s | 742.7 MB/s | 0.68x | 104.7 MiB | 45.9 MiB | 106,787,160 | 106,796,772 | pass |
+| 3 | 331.9 MB/s | 479.9 MB/s | 0.69x | 185.5 MiB | 84.1 MiB | 101,629,585 | 101,676,160 | pass |
+| 4 | 294.3 MB/s | 415.9 MB/s | 0.71x | 192.0 MiB | 85.0 MiB | 99,814,657 | 99,857,954 | pass |
+| 5 | 202.6 MB/s | 271.3 MB/s | 0.75x | 220.5 MiB | 85.6 MiB | 96,772,294 | 96,617,715 | pass |
+| 6 | 158.4 MB/s | 196.2 MB/s | 0.81x | 220.5 MiB | 86.2 MiB | 94,220,828 | 94,043,466 | pass |
+| 7 | 136.8 MB/s | 170.5 MB/s | 0.80x | 241.6 MiB | 95.3 MiB | 92,732,784 | 92,516,005 | pass |
+| 8 | 106.5 MB/s | 139.9 MB/s | 0.76x | 250.1 MiB | 95.9 MiB | 91,807,310 | 91,491,427 | pass |
+| 9 | 89.9 MB/s | 106.5 MB/s | 0.84x | 492.8 MiB | 187.8 MiB | 90,564,509 | 90,301,620 | pass |
+| 10 | 65.3 MB/s | 84.1 MB/s | 0.78x | 577.1 MiB | 227.5 MiB | 89,499,884 | 89,194,111 | pass |
+| 11 | 46.6 MB/s | 58.2 MB/s | 0.80x | 575.9 MiB | 227.2 MiB | 88,904,223 | 88,580,173 | pass |
+| 12 | 42.0 MB/s | 53.4 MB/s | 0.79x | 727.7 MiB | 307.2 MiB | 88,787,023 | 88,456,447 | pass |
+| 13 | 19.4 MB/s | 24.1 MB/s | 0.81x | 583.4 MiB | 273.8 MiB | 87,779,883 | 87,827,852 | pass |
+| 14 | 17.2 MB/s | 20.8 MB/s | 0.83x | 695.9 MiB | 339.4 MiB | 87,206,504 | 87,254,148 | pass |
+| 15 | 14.5 MB/s | 15.8 MB/s | 0.92x | 792.2 MiB | 402.8 MiB | 86,522,089 | 86,569,224 | pass |
+| 16 | 10.4 MB/s | 13.0 MB/s | 0.80x | 635.0 MiB | 273.4 MiB | 83,902,077 | 83,765,173 | pass |
+| 17 | 7.4 MB/s | 8.5 MB/s | 0.87x | 1072.1 MiB | 464.7 MiB | 82,056,260 | 81,931,719 | pass |
+| 18 | 5.5 MB/s | 6.3 MB/s | 0.88x | 1083.0 MiB | 465.0 MiB | 80,732,364 | 80,635,069 | pass |
+| 19 | 4.2 MB/s | 5.0 MB/s | 0.85x | 1369.8 MiB | 591.6 MiB | 79,868,593 | 79,773,363 | pass |
+| 20 | 2.9 MB/s | 3.1 MB/s | 0.95x | 1625.4 MiB | 854.4 MiB | 78,439,964 | 78,354,300 | pass |
+| 21 | 1.4 MB/s | 1.9 MB/s | 0.74x | 1817.2 MiB | 1015.3 MiB | 77,842,787 | 77,754,755 | pass |
+| 22 | 1.2 MB/s | 1.4 MB/s | 0.87x | 1456.6 MiB | 1089.4 MiB | 77,598,139 | 77,506,752 | pass |
 
 Rust-compressed and original-compressed frames are generally **not byte-identical**. On this larger mixed corpus, upstream decoded each Rust frame back to the original input at every level 1-22, and the Rust decoder accepted each upstream frame back to the original input at every level 1-22. This snapshot was regenerated after fixing decoder repeat-offset initialization. A larger 466,432,000-byte repeat corpus gives a less noisy decompression comparison: Rust file-output median 1665.8 MB/s / 5.0 MiB RSS versus original median 1504.6 MB/s / 4.4 MiB. In test mode (`-t`, no output), Rust now streams at 6663.3 MB/s / 5.0 MiB RSS versus original 5830.4 MB/s / 4.4 MiB RSS; before the streaming test-mode fix, Rust `-t` staged the whole 466 MB output and reached about 458 MiB RSS. The CLI decompression path now uses the decoder's history-backed streaming path for frames up to a 4 MiB window and uses the whole-buffer decoder above that until high-window streaming history is audited.
 

@@ -383,6 +383,13 @@ const fn STREAM_ACCUMULATOR_MIN() -> u32 {
 ///
 /// The returned `usize` is the size of the emitted bitstream, or an
 /// error code (via `ERR_isError`).
+///
+/// Upstream marks this `FORCE_INLINE_TEMPLATE` so the body can be
+/// monomorphized into both the scalar `_default` and the BMI2-targeted
+/// `_bmi2` callers; `#[inline(always)]` is the faithful mapping and is
+/// also what lets the `#[target_feature(enable = "bmi1,bmi2,lzcnt")]`
+/// wrapper actually emit BZHI/SHLX codegen for the bit packing.
+#[inline(always)]
 pub fn ZSTD_encodeSequences_body(
     dst: &mut [u8],
     CTable_MatchLength: &[FSE_CTable],
@@ -549,8 +556,9 @@ pub fn ZSTD_encodeSequences_body(
     streamSize
 }
 
-/// Port of `ZSTD_encodeSequences`. BMI2 variant is a no-op dispatch in
-/// upstream's scalar build — we collapse to a single body call.
+/// Port of `ZSTD_encodeSequences_default` — the scalar entry point;
+/// forwards straight to the (force-inlined) body with no target-feature
+/// specialization.
 #[allow(clippy::too_many_arguments)]
 pub fn ZSTD_encodeSequences_default(
     dst: &mut [u8],
@@ -578,9 +586,52 @@ pub fn ZSTD_encodeSequences_default(
     )
 }
 
+/// Rust-only helper: BMI2-targeted body of `ZSTD_encodeSequences`.
+/// Upstream's `BMI2_TARGET_ATTRIBUTE` compiles the inlined
+/// `ZSTD_encodeSequences_body` with `bmi2` enabled so the per-symbol
+/// bit packing (`BIT_getLowerBits`'s `& mask`, the variable
+/// `<< bitPos` shift) lowers to BZHI/SHLX rather than branchy scalar
+/// masking. We reproduce that with `#[target_feature]`; because the
+/// body and every `BIT_*`/`FSE_*` callee it touches are
+/// `#[inline(always)]`, the whole hot loop is monomorphized under the
+/// enabled features.
+///
+/// SAFETY: caller must have verified `bmi1`+`bmi2`+`lzcnt` are present
+/// at runtime (the `ZSTD_encodeSequences_bmi2` dispatcher does this).
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+#[target_feature(enable = "bmi1,bmi2,lzcnt")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn ZSTD_encodeSequences_body_bmi2_impl(
+    dst: &mut [u8],
+    CTable_MatchLength: &[FSE_CTable],
+    mlCodeTable: &[u8],
+    CTable_OffsetBits: &[FSE_CTable],
+    ofCodeTable: &[u8],
+    CTable_LitLength: &[FSE_CTable],
+    llCodeTable: &[u8],
+    sequences: &[SeqDef],
+    nbSeq: usize,
+    longOffsets: i32,
+) -> usize {
+    ZSTD_encodeSequences_body(
+        dst,
+        CTable_MatchLength,
+        mlCodeTable,
+        CTable_OffsetBits,
+        ofCodeTable,
+        CTable_LitLength,
+        llCodeTable,
+        sequences,
+        nbSeq,
+        longOffsets,
+    )
+}
+
 /// Port of `ZSTD_encodeSequences_bmi2` (`zstd_compress_sequences.c:403`).
-/// In this pure-Rust build there is no alternate BMI2 body, so this
-/// is a one-shot alias of the default scalar path.
+/// Guarded by `DYNAMIC_BMI2` upstream; here it runtime-dispatches to the
+/// `#[target_feature(enable = "bmi1,bmi2,lzcnt")]` body when the CPU
+/// supports it and otherwise falls back to the scalar default. Output is
+/// bitwise-identical either way — only instruction selection differs.
 #[allow(clippy::too_many_arguments)]
 pub fn ZSTD_encodeSequences_bmi2(
     dst: &mut [u8],
@@ -594,6 +645,28 @@ pub fn ZSTD_encodeSequences_bmi2(
     nbSeq: usize,
     longOffsets: i32,
 ) -> usize {
+    #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+    {
+        if std::is_x86_feature_detected!("bmi1")
+            && std::is_x86_feature_detected!("bmi2")
+            && std::is_x86_feature_detected!("lzcnt")
+        {
+            return unsafe {
+                ZSTD_encodeSequences_body_bmi2_impl(
+                    dst,
+                    CTable_MatchLength,
+                    mlCodeTable,
+                    CTable_OffsetBits,
+                    ofCodeTable,
+                    CTable_LitLength,
+                    llCodeTable,
+                    sequences,
+                    nbSeq,
+                    longOffsets,
+                )
+            };
+        }
+    }
     ZSTD_encodeSequences_default(
         dst,
         CTable_MatchLength,
@@ -608,8 +681,9 @@ pub fn ZSTD_encodeSequences_bmi2(
     )
 }
 
-/// Port of `ZSTD_encodeSequences`. BMI2 variant is a no-op dispatch in
-/// upstream's scalar build — we collapse to a single body call.
+/// Port of `ZSTD_encodeSequences`. Dispatches to the BMI2-targeted body
+/// when `bmi2 != 0` (the CCtx caches `ZSTD_cpuSupportsBmi2`), else the
+/// scalar default. Mirrors upstream's `DYNAMIC_BMI2` branch.
 #[allow(clippy::too_many_arguments)]
 pub fn ZSTD_encodeSequences(
     dst: &mut [u8],

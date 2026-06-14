@@ -125,9 +125,18 @@ pub fn ZSTD_getDictID_fromDDict(ddict: &ZSTD_DDict) -> u32 {
     ddict.dictID
 }
 
+/// Whether the dictionary carries precomputed entropy tables. Mirrors the
+/// `entropyPresent` field of the original opaque `ZSTD_DDict`.
 #[inline]
-pub(crate) fn ZSTD_DDict_entropyPresent(ddict: &ZSTD_DDict) -> u32 {
+pub fn ZSTD_DDict_entropyPresent(ddict: &ZSTD_DDict) -> u32 {
     ddict.entropyPresent
+}
+
+/// The full stored dictionary buffer (magic + dictID + entropy + content),
+/// as passed to `ZSTD_loadDEntropy`. Mirrors the original `dictBuffer` field.
+#[inline]
+pub fn ZSTD_DDict_dictBuffer(ddict: &ZSTD_DDict) -> &[u8] {
+    &ddict.dictBuffer
 }
 
 #[inline]

@@ -151,6 +151,7 @@ compile_error!(
 pub mod common;
 pub mod compress;
 pub mod decompress;
+pub mod dict_builder;
 
 pub use common::error::{ErrorCode, ZstdError};
 pub use common::mem::is_little_endian;
@@ -319,6 +320,8 @@ pub mod prelude {
         ZSTD_dedicatedDictSearch_isSupported, ZSTD_dedicatedDictSearch_revertCParams,
         ZSTD_dictAndWindowLog,
     };
+    // Dictionary trainer (fastcover).
+    pub use crate::dict_builder::train_from_buffer;
     // One-shot + streaming decompression.
     pub use crate::decompress::zstd_decompress::{
         ZSTD_DCtx, ZSTD_DCtx_getParameter, ZSTD_DCtx_loadDictionary,

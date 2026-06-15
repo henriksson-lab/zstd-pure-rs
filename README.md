@@ -4,7 +4,7 @@ A pure-Rust port of the [Zstandard (`zstd`)](https://github.com/facebook/zstd) c
 
 **Beware that translation is immature technology. Check that this crate works on your data to avoid data loss**
 
-* 2026-06-15: Another big audit. Getting closer to being a trustworthy but more testing needed
+* 2026-06-15: Getting closer to being a trustworthy but more testing needed. also need to translate cover.rs, zdict.rs, divsufsort.rs 
 * 2026-06-02: Big audit
 * 2026-04-27: Tested locally for core compression/decompression behavior. Treat performance and parity notes as status snapshots, not guarantees.
 * Some features out of scope. Contact if you need them

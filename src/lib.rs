@@ -145,7 +145,7 @@
 #[cfg(not(feature = "std"))]
 compile_error!(
     "zstd-pure-rs v0.1 requires the `std` feature (enabled by default). \
-     no_std support is a future goal; see TODO.md."
+     no_std support is a future goal."
 );
 
 pub mod common;
@@ -320,8 +320,14 @@ pub mod prelude {
         ZSTD_dedicatedDictSearch_isSupported, ZSTD_dedicatedDictSearch_revertCParams,
         ZSTD_dictAndWindowLog,
     };
-    // Dictionary trainer (fastcover).
-    pub use crate::dict_builder::train_from_buffer;
+    // Dictionary trainer (ZDICT: cover / fastCover / legacy).
+    pub use crate::dict_builder::{
+        ZDICT_addEntropyTablesFromBuffer, ZDICT_cover_params_t, ZDICT_fastCover_params_t,
+        ZDICT_finalizeDictionary, ZDICT_getDictHeaderSize, ZDICT_getDictID, ZDICT_getErrorName,
+        ZDICT_isError, ZDICT_legacy_params_t, ZDICT_optimizeTrainFromBuffer_cover,
+        ZDICT_optimizeTrainFromBuffer_fastCover, ZDICT_params_t, ZDICT_trainFromBuffer,
+        ZDICT_trainFromBuffer_cover, ZDICT_trainFromBuffer_fastCover, ZDICT_trainFromBuffer_legacy,
+    };
     // One-shot + streaming decompression.
     pub use crate::decompress::zstd_decompress::{
         ZSTD_DCtx, ZSTD_DCtx_getParameter, ZSTD_DCtx_loadDictionary,

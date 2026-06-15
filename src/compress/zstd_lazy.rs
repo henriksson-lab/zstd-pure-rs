@@ -3136,10 +3136,18 @@ pub fn ZSTD_DUBT_findBetterDictMatch(
 
         let use_prefix_byte = dictMatchIndex.wrapping_add(matchLength as u32) >= dictHighLimit;
         let matchByte = if use_prefix_byte {
+            // Upstream reads `(base + dictMatchIndex + dictIndexDelta)[matchLength]`,
+            // i.e. the byte at working index `dictMatchIndex + dictIndexDelta +
+            // matchLength`. Keep the whole computation in wrapping u32 (matching
+            // upstream's U32 index arithmetic) and cast to `usize` only at the
+            // end — folding `matchLength` in before the cast. Casting the
+            // (possibly transiently-negative) base-relative index to `usize`
+            // first and then adding `matchLength` overflowed past 2^32.
             let prefixPos = dictMatchIndex
                 .wrapping_add(dictIndexDelta)
+                .wrapping_add(matchLength as u32)
                 .wrapping_sub(base_off) as usize;
-            src[prefixPos + matchLength]
+            src[prefixPos]
         } else {
             dictBase[dictMatchPos + matchLength]
         };

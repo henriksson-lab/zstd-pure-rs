@@ -1666,7 +1666,7 @@ pub fn ZSTD_optimalBlockSize(
     // strategies) thinking byChunks corrupted output. Bisection showed
     // the actual bug is a separate L5+ greedy/lazy corruption that
     // triggers on specific content past ~80 MB silesia and fires
-    // regardless of splitter choice — see TODO.md.)
+    // regardless of splitter choice.)
     const SPLIT_LEVELS: [i32; 10] = [0, 0, 1, 2, 2, 3, 3, 4, 4, 4];
 
     if src.len() < FULL_BLOCK || blockSizeMax < FULL_BLOCK {
@@ -6237,9 +6237,7 @@ pub fn ZSTD_initCDict_internal(
     params: ZSTD_CCtx_params,
 ) -> usize {
     use crate::common::mem::MEM_readLE32;
-    use crate::compress::zstd_fast::{
-        ZSTD_dictTableLoadMethod_e, ZSTD_fillHashTable, ZSTD_tableFillPurpose_e,
-    };
+    use crate::compress::zstd_fast::{ZSTD_dictTableLoadMethod_e, ZSTD_tableFillPurpose_e};
     use crate::decompress::zstd_ddict::ZSTD_dictContentType_e;
     use crate::decompress::zstd_decompress::ZSTD_MAGICNUMBER_DICTIONARY;
 
@@ -6288,15 +6286,25 @@ pub fn ZSTD_initCDict_internal(
     } else {
         cdict.dictID = 0;
         if !cdict.dictContent.is_empty() {
-            cdict.matchState.dictContent = cdict.dictContent.clone();
-            cdict.matchState.window.nextSrc = crate::compress::match_state::ZSTD_WINDOW_START_INDEX
-                .wrapping_add(cdict.dictContent.len() as u32);
-            ZSTD_fillHashTable(
+            // Mirror upstream `ZSTD_compress_insertDictionary` (rawContent
+            // path): fill whatever tables the strategy needs (e.g. the long
+            // hash table for dfast, the chain/tree for lazy/btopt), not just
+            // the short hash table. Calling `ZSTD_fillHashTable` alone left
+            // higher strategies under-indexed, so dictionary matches were
+            // mostly missed (see CDict attach/copy parity).
+            let dictContent = core::mem::take(&mut cdict.dictContent);
+            let load = ZSTD_loadDictionaryContent(
                 &mut cdict.matchState,
-                &cdict.dictContent,
+                None,
+                &params,
+                &dictContent,
                 ZSTD_dictTableLoadMethod_e::ZSTD_dtlm_full,
                 ZSTD_tableFillPurpose_e::ZSTD_tfp_forCDict,
             );
+            cdict.dictContent = dictContent;
+            if ERR_isError(load) {
+                return load;
+            }
         }
     }
     0

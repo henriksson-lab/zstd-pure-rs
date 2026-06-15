@@ -1,653 +1,643 @@
-//! Pure-Rust zstd dictionary trainer (fastcover variant).
-//!
-//! Ported from the blosc2-pure-rs project, which previously carried this code
-//! while depending on this crate's primitives. It builds a zstd dictionary
-//! (magic header + entropy tables + content) from a set of training samples,
-//! matching the layout produced by upstream `ZDICT_trainFromBuffer`.
+//! Translation of `lib/dictBuilder/fastcover.c` (the fastCover dictionary
+//! trainer). The verbatim translation lives in [`fastcover_c`]; its public
+//! entry points are re-exported here.
 
-use crate::common::error::ERR_isError;
-use crate::common::xxhash::XXH64;
-use crate::compress::fse_compress::{FSE_normalizeCount, FSE_writeNCount};
-use crate::compress::huf_compress::{
-    HUF_buildCTable_wksp, HUF_writeCTable, HUF_CElt, HUF_CTABLE_WORKSPACE_SIZE_U32,
-};
-use crate::compress::zstd_compress::{
-    ZSTD_compressBegin_usingCDict_deprecated, ZSTD_compressBlock_deprecated, ZSTD_compressBound,
-    ZSTD_compress_usingCDict, ZSTD_createCCtx, ZSTD_createCDict, ZSTD_createCDict_advanced,
-    ZSTD_getParams, ZSTD_seqToCodes,
-};
-use crate::decompress::zstd_ddict::{ZSTD_dictContentType_e, ZSTD_dictLoadMethod_e};
-use crate::compress::zstd_hashes::ZSTD_hashPtr;
-use crate::common::bits::ZSTD_highbit32;
-use crate::decompress::zstd_decompress::ZSTD_MAGIC_DICTIONARY;
-use crate::decompress::zstd_decompress_block::{
-    LLFSELog, MLFSELog, MaxLL, MaxML, MaxOff, OffFSELog,
+pub use fastcover_c::{
+    ZDICT_optimizeTrainFromBuffer_fastCover, ZDICT_trainFromBuffer_fastCover,
 };
 
-/// Train a zstd dictionary from `samples_buffer` (the concatenated samples,
-/// each `sample_sizes[i]` bytes). `dict_capacity` is the maximum dictionary
-/// size to produce; `min_useful_dict` is the smallest dictionary considered
-/// worthwhile. Returns the serialized dictionary (starting with the zstd
-/// dictionary magic) or `None` if no useful dictionary could be built.
-pub fn train_from_buffer(
-    samples_buffer: &[u8],
-    sample_sizes: &[usize],
-    dict_capacity: usize,
-    min_useful_dict: usize,
-) -> Option<Vec<u8>> {
-    if dict_capacity < min_useful_dict || samples_buffer.is_empty() || sample_sizes.is_empty() {
-        return None;
-    }
+#[allow(dead_code)]
+#[allow(non_upper_case_globals)]
+pub mod fastcover_c {
+    use crate::common::error::{ErrorCode, ERROR};
+    use crate::compress::zstd_hashes::{ZSTD_hash6Ptr, ZSTD_hash8Ptr};
+    use crate::dict_builder::cover::{COVER_computeEpochs, COVER_segment_t, COVER_sum};
+    use crate::dict_builder::zdict::ZDICT_cover_params_t;
 
-    let samples_len = sample_sizes.iter().try_fold(0usize, |acc, &size| {
-        if size == 0 {
-            None
+    pub const FASTCOVER_MAX_SAMPLES_SIZE: usize = u32::MAX as usize; // 64-bit
+    pub const FASTCOVER_MAX_F: u32 = 31;
+    pub const FASTCOVER_MAX_ACCEL: usize = 10;
+    pub const FASTCOVER_DEFAULT_SPLITPOINT: f64 = 0.75;
+    pub const DEFAULT_F: u32 = 20;
+    pub const DEFAULT_ACCEL: u32 = 1;
+
+    /// Port of `FASTCOVER_hashPtrToIndex`. `p` must have >= 8 readable bytes.
+    #[inline]
+    unsafe fn FASTCOVER_hashPtrToIndex(p: *const u8, f: u32, d: u32) -> usize {
+        let slice = core::slice::from_raw_parts(p, 8);
+        if d == 6 {
+            ZSTD_hash6Ptr(slice, f)
         } else {
-            acc.checked_add(size)
+            ZSTD_hash8Ptr(slice, f)
         }
-    })?;
-    let target = dict_capacity.min(samples_len);
-    if target < min_useful_dict || samples_buffer.len() < samples_len {
-        return None;
     }
 
-    let content = zstd_fastcover_content(samples_buffer, sample_sizes, target, min_useful_dict)?;
-
-    let training_sample_count =
-        zstd_fastcover_training_count(sample_sizes).unwrap_or(sample_sizes.len());
-    let entropy_len = sample_sizes[..training_sample_count]
-        .iter()
-        .try_fold(0usize, |acc, &size| acc.checked_add(size))?;
-    let entropy_samples = &samples_buffer[..entropy_len];
-    let entropy_sample_sizes = &sample_sizes[..training_sample_count];
-    finalize_zstd_fallback_dict(
-        &content,
-        entropy_samples,
-        entropy_sample_sizes,
-        dict_capacity,
-        min_useful_dict,
-    )
-}
-
-#[derive(Clone, Copy)]
-struct FastCoverSegment {
-    begin: usize,
-    end: usize,
-    score: u32,
-}
-
-fn zstd_fastcover_content(
-    samples_buffer: &[u8],
-    sample_sizes: &[usize],
-    dict_capacity: usize,
-    min_useful_dict: usize,
-) -> Option<Vec<u8>> {
-    const D: usize = 8;
-    const DEFAULT_K_CANDIDATES: [usize; 5] = [50, 537, 1024, 1511, 1998];
-
-    if dict_capacity < min_useful_dict || sample_sizes.len() < 5 {
-        return None;
-    }
-    let training_sample_count = sample_sizes.len() * 3 / 4;
-    if training_sample_count < 5 || training_sample_count >= sample_sizes.len() {
-        return None;
-    }
-    let mut offsets = Vec::with_capacity(sample_sizes.len() + 1);
-    offsets.push(0usize);
-    for &size in sample_sizes {
-        offsets.push(offsets.last()?.checked_add(size)?);
-    }
-    let total_size = offsets[training_sample_count];
-    if *offsets.last()? > samples_buffer.len() || total_size < D {
-        return None;
+    /// Port of `FASTCOVER_accel_t`.
+    #[derive(Clone, Copy, Default)]
+    pub struct FASTCOVER_accel_t {
+        pub finalize: u32,
+        pub skip: u32,
     }
 
-    let nb_dmers = total_size.checked_sub(D)?.checked_add(1)?;
-    let mut best = Vec::new();
-    let mut best_score = usize::MAX;
-    let training_offsets = &offsets[..=training_sample_count];
-    let entropy_samples = &samples_buffer[..total_size];
-    for k in DEFAULT_K_CANDIDATES
-        .into_iter()
-        .filter(|&k| k >= D && k <= dict_capacity)
-    {
-        let Some(candidate) = fastcover_build_dictionary(
-            samples_buffer,
-            training_offsets,
-            nb_dmers,
-            k,
-            dict_capacity,
-        ) else {
-            continue;
+    /// Port of `FASTCOVER_defaultAccelParameters`.
+    pub static FASTCOVER_defaultAccelParameters: [FASTCOVER_accel_t; FASTCOVER_MAX_ACCEL + 1] = [
+        FASTCOVER_accel_t { finalize: 100, skip: 0 }, // accel = 0 (defaults to 1)
+        FASTCOVER_accel_t { finalize: 100, skip: 0 }, // accel = 1
+        FASTCOVER_accel_t { finalize: 50, skip: 1 },
+        FASTCOVER_accel_t { finalize: 34, skip: 2 },
+        FASTCOVER_accel_t { finalize: 25, skip: 3 },
+        FASTCOVER_accel_t { finalize: 20, skip: 4 },
+        FASTCOVER_accel_t { finalize: 17, skip: 5 },
+        FASTCOVER_accel_t { finalize: 14, skip: 6 },
+        FASTCOVER_accel_t { finalize: 13, skip: 7 },
+        FASTCOVER_accel_t { finalize: 11, skip: 8 },
+        FASTCOVER_accel_t { finalize: 10, skip: 9 },
+    ];
+
+    /// Port of `FASTCOVER_ctx_t`.
+    pub struct FASTCOVER_ctx_t {
+        pub samples: *const u8,
+        pub offsets: Vec<usize>,
+        pub samplesSizes: *const usize,
+        pub nbSamples: usize,
+        pub nbTrainSamples: usize,
+        pub nbTestSamples: usize,
+        pub nbDmers: usize,
+        pub freqs: Vec<u32>,
+        pub d: u32,
+        pub f: u32,
+        pub accelParams: FASTCOVER_accel_t,
+        pub displayLevel: i32,
+    }
+
+    impl Default for FASTCOVER_ctx_t {
+        fn default() -> Self {
+            FASTCOVER_ctx_t {
+                samples: core::ptr::null(),
+                offsets: Vec::new(),
+                samplesSizes: core::ptr::null(),
+                nbSamples: 0,
+                nbTrainSamples: 0,
+                nbTestSamples: 0,
+                nbDmers: 0,
+                freqs: Vec::new(),
+                d: 0,
+                f: 0,
+                accelParams: FASTCOVER_accel_t::default(),
+                displayLevel: 0,
+            }
+        }
+    }
+
+    /// Port of `FASTCOVER_selectSegment`.
+    pub fn FASTCOVER_selectSegment(
+        ctx: &FASTCOVER_ctx_t,
+        freqs: &mut [u32],
+        begin: u32,
+        end: u32,
+        parameters: ZDICT_cover_params_t,
+        segmentFreqs: &mut [u16],
+    ) -> COVER_segment_t {
+        let k = parameters.k;
+        let d = parameters.d;
+        let f = ctx.f;
+        let dmersInK = k - d + 1;
+
+        let mut bestSegment = COVER_segment_t {
+            begin: 0,
+            end: 0,
+            score: 0,
         };
-        let Some(score) = fastcover_candidate_score(
-            samples_buffer,
-            sample_sizes,
-            &offsets,
-            training_sample_count,
-            &candidate,
-            entropy_samples,
-            &sample_sizes[..training_sample_count],
-            dict_capacity,
-            min_useful_dict,
-        ) else {
-            continue;
+        let mut activeSegment = COVER_segment_t {
+            begin,
+            end: begin,
+            score: 0,
         };
-        if score < best_score {
-            best_score = score;
-            best = candidate;
+
+        while activeSegment.end < end {
+            let idx = unsafe { FASTCOVER_hashPtrToIndex(ctx.samples.add(activeSegment.end as usize), f, d) };
+            if segmentFreqs[idx] == 0 {
+                activeSegment.score += freqs[idx];
+            }
+            activeSegment.end += 1;
+            segmentFreqs[idx] += 1;
+            if activeSegment.end - activeSegment.begin == dmersInK + 1 {
+                let delIndex =
+                    unsafe { FASTCOVER_hashPtrToIndex(ctx.samples.add(activeSegment.begin as usize), f, d) };
+                segmentFreqs[delIndex] -= 1;
+                if segmentFreqs[delIndex] == 0 {
+                    activeSegment.score -= freqs[delIndex];
+                }
+                activeSegment.begin += 1;
+            }
+            if activeSegment.score > bestSegment.score {
+                bestSegment = activeSegment;
+            }
+        }
+
+        /* Zero out rest of segmentFreqs array */
+        while activeSegment.begin < end {
+            let delIndex =
+                unsafe { FASTCOVER_hashPtrToIndex(ctx.samples.add(activeSegment.begin as usize), f, d) };
+            segmentFreqs[delIndex] -= 1;
+            activeSegment.begin += 1;
+        }
+
+        {
+            let mut pos = bestSegment.begin;
+            while pos != bestSegment.end {
+                let i = unsafe { FASTCOVER_hashPtrToIndex(ctx.samples.add(pos as usize), f, d) };
+                freqs[i] = 0;
+                pos += 1;
+            }
+        }
+
+        bestSegment
+    }
+
+    /// Port of `FASTCOVER_checkParameters`.
+    pub fn FASTCOVER_checkParameters(
+        parameters: ZDICT_cover_params_t,
+        maxDictSize: usize,
+        f: u32,
+        accel: u32,
+    ) -> i32 {
+        if parameters.d == 0 || parameters.k == 0 {
+            return 0;
+        }
+        if parameters.d != 6 && parameters.d != 8 {
+            return 0;
+        }
+        if parameters.k as usize > maxDictSize {
+            return 0;
+        }
+        if parameters.d > parameters.k {
+            return 0;
+        }
+        if f > FASTCOVER_MAX_F || f == 0 {
+            return 0;
+        }
+        if parameters.splitPoint <= 0.0 || parameters.splitPoint > 1.0 {
+            return 0;
+        }
+        if accel > 10 || accel == 0 {
+            return 0;
+        }
+        1
+    }
+
+    /// Port of `FASTCOVER_ctx_destroy`.
+    pub fn FASTCOVER_ctx_destroy(ctx: &mut FASTCOVER_ctx_t) {
+        ctx.freqs = Vec::new();
+        ctx.offsets = Vec::new();
+    }
+
+    /// Port of `FASTCOVER_computeFrequency`.
+    pub fn FASTCOVER_computeFrequency(freqs: &mut [u32], ctx: &FASTCOVER_ctx_t) {
+        let f = ctx.f;
+        let d = ctx.d;
+        let skip = ctx.accelParams.skip;
+        let readLength = core::cmp::max(d as usize, 8);
+        for i in 0..ctx.nbTrainSamples {
+            let mut start = ctx.offsets[i]; /* start of current dmer */
+            let currSampleEnd = ctx.offsets[i + 1];
+            while start + readLength <= currSampleEnd {
+                let dmerIndex = unsafe { FASTCOVER_hashPtrToIndex(ctx.samples.add(start), f, d) };
+                freqs[dmerIndex] += 1;
+                start = start + skip as usize + 1;
+            }
         }
     }
-    (!best.is_empty()).then_some(best)
-}
 
-#[allow(clippy::too_many_arguments)]
-fn fastcover_candidate_score(
-    samples_buffer: &[u8],
-    sample_sizes: &[usize],
-    offsets: &[usize],
-    test_sample_start: usize,
-    content: &[u8],
-    entropy_samples: &[u8],
-    entropy_sample_sizes: &[usize],
-    dict_capacity: usize,
-    min_useful_dict: usize,
-) -> Option<usize> {
-    let dict = finalize_zstd_fallback_dict(
-        content,
-        entropy_samples,
-        entropy_sample_sizes,
-        dict_capacity,
-        min_useful_dict,
-    )?;
-    let cdict = ZSTD_createCDict(&dict, 3)?;
-    let max_sample_size = sample_sizes[test_sample_start..].iter().copied().max()?;
-    let mut dst = vec![0u8; ZSTD_compressBound(max_sample_size)];
-    let mut cctx = ZSTD_createCCtx()?;
-    let mut score = dict.len();
-    for idx in test_sample_start..sample_sizes.len() {
-        let sample = &samples_buffer[offsets[idx]..offsets[idx + 1]];
-        let written = ZSTD_compress_usingCDict(&mut cctx, &mut dst, sample, &cdict);
-        if ERR_isError(written) {
-            return None;
+    /// Port of `FASTCOVER_ctx_init`. Returns 0 on success or an error code.
+    #[allow(clippy::too_many_arguments)]
+    pub fn FASTCOVER_ctx_init(
+        ctx: &mut FASTCOVER_ctx_t,
+        samples: &[u8],
+        samplesSizes: &[usize],
+        nbSamples: u32,
+        d: u32,
+        splitPoint: f64,
+        f: u32,
+        accelParams: FASTCOVER_accel_t,
+        displayLevel: i32,
+    ) -> usize {
+        let totalSamplesSize = COVER_sum(samplesSizes, nbSamples);
+        let nbTrainSamples = if splitPoint < 1.0 {
+            (nbSamples as f64 * splitPoint) as u32
+        } else {
+            nbSamples
+        };
+        let nbTestSamples = if splitPoint < 1.0 {
+            nbSamples - nbTrainSamples
+        } else {
+            nbSamples
+        };
+        let trainingSamplesSize = if splitPoint < 1.0 {
+            COVER_sum(samplesSizes, nbTrainSamples)
+        } else {
+            totalSamplesSize
+        };
+        let _testSamplesSize = if splitPoint < 1.0 {
+            COVER_sum(&samplesSizes[nbTrainSamples as usize..], nbTestSamples)
+        } else {
+            totalSamplesSize
+        };
+        ctx.displayLevel = displayLevel;
+
+        /* Checks */
+        if totalSamplesSize < core::cmp::max(d as usize, core::mem::size_of::<u64>())
+            || totalSamplesSize >= FASTCOVER_MAX_SAMPLES_SIZE
+        {
+            return ERROR(ErrorCode::SrcSizeWrong);
         }
-        score = score.checked_add(written)?;
+        if nbTrainSamples < 5 {
+            return ERROR(ErrorCode::SrcSizeWrong);
+        }
+        if nbTestSamples < 1 {
+            return ERROR(ErrorCode::SrcSizeWrong);
+        }
+
+        /* Zero the context (fresh) */
+        *ctx = FASTCOVER_ctx_t::default();
+        ctx.displayLevel = displayLevel;
+        ctx.samples = samples.as_ptr();
+        ctx.samplesSizes = samplesSizes.as_ptr();
+        ctx.nbSamples = nbSamples as usize;
+        ctx.nbTrainSamples = nbTrainSamples as usize;
+        ctx.nbTestSamples = nbTestSamples as usize;
+        ctx.nbDmers = trainingSamplesSize - core::cmp::max(d as usize, core::mem::size_of::<u64>()) + 1;
+        ctx.d = d;
+        ctx.f = f;
+        ctx.accelParams = accelParams;
+
+        /* The offsets of each file */
+        ctx.offsets = vec![0usize; nbSamples as usize + 1];
+
+        /* Fill offsets from the samplesSizes */
+        ctx.offsets[0] = 0;
+        for i in 1..=nbSamples as usize {
+            ctx.offsets[i] = ctx.offsets[i - 1] + samplesSizes[i - 1];
+        }
+
+        /* Initialize frequency array of size 2^f */
+        ctx.freqs = vec![0u32; 1usize << f];
+
+        /* Compute frequencies. `freqs` aliases `ctx.freqs` in C; move it out so
+         * `&ctx` + `&mut freqs` don't conflict, then put it back. */
+        let mut freqs_local = core::mem::take(&mut ctx.freqs);
+        FASTCOVER_computeFrequency(&mut freqs_local, ctx);
+        ctx.freqs = freqs_local;
+        0
     }
-    Some(score)
-}
 
-fn zstd_fastcover_training_count(sample_sizes: &[usize]) -> Option<usize> {
-    let training_sample_count = sample_sizes.len() * 3 / 4;
-    if training_sample_count < 5 || training_sample_count >= sample_sizes.len() {
-        return None;
-    }
-    Some(training_sample_count)
-}
-
-fn fastcover_build_dictionary(
-    samples_buffer: &[u8],
-    offsets: &[usize],
-    nb_dmers: usize,
-    k: usize,
-    dict_capacity: usize,
-) -> Option<Vec<u8>> {
-    const D: usize = 8;
-    const F: u32 = 20;
-    const MAX_ZERO_SCORE_RUN: usize = 10;
-
-    let mut freqs = fastcover_compute_frequencies(samples_buffer, offsets)?;
-    let (num_epochs, epoch_size) = fastcover_compute_epochs(dict_capacity, nb_dmers, k);
-    if num_epochs == 0 || epoch_size == 0 {
-        return None;
-    }
-
-    let mut segment_freqs = vec![0u16; 1usize << F];
-    let mut dict = vec![0u8; dict_capacity];
-    let mut tail = dict_capacity;
-    let mut zero_score_run = 0usize;
-    let mut epoch = 0usize;
-
-    while tail > 0 {
-        let epoch_begin = epoch.checked_mul(epoch_size)?;
-        let segment = fastcover_select_segment(
-            samples_buffer,
-            &mut freqs,
-            epoch_begin,
-            epoch_begin + epoch_size,
-            k,
-            &mut segment_freqs,
-        )?;
-        if segment.score == 0 {
-            zero_score_run += 1;
-            if zero_score_run >= MAX_ZERO_SCORE_RUN {
+    /// Port of `FASTCOVER_buildDictionary`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn FASTCOVER_buildDictionary(
+        ctx: &FASTCOVER_ctx_t,
+        freqs: &mut [u32],
+        dict: &mut [u8],
+        dictBufferCapacity: usize,
+        parameters: ZDICT_cover_params_t,
+        segmentFreqs: &mut [u16],
+    ) -> usize {
+        let mut tail = dictBufferCapacity;
+        let epochs = COVER_computeEpochs(
+            dictBufferCapacity as u32,
+            ctx.nbDmers as u32,
+            parameters.k,
+            1,
+        );
+        let maxZeroScoreRun: usize = 10;
+        let mut zeroScoreRun: usize = 0;
+        let mut epoch: usize = 0;
+        while tail > 0 {
+            let epochBegin = (epoch as u32).wrapping_mul(epochs.size);
+            let epochEnd = epochBegin + epochs.size;
+            let segment =
+                FASTCOVER_selectSegment(ctx, freqs, epochBegin, epochEnd, parameters, segmentFreqs);
+            if segment.score == 0 {
+                zeroScoreRun += 1;
+                if zeroScoreRun >= maxZeroScoreRun {
+                    break;
+                }
+                epoch = (epoch + 1) % epochs.num as usize;
+                continue;
+            }
+            zeroScoreRun = 0;
+            let segmentSize = core::cmp::min(
+                (segment.end - segment.begin + parameters.d - 1) as usize,
+                tail,
+            );
+            if segmentSize < parameters.d as usize {
                 break;
             }
-            epoch = (epoch + 1) % num_epochs;
-            continue;
-        }
-        zero_score_run = 0;
-
-        let segment_size = (segment.end - segment.begin + D - 1).min(tail);
-        if segment_size < D {
-            break;
-        }
-        tail -= segment_size;
-        dict[tail..tail + segment_size]
-            .copy_from_slice(&samples_buffer[segment.begin..segment.begin + segment_size]);
-        epoch = (epoch + 1) % num_epochs;
-    }
-
-    (tail < dict_capacity).then(|| dict[tail..].to_vec())
-}
-
-fn fastcover_compute_frequencies(samples_buffer: &[u8], offsets: &[usize]) -> Option<Vec<u32>> {
-    const D: usize = 8;
-    const F: u32 = 20;
-
-    let mut freqs = vec![0u32; 1usize << F];
-    for window in offsets.windows(2) {
-        let mut pos = window[0];
-        let end = window[1];
-        while pos + D <= end {
-            let idx = ZSTD_hashPtr(&samples_buffer[pos..], F, D as u32);
-            freqs[idx] = freqs[idx].wrapping_add(1);
-            pos += 1;
-        }
-    }
-    Some(freqs)
-}
-
-fn fastcover_compute_epochs(max_dict_size: usize, nb_dmers: usize, k: usize) -> (usize, usize) {
-    let min_epoch_size = k * 10;
-    let mut num = (max_dict_size / k).max(1);
-    let mut size = nb_dmers / num;
-    if size >= min_epoch_size {
-        return (num, size);
-    }
-    size = min_epoch_size.min(nb_dmers);
-    num = nb_dmers / size;
-    (num.max(1), size)
-}
-
-fn fastcover_select_segment(
-    samples_buffer: &[u8],
-    freqs: &mut [u32],
-    begin: usize,
-    end: usize,
-    k: usize,
-    segment_freqs: &mut [u16],
-) -> Option<FastCoverSegment> {
-    const D: usize = 8;
-    const F: u32 = 20;
-
-    let dmers_in_k = k - D + 1;
-    let mut best = FastCoverSegment {
-        begin: 0,
-        end: 0,
-        score: 0,
-    };
-    let mut active = FastCoverSegment {
-        begin,
-        end: begin,
-        score: 0,
-    };
-
-    while active.end < end {
-        let idx = ZSTD_hashPtr(&samples_buffer[active.end..], F, D as u32);
-        if segment_freqs[idx] == 0 {
-            active.score = active.score.wrapping_add(freqs[idx]);
-        }
-        active.end += 1;
-        segment_freqs[idx] = segment_freqs[idx].wrapping_add(1);
-
-        if active.end - active.begin == dmers_in_k + 1 {
-            let del_idx = ZSTD_hashPtr(&samples_buffer[active.begin..], F, D as u32);
-            segment_freqs[del_idx] = segment_freqs[del_idx].wrapping_sub(1);
-            if segment_freqs[del_idx] == 0 {
-                active.score = active.score.wrapping_sub(freqs[del_idx]);
+            tail -= segmentSize;
+            unsafe {
+                let src = core::slice::from_raw_parts(ctx.samples.add(segment.begin as usize), segmentSize);
+                dict[tail..tail + segmentSize].copy_from_slice(src);
             }
-            active.begin += 1;
+            epoch = (epoch + 1) % epochs.num as usize;
         }
-
-        if active.score > best.score {
-            best = active;
-        }
+        tail
     }
 
-    while active.begin < end {
-        let del_idx = ZSTD_hashPtr(&samples_buffer[active.begin..], F, D as u32);
-        segment_freqs[del_idx] = segment_freqs[del_idx].wrapping_sub(1);
-        active.begin += 1;
+    /// Port of `FASTCOVER_convertToCoverParams`.
+    pub fn FASTCOVER_convertToCoverParams(
+        fastCoverParams: crate::dict_builder::zdict::ZDICT_fastCover_params_t,
+        coverParams: &mut ZDICT_cover_params_t,
+    ) {
+        coverParams.k = fastCoverParams.k;
+        coverParams.d = fastCoverParams.d;
+        coverParams.steps = fastCoverParams.steps;
+        coverParams.nbThreads = fastCoverParams.nbThreads;
+        coverParams.splitPoint = fastCoverParams.splitPoint;
+        coverParams.zParams = fastCoverParams.zParams;
+        coverParams.shrinkDict = fastCoverParams.shrinkDict;
     }
 
-    for pos in best.begin..best.end {
-        let idx = ZSTD_hashPtr(&samples_buffer[pos..], F, D as u32);
-        freqs[idx] = 0;
+    /// Port of `FASTCOVER_convertToFastCoverParams`.
+    pub fn FASTCOVER_convertToFastCoverParams(
+        coverParams: ZDICT_cover_params_t,
+        fastCoverParams: &mut crate::dict_builder::zdict::ZDICT_fastCover_params_t,
+        f: u32,
+        accel: u32,
+    ) {
+        fastCoverParams.k = coverParams.k;
+        fastCoverParams.d = coverParams.d;
+        fastCoverParams.steps = coverParams.steps;
+        fastCoverParams.nbThreads = coverParams.nbThreads;
+        fastCoverParams.splitPoint = coverParams.splitPoint;
+        fastCoverParams.f = f;
+        fastCoverParams.accel = accel;
+        fastCoverParams.zParams = coverParams.zParams;
+        fastCoverParams.shrinkDict = coverParams.shrinkDict;
     }
 
-    Some(best)
-}
+    /// Port of `ZDICT_trainFromBuffer_fastCover`. Single-threaded fastCover
+    /// training entry point. Returns the dictionary size or an error code.
+    pub fn ZDICT_trainFromBuffer_fastCover(
+        dictBuffer: &mut [u8],
+        dictBufferCapacity: usize,
+        samplesBuffer: &[u8],
+        samplesSizes: &[usize],
+        nbSamples: u32,
+        mut parameters: crate::dict_builder::zdict::ZDICT_fastCover_params_t,
+    ) -> usize {
+        use crate::common::error::ERR_isError;
+        use crate::dict_builder::cover::COVER_warnOnSmallCorpus;
+        use crate::dict_builder::zdict::{ZDICT_finalizeDictionary, ZDICT_DICTSIZE_MIN};
 
-fn finalize_zstd_fallback_dict(
-    content: &[u8],
-    entropy_samples: &[u8],
-    entropy_sample_sizes: &[usize],
-    dict_maxsize: usize,
-    min_useful_dict: usize,
-) -> Option<Vec<u8>> {
-    if content.is_empty() || dict_maxsize < min_useful_dict {
-        return None;
-    }
-
-    build_minimal_zstd_dict(
-        content,
-        entropy_samples,
-        entropy_sample_sizes,
-        dict_maxsize,
-        min_useful_dict,
-    )
-}
-
-fn build_minimal_zstd_dict(
-    content: &[u8],
-    entropy_samples: &[u8],
-    entropy_sample_sizes: &[usize],
-    dict_capacity: usize,
-    min_useful_dict: usize,
-) -> Option<Vec<u8>> {
-    const MIN_CONTENT_SIZE: usize = 8;
-
-    if content.is_empty() || dict_capacity < min_useful_dict || dict_capacity < content.len() {
-        return None;
-    }
-
-    let mut out = Vec::with_capacity(content.len() + 256);
-    out.extend_from_slice(&ZSTD_MAGIC_DICTIONARY.to_le_bytes());
-    let random_id = XXH64(content, 0);
-    let compliant_id = (random_id % ((1u64 << 31) - 32768)) + 32768;
-    out.extend_from_slice(&(compliant_id as u32).to_le_bytes());
-
-    let entropy_start = out.len();
-    if append_zstd_entropy_tables_from_block_samples(
-        &mut out,
-        content,
-        entropy_samples,
-        entropy_sample_sizes,
-    )
-    .is_none()
-    {
-        out.truncate(entropy_start);
-        let sample_len = entropy_samples.len().min(content.len());
-        let huf_source = if sample_len == 0 {
-            content
+        let displayLevel = parameters.zParams.notificationLevel as i32;
+        /* Assign splitPoint and f if not provided */
+        parameters.splitPoint = 1.0;
+        parameters.f = if parameters.f == 0 { DEFAULT_F } else { parameters.f };
+        parameters.accel = if parameters.accel == 0 {
+            DEFAULT_ACCEL
         } else {
-            &entropy_samples[..sample_len]
+            parameters.accel
         };
-        if append_minimal_zstd_huf_table(&mut out, huf_source).is_none() {
-            out.truncate(entropy_start);
-            append_minimal_zstd_huf_table(&mut out, content)?;
+        /* Convert to cover parameter */
+        let mut coverParams = ZDICT_cover_params_t::default();
+        FASTCOVER_convertToCoverParams(parameters, &mut coverParams);
+        /* Checks */
+        if FASTCOVER_checkParameters(coverParams, dictBufferCapacity, parameters.f, parameters.accel) == 0 {
+            return ERROR(ErrorCode::ParameterOutOfBound);
         }
-        append_zstd_fallback_sequence_tables(&mut out, content.len())?;
-    }
-
-    let header_len = out.len() + 12;
-    if header_len > dict_capacity {
-        return None;
-    }
-    let content_len = content.len().min(dict_capacity - header_len);
-    if content_len < MIN_CONTENT_SIZE && header_len + MIN_CONTENT_SIZE > dict_capacity {
-        return None;
-    }
-    let padding_len = MIN_CONTENT_SIZE.saturating_sub(content_len);
-    for rep in [1u32, 4, 8] {
-        out.extend_from_slice(&rep.to_le_bytes());
-    }
-    out.resize(out.len() + padding_len, 0);
-    out.extend_from_slice(&content[..content_len]);
-    if out.len() > dict_capacity {
-        return None;
-    }
-    Some(out)
-}
-
-fn append_zstd_entropy_tables_from_block_samples(
-    out: &mut Vec<u8>,
-    content: &[u8],
-    entropy_samples: &[u8],
-    entropy_sample_sizes: &[usize],
-) -> Option<()> {
-    const ZDICT_OFFCODE_MAX: u32 = 30;
-    const ZSTD_BLOCKSIZE_MAX: usize = 128 * 1024;
-
-    let samples_len = entropy_sample_sizes
-        .iter()
-        .try_fold(0usize, |acc, &size| acc.checked_add(size))?;
-    if samples_len == 0 || samples_len > entropy_samples.len() {
-        return None;
-    }
-
-    let offcode_max = ZSTD_highbit32((content.len() + ZSTD_BLOCKSIZE_MAX) as u32);
-    if offcode_max > ZDICT_OFFCODE_MAX || offcode_max > MaxOff {
-        return None;
-    }
-
-    // C `ZDICT_analyzeEntropy`: counts are seeded with 1 for every symbol in range.
-    let mut literal_count = [1u32; 256];
-    let mut offcode_count = zstd_seeded_offcode_counts(offcode_max);
-    let mut ml_count = vec![1u32; (MaxML + 1) as usize];
-    let mut ll_count = vec![1u32; (MaxLL + 1) as usize];
-
-    // C builds the entropy CDict with cParams derived from the average sample
-    // size and the dict (content) size: `ZSTD_getParams(level, avgSampleSize,
-    // dictSize)` then `ZSTD_createCDict_advanced(content, byRef, rawContent, ...)`.
-    let avg_sample_size = samples_len / entropy_sample_sizes.len().max(1);
-    let params = ZSTD_getParams(3, avg_sample_size as u64, content.len());
-    let block_size_max = ZSTD_BLOCKSIZE_MAX.min(1usize << params.cParams.windowLog);
-    let cdict = ZSTD_createCDict_advanced(
-        content,
-        ZSTD_dictLoadMethod_e::ZSTD_dlm_byRef,
-        ZSTD_dictContentType_e::ZSTD_dct_rawContent,
-        params.cParams,
-    )?;
-    let mut cctx = ZSTD_createCCtx()?;
-    let mut work_place = vec![0u8; ZSTD_BLOCKSIZE_MAX];
-    let mut sample_offset = 0usize;
-    for &sample_size in entropy_sample_sizes {
-        let sample_end = sample_offset.checked_add(sample_size)?;
-        let sample = &entropy_samples[sample_offset..sample_end];
-        let sample = &sample[..sample.len().min(block_size_max)];
-        sample_offset = sample_end;
-        if sample.is_empty() {
-            continue;
+        if nbSamples == 0 {
+            return ERROR(ErrorCode::SrcSizeWrong);
         }
-
-        if ERR_isError(ZSTD_compressBegin_usingCDict_deprecated(&mut cctx, &cdict)) {
-            return None;
+        if dictBufferCapacity < ZDICT_DICTSIZE_MIN {
+            return ERROR(ErrorCode::DstSizeTooSmall);
         }
-        let csize = ZSTD_compressBlock_deprecated(&mut cctx, &mut work_place, sample);
-        if ERR_isError(csize) {
-            return None;
-        }
-        if csize == 0 {
-            continue;
-        }
-
-        let seq_store = cctx.seqStore.as_mut()?;
-        for &literal in &seq_store.literals {
-            literal_count[literal as usize] = literal_count[literal as usize].saturating_add(1);
-        }
-        ZSTD_seqToCodes(seq_store);
-        for idx in 0..seq_store.sequences.len() {
-            let offcode = *seq_store.ofCode.get(idx)? as u32;
-            if offcode > offcode_max {
-                return None;
+        /* Assign corresponding FASTCOVER_accel_t */
+        let accelParams = FASTCOVER_defaultAccelParameters[parameters.accel as usize];
+        /* Initialize context */
+        let mut ctx = FASTCOVER_ctx_t::default();
+        {
+            let initVal = FASTCOVER_ctx_init(
+                &mut ctx,
+                samplesBuffer,
+                samplesSizes,
+                nbSamples,
+                coverParams.d,
+                parameters.splitPoint,
+                parameters.f,
+                accelParams,
+                displayLevel,
+            );
+            if ERR_isError(initVal) {
+                return initVal;
             }
-            offcode_count[offcode as usize] = offcode_count[offcode as usize].saturating_add(1);
+        }
+        COVER_warnOnSmallCorpus(dictBufferCapacity, ctx.nbDmers, displayLevel);
+        /* Build the dictionary */
+        let mut segmentFreqs = vec![0u16; 1usize << parameters.f];
+        let dictionarySize;
+        {
+            // freqs aliases ctx.freqs; move out / restore.
+            let mut freqs = core::mem::take(&mut ctx.freqs);
+            let tail = FASTCOVER_buildDictionary(
+                &ctx,
+                &mut freqs,
+                dictBuffer,
+                dictBufferCapacity,
+                coverParams,
+                &mut segmentFreqs,
+            );
+            ctx.freqs = freqs;
+            let nbFinalizeSamples =
+                (ctx.nbTrainSamples * ctx.accelParams.finalize as usize / 100) as u32;
+            // customDictContent == dict + tail overlaps dictBuffer; copy out.
+            let content: Vec<u8> = dictBuffer[tail..dictBufferCapacity].to_vec();
+            dictionarySize = ZDICT_finalizeDictionary(
+                dictBuffer,
+                dictBufferCapacity,
+                &content,
+                dictBufferCapacity - tail,
+                samplesBuffer,
+                samplesSizes,
+                nbFinalizeSamples,
+                coverParams.zParams,
+            );
+        }
+        FASTCOVER_ctx_destroy(&mut ctx);
+        dictionarySize
+    }
 
-            let ml_code = *seq_store.mlCode.get(idx)? as u32;
-            let ll_code = *seq_store.llCode.get(idx)? as u32;
-            if ml_code > MaxML || ll_code > MaxLL {
-                return None;
+    /// Port of `FASTCOVER_tryParameters`. Tries one parameter set and updates
+    /// `best`. (C passes an owning opaque pointer for threading; here it is a
+    /// plain sequential call.)
+    fn FASTCOVER_tryParameters(
+        ctx: &FASTCOVER_ctx_t,
+        best: &mut crate::dict_builder::cover::COVER_best_t,
+        dictBufferCapacity: usize,
+        parameters: ZDICT_cover_params_t,
+    ) {
+        use crate::dict_builder::cover::{
+            COVER_best_finish, COVER_dictSelectionError, COVER_dictSelectionIsError, COVER_selectDict,
+        };
+
+        let totalCompressedSize = ERROR(ErrorCode::Generic);
+        let mut segmentFreqs = vec![0u16; 1usize << ctx.f];
+        let mut dict = vec![0u8; dictBufferCapacity];
+        let mut selection = COVER_dictSelectionError(ERROR(ErrorCode::Generic));
+        /* Copy the frequencies because we need to modify them */
+        let mut freqs = ctx.freqs.clone();
+        {
+            let tail = FASTCOVER_buildDictionary(
+                ctx,
+                &mut freqs,
+                &mut dict,
+                dictBufferCapacity,
+                parameters,
+                &mut segmentFreqs,
+            );
+            let nbFinalizeSamples =
+                (ctx.nbTrainSamples * ctx.accelParams.finalize as usize / 100) as u32;
+            let content = dict[tail..dictBufferCapacity].to_vec();
+            let total_samples_size = ctx.offsets[ctx.nbSamples];
+            let samples = unsafe { core::slice::from_raw_parts(ctx.samples, total_samples_size) };
+            let samplesSizes = unsafe { core::slice::from_raw_parts(ctx.samplesSizes, ctx.nbSamples) };
+            selection = COVER_selectDict(
+                &content,
+                dictBufferCapacity,
+                dictBufferCapacity - tail,
+                samples,
+                samplesSizes,
+                nbFinalizeSamples,
+                ctx.nbTrainSamples,
+                ctx.nbSamples,
+                parameters,
+                &ctx.offsets,
+                totalCompressedSize,
+            );
+            let _ = COVER_dictSelectionIsError(&selection); /* C logs/cleanups; best_finish still called */
+        }
+        COVER_best_finish(best, parameters, &selection);
+        // `selection` (and its Vec) drops here == COVER_dictSelectionFree.
+    }
+
+    /// Port of `ZDICT_optimizeTrainFromBuffer_fastCover`. Tries a grid of
+    /// (d, k) parameters and returns the best dictionary. The POOL parallelism
+    /// is collapsed to a sequential loop (deterministic result).
+    pub fn ZDICT_optimizeTrainFromBuffer_fastCover(
+        dictBuffer: &mut [u8],
+        dictBufferCapacity: usize,
+        samplesBuffer: &[u8],
+        samplesSizes: &[usize],
+        nbSamples: u32,
+        parameters: &mut crate::dict_builder::zdict::ZDICT_fastCover_params_t,
+    ) -> usize {
+        use crate::common::error::ERR_isError;
+        use crate::dict_builder::cover::{
+            COVER_best_destroy, COVER_best_init, COVER_best_start, COVER_best_t, COVER_best_wait,
+            COVER_warnOnSmallCorpus,
+        };
+        use crate::dict_builder::zdict::ZDICT_DICTSIZE_MIN;
+
+        let _nbThreads = parameters.nbThreads; // POOL collapsed to sequential
+        let splitPoint = if parameters.splitPoint <= 0.0 {
+            FASTCOVER_DEFAULT_SPLITPOINT
+        } else {
+            parameters.splitPoint
+        };
+        let kMinD = if parameters.d == 0 { 6 } else { parameters.d };
+        let kMaxD = if parameters.d == 0 { 8 } else { parameters.d };
+        let kMinK = if parameters.k == 0 { 50 } else { parameters.k };
+        let kMaxK = if parameters.k == 0 { 2000 } else { parameters.k };
+        let kSteps = if parameters.steps == 0 { 40 } else { parameters.steps };
+        let kStepSize = core::cmp::max((kMaxK - kMinK) / kSteps, 1);
+        let f = if parameters.f == 0 { DEFAULT_F } else { parameters.f };
+        let accel = if parameters.accel == 0 { DEFAULT_ACCEL } else { parameters.accel };
+        let shrinkDict: u32 = 0;
+        let displayLevel = parameters.zParams.notificationLevel as i32;
+        let _ = displayLevel;
+
+        /* Checks */
+        if splitPoint <= 0.0 || splitPoint > 1.0 {
+            return ERROR(ErrorCode::ParameterOutOfBound);
+        }
+        if accel == 0 || accel as usize > FASTCOVER_MAX_ACCEL {
+            return ERROR(ErrorCode::ParameterOutOfBound);
+        }
+        if kMinK < kMaxD || kMaxK < kMinK {
+            return ERROR(ErrorCode::ParameterOutOfBound);
+        }
+        if nbSamples == 0 {
+            return ERROR(ErrorCode::SrcSizeWrong);
+        }
+        if dictBufferCapacity < ZDICT_DICTSIZE_MIN {
+            return ERROR(ErrorCode::DstSizeTooSmall);
+        }
+
+        /* Initialization */
+        let mut best = COVER_best_t::default();
+        COVER_best_init(&mut best);
+        let mut coverParams = ZDICT_cover_params_t::default();
+        FASTCOVER_convertToCoverParams(*parameters, &mut coverParams);
+        let accelParams = FASTCOVER_defaultAccelParameters[accel as usize];
+        let mut warned = false;
+
+        /* Loop through d first because each new value needs a new context */
+        let mut d = kMinD;
+        while d <= kMaxD {
+            let mut ctx = FASTCOVER_ctx_t::default();
+            {
+                let childDisplayLevel = if displayLevel == 0 { 0 } else { displayLevel - 1 };
+                let initVal = FASTCOVER_ctx_init(
+                    &mut ctx,
+                    samplesBuffer,
+                    samplesSizes,
+                    nbSamples,
+                    d,
+                    splitPoint,
+                    f,
+                    accelParams,
+                    childDisplayLevel,
+                );
+                if ERR_isError(initVal) {
+                    COVER_best_destroy(&mut best);
+                    return initVal;
+                }
             }
-            ml_count[ml_code as usize] = ml_count[ml_code as usize].saturating_add(1);
-            ll_count[ll_code as usize] = ll_count[ll_code as usize].saturating_add(1);
-        }
-    }
-
-    append_zstd_huf_table_from_counts(out, &literal_count)?;
-    append_normalized_zstd_count(
-        out,
-        &offcode_count,
-        offcode_max,
-        ZDICT_OFFCODE_MAX,
-        OffFSELog,
-    )?;
-    append_normalized_zstd_count(out, &ml_count, MaxML, MaxML, MLFSELog)?;
-    append_normalized_zstd_count(out, &ll_count, MaxLL, MaxLL, LLFSELog)?;
-    Some(())
-}
-
-fn append_zstd_fallback_sequence_tables(out: &mut Vec<u8>, dict_content_len: usize) -> Option<()> {
-    const ZDICT_OFFCODE_MAX: u32 = 30;
-
-    let offcode_max = ZSTD_highbit32((dict_content_len + (128 * 1024)) as u32);
-    if offcode_max > ZDICT_OFFCODE_MAX || offcode_max > MaxOff {
-        return None;
-    }
-    let offcode_count = zstd_seeded_offcode_counts(offcode_max);
-    let ml_count = vec![1u32; (MaxML + 1) as usize];
-    let ll_count = vec![1u32; (MaxLL + 1) as usize];
-    append_normalized_zstd_count(
-        out,
-        &offcode_count,
-        offcode_max,
-        ZDICT_OFFCODE_MAX,
-        OffFSELog,
-    )?;
-    append_normalized_zstd_count(out, &ml_count, MaxML, MaxML, MLFSELog)?;
-    append_normalized_zstd_count(out, &ll_count, MaxLL, MaxLL, LLFSELog)?;
-    Some(())
-}
-
-fn zstd_seeded_offcode_counts(offcode_max: u32) -> Vec<u32> {
-    let mut offcode_count = vec![0u32; (MaxOff + 1) as usize];
-    for count in offcode_count.iter_mut().take(offcode_max as usize + 1) {
-        *count = 1;
-    }
-    offcode_count
-}
-
-fn append_normalized_zstd_count(
-    out: &mut Vec<u8>,
-    count: &[u32],
-    normalize_max_symbol: u32,
-    write_max_symbol: u32,
-    table_log: u32,
-) -> Option<()> {
-    let total = count
-        .iter()
-        .take(normalize_max_symbol as usize + 1)
-        .map(|&count| count as usize)
-        .sum::<usize>();
-    let mut normalized = vec![0i16; count.len()];
-    let normalized_log = FSE_normalizeCount(
-        &mut normalized,
-        table_log,
-        count,
-        total,
-        normalize_max_symbol,
-        1,
-    );
-    if ERR_isError(normalized_log) || normalized_log == 0 {
-        return None;
-    }
-    let mut fse_header = vec![0u8; 256];
-    let written = FSE_writeNCount(
-        &mut fse_header,
-        &normalized,
-        write_max_symbol,
-        normalized_log as u32,
-    );
-    if ERR_isError(written) {
-        return None;
-    }
-    out.extend_from_slice(&fse_header[..written]);
-    Some(())
-}
-
-fn append_minimal_zstd_huf_table(out: &mut Vec<u8>, huf_source: &[u8]) -> Option<()> {
-    let mut count = [1u32; 256];
-    for &byte in huf_source {
-        count[byte as usize] += 1;
-    }
-    append_zstd_huf_table_from_counts(out, &count)
-}
-
-fn append_zstd_huf_table_from_counts(out: &mut Vec<u8>, count: &[u32; 256]) -> Option<()> {
-    // C `ZDICT_analyzeEntropy`: `huffLog = 11` is passed as the *cap* to
-    // `HUF_buildCTable_wksp` (not an "optimal" log), and the resulting
-    // `maxNbBits` is then used directly for `HUF_writeCTable`.
-    const HUFFLOG: u32 = 11;
-    let max_symbol_value = 255;
-    let mut ctable = vec![0 as HUF_CElt; 257];
-    let mut workspace = vec![0u32; HUF_CTABLE_WORKSPACE_SIZE_U32];
-    let mut max_nb_bits =
-        HUF_buildCTable_wksp(&mut ctable, count, max_symbol_value, HUFFLOG, &mut workspace);
-    if ERR_isError(max_nb_bits) {
-        return None;
-    }
-    if max_nb_bits == 8 {
-        // Pathological (incompressible) literals: C replaces the distribution
-        // with `ZDICT_flatLit` (a mostly-flat but encodable distribution) and
-        // rebuilds — yielding maxNbBits == 9.
-        let mut flat_count = [2u32; 256];
-        flat_count[0] = 4;
-        flat_count[253] = 1;
-        flat_count[254] = 1;
-        max_nb_bits =
-            HUF_buildCTable_wksp(&mut ctable, &flat_count, max_symbol_value, HUFFLOG, &mut workspace);
-        if ERR_isError(max_nb_bits) {
-            return None;
-        }
-    }
-    let huff_log = max_nb_bits as u32;
-    let mut huf_header = vec![0u8; 512];
-    let written = HUF_writeCTable(&mut huf_header, &ctable, max_symbol_value, huff_log);
-    if ERR_isError(written) {
-        return None;
-    }
-    out.extend_from_slice(&huf_header[..written]);
-    Some(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn train_from_buffer_produces_magic_dictionary() {
-        // Build many small, varied-but-repetitive samples so fastcover has
-        // recurring d-mers to latch onto.
-        let mut samples = Vec::new();
-        let mut sizes = Vec::new();
-        for i in 0..64u32 {
-            let mut s = Vec::new();
-            for j in 0..40u32 {
-                s.extend_from_slice(&((i % 7) * 1000 + (j % 11)).to_le_bytes());
+            if !warned {
+                COVER_warnOnSmallCorpus(dictBufferCapacity, ctx.nbDmers, displayLevel);
+                warned = true;
             }
-            sizes.push(s.len());
-            samples.extend_from_slice(&s);
+            /* Loop through k reusing the same context */
+            let mut k = kMinK;
+            while k <= kMaxK {
+                let mut p = coverParams;
+                p.k = k;
+                p.d = d;
+                p.splitPoint = splitPoint;
+                p.steps = kSteps;
+                p.shrinkDict = shrinkDict;
+                p.zParams.notificationLevel = ctx.displayLevel as u32;
+                if FASTCOVER_checkParameters(p, dictBufferCapacity, ctx.f, accel) == 0 {
+                    k += kStepSize;
+                    continue;
+                }
+                COVER_best_start(&mut best);
+                FASTCOVER_tryParameters(&ctx, &mut best, dictBufferCapacity, p);
+                k += kStepSize;
+            }
+            COVER_best_wait(&best);
+            FASTCOVER_ctx_destroy(&mut ctx);
+            d += 2;
         }
 
-        let dict = train_from_buffer(&samples, &sizes, 4096, 8)
-            .expect("dictionary training should succeed for repetitive samples");
-        assert!(dict.len() >= 8);
-        assert_eq!(
-            &dict[..4],
-            &ZSTD_MAGIC_DICTIONARY.to_le_bytes(),
-            "dictionary must start with the zstd dictionary magic"
-        );
+        /* Fill the output buffer and parameters with the best */
+        let dictSize = best.dictSize;
+        if ERR_isError(best.compressedSize) {
+            let compressedSize = best.compressedSize;
+            COVER_best_destroy(&mut best);
+            return compressedSize;
+        }
+        FASTCOVER_convertToFastCoverParams(best.parameters, parameters, f, accel);
+        dictBuffer[..dictSize].copy_from_slice(&best.dict[..dictSize]);
+        COVER_best_destroy(&mut best);
+        dictSize
     }
 }
-
-

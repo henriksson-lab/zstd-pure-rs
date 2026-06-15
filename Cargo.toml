@@ -18,7 +18,6 @@ include = [
     "/LICENSE",
     "/COPYING",
     "/README.md",
-    "/TODO.md",
     "/FUNCTIONS.md",
     "/ccc_mapping.toml",
 ]
@@ -35,6 +34,11 @@ required-features = ["cli"]
 [[bin]]
 name = "bench"
 path = "src/bin/bench.rs"
+required-features = ["cli"]
+
+[[bin]]
+name = "train"
+path = "src/bin/train.rs"
 required-features = ["cli"]
 
 [features]
@@ -56,3 +60,4 @@ opt-level = 3
 [profile.bench]
 lto = true
 codegen-units = 1
+

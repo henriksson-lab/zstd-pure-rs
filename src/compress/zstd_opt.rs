@@ -1283,7 +1283,7 @@ pub fn ZSTD_insertBtAndGetAllMatches(
             while nbCompares > 0 && dictMatchIndex > dmsLowLimit {
                 let nextBase = (2 * (dictMatchIndex & dmsBtMask)) as usize;
                 let mut matchLength = commonLengthSmaller.min(commonLengthLarger);
-                let mut match_pos = dictMatchIndex.saturating_sub(dmsBaseOff) as usize;
+                let match_pos = dictMatchIndex.saturating_sub(dmsBaseOff) as usize;
                 matchLength += ZSTD_count_2segments(
                     buf,
                     ip_pos + matchLength,
@@ -1293,12 +1293,6 @@ pub fn ZSTD_insertBtAndGetAllMatches(
                     match_pos + matchLength,
                     dms.dictContent.len(),
                 );
-                if dictMatchIndex.wrapping_add(matchLength as u32) >= dmsHighLimit {
-                    match_pos = dictMatchIndex
-                        .wrapping_add(dmsIndexDelta)
-                        .wrapping_sub(ms.window.base_offset)
-                        as usize;
-                }
 
                 if matchLength > bestLength {
                     let translatedIndex = dictMatchIndex.wrapping_add(dmsIndexDelta);
@@ -1323,7 +1317,15 @@ pub fn ZSTD_insertBtAndGetAllMatches(
                 let crossedIntoPrefix =
                     dictMatchIndex.wrapping_add(matchLength as u32) >= dmsHighLimit;
                 let matchByte = if crossedIntoPrefix {
-                    buf[match_pos + matchLength]
+                    // Upstream reads `(base + dictMatchIndex + dmsIndexDelta)[matchLength]`.
+                    // Keep the whole index in wrapping u32 (folding in `matchLength`)
+                    // and cast to `usize` only at the end — casting the transiently-
+                    // negative base-relative index first overflowed past 2^32.
+                    let prefixPos = dictMatchIndex
+                        .wrapping_add(dmsIndexDelta)
+                        .wrapping_add(matchLength as u32)
+                        .wrapping_sub(ms.window.base_offset) as usize;
+                    buf[prefixPos]
                 } else {
                     dms.dictContent
                         [dictMatchIndex.saturating_sub(dmsBaseOff) as usize + matchLength]

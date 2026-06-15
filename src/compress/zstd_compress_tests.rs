@@ -3255,7 +3255,7 @@ fn zstd_boundary_sizes_roundtrip() {
 #[test]
 fn zstd_repetitive_multiblock_regression_gate() {
     // Regression gate for the fast-strategy repcode-litLength-0
-    // bug (see TODO.md "Bugs fixed" entry). Uses payloads where
+    // bug. Uses payloads where
     // block 1's first match covers most of the block — forcing
     // block 2 to start at a block boundary with a rep match
     // immediately available. Pre-fix behavior: decoder output

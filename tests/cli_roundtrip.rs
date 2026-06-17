@@ -166,6 +166,59 @@ fn external_tool_available(command: &str) -> bool {
 }
 
 #[test]
+#[ignore = "large corpus bitwise parity target; currently documents the known encoder divergence"]
+fn cli_single_thread_large_mixed_corpus_matches_upstream_bitwise_level1() {
+    let Some(upstream) = upstream_zstd() else {
+        eprintln!("vendored upstream zstd/programs/zstd not built; skipping");
+        return;
+    };
+    let corpus = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".tmp/bench/realistic_5x.tar");
+    if !corpus.is_file() {
+        eprintln!(
+            "{} missing; skipping large bitwise parity test",
+            corpus.display()
+        );
+        return;
+    }
+
+    let rust_out = temp_path("large_mixed_rust_l1", "zst");
+    let upstream_out = temp_path("large_mixed_upstream_l1", "zst");
+
+    let rust = Command::new(bin_path())
+        .args(["--single-thread", "-1", "--no-check", "-f", "-q"])
+        .arg(&corpus)
+        .arg("-o")
+        .arg(&rust_out)
+        .output()
+        .expect("run rust zstd");
+    assert!(
+        rust.status.success(),
+        "rust zstd failed: {}",
+        String::from_utf8_lossy(&rust.stderr)
+    );
+
+    let original = Command::new(upstream)
+        .args(["--single-thread", "-1", "--no-check", "-f", "-q"])
+        .arg(&corpus)
+        .arg("-o")
+        .arg(&upstream_out)
+        .output()
+        .expect("run upstream zstd");
+    assert!(
+        original.status.success(),
+        "upstream zstd failed: {}",
+        String::from_utf8_lossy(&original.stderr)
+    );
+
+    let rust_bytes = fs::read(&rust_out).expect("read rust output");
+    let upstream_bytes = fs::read(&upstream_out).expect("read upstream output");
+    assert_eq!(
+        rust_bytes, upstream_bytes,
+        "single-thread level-1 output is not bitwise-identical to upstream"
+    );
+}
+
+#[test]
 fn cli_output_decompressed_by_upstream_zstd() {
     // Produce a frame with our compressor, then pipe it into the
     // vendored upstream zstd binary (if available) and assert the round

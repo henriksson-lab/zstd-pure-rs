@@ -23,6 +23,8 @@ use crate::compress::zstd_hashes::{
     ZSTD_count, ZSTD_count_2segments, ZSTD_hash4, ZSTD_hash5, ZSTD_hash6, ZSTD_hash7, ZSTD_hash8,
     ZSTD_hashPtr,
 };
+#[cfg(debug_assertions)]
+use std::sync::OnceLock;
 
 /// Upstream `kSearchStrength` — controls how aggressively the
 /// match finder widens its step when mismatches are common.
@@ -142,6 +144,61 @@ pub fn ZSTD_match4Found_cmov(
 
 /// Upstream `HASH_READ_SIZE` — the hash reads 8 bytes at a time.
 pub const HASH_READ_SIZE: usize = 8;
+
+#[cfg(debug_assertions)]
+#[derive(Clone, Copy)]
+enum ZSTD_fastTraceRange {
+    Index { start: usize, end: usize },
+    Rel { start: usize, end: usize },
+}
+
+#[cfg(debug_assertions)]
+fn ZSTD_fastTraceConfig() -> Option<ZSTD_fastTraceRange> {
+    static CONFIG: OnceLock<Option<ZSTD_fastTraceRange>> = OnceLock::new();
+    *CONFIG.get_or_init(|| {
+        std::env::var_os("ZSTD_TRACE_FAST")?;
+        let index_start = std::env::var("ZSTD_TRACE_FAST_INDEX_START")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok());
+        let index_end = std::env::var("ZSTD_TRACE_FAST_INDEX_END")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok());
+        if let (Some(start), Some(end)) = (index_start, index_end) {
+            return Some(ZSTD_fastTraceRange::Index { start, end });
+        }
+        let start = std::env::var("ZSTD_TRACE_FAST_REL_START")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(0);
+        let end = std::env::var("ZSTD_TRACE_FAST_REL_END")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(usize::MAX);
+        Some(ZSTD_fastTraceRange::Rel { start, end })
+    })
+}
+
+#[cfg(debug_assertions)]
+#[inline(always)]
+fn ZSTD_fastTraceEnabled(istart: usize, pos: usize, index: u32) -> bool {
+    match ZSTD_fastTraceConfig() {
+        Some(ZSTD_fastTraceRange::Index { start, end }) => {
+            let index = index as usize;
+            index >= start && index <= end
+        }
+        Some(ZSTD_fastTraceRange::Rel { start, end }) => {
+            let rel = pos.wrapping_sub(istart);
+            rel >= start && rel <= end
+        }
+        None => false,
+    }
+}
+
+#[cfg(not(debug_assertions))]
+#[inline(always)]
+fn ZSTD_fastTraceEnabled(_istart: usize, _pos: usize, _index: u32) -> bool {
+    false
+}
 
 /// Port of `ZSTD_dictTableLoadMethod_e`.
 #[repr(u32)]
@@ -437,12 +494,44 @@ fn ZSTD_compressBlock_fast_noDict_generic_mls<const MLS: u32, const USE_CMOV: bo
                 unsafe { (src.as_ptr().wrapping_add(rep_read_pos) as *const u32).read_unaligned() };
             let rep_cval =
                 unsafe { (src.as_ptr().wrapping_add(ip2) as *const u32).read_unaligned() };
+            if ZSTD_fastTraceEnabled(istart, ip2, base_off.wrapping_add(ip2 as u32)) {
+                eprintln!(
+                    "zstd-rs-fast stage=rep istart={} rel={} ip={} current0={} anchor_rel={} rep1={} rep2={} eq={} hash0={} hash1={} matchIdx={} prefixStartIndex={}",
+                    istart,
+                    ip2.wrapping_sub(istart),
+                    ip2,
+                    base_off.wrapping_add(ip2 as u32),
+                    anchor.wrapping_sub(istart),
+                    rep_offset1,
+                    rep_offset2,
+                    rep_rval == rep_cval,
+                    hash0,
+                    hash1,
+                    matchIdx,
+                    prefixStartIndex
+                );
+            }
             if (rep_rval == rep_cval) & (rep_offset1 > 0) {
                 ip0 = ip2;
                 let mut match0 = ip0 - rep_offset1 as usize;
                 let back = usize::from(ip0 > 0 && match0 > 0 && src[ip0 - 1] == src[match0 - 1]);
                 ip0 -= back;
                 match0 -= back;
+                if ZSTD_fastTraceEnabled(istart, ip0, base_off.wrapping_add(ip0 as u32)) {
+                    eprintln!(
+                        "zstd-rs-fast-match branch=rep istart={} rel={} ip={} match_rel={} match_ip={} lit={} mLength={} offcode={} rep1={} rep2={}",
+                        istart,
+                        ip0.wrapping_sub(istart),
+                        ip0,
+                        match0.wrapping_sub(istart),
+                        match0,
+                        ip0.wrapping_sub(anchor),
+                        back + 4,
+                        REPCODE_TO_OFFBASE(1),
+                        rep_offset1,
+                        rep_offset2
+                    );
+                }
                 // SAFETY: hash1 < hashTable.len() as above.
                 unsafe {
                     *hashTable.add(hash1) = base_off.wrapping_add(ip1 as u32);
@@ -460,6 +549,25 @@ fn ZSTD_compressBlock_fast_noDict_generic_mls<const MLS: u32, const USE_CMOV: bo
             } else {
                 ZSTD_match4Found_branch(src, ip0, match0_pos, matchIdx, prefixStartIndex)
             };
+            if ZSTD_fastTraceEnabled(istart, ip0, current0) {
+                eprintln!(
+                    "zstd-rs-fast stage=hash0 istart={} rel={} ip={} current0={} anchor_rel={} hash0={} hash1={} matchIdx={} match_rel={} match_ip={} prefixStartIndex={} found={} rep1={} rep2={}",
+                    istart,
+                    ip0.wrapping_sub(istart),
+                    ip0,
+                    current0,
+                    anchor.wrapping_sub(istart),
+                    hash0,
+                    hash1,
+                    matchIdx,
+                    match0_pos.wrapping_sub(istart),
+                    match0_pos,
+                    prefixStartIndex,
+                    match0_found,
+                    rep_offset1,
+                    rep_offset2
+                );
+            }
             if match0_found {
                 unsafe {
                     *hashTable.add(hash1) = base_off.wrapping_add(ip1 as u32);
@@ -473,6 +581,21 @@ fn ZSTD_compressBlock_fast_noDict_generic_mls<const MLS: u32, const USE_CMOV: bo
                     ip0 -= 1;
                     match0 -= 1;
                     mLength += 1;
+                }
+                if ZSTD_fastTraceEnabled(istart, ip0, base_off.wrapping_add(ip0 as u32)) {
+                    eprintln!(
+                        "zstd-rs-fast-match branch=hash0 istart={} rel={} ip={} match_rel={} match_ip={} lit={} mLength={} offcode={} rep1={} rep2={}",
+                        istart,
+                        ip0.wrapping_sub(istart),
+                        ip0,
+                        match0.wrapping_sub(istart),
+                        match0,
+                        ip0.wrapping_sub(anchor),
+                        mLength,
+                        offcode,
+                        rep_offset1,
+                        rep_offset2
+                    );
                 }
                 break (match0, mLength, offcode);
             }
@@ -508,6 +631,25 @@ fn ZSTD_compressBlock_fast_noDict_generic_mls<const MLS: u32, const USE_CMOV: bo
             } else {
                 ZSTD_match4Found_branch(src, ip0, match0_pos2, matchIdx, prefixStartIndex)
             };
+            if ZSTD_fastTraceEnabled(istart, ip0, current0) {
+                eprintln!(
+                    "zstd-rs-fast stage=hash1 istart={} rel={} ip={} current0={} anchor_rel={} hash0={} hash1={} matchIdx={} match_rel={} match_ip={} prefixStartIndex={} found={} rep1={} rep2={}",
+                    istart,
+                    ip0.wrapping_sub(istart),
+                    ip0,
+                    current0,
+                    anchor.wrapping_sub(istart),
+                    hash0,
+                    hash1,
+                    matchIdx,
+                    match0_pos2.wrapping_sub(istart),
+                    match0_pos2,
+                    prefixStartIndex,
+                    match0_found2,
+                    rep_offset1,
+                    rep_offset2
+                );
+            }
             if match0_found2 {
                 if step <= 4 {
                     unsafe {
@@ -523,6 +665,21 @@ fn ZSTD_compressBlock_fast_noDict_generic_mls<const MLS: u32, const USE_CMOV: bo
                     ip0 -= 1;
                     match0 -= 1;
                     mLength += 1;
+                }
+                if ZSTD_fastTraceEnabled(istart, ip0, base_off.wrapping_add(ip0 as u32)) {
+                    eprintln!(
+                        "zstd-rs-fast-match branch=hash1 istart={} rel={} ip={} match_rel={} match_ip={} lit={} mLength={} offcode={} rep1={} rep2={}",
+                        istart,
+                        ip0.wrapping_sub(istart),
+                        ip0,
+                        match0.wrapping_sub(istart),
+                        match0,
+                        ip0.wrapping_sub(anchor),
+                        mLength,
+                        offcode,
+                        rep_offset1,
+                        rep_offset2
+                    );
                 }
                 break (match0, mLength, offcode);
             }
@@ -982,10 +1139,20 @@ pub fn ZSTD_compressBlock_fast_extDict_generic(
     rep: &mut [u32; ZSTD_REP_NUM],
     src: &[u8],
 ) -> usize {
+    ZSTD_compressBlock_fast_extDict_generic_with_start(ms, seqStore, rep, src, 0)
+}
+
+pub fn ZSTD_compressBlock_fast_extDict_generic_with_start(
+    ms: &mut ZSTD_MatchState_t,
+    seqStore: &mut SeqStore_t,
+    rep: &mut [u32; ZSTD_REP_NUM],
+    src: &[u8],
+    istart: usize,
+) -> usize {
     let cParams = ms.cParams;
     let mls = cParams.minMatch;
     if !ZSTD_window_hasExtDict(&ms.window) {
-        return ZSTD_compressBlock_fast_noDict_generic(ms, seqStore, rep, src, 0, mls);
+        return ZSTD_compressBlock_fast_noDict_generic(ms, seqStore, rep, src, istart, mls);
     }
     let hlog = cParams.hashLog;
     let stepSize = (cParams.targetLength + u32::from(cParams.targetLength == 0) + 1) as usize;
@@ -1002,20 +1169,20 @@ pub fn ZSTD_compressBlock_fast_extDict_generic(
     let dictEnd = prefixStartIndex.wrapping_sub(dict_base_off) as usize;
     let iend = src.len();
     let ilimit = iend.saturating_sub(HASH_READ_SIZE);
-    let mut anchor = 0usize;
+    let mut anchor = istart;
     let mut offset_1 = rep[0];
     let mut offset_2 = rep[1];
     let mut offsetSaved1 = 0u32;
     let mut offsetSaved2 = 0u32;
 
     if prefixStartIndex == dictStartIndex {
-        return ZSTD_compressBlock_fast_noDict_generic(ms, seqStore, rep, src, 0, mls);
+        return ZSTD_compressBlock_fast_noDict_generic(ms, seqStore, rep, src, istart, mls);
     }
-    if src.len() < HASH_READ_SIZE || stepSize == 0 {
-        return src.len();
+    if src.len().saturating_sub(istart) < HASH_READ_SIZE || stepSize == 0 {
+        return src.len().saturating_sub(istart);
     }
     {
-        let curr = base_off;
+        let curr = base_off.wrapping_add(istart as u32);
         let maxRep = curr.wrapping_sub(dictStartIndex);
         if offset_2 >= maxRep {
             offsetSaved2 = offset_2;
@@ -1032,8 +1199,8 @@ pub fn ZSTD_compressBlock_fast_extDict_generic(
     debug_assert!(dictEnd <= dict.len());
     debug_assert!(dictStart <= dictEnd);
 
-    let mut ip0 = 0usize;
-    loop {
+    let mut ip0 = istart;
+    'outer: loop {
         let mut step = stepSize;
         let kStepIncr = 1usize << (kSearchStrength - 1);
         let mut nextStep = ip0 + kStepIncr;
@@ -1073,6 +1240,25 @@ pub fn ZSTD_compressBlock_fast_extDict_generic(
             } else {
                 (unsafe { (src.as_ptr().wrapping_add(ip2) as *const u32).read_unaligned() }) ^ 1
             };
+            if ZSTD_fastTraceEnabled(istart, ip2, current2) {
+                eprintln!(
+                    "zstd-rs-fast-ext stage=rep istart={} rel={} current={} anchor_rel={} rep1={} rep2={} repIndex={} repInDict={} eq={} hash0={} hash1={} idx={} prefixStartIndex={} dictStartIndex={}",
+                    istart,
+                    ip2.saturating_sub(istart),
+                    current2,
+                    anchor.saturating_sub(istart),
+                    offset_1,
+                    offset_2,
+                    repIndex,
+                    repInDict as u8,
+                    (unsafe { (src.as_ptr().wrapping_add(ip2) as *const u32).read_unaligned() } == rval) as u8,
+                    hash0,
+                    hash1,
+                    idx,
+                    prefixStartIndex,
+                    dictStartIndex
+                );
+            }
             if unsafe { (src.as_ptr().wrapping_add(ip2) as *const u32).read_unaligned() } == rval {
                 let mut match_local = repLocal;
                 let mut mLength = usize::from(
@@ -1105,6 +1291,25 @@ pub fn ZSTD_compressBlock_fast_extDict_generic(
                     REPCODE_TO_OFFBASE(1),
                     mLength,
                 );
+                if ZSTD_fastTraceEnabled(istart, ip0, base_off.wrapping_add(ip0 as u32)) {
+                    eprintln!(
+                        "zstd-rs-fast-ext-match branch=rep istart={} rel={} current={} match_rel={} matchIndex={} lit={} mLength={} offcode={} rep1={} rep2={}",
+                        istart,
+                        ip0.saturating_sub(istart),
+                        base_off.wrapping_add(ip0 as u32),
+                        match_local as isize - istart as isize,
+                        if repInDict {
+                            dict_base_off.wrapping_add(match_local as u32)
+                        } else {
+                            base_off.wrapping_add(match_local as u32)
+                        },
+                        ip0 - anchor,
+                        mLength,
+                        REPCODE_TO_OFFBASE(1),
+                        offset_1,
+                        offset_2
+                    );
+                }
                 ip0 += mLength;
                 anchor = ip0;
                 if ip1 < ip0 {
@@ -1166,7 +1371,7 @@ pub fn ZSTD_compressBlock_fast_extDict_generic(
                 break 'search;
             }
 
-            if idx >= dictStartIndex {
+            let hash0_found = if idx >= dictStartIndex {
                 let idxInDict = idx < prefixStartIndex;
                 let idxLocal = if idxInDict {
                     idx.wrapping_sub(dict_base_off) as usize
@@ -1180,9 +1385,29 @@ pub fn ZSTD_compressBlock_fast_extDict_generic(
                     debug_assert!(idxLocal + 4 <= src.len());
                     unsafe { (src.as_ptr().wrapping_add(idxLocal) as *const u32).read_unaligned() }
                 };
-                if unsafe { (src.as_ptr().wrapping_add(ip0) as *const u32).read_unaligned() }
-                    == mval
-                {
+                let found =
+                    unsafe { (src.as_ptr().wrapping_add(ip0) as *const u32).read_unaligned() }
+                        == mval;
+                if ZSTD_fastTraceEnabled(istart, ip0, current0) {
+                    eprintln!(
+                        "zstd-rs-fast-ext stage=hash0 istart={} rel={} current={} anchor_rel={} hash0={} hash1={} idx={} idxInDict={} match_rel={} prefixStartIndex={} dictStartIndex={} found={} rep1={} rep2={}",
+                        istart,
+                        ip0.saturating_sub(istart),
+                        current0,
+                        anchor.saturating_sub(istart),
+                        hash0,
+                        hash1,
+                        idx,
+                        idxInDict as u8,
+                        idxLocal as isize - istart as isize,
+                        prefixStartIndex,
+                        dictStartIndex,
+                        found as u8,
+                        offset_1,
+                        offset_2
+                    );
+                }
+                if found {
                     let offset = current0 - idx;
                     let mut match_local = idxLocal;
                     let lowMatchPtr = if idxInDict { dictStart } else { prefixStart };
@@ -1219,6 +1444,25 @@ pub fn ZSTD_compressBlock_fast_extDict_generic(
                         OFFSET_TO_OFFBASE(offset),
                         mLength,
                     );
+                    if ZSTD_fastTraceEnabled(istart, ip0, base_off.wrapping_add(ip0 as u32)) {
+                        eprintln!(
+                            "zstd-rs-fast-ext-match branch=hash0 istart={} rel={} current={} match_rel={} matchIndex={} lit={} mLength={} offcode={} rep1={} rep2={}",
+                            istart,
+                            ip0.saturating_sub(istart),
+                            base_off.wrapping_add(ip0 as u32),
+                            match_local as isize - istart as isize,
+                            if idxInDict {
+                                dict_base_off.wrapping_add(match_local as u32)
+                            } else {
+                                base_off.wrapping_add(match_local as u32)
+                            },
+                            ip0 - anchor,
+                            mLength,
+                            OFFSET_TO_OFFBASE(offset),
+                            offset_1,
+                            offset_2
+                        );
+                    }
                     ip0 += mLength;
                     anchor = ip0;
                     if ip1 < ip0 {
@@ -1291,7 +1535,27 @@ pub fn ZSTD_compressBlock_fast_extDict_generic(
                     }
                     break 'search;
                 }
-            }
+                found
+            } else {
+                if ZSTD_fastTraceEnabled(istart, ip0, current0) {
+                    eprintln!(
+                        "zstd-rs-fast-ext stage=hash0 istart={} rel={} current={} anchor_rel={} hash0={} hash1={} idx={} idxInDict=0 match_rel=0 prefixStartIndex={} dictStartIndex={} found=0 rep1={} rep2={}",
+                        istart,
+                        ip0.saturating_sub(istart),
+                        current0,
+                        anchor.saturating_sub(istart),
+                        hash0,
+                        hash1,
+                        idx,
+                        prefixStartIndex,
+                        dictStartIndex,
+                        offset_1,
+                        offset_2
+                    );
+                }
+                false
+            };
+            let _ = hash0_found;
 
             idx = ms.hashTable[hash1];
             hash0 = hash1;
@@ -1317,9 +1581,29 @@ pub fn ZSTD_compressBlock_fast_extDict_generic(
                     debug_assert!(idxLocal + 4 <= src.len());
                     unsafe { (src.as_ptr().wrapping_add(idxLocal) as *const u32).read_unaligned() }
                 };
-                if unsafe { (src.as_ptr().wrapping_add(ip0) as *const u32).read_unaligned() }
-                    == mval
-                {
+                let found =
+                    unsafe { (src.as_ptr().wrapping_add(ip0) as *const u32).read_unaligned() }
+                        == mval;
+                if ZSTD_fastTraceEnabled(istart, ip0, current0) {
+                    eprintln!(
+                        "zstd-rs-fast-ext stage=hash1 istart={} rel={} current={} anchor_rel={} hash0={} hash1={} idx={} idxInDict={} match_rel={} prefixStartIndex={} dictStartIndex={} found={} rep1={} rep2={}",
+                        istart,
+                        ip0.saturating_sub(istart),
+                        current0,
+                        anchor.saturating_sub(istart),
+                        hash0,
+                        hash1,
+                        idx,
+                        idxInDict as u8,
+                        idxLocal as isize - istart as isize,
+                        prefixStartIndex,
+                        dictStartIndex,
+                        found as u8,
+                        offset_1,
+                        offset_2
+                    );
+                }
+                if found {
                     let offset = current0 - idx;
                     let mut match_local = idxLocal;
                     let lowMatchPtr = if idxInDict { dictStart } else { prefixStart };
@@ -1356,6 +1640,25 @@ pub fn ZSTD_compressBlock_fast_extDict_generic(
                         OFFSET_TO_OFFBASE(offset),
                         mLength,
                     );
+                    if ZSTD_fastTraceEnabled(istart, ip0, base_off.wrapping_add(ip0 as u32)) {
+                        eprintln!(
+                            "zstd-rs-fast-ext-match branch=hash1 istart={} rel={} current={} match_rel={} matchIndex={} lit={} mLength={} offcode={} rep1={} rep2={}",
+                            istart,
+                            ip0.saturating_sub(istart),
+                            base_off.wrapping_add(ip0 as u32),
+                            match_local as isize - istart as isize,
+                            if idxInDict {
+                                dict_base_off.wrapping_add(match_local as u32)
+                            } else {
+                                base_off.wrapping_add(match_local as u32)
+                            },
+                            ip0 - anchor,
+                            mLength,
+                            OFFSET_TO_OFFBASE(offset),
+                            offset_1,
+                            offset_2
+                        );
+                    }
                     ip0 += mLength;
                     anchor = ip0;
                     if ip1 < ip0 {
@@ -1428,6 +1731,21 @@ pub fn ZSTD_compressBlock_fast_extDict_generic(
                     }
                     break 'search;
                 }
+            } else if ZSTD_fastTraceEnabled(istart, ip0, current0) {
+                eprintln!(
+                    "zstd-rs-fast-ext stage=hash1 istart={} rel={} current={} anchor_rel={} hash0={} hash1={} idx={} idxInDict=0 match_rel=0 prefixStartIndex={} dictStartIndex={} found=0 rep1={} rep2={}",
+                    istart,
+                    ip0.saturating_sub(istart),
+                    current0,
+                    anchor.saturating_sub(istart),
+                    hash0,
+                    hash1,
+                    idx,
+                    prefixStartIndex,
+                    dictStartIndex,
+                    offset_1,
+                    offset_2
+                );
             }
 
             idx = ms.hashTable[hash1];
@@ -1444,7 +1762,7 @@ pub fn ZSTD_compressBlock_fast_extDict_generic(
                 nextStep += kStepIncr;
             }
             if ip3 >= ilimit {
-                break 'search;
+                break 'outer;
             }
         }
     }

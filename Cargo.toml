@@ -41,6 +41,11 @@ name = "train"
 path = "src/bin/train.rs"
 required-features = ["cli"]
 
+[[bin]]
+name = "trace_blocks"
+path = "src/bin/trace_blocks.rs"
+required-features = ["cli"]
+
 [features]
 default = ["std"]
 std = []
@@ -60,4 +65,3 @@ opt-level = 3
 [profile.bench]
 lto = true
 codegen-units = 1
-

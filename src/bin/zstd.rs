@@ -16,9 +16,9 @@ use zstd_pure_rs::common::error::{ERR_getErrorName, ERR_isError};
 use zstd_pure_rs::common::xxhash::XXH64_state_t;
 use zstd_pure_rs::compress::zstd_compress::{
     ZSTD_CCtx_loadDictionary, ZSTD_CCtx_setParameter, ZSTD_CCtx_setPledgedSrcSize,
-    ZSTD_CStreamInSize, ZSTD_CStreamOutSize, ZSTD_cParameter, ZSTD_compress2, ZSTD_compressBound,
-    ZSTD_compressStream, ZSTD_createCCtx, ZSTD_endStream, ZSTD_forceIgnoreChecksum_e,
-    ZSTD_maxCLevel, ZSTD_minCLevel,
+    ZSTD_CStreamInSize, ZSTD_CStreamOutSize, ZSTD_EndDirective, ZSTD_cParameter, ZSTD_compress2,
+    ZSTD_compressBound, ZSTD_compressStream, ZSTD_compressStream2, ZSTD_createCCtx, ZSTD_endStream,
+    ZSTD_forceIgnoreChecksum_e, ZSTD_maxCLevel, ZSTD_minCLevel,
 };
 use zstd_pure_rs::decompress::zstd_decompress::{
     ZSTD_DCtx_setFormat, ZSTD_FrameHeader, ZSTD_decompress, ZSTD_decompressContinue_into_history,
@@ -1398,6 +1398,7 @@ fn stream_buffered_compress_zstd_file_to_writer<W: Write>(
     let mut output_buf = vec![0u8; ZSTD_CStreamOutSize().max(output_bound).max(32)];
     let mut total_in = 0usize;
     let mut total_out = 0usize;
+    let mut sent_end = false;
 
     loop {
         let read = reader
@@ -1407,16 +1408,32 @@ fn stream_buffered_compress_zstd_file_to_writer<W: Write>(
             break;
         }
         total_in = total_in.saturating_add(read);
+        let end_op = if total_in as u64 == src_size {
+            ZSTD_EndDirective::ZSTD_e_end
+        } else {
+            ZSTD_EndDirective::ZSTD_e_continue
+        };
         let mut src_pos = 0usize;
-        while src_pos < read {
+        while src_pos < read || end_op == ZSTD_EndDirective::ZSTD_e_end {
             let mut dst_pos = 0usize;
-            let rc = ZSTD_compressStream(
-                &mut cctx,
-                &mut output_buf,
-                &mut dst_pos,
-                &input_buf[..read],
-                &mut src_pos,
-            );
+            let rc = if end_op == ZSTD_EndDirective::ZSTD_e_continue {
+                ZSTD_compressStream(
+                    &mut cctx,
+                    &mut output_buf,
+                    &mut dst_pos,
+                    &input_buf[..read],
+                    &mut src_pos,
+                )
+            } else {
+                ZSTD_compressStream2(
+                    &mut cctx,
+                    &mut output_buf,
+                    &mut dst_pos,
+                    &input_buf[..read],
+                    &mut src_pos,
+                    end_op,
+                )
+            };
             if ERR_isError(rc) {
                 return Err(ERR_getErrorName(rc).to_string());
             }
@@ -1426,10 +1443,17 @@ fn stream_buffered_compress_zstd_file_to_writer<W: Write>(
                     .map_err(|e| e.to_string())?;
                 total_out = total_out.saturating_add(dst_pos);
             }
+            if end_op == ZSTD_EndDirective::ZSTD_e_end && rc == 0 {
+                sent_end = true;
+                break;
+            }
+            if end_op == ZSTD_EndDirective::ZSTD_e_end && dst_pos == 0 && src_pos == read {
+                output_buf.resize(output_buf.len().saturating_add(rc.max(32)), 0);
+            }
         }
     }
 
-    loop {
+    while !sent_end {
         let mut dst_pos = 0usize;
         let rc = ZSTD_endStream(&mut cctx, &mut output_buf, &mut dst_pos);
         if ERR_isError(rc) {

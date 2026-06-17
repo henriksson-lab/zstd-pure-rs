@@ -145,6 +145,12 @@ pub struct ZSTD_CCtx {
     pub stream_frame_ended: bool,
     /// Absolute match-state index represented by `stream_in_buffer[0]`.
     pub stream_window_base: u32,
+    /// Start offset of the current emulated upstream input-ring segment.
+    pub stream_in_segment_start: usize,
+    /// Current write/read position in the emulated upstream input ring.
+    pub stream_in_ring_pos: usize,
+    /// True when the next block starts after an emulated input-ring wrap.
+    pub stream_force_next_segment: bool,
     /// Internal escape hatch for CLI routes that must preserve the
     /// buffered output shape while still using the streaming API.
     pub stream_disable_windowed: bool,
@@ -230,6 +236,8 @@ pub struct ZSTD_CCtx {
     /// Upstream `cctx.staticSize`. Non-zero when initialized from a
     /// caller-provided static workspace.
     pub staticSize: usize,
+    /// Rust-only trace counter used when `ZSTD_TRACE_BLOCKS` is set.
+    pub traceBlockIndex: usize,
 }
 
 impl core::fmt::Debug for ZSTD_CCtx {
@@ -286,6 +294,9 @@ impl Clone for ZSTD_CCtx {
             stream_in_target: self.stream_in_target,
             stream_frame_ended: self.stream_frame_ended,
             stream_window_base: self.stream_window_base,
+            stream_in_segment_start: self.stream_in_segment_start,
+            stream_in_ring_pos: self.stream_in_ring_pos,
+            stream_force_next_segment: self.stream_force_next_segment,
             stream_disable_windowed: self.stream_disable_windowed,
             expected_in_src: self.expected_in_src,
             expected_in_size: self.expected_in_size,
@@ -312,6 +323,7 @@ impl Clone for ZSTD_CCtx {
             prefix_is_single_use: self.prefix_is_single_use,
             customMem: self.customMem,
             staticSize: self.staticSize,
+            traceBlockIndex: self.traceBlockIndex,
         }
     }
 
@@ -363,6 +375,9 @@ impl Default for ZSTD_CCtx {
             stream_in_target: 0,
             stream_frame_ended: false,
             stream_window_base: crate::compress::match_state::ZSTD_WINDOW_START_INDEX,
+            stream_in_segment_start: 0,
+            stream_in_ring_pos: 0,
+            stream_force_next_segment: false,
             stream_disable_windowed: false,
             expected_in_src: 0,
             expected_in_size: 0,
@@ -389,6 +404,7 @@ impl Default for ZSTD_CCtx {
             prefix_is_single_use: false,
             customMem: ZSTD_customMem::default(),
             staticSize: 0,
+            traceBlockIndex: 0,
         }
     }
 }
@@ -1259,6 +1275,9 @@ fn cctx_mark_stream_frame_completed(cctx: &mut ZSTD_CCtx) {
     cctx.stream_in_target = 0;
     cctx.stream_frame_ended = false;
     cctx.stream_window_base = crate::compress::match_state::ZSTD_WINDOW_START_INDEX;
+    cctx.stream_in_segment_start = 0;
+    cctx.stream_in_ring_pos = 0;
+    cctx.stream_force_next_segment = false;
     cctx.stream_closed = false;
     cctx.stream_frame_completed = true;
     #[cfg(feature = "mt")]
@@ -1784,6 +1803,98 @@ fn ZSTD_compressBlock_internal(
     cSize
 }
 
+fn ZSTD_traceBlocksEnabled() -> bool {
+    std::env::var_os("ZSTD_TRACE_BLOCKS").is_some()
+}
+
+fn ZSTD_traceSeqBlock() -> Option<usize> {
+    std::env::var("ZSTD_TRACE_SEQ_BLOCK")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+}
+
+fn ZSTD_seqStoreTraceHash(seqStore: &SeqStore_t) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    let mut mix = |v: u64| {
+        hash ^= v;
+        hash = hash.wrapping_mul(0x100000001b3);
+    };
+    mix(seqStore.sequences.len() as u64);
+    mix(seqStore.literals.len() as u64);
+    mix(seqStore.longLengthPos as u64);
+    mix(seqStore.longLengthType as u64);
+    for seq in &seqStore.sequences {
+        mix(seq.litLength as u64);
+        mix(seq.mlBase as u64);
+        mix(seq.offBase as u64);
+    }
+    for &lit in &seqStore.literals {
+        mix(lit as u64);
+    }
+    hash
+}
+
+fn ZSTD_traceSequences(cctx: &ZSTD_CCtx, seqStore: &SeqStore_t) {
+    if ZSTD_traceSeqBlock() != Some(cctx.traceBlockIndex) {
+        return;
+    }
+    for (i, seq) in seqStore.sequences.iter().enumerate() {
+        eprintln!(
+            "zstd-rs-seq block={} index={} lit={} mlBase={} offBase={}",
+            cctx.traceBlockIndex, i, seq.litLength, seq.mlBase, seq.offBase
+        );
+    }
+}
+
+fn ZSTD_traceBlock(
+    cctx: &ZSTD_CCtx,
+    abs_src_pos: usize,
+    block_size: usize,
+    block_result: usize,
+    c_body_size: Option<usize>,
+    final_block_size: Option<usize>,
+) {
+    if !ZSTD_traceBlocksEnabled() {
+        return;
+    }
+    let seqStore = cctx.seqStore.as_ref();
+    let (nb_seq, nb_lit, seq_hash, long_ty, long_pos) = if let Some(seqStore) = seqStore {
+        (
+            seqStore.sequences.len(),
+            seqStore.literals.len(),
+            ZSTD_seqStoreTraceHash(seqStore),
+            seqStore.longLengthType as u32,
+            seqStore.longLengthPos,
+        )
+    } else {
+        (0, 0, 0, 0, 0)
+    };
+    eprintln!(
+        "zstd-rs-block index={} abs_src_pos={} block_size={} strategy={} minMatch={} row={:?} targetCBlock={} splitter={} bss={} c_body={:?} c_block={:?} rep_prev={:?} rep_next={:?} nb_seq={} nb_lit={} long_ty={} long_pos={} seq_hash={:016x}",
+        cctx.traceBlockIndex,
+        abs_src_pos,
+        block_size,
+        cctx.appliedParams.cParams.strategy,
+        cctx.appliedParams.cParams.minMatch,
+        cctx.appliedParams.useRowMatchFinder,
+        ZSTD_useTargetCBlockSize(&cctx.appliedParams) as u32,
+        ZSTD_blockSplitterEnabled(&cctx.appliedParams) as u32,
+        block_result,
+        c_body_size,
+        final_block_size,
+        cctx.prev_rep,
+        cctx.next_rep,
+        nb_seq,
+        nb_lit,
+        long_ty,
+        long_pos,
+        seq_hash,
+    );
+    if let Some(seqStore) = seqStore {
+        ZSTD_traceSequences(cctx, seqStore);
+    }
+}
+
 /// Port of `ZSTD_compress_frameChunk` (`zstd_compress.c:4615`).
 /// Compresses a chunk of data into one or multiple blocks. All blocks are
 /// terminated and all input is consumed. The frame header must already
@@ -1894,6 +2005,7 @@ pub fn ZSTD_compress_frameChunk(
             }
         }
 
+        let mut trace_c_body_size = None;
         let cSize = if ZSTD_useTargetCBlockSize(&cctx.appliedParams) {
             let bss = ZSTD_buildSeqStore_with_window(
                 cctx,
@@ -1959,6 +2071,7 @@ pub fn ZSTD_compress_frameChunk(
                 history_prefix_len + ip + blockSize,
                 true,
             );
+            trace_c_body_size = Some(cBodySize);
             if ERR_isError(cBodySize) {
                 cBodySize
             } else if cBodySize == 0 {
@@ -1986,6 +2099,15 @@ pub fn ZSTD_compress_frameChunk(
         if ERR_isError(cSize) {
             return cSize;
         }
+        ZSTD_traceBlock(
+            cctx,
+            cctx.consumedSrcSize as usize + ip,
+            blockSize,
+            usize::MAX,
+            trace_c_body_size,
+            Some(cSize),
+        );
+        cctx.traceBlockIndex += 1;
 
         savings += blockSize as i64 - cSize as i64;
         remaining -= blockSize;
@@ -2087,6 +2209,7 @@ fn ZSTD_compress_frameChunk_windowed(
             }
         }
 
+        let mut trace_c_body_size = None;
         let cSize = if ZSTD_useTargetCBlockSize(&cctx.appliedParams) {
             let bss = ZSTD_buildSeqStore_with_window(cctx, window_buf, ip, ip + blockSize);
             if ERR_isError(bss) {
@@ -2151,6 +2274,7 @@ fn ZSTD_compress_frameChunk_windowed(
                 ip + blockSize,
                 true,
             );
+            trace_c_body_size = Some(cBodySize);
             if ERR_isError(cBodySize) {
                 cBodySize
             } else if cBodySize == 0 {
@@ -2178,6 +2302,15 @@ fn ZSTD_compress_frameChunk_windowed(
         if ERR_isError(cSize) {
             return cSize;
         }
+        ZSTD_traceBlock(
+            cctx,
+            cctx.consumedSrcSize as usize + (ip - src_pos),
+            blockSize,
+            usize::MAX,
+            trace_c_body_size,
+            Some(cSize),
+        );
+        cctx.traceBlockIndex += 1;
 
         savings += blockSize as i64 - cSize as i64;
         remaining -= blockSize;
@@ -3768,6 +3901,9 @@ pub fn ZSTD_CCtx_reset(cctx: &mut ZSTD_CCtx, reset: ZSTD_ResetDirective) -> usiz
         cctx.stream_in_target = 0;
         cctx.stream_frame_ended = false;
         cctx.stream_window_base = crate::compress::match_state::ZSTD_WINDOW_START_INDEX;
+        cctx.stream_in_segment_start = 0;
+        cctx.stream_in_ring_pos = 0;
+        cctx.stream_force_next_segment = false;
         cctx.expected_in_src = 0;
         cctx.expected_in_size = 0;
         cctx.expected_in_pos = 0;
@@ -5258,6 +5394,17 @@ fn ZSTD_buildSeqStore_selectMatches_with_window(
                     src_end,
                 )
             }
+            (s, ZSTD_dictMode_e::ZSTD_extDict)
+                if s == crate::compress::zstd_compress_sequences::ZSTD_fast =>
+            {
+                crate::compress::zstd_fast::ZSTD_compressBlock_fast_extDict_generic_with_start(
+                    ms,
+                    seqStore,
+                    &mut cctx.next_rep,
+                    window_to_block_end,
+                    src_pos,
+                )
+            }
             _ => {
                 ms.ldmSeqStore = None;
                 let blockCompressor = ZSTD_selectBlockCompressor(
@@ -5739,6 +5886,7 @@ pub fn ZSTD_resetCCtx_internal(
 
     debug_assert!(!ERR_isError(ZSTD_checkCParams(params.cParams)));
     zc.isFirstBlock = 1;
+    zc.traceBlockIndex = 0;
     zc.appliedParams = *params;
     zc.appliedParams.useRowMatchFinder = ZSTD_resolveRowMatchFinderMode(
         zc.appliedParams.useRowMatchFinder,
@@ -5910,6 +6058,9 @@ pub fn ZSTD_resetCCtx_internal(
     zc.stream_in_target = 0;
     zc.stream_frame_ended = false;
     zc.stream_window_base = crate::compress::match_state::ZSTD_WINDOW_START_INDEX;
+    zc.stream_in_segment_start = 0;
+    zc.stream_in_ring_pos = 0;
+    zc.stream_force_next_segment = false;
     zc.expected_in_src = 0;
     zc.expected_in_size = 0;
     zc.expected_in_pos = 0;
@@ -11578,6 +11729,9 @@ pub fn ZSTD_initCStream(zcs: &mut ZSTD_CCtx, compressionLevel: i32) -> usize {
     zcs.stream_in_target = 0;
     zcs.stream_frame_ended = false;
     zcs.stream_window_base = crate::compress::match_state::ZSTD_WINDOW_START_INDEX;
+    zcs.stream_in_segment_start = 0;
+    zcs.stream_in_ring_pos = 0;
+    zcs.stream_force_next_segment = false;
     zcs.stream_closed = false;
     zcs.stream_frame_completed = false;
     ZSTD_clearAllDicts(zcs);
@@ -12456,6 +12610,10 @@ fn zstd_stream_window_capacity(zcs: &ZSTD_CCtx) -> usize {
     window_size.saturating_add(zcs.blockSizeMax.max(1))
 }
 
+fn zstd_stream_segment_capacity(zcs: &ZSTD_CCtx) -> usize {
+    zstd_stream_window_capacity(zcs)
+}
+
 fn zstd_stream_can_use_windowed(zcs: &ZSTD_CCtx) -> bool {
     zstd_stream_can_use_windowed_with_stable_one_shot(zcs, false)
 }
@@ -12670,14 +12828,31 @@ fn zstd_stream_compress_windowed_block(
         return rc;
     }
 
+    let force_segment = zcs.stream_force_next_segment;
+    let segment_pos = if force_segment {
+        src_pos
+    } else {
+        zcs.stream_in_segment_start.min(src_pos)
+    };
+    let segment_abs = zcs.stream_window_base.wrapping_add(segment_pos as u32);
     let src_abs = zcs.stream_window_base.wrapping_add(src_pos as u32);
     {
         let ms = zcs.ms.as_mut().unwrap();
-        ms.window.base_offset = zcs.stream_window_base;
-        if !ZSTD_window_update(&mut ms.window, src_abs, src_len, ms.forceNonContiguous) {
+        if force_segment {
+            ms.dictContent.clear();
+            ms.dictContent
+                .extend_from_slice(&zcs.stream_in_buffer[..src_pos]);
+            ms.window.base_offset = zcs.stream_window_base;
+            zcs.stream_in_segment_start = src_pos;
+        } else {
+            ms.window.base_offset = segment_abs;
+        }
+        let force_non_contiguous = ms.forceNonContiguous || force_segment;
+        if !ZSTD_window_update(&mut ms.window, src_abs, src_len, force_non_contiguous) {
             ms.forceNonContiguous = false;
             ms.nextToUpdate = ms.window.dictLimit;
         }
+        zcs.stream_force_next_segment = false;
     }
 
     if zcs.appliedParams.ldmEnable == crate::compress::zstd_ldm::ZSTD_ParamSwitch_e::ZSTD_ps_enable
@@ -12687,14 +12862,18 @@ fn zstd_stream_compress_windowed_block(
         }
     }
 
-    let ptr = zcs.stream_in_buffer.as_ptr();
-    let len = zcs.stream_in_buffer.len();
+    let active_segment_pos = zcs.stream_in_segment_start.min(src_pos);
+    let ptr = unsafe { zcs.stream_in_buffer.as_ptr().add(active_segment_pos) };
+    let len = zcs
+        .stream_in_buffer
+        .len()
+        .saturating_sub(active_segment_pos);
     let window = unsafe { core::slice::from_raw_parts(ptr, len) };
     let cSize = ZSTD_compress_frameChunk_windowed(
         zcs,
         unsafe { core::slice::from_raw_parts_mut(dst.add(op), compressed_capacity - op) },
         window,
-        src_pos,
+        src_pos.saturating_sub(active_segment_pos),
         src_len,
         last_block as u32,
     );
@@ -12752,6 +12931,7 @@ fn zstd_stream_trim_window(zcs: &mut ZSTD_CCtx) {
         zcs.stream_window_base = zcs.stream_window_base.wrapping_add(drain as u32);
         zcs.stream_in_to_compress = zcs.stream_in_to_compress.saturating_sub(drain);
         zcs.stream_in_target = zcs.stream_in_target.saturating_sub(drain);
+        zcs.stream_in_segment_start = zcs.stream_in_segment_start.saturating_sub(drain);
         if let Some(ms) = zcs.ms.as_mut() {
             ms.window.base_offset = zcs.stream_window_base;
         }
@@ -12874,6 +13054,14 @@ fn zstd_compressStream_windowed(
         }
         zcs.stream_in_to_compress += block_len;
         zcs.stream_in_target = zcs.stream_in_to_compress + zcs.blockSizeMax;
+        zcs.stream_in_ring_pos = zcs.stream_in_ring_pos.saturating_add(block_len);
+        if zcs.stream_in_ring_pos.saturating_add(zcs.blockSizeMax)
+            > zstd_stream_segment_capacity(zcs)
+        {
+            zcs.stream_in_ring_pos = 0;
+            zcs.stream_in_segment_start = zcs.stream_in_to_compress;
+            zcs.stream_force_next_segment = !last;
+        }
         zstd_stream_trim_window(zcs);
     }
 }
@@ -13670,6 +13858,9 @@ pub fn ZSTD_CCtx_init_compressStream2(
         .as_ref()
         .map(|ms| ms.window.base_offset)
         .unwrap_or(crate::compress::match_state::ZSTD_WINDOW_START_INDEX);
+    cctx.stream_in_segment_start = 0;
+    cctx.stream_in_ring_pos = 0;
+    cctx.stream_force_next_segment = false;
     0
 }
 

@@ -1149,8 +1149,46 @@ pub fn ZSTD_compressBlock_fast_extDict_generic_with_start(
     src: &[u8],
     istart: usize,
 ) -> usize {
+    match ms.cParams.minMatch {
+        5 => ZSTD_compressBlock_fast_extDict_generic_with_start_mls::<5>(
+            ms, seqStore, rep, src, istart,
+        ),
+        6 => ZSTD_compressBlock_fast_extDict_generic_with_start_mls::<6>(
+            ms, seqStore, rep, src, istart,
+        ),
+        7 => ZSTD_compressBlock_fast_extDict_generic_with_start_mls::<7>(
+            ms, seqStore, rep, src, istart,
+        ),
+        _ => ZSTD_compressBlock_fast_extDict_generic_with_start_mls::<4>(
+            ms, seqStore, rep, src, istart,
+        ),
+    }
+}
+
+#[inline(always)]
+fn ZSTD_fastHash<const MLS: u32>(src: &[u8], pos: usize, hlog: u32) -> usize {
+    unsafe {
+        let p = src.as_ptr().wrapping_add(pos);
+        match MLS {
+            5 => ZSTD_hash5((p as *const u64).read_unaligned().to_le(), hlog, 0),
+            6 => ZSTD_hash6((p as *const u64).read_unaligned().to_le(), hlog, 0),
+            7 => ZSTD_hash7((p as *const u64).read_unaligned().to_le(), hlog, 0),
+            8 => ZSTD_hash8((p as *const u64).read_unaligned().to_le(), hlog, 0),
+            _ => ZSTD_hash4((p as *const u32).read_unaligned().to_le(), hlog, 0) as usize,
+        }
+    }
+}
+
+#[inline(never)]
+fn ZSTD_compressBlock_fast_extDict_generic_with_start_mls<const MLS: u32>(
+    ms: &mut ZSTD_MatchState_t,
+    seqStore: &mut SeqStore_t,
+    rep: &mut [u32; ZSTD_REP_NUM],
+    src: &[u8],
+    istart: usize,
+) -> usize {
     let cParams = ms.cParams;
-    let mls = cParams.minMatch;
+    let mls = MLS;
     if !ZSTD_window_hasExtDict(&ms.window) {
         return ZSTD_compressBlock_fast_noDict_generic(ms, seqStore, rep, src, istart, mls);
     }
@@ -1211,8 +1249,8 @@ pub fn ZSTD_compressBlock_fast_extDict_generic_with_start(
             break;
         }
 
-        let mut hash0 = ZSTD_hashPtr(&src[ip0..], hlog, mls);
-        let mut hash1 = ZSTD_hashPtr(&src[ip1..], hlog, mls);
+        let mut hash0 = ZSTD_fastHash::<MLS>(src, ip0, hlog);
+        let mut hash1 = ZSTD_fastHash::<MLS>(src, ip1, hlog);
         let mut idx = ms.hashTable[hash0];
 
         'search: loop {
@@ -1316,12 +1354,12 @@ pub fn ZSTD_compressBlock_fast_extDict_generic_with_start(
                     ms.hashTable[hash1] = base_off.wrapping_add(ip1 as u32);
                 }
                 if ip0 <= ilimit {
-                    ms.hashTable[ZSTD_hashPtr(
-                        &src[(current0.wrapping_add(2).wrapping_sub(base_off)) as usize..],
+                    ms.hashTable[ZSTD_fastHash::<MLS>(
+                        src,
+                        (current0.wrapping_add(2).wrapping_sub(base_off)) as usize,
                         hlog,
-                        mls,
                     )] = current0.wrapping_add(2);
-                    ms.hashTable[ZSTD_hashPtr(&src[ip0 - 2..], hlog, mls)] =
+                    ms.hashTable[ZSTD_fastHash::<MLS>(src, ip0 - 2, hlog)] =
                         base_off.wrapping_add((ip0 - 2) as u32);
                     while ip0 <= ilimit {
                         let repIndex2 = base_off.wrapping_add(ip0 as u32).wrapping_sub(offset_2);
@@ -1359,7 +1397,7 @@ pub fn ZSTD_compressBlock_fast_extDict_generic_with_start(
                                 REPCODE_TO_OFFBASE(1),
                                 repLength2,
                             );
-                            ms.hashTable[ZSTD_hashPtr(&src[ip0..], hlog, mls)] =
+                            ms.hashTable[ZSTD_fastHash::<MLS>(src, ip0, hlog)] =
                                 base_off.wrapping_add(ip0 as u32);
                             ip0 += repLength2;
                             anchor = ip0;
@@ -1469,12 +1507,12 @@ pub fn ZSTD_compressBlock_fast_extDict_generic_with_start(
                         ms.hashTable[hash1] = base_off.wrapping_add(ip1 as u32);
                     }
                     if ip0 <= ilimit {
-                        ms.hashTable[ZSTD_hashPtr(
-                            &src[(current0.wrapping_add(2).wrapping_sub(base_off)) as usize..],
+                        ms.hashTable[ZSTD_fastHash::<MLS>(
+                            src,
+                            (current0.wrapping_add(2).wrapping_sub(base_off)) as usize,
                             hlog,
-                            mls,
                         )] = current0.wrapping_add(2);
-                        ms.hashTable[ZSTD_hashPtr(&src[ip0 - 2..], hlog, mls)] =
+                        ms.hashTable[ZSTD_fastHash::<MLS>(src, ip0 - 2, hlog)] =
                             base_off.wrapping_add((ip0 - 2) as u32);
                         while ip0 <= ilimit {
                             let repIndex2 =
@@ -1524,7 +1562,7 @@ pub fn ZSTD_compressBlock_fast_extDict_generic_with_start(
                                     REPCODE_TO_OFFBASE(1),
                                     repLength2,
                                 );
-                                ms.hashTable[ZSTD_hashPtr(&src[ip0..], hlog, mls)] =
+                                ms.hashTable[ZSTD_fastHash::<MLS>(src, ip0, hlog)] =
                                     base_off.wrapping_add(ip0 as u32);
                                 ip0 += repLength2;
                                 anchor = ip0;
@@ -1559,7 +1597,7 @@ pub fn ZSTD_compressBlock_fast_extDict_generic_with_start(
 
             idx = ms.hashTable[hash1];
             hash0 = hash1;
-            hash1 = ZSTD_hashPtr(&src[ip2..], hlog, mls);
+            hash1 = ZSTD_fastHash::<MLS>(src, ip2, hlog);
             ip0 = ip1;
             ip1 = ip2;
             ip2 = ip3;
@@ -1665,12 +1703,12 @@ pub fn ZSTD_compressBlock_fast_extDict_generic_with_start(
                         ms.hashTable[hash1] = base_off.wrapping_add(ip1 as u32);
                     }
                     if ip0 <= ilimit {
-                        ms.hashTable[ZSTD_hashPtr(
-                            &src[(current0.wrapping_add(2).wrapping_sub(base_off)) as usize..],
+                        ms.hashTable[ZSTD_fastHash::<MLS>(
+                            src,
+                            (current0.wrapping_add(2).wrapping_sub(base_off)) as usize,
                             hlog,
-                            mls,
                         )] = current0.wrapping_add(2);
-                        ms.hashTable[ZSTD_hashPtr(&src[ip0 - 2..], hlog, mls)] =
+                        ms.hashTable[ZSTD_fastHash::<MLS>(src, ip0 - 2, hlog)] =
                             base_off.wrapping_add((ip0 - 2) as u32);
                         while ip0 <= ilimit {
                             let repIndex2 =
@@ -1720,7 +1758,7 @@ pub fn ZSTD_compressBlock_fast_extDict_generic_with_start(
                                     REPCODE_TO_OFFBASE(1),
                                     repLength2,
                                 );
-                                ms.hashTable[ZSTD_hashPtr(&src[ip0..], hlog, mls)] =
+                                ms.hashTable[ZSTD_fastHash::<MLS>(src, ip0, hlog)] =
                                     base_off.wrapping_add(ip0 as u32);
                                 ip0 += repLength2;
                                 anchor = ip0;
@@ -1750,7 +1788,7 @@ pub fn ZSTD_compressBlock_fast_extDict_generic_with_start(
 
             idx = ms.hashTable[hash1];
             hash0 = hash1;
-            hash1 = ZSTD_hashPtr(&src[ip2..], hlog, mls);
+            hash1 = ZSTD_fastHash::<MLS>(src, ip2, hlog);
             ip0 = ip1;
             ip1 = ip2;
             ip2 = ip0 + step;

@@ -1254,7 +1254,7 @@ fn ZSTD_compressBlock_fast_extDict_generic_with_start_mls<const MLS: u32>(
         let mut hash1 = ZSTD_fastHash::<MLS>(src, ip1, hlog);
         let mut idx = unsafe { *hashTable.add(hash0) };
 
-        'search: loop {
+        let (match_branch, match_local, match_in_dict, mut mLength, offcode, current0_for_fill) = 'search: loop {
             let current2 = base_off.wrapping_add(ip2 as u32);
             let repIndex = current2.wrapping_sub(offset_1);
             let repInDict = repIndex < prefixStartIndex;
@@ -1315,135 +1315,15 @@ fn ZSTD_compressBlock_fast_extDict_generic_with_start_mls<const MLS: u32>(
                 );
                 ip0 = ip2 - mLength;
                 match_local -= mLength;
-                let matchEnd = if repInDict { dictEnd } else { iend };
                 mLength += 4;
-                mLength += if repInDict {
-                    ZSTD_count_2segments(
-                        src,
-                        ip0 + mLength,
-                        iend,
-                        prefixStart,
-                        dict,
-                        match_local + mLength,
-                        matchEnd,
-                    )
-                } else {
-                    ZSTD_count(src, ip0 + mLength, match_local + mLength, iend)
-                };
-                ZSTD_storeSeq(
-                    seqStore,
-                    ip0 - anchor,
-                    &src[anchor..ip0],
-                    REPCODE_TO_OFFBASE(1),
+                break 'search (
+                    "rep",
+                    match_local,
+                    repInDict,
                     mLength,
+                    REPCODE_TO_OFFBASE(1),
+                    current0,
                 );
-                if ZSTD_fastTraceEnabled(istart, ip0, base_off.wrapping_add(ip0 as u32)) {
-                    eprintln!(
-                        "zstd-rs-fast-ext-match branch=rep istart={} rel={} current={} match_rel={} matchIndex={} lit={} mLength={} offcode={} rep1={} rep2={}",
-                        istart,
-                        ip0.saturating_sub(istart),
-                        base_off.wrapping_add(ip0 as u32),
-                        match_local as isize - istart as isize,
-                        if repInDict {
-                            dict_base_off.wrapping_add(match_local as u32)
-                        } else {
-                            base_off.wrapping_add(match_local as u32)
-                        },
-                        ip0 - anchor,
-                        mLength,
-                        REPCODE_TO_OFFBASE(1),
-                        offset_1,
-                        offset_2
-                    );
-                }
-                ip0 += mLength;
-                anchor = ip0;
-                if ip1 < ip0 {
-                    unsafe {
-                        *hashTable.add(hash1) = base_off.wrapping_add(ip1 as u32);
-                    }
-                }
-                if ip0 <= ilimit {
-                    let h = ZSTD_fastHash::<MLS>(
-                        src,
-                        (current0.wrapping_add(2).wrapping_sub(base_off)) as usize,
-                        hlog,
-                    );
-                    unsafe {
-                        *hashTable.add(h) = current0.wrapping_add(2);
-                    }
-                    let h = ZSTD_fastHash::<MLS>(src, ip0 - 2, hlog);
-                    unsafe {
-                        *hashTable.add(h) = base_off.wrapping_add((ip0 - 2) as u32);
-                    }
-                    while ip0 <= ilimit {
-                        let repIndex2 = base_off.wrapping_add(ip0 as u32).wrapping_sub(offset_2);
-                        let repInDict2 = repIndex2 < prefixStartIndex;
-                        let repLocal2 = if repInDict2 {
-                            repIndex2.wrapping_sub(dict_base_off) as usize
-                        } else {
-                            repIndex2.wrapping_sub(base_off) as usize
-                        };
-                        if offset_2 > 0
-                            && ZSTD_index_overlap_check(prefixStartIndex, repIndex2)
-                            && if repInDict2 {
-                                if repLocal2 + 4 <= dictEnd {
-                                    unsafe {
-                                        (dict.as_ptr().wrapping_add(repLocal2) as *const u32)
-                                            .read_unaligned()
-                                            == (src.as_ptr().wrapping_add(ip0) as *const u32)
-                                                .read_unaligned()
-                                    }
-                                } else {
-                                    false
-                                }
-                            } else {
-                                if repLocal2 + 4 <= src.len() {
-                                    unsafe {
-                                        (src.as_ptr().wrapping_add(repLocal2) as *const u32)
-                                            .read_unaligned()
-                                            == (src.as_ptr().wrapping_add(ip0) as *const u32)
-                                                .read_unaligned()
-                                    }
-                                } else {
-                                    false
-                                }
-                            }
-                        {
-                            let repEnd2 = if repInDict2 { dictEnd } else { iend };
-                            let repLength2 = if repInDict2 {
-                                ZSTD_count_2segments(
-                                    src,
-                                    ip0 + 4,
-                                    iend,
-                                    prefixStart,
-                                    dict,
-                                    repLocal2 + 4,
-                                    repEnd2,
-                                )
-                            } else {
-                                ZSTD_count(src, ip0 + 4, repLocal2 + 4, iend)
-                            } + 4;
-                            std::mem::swap(&mut offset_2, &mut offset_1);
-                            ZSTD_storeSeq(
-                                seqStore,
-                                0,
-                                &src[anchor..anchor],
-                                REPCODE_TO_OFFBASE(1),
-                                repLength2,
-                            );
-                            let h = ZSTD_fastHash::<MLS>(src, ip0, hlog);
-                            unsafe {
-                                *hashTable.add(h) = base_off.wrapping_add(ip0 as u32);
-                            }
-                            ip0 += repLength2;
-                            anchor = ip0;
-                            continue;
-                        }
-                        break;
-                    }
-                }
-                break 'search;
             }
 
             let hash0_found = if idx >= dictStartIndex {
@@ -1486,7 +1366,6 @@ fn ZSTD_compressBlock_fast_extDict_generic_with_start_mls<const MLS: u32>(
                     let offset = current0 - idx;
                     let mut match_local = idxLocal;
                     let lowMatchPtr = if idxInDict { dictStart } else { prefixStart };
-                    let matchEnd = if idxInDict { dictEnd } else { iend };
                     let mut mLength = 4usize;
                     while ip0 > anchor
                         && match_local > lowMatchPtr
@@ -1503,129 +1382,14 @@ fn ZSTD_compressBlock_fast_extDict_generic_with_start_mls<const MLS: u32>(
                     }
                     offset_2 = offset_1;
                     offset_1 = offset;
-                    mLength += if idxInDict {
-                        ZSTD_count_2segments(
-                            src,
-                            ip0 + mLength,
-                            iend,
-                            prefixStart,
-                            dict,
-                            match_local + mLength,
-                            matchEnd,
-                        )
-                    } else {
-                        ZSTD_count(src, ip0 + mLength, match_local + mLength, iend)
-                    };
-                    ZSTD_storeSeq(
-                        seqStore,
-                        ip0 - anchor,
-                        &src[anchor..ip0],
-                        OFFSET_TO_OFFBASE(offset),
+                    break 'search (
+                        "hash0",
+                        match_local,
+                        idxInDict,
                         mLength,
+                        OFFSET_TO_OFFBASE(offset),
+                        current0,
                     );
-                    if ZSTD_fastTraceEnabled(istart, ip0, base_off.wrapping_add(ip0 as u32)) {
-                        eprintln!(
-                            "zstd-rs-fast-ext-match branch=hash0 istart={} rel={} current={} match_rel={} matchIndex={} lit={} mLength={} offcode={} rep1={} rep2={}",
-                            istart,
-                            ip0.saturating_sub(istart),
-                            base_off.wrapping_add(ip0 as u32),
-                            match_local as isize - istart as isize,
-                            if idxInDict {
-                                dict_base_off.wrapping_add(match_local as u32)
-                            } else {
-                                base_off.wrapping_add(match_local as u32)
-                            },
-                            ip0 - anchor,
-                            mLength,
-                            OFFSET_TO_OFFBASE(offset),
-                            offset_1,
-                            offset_2
-                        );
-                    }
-                    ip0 += mLength;
-                    anchor = ip0;
-                    if ip1 < ip0 {
-                        unsafe {
-                            *hashTable.add(hash1) = base_off.wrapping_add(ip1 as u32);
-                        }
-                    }
-                    if ip0 <= ilimit {
-                        let h = ZSTD_fastHash::<MLS>(
-                            src,
-                            (current0.wrapping_add(2).wrapping_sub(base_off)) as usize,
-                            hlog,
-                        );
-                        unsafe {
-                            *hashTable.add(h) = current0.wrapping_add(2);
-                        }
-                        let h = ZSTD_fastHash::<MLS>(src, ip0 - 2, hlog);
-                        unsafe {
-                            *hashTable.add(h) = base_off.wrapping_add((ip0 - 2) as u32);
-                        }
-                        while ip0 <= ilimit {
-                            let repIndex2 =
-                                base_off.wrapping_add(ip0 as u32).wrapping_sub(offset_2);
-                            let repInDict2 = repIndex2 < prefixStartIndex;
-                            let repLocal2 = if repInDict2 {
-                                repIndex2.wrapping_sub(dict_base_off) as usize
-                            } else {
-                                repIndex2.wrapping_sub(base_off) as usize
-                            };
-                            if offset_2 > 0 && ZSTD_index_overlap_check(prefixStartIndex, repIndex2)
-                            {
-                                let r2 = if repInDict2 {
-                                    debug_assert!(repLocal2 + 4 <= dictEnd);
-                                    unsafe {
-                                        (dict.as_ptr().wrapping_add(repLocal2) as *const u32)
-                                            .read_unaligned()
-                                    }
-                                } else {
-                                    debug_assert!(repLocal2 + 4 <= src.len());
-                                    unsafe {
-                                        (src.as_ptr().wrapping_add(repLocal2) as *const u32)
-                                            .read_unaligned()
-                                    }
-                                };
-                                if unsafe {
-                                    (src.as_ptr().wrapping_add(ip0) as *const u32).read_unaligned()
-                                } != r2
-                                {
-                                    break;
-                                }
-                                let repEnd2 = if repInDict2 { dictEnd } else { iend };
-                                let repLength2 = if repInDict2 {
-                                    ZSTD_count_2segments(
-                                        src,
-                                        ip0 + 4,
-                                        iend,
-                                        prefixStart,
-                                        dict,
-                                        repLocal2 + 4,
-                                        repEnd2,
-                                    )
-                                } else {
-                                    ZSTD_count(src, ip0 + 4, repLocal2 + 4, iend)
-                                } + 4;
-                                std::mem::swap(&mut offset_2, &mut offset_1);
-                                ZSTD_storeSeq(
-                                    seqStore,
-                                    0,
-                                    &src[anchor..anchor],
-                                    REPCODE_TO_OFFBASE(1),
-                                    repLength2,
-                                );
-                                let h = ZSTD_fastHash::<MLS>(src, ip0, hlog);
-                                unsafe {
-                                    *hashTable.add(h) = base_off.wrapping_add(ip0 as u32);
-                                }
-                                ip0 += repLength2;
-                                anchor = ip0;
-                                continue;
-                            }
-                            break;
-                        }
-                    }
-                    break 'search;
                 }
                 found
             } else {
@@ -1701,7 +1465,6 @@ fn ZSTD_compressBlock_fast_extDict_generic_with_start_mls<const MLS: u32>(
                     let offset = current0 - idx;
                     let mut match_local = idxLocal;
                     let lowMatchPtr = if idxInDict { dictStart } else { prefixStart };
-                    let matchEnd = if idxInDict { dictEnd } else { iend };
                     let mut mLength = 4usize;
                     while ip0 > anchor
                         && match_local > lowMatchPtr
@@ -1718,129 +1481,14 @@ fn ZSTD_compressBlock_fast_extDict_generic_with_start_mls<const MLS: u32>(
                     }
                     offset_2 = offset_1;
                     offset_1 = offset;
-                    mLength += if idxInDict {
-                        ZSTD_count_2segments(
-                            src,
-                            ip0 + mLength,
-                            iend,
-                            prefixStart,
-                            dict,
-                            match_local + mLength,
-                            matchEnd,
-                        )
-                    } else {
-                        ZSTD_count(src, ip0 + mLength, match_local + mLength, iend)
-                    };
-                    ZSTD_storeSeq(
-                        seqStore,
-                        ip0 - anchor,
-                        &src[anchor..ip0],
-                        OFFSET_TO_OFFBASE(offset),
+                    break 'search (
+                        "hash1",
+                        match_local,
+                        idxInDict,
                         mLength,
+                        OFFSET_TO_OFFBASE(offset),
+                        current0,
                     );
-                    if ZSTD_fastTraceEnabled(istart, ip0, base_off.wrapping_add(ip0 as u32)) {
-                        eprintln!(
-                            "zstd-rs-fast-ext-match branch=hash1 istart={} rel={} current={} match_rel={} matchIndex={} lit={} mLength={} offcode={} rep1={} rep2={}",
-                            istart,
-                            ip0.saturating_sub(istart),
-                            base_off.wrapping_add(ip0 as u32),
-                            match_local as isize - istart as isize,
-                            if idxInDict {
-                                dict_base_off.wrapping_add(match_local as u32)
-                            } else {
-                                base_off.wrapping_add(match_local as u32)
-                            },
-                            ip0 - anchor,
-                            mLength,
-                            OFFSET_TO_OFFBASE(offset),
-                            offset_1,
-                            offset_2
-                        );
-                    }
-                    ip0 += mLength;
-                    anchor = ip0;
-                    if ip1 < ip0 {
-                        unsafe {
-                            *hashTable.add(hash1) = base_off.wrapping_add(ip1 as u32);
-                        }
-                    }
-                    if ip0 <= ilimit {
-                        let h = ZSTD_fastHash::<MLS>(
-                            src,
-                            (current0.wrapping_add(2).wrapping_sub(base_off)) as usize,
-                            hlog,
-                        );
-                        unsafe {
-                            *hashTable.add(h) = current0.wrapping_add(2);
-                        }
-                        let h = ZSTD_fastHash::<MLS>(src, ip0 - 2, hlog);
-                        unsafe {
-                            *hashTable.add(h) = base_off.wrapping_add((ip0 - 2) as u32);
-                        }
-                        while ip0 <= ilimit {
-                            let repIndex2 =
-                                base_off.wrapping_add(ip0 as u32).wrapping_sub(offset_2);
-                            let repInDict2 = repIndex2 < prefixStartIndex;
-                            let repLocal2 = if repInDict2 {
-                                repIndex2.wrapping_sub(dict_base_off) as usize
-                            } else {
-                                repIndex2.wrapping_sub(base_off) as usize
-                            };
-                            if offset_2 > 0 && ZSTD_index_overlap_check(prefixStartIndex, repIndex2)
-                            {
-                                let r2 = if repInDict2 {
-                                    debug_assert!(repLocal2 + 4 <= dictEnd);
-                                    unsafe {
-                                        (dict.as_ptr().wrapping_add(repLocal2) as *const u32)
-                                            .read_unaligned()
-                                    }
-                                } else {
-                                    debug_assert!(repLocal2 + 4 <= src.len());
-                                    unsafe {
-                                        (src.as_ptr().wrapping_add(repLocal2) as *const u32)
-                                            .read_unaligned()
-                                    }
-                                };
-                                if unsafe {
-                                    (src.as_ptr().wrapping_add(ip0) as *const u32).read_unaligned()
-                                } != r2
-                                {
-                                    break;
-                                }
-                                let repEnd2 = if repInDict2 { dictEnd } else { iend };
-                                let repLength2 = if repInDict2 {
-                                    ZSTD_count_2segments(
-                                        src,
-                                        ip0 + 4,
-                                        iend,
-                                        prefixStart,
-                                        dict,
-                                        repLocal2 + 4,
-                                        repEnd2,
-                                    )
-                                } else {
-                                    ZSTD_count(src, ip0 + 4, repLocal2 + 4, iend)
-                                } + 4;
-                                std::mem::swap(&mut offset_2, &mut offset_1);
-                                ZSTD_storeSeq(
-                                    seqStore,
-                                    0,
-                                    &src[anchor..anchor],
-                                    REPCODE_TO_OFFBASE(1),
-                                    repLength2,
-                                );
-                                let h = ZSTD_fastHash::<MLS>(src, ip0, hlog);
-                                unsafe {
-                                    *hashTable.add(h) = base_off.wrapping_add(ip0 as u32);
-                                }
-                                ip0 += repLength2;
-                                anchor = ip0;
-                                continue;
-                            }
-                            break;
-                        }
-                    }
-                    break 'search;
                 }
             } else if ZSTD_fastTraceEnabled(istart, ip0, current0) {
                 eprintln!(
@@ -1874,6 +1522,124 @@ fn ZSTD_compressBlock_fast_extDict_generic_with_start_mls<const MLS: u32>(
             }
             if ip3 >= ilimit {
                 break 'outer;
+            }
+        };
+
+        mLength += if match_in_dict {
+            ZSTD_count_2segments(
+                src,
+                ip0 + mLength,
+                iend,
+                prefixStart,
+                dict,
+                match_local + mLength,
+                dictEnd,
+            )
+        } else {
+            ZSTD_count(src, ip0 + mLength, match_local + mLength, iend)
+        };
+        ZSTD_storeSeq(seqStore, ip0 - anchor, &src[anchor..ip0], offcode, mLength);
+        if ZSTD_fastTraceEnabled(istart, ip0, base_off.wrapping_add(ip0 as u32)) {
+            eprintln!(
+                "zstd-rs-fast-ext-match branch={} istart={} rel={} current={} match_rel={} matchIndex={} lit={} mLength={} offcode={} rep1={} rep2={}",
+                match_branch,
+                istart,
+                ip0.saturating_sub(istart),
+                base_off.wrapping_add(ip0 as u32),
+                match_local as isize - istart as isize,
+                if match_in_dict {
+                    dict_base_off.wrapping_add(match_local as u32)
+                } else {
+                    base_off.wrapping_add(match_local as u32)
+                },
+                ip0 - anchor,
+                mLength,
+                offcode,
+                offset_1,
+                offset_2
+            );
+        }
+        ip0 += mLength;
+        anchor = ip0;
+        if ip1 < ip0 {
+            unsafe {
+                *hashTable.add(hash1) = base_off.wrapping_add(ip1 as u32);
+            }
+        }
+        if ip0 <= ilimit {
+            let h = ZSTD_fastHash::<MLS>(
+                src,
+                (current0_for_fill.wrapping_add(2).wrapping_sub(base_off)) as usize,
+                hlog,
+            );
+            unsafe {
+                *hashTable.add(h) = current0_for_fill.wrapping_add(2);
+            }
+            let h = ZSTD_fastHash::<MLS>(src, ip0 - 2, hlog);
+            unsafe {
+                *hashTable.add(h) = base_off.wrapping_add((ip0 - 2) as u32);
+            }
+            while ip0 <= ilimit {
+                let repIndex2 = base_off.wrapping_add(ip0 as u32).wrapping_sub(offset_2);
+                let repInDict2 = repIndex2 < prefixStartIndex;
+                let repLocal2 = if repInDict2 {
+                    repIndex2.wrapping_sub(dict_base_off) as usize
+                } else {
+                    repIndex2.wrapping_sub(base_off) as usize
+                };
+                if offset_2 > 0
+                    && ZSTD_index_overlap_check(prefixStartIndex, repIndex2)
+                    && if repInDict2 {
+                        if repLocal2 + 4 <= dictEnd {
+                            unsafe {
+                                (dict.as_ptr().wrapping_add(repLocal2) as *const u32)
+                                    .read_unaligned()
+                                    == (src.as_ptr().wrapping_add(ip0) as *const u32)
+                                        .read_unaligned()
+                            }
+                        } else {
+                            false
+                        }
+                    } else if repLocal2 + 4 <= src.len() {
+                        unsafe {
+                            (src.as_ptr().wrapping_add(repLocal2) as *const u32).read_unaligned()
+                                == (src.as_ptr().wrapping_add(ip0) as *const u32).read_unaligned()
+                        }
+                    } else {
+                        false
+                    }
+                {
+                    let repEnd2 = if repInDict2 { dictEnd } else { iend };
+                    let repLength2 = if repInDict2 {
+                        ZSTD_count_2segments(
+                            src,
+                            ip0 + 4,
+                            iend,
+                            prefixStart,
+                            dict,
+                            repLocal2 + 4,
+                            repEnd2,
+                        )
+                    } else {
+                        ZSTD_count(src, ip0 + 4, repLocal2 + 4, iend)
+                    } + 4;
+                    std::mem::swap(&mut offset_2, &mut offset_1);
+                    ZSTD_storeSeq(
+                        seqStore,
+                        0,
+                        &src[anchor..anchor],
+                        REPCODE_TO_OFFBASE(1),
+                        repLength2,
+                    );
+                    let h = ZSTD_fastHash::<MLS>(src, ip0, hlog);
+                    unsafe {
+                        *hashTable.add(h) = base_off.wrapping_add(ip0 as u32);
+                    }
+                    ip0 += repLength2;
+                    anchor = ip0;
+                    continue;
+                }
+                break;
             }
         }
     }

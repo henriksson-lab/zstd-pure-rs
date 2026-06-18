@@ -1392,7 +1392,7 @@ fn stream_buffered_compress_zstd_file_to_writer<W: Write>(
         overlap_log,
     )?;
 
-    let file_chunk_size = ZSTD_CStreamInSize().max(1);
+    let file_chunk_size = ZSTD_CStreamInSize().saturating_mul(4).max(1);
     let mut input_buf = vec![0u8; file_chunk_size];
     let output_bound = ZSTD_compressBound(file_chunk_size).saturating_add(64);
     let mut output_buf = vec![0u8; ZSTD_CStreamOutSize().max(output_bound).max(32)];

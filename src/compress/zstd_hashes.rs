@@ -258,19 +258,19 @@ pub fn ZSTD_count_2segments(
     match_pos: usize,
     mend_pos: usize,
 ) -> usize {
+    if core::ptr::eq(input_buf.as_ptr(), dict_buf.as_ptr()) && mend_pos == iend_pos {
+        return ZSTD_count(input_buf, ip_pos, match_pos, iend_pos);
+    }
+
     // vEnd is min(mEnd, iEnd) in the SAME (input) coordinate system,
     // so we compute it as "how much of the input we can compare before
     // the dict segment runs out".
     let dict_remaining = mend_pos - match_pos;
     let vend_pos = (ip_pos + dict_remaining).min(iend_pos);
 
-    let mut matchLength = 0usize;
-    while ip_pos + matchLength < vend_pos
-        && match_pos + matchLength < mend_pos
-        && input_buf[ip_pos + matchLength] == dict_buf[match_pos + matchLength]
-    {
-        matchLength += 1;
-    }
+    let matchLength = ZSTD_count_2segments_first_segment(
+        input_buf, ip_pos, vend_pos, dict_buf, match_pos, mend_pos,
+    );
 
     if match_pos + matchLength != mend_pos {
         return matchLength;
@@ -280,6 +280,82 @@ pub fn ZSTD_count_2segments(
         return matchLength;
     }
     matchLength + ZSTD_count(input_buf, ip_pos + matchLength, istart_pos, iend_pos)
+}
+
+#[inline(always)]
+fn ZSTD_count_2segments_first_segment(
+    input_buf: &[u8],
+    ip_pos: usize,
+    vend_pos: usize,
+    dict_buf: &[u8],
+    match_pos: usize,
+    mend_pos: usize,
+) -> usize {
+    let word = core::mem::size_of::<usize>();
+    let start = ip_pos;
+    let mut pIn = ip_pos;
+    let mut pMatch = match_pos;
+    let in_limit = vend_pos.min(input_buf.len());
+    let match_limit = mend_pos.min(dict_buf.len());
+    let inLoopLimit = in_limit.saturating_sub(word - 1);
+    let input_base = input_buf.as_ptr();
+    let dict_base = dict_buf.as_ptr();
+
+    if pIn < inLoopLimit && pIn + word <= input_buf.len() && pMatch + word <= match_limit {
+        let diff = unsafe {
+            (dict_base.add(pMatch) as *const usize).read_unaligned()
+                ^ (input_base.add(pIn) as *const usize).read_unaligned()
+        };
+        if diff != 0 {
+            return ZSTD_NbCommonBytes(diff) as usize;
+        }
+        pIn += word;
+        pMatch += word;
+        while pIn < inLoopLimit && pIn + word <= input_buf.len() && pMatch + word <= match_limit {
+            let diff = unsafe {
+                (dict_base.add(pMatch) as *const usize).read_unaligned()
+                    ^ (input_base.add(pIn) as *const usize).read_unaligned()
+            };
+            if diff == 0 {
+                pIn += word;
+                pMatch += word;
+                continue;
+            }
+            pIn += ZSTD_NbCommonBytes(diff) as usize;
+            return pIn - start;
+        }
+    }
+
+    unsafe {
+        if MEM_64bits() != 0
+            && pIn + 3 < in_limit
+            && pIn + 4 <= input_buf.len()
+            && pMatch + 4 <= match_limit
+            && (dict_base.add(pMatch) as *const u32).read_unaligned()
+                == (input_base.add(pIn) as *const u32).read_unaligned()
+        {
+            pIn += 4;
+            pMatch += 4;
+        }
+        if pIn + 1 < in_limit
+            && pIn + 2 <= input_buf.len()
+            && pMatch + 2 <= match_limit
+            && (dict_base.add(pMatch) as *const u16).read_unaligned()
+                == (input_base.add(pIn) as *const u16).read_unaligned()
+        {
+            pIn += 2;
+            pMatch += 2;
+        }
+        if pIn < in_limit
+            && pIn < input_buf.len()
+            && pMatch < match_limit
+            && *dict_base.add(pMatch) == *input_base.add(pIn)
+        {
+            pIn += 1;
+        }
+    }
+
+    pIn - start
 }
 
 /// Port of `ZSTD_count`. Returns the number of leading bytes that

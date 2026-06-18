@@ -1237,6 +1237,7 @@ fn ZSTD_compressBlock_fast_extDict_generic_with_start_mls<const MLS: u32>(
     debug_assert!(dictEnd <= dict.len());
     debug_assert!(dictStart <= dictEnd);
 
+    let hashTable = ms.hashTable.as_mut_ptr();
     let mut ip0 = istart;
     'outer: loop {
         let mut step = stepSize;
@@ -1251,7 +1252,7 @@ fn ZSTD_compressBlock_fast_extDict_generic_with_start_mls<const MLS: u32>(
 
         let mut hash0 = ZSTD_fastHash::<MLS>(src, ip0, hlog);
         let mut hash1 = ZSTD_fastHash::<MLS>(src, ip1, hlog);
-        let mut idx = ms.hashTable[hash0];
+        let mut idx = unsafe { *hashTable.add(hash0) };
 
         'search: loop {
             let current2 = base_off.wrapping_add(ip2 as u32);
@@ -1264,9 +1265,12 @@ fn ZSTD_compressBlock_fast_extDict_generic_with_start_mls<const MLS: u32>(
             };
 
             let current0 = base_off.wrapping_add(ip0 as u32);
-            ms.hashTable[hash0] = current0;
+            unsafe {
+                *hashTable.add(hash0) = current0;
+            }
 
             let rep_candidate = offset_1 > 0 && prefixStartIndex.wrapping_sub(repIndex) >= 4;
+            let cval = unsafe { (src.as_ptr().wrapping_add(ip2) as *const u32).read_unaligned() };
             let rval = if rep_candidate {
                 if repInDict {
                     debug_assert!(repLocal + 4 <= dictEnd);
@@ -1276,7 +1280,7 @@ fn ZSTD_compressBlock_fast_extDict_generic_with_start_mls<const MLS: u32>(
                     unsafe { (src.as_ptr().wrapping_add(repLocal) as *const u32).read_unaligned() }
                 }
             } else {
-                (unsafe { (src.as_ptr().wrapping_add(ip2) as *const u32).read_unaligned() }) ^ 1
+                cval ^ 1
             };
             if ZSTD_fastTraceEnabled(istart, ip2, current2) {
                 eprintln!(
@@ -1289,7 +1293,7 @@ fn ZSTD_compressBlock_fast_extDict_generic_with_start_mls<const MLS: u32>(
                     offset_2,
                     repIndex,
                     repInDict as u8,
-                    (unsafe { (src.as_ptr().wrapping_add(ip2) as *const u32).read_unaligned() } == rval) as u8,
+                    (cval == rval) as u8,
                     hash0,
                     hash1,
                     idx,
@@ -1297,7 +1301,7 @@ fn ZSTD_compressBlock_fast_extDict_generic_with_start_mls<const MLS: u32>(
                     dictStartIndex
                 );
             }
-            if unsafe { (src.as_ptr().wrapping_add(ip2) as *const u32).read_unaligned() } == rval {
+            if cval == rval {
                 let mut match_local = repLocal;
                 let mut mLength = usize::from(
                     ip2 > 0
@@ -1313,15 +1317,19 @@ fn ZSTD_compressBlock_fast_extDict_generic_with_start_mls<const MLS: u32>(
                 match_local -= mLength;
                 let matchEnd = if repInDict { dictEnd } else { iend };
                 mLength += 4;
-                mLength += ZSTD_count_2segments(
-                    src,
-                    ip0 + mLength,
-                    iend,
-                    prefixStart,
-                    if repInDict { dict } else { src },
-                    match_local + mLength,
-                    matchEnd,
-                );
+                mLength += if repInDict {
+                    ZSTD_count_2segments(
+                        src,
+                        ip0 + mLength,
+                        iend,
+                        prefixStart,
+                        dict,
+                        match_local + mLength,
+                        matchEnd,
+                    )
+                } else {
+                    ZSTD_count(src, ip0 + mLength, match_local + mLength, iend)
+                };
                 ZSTD_storeSeq(
                     seqStore,
                     ip0 - anchor,
@@ -1351,16 +1359,23 @@ fn ZSTD_compressBlock_fast_extDict_generic_with_start_mls<const MLS: u32>(
                 ip0 += mLength;
                 anchor = ip0;
                 if ip1 < ip0 {
-                    ms.hashTable[hash1] = base_off.wrapping_add(ip1 as u32);
+                    unsafe {
+                        *hashTable.add(hash1) = base_off.wrapping_add(ip1 as u32);
+                    }
                 }
                 if ip0 <= ilimit {
-                    ms.hashTable[ZSTD_fastHash::<MLS>(
+                    let h = ZSTD_fastHash::<MLS>(
                         src,
                         (current0.wrapping_add(2).wrapping_sub(base_off)) as usize,
                         hlog,
-                    )] = current0.wrapping_add(2);
-                    ms.hashTable[ZSTD_fastHash::<MLS>(src, ip0 - 2, hlog)] =
-                        base_off.wrapping_add((ip0 - 2) as u32);
+                    );
+                    unsafe {
+                        *hashTable.add(h) = current0.wrapping_add(2);
+                    }
+                    let h = ZSTD_fastHash::<MLS>(src, ip0 - 2, hlog);
+                    unsafe {
+                        *hashTable.add(h) = base_off.wrapping_add((ip0 - 2) as u32);
+                    }
                     while ip0 <= ilimit {
                         let repIndex2 = base_off.wrapping_add(ip0 as u32).wrapping_sub(offset_2);
                         let repInDict2 = repIndex2 < prefixStartIndex;
@@ -1372,23 +1387,43 @@ fn ZSTD_compressBlock_fast_extDict_generic_with_start_mls<const MLS: u32>(
                         if offset_2 > 0
                             && ZSTD_index_overlap_check(prefixStartIndex, repIndex2)
                             && if repInDict2 {
-                                repLocal2 + 4 <= dictEnd
-                                    && MEM_read32(&dict[repLocal2..]) == MEM_read32(&src[ip0..])
+                                if repLocal2 + 4 <= dictEnd {
+                                    unsafe {
+                                        (dict.as_ptr().wrapping_add(repLocal2) as *const u32)
+                                            .read_unaligned()
+                                            == (src.as_ptr().wrapping_add(ip0) as *const u32)
+                                                .read_unaligned()
+                                    }
+                                } else {
+                                    false
+                                }
                             } else {
-                                repLocal2 + 4 <= src.len()
-                                    && MEM_read32(&src[repLocal2..]) == MEM_read32(&src[ip0..])
+                                if repLocal2 + 4 <= src.len() {
+                                    unsafe {
+                                        (src.as_ptr().wrapping_add(repLocal2) as *const u32)
+                                            .read_unaligned()
+                                            == (src.as_ptr().wrapping_add(ip0) as *const u32)
+                                                .read_unaligned()
+                                    }
+                                } else {
+                                    false
+                                }
                             }
                         {
                             let repEnd2 = if repInDict2 { dictEnd } else { iend };
-                            let repLength2 = ZSTD_count_2segments(
-                                src,
-                                ip0 + 4,
-                                iend,
-                                prefixStart,
-                                if repInDict2 { dict } else { src },
-                                repLocal2 + 4,
-                                repEnd2,
-                            ) + 4;
+                            let repLength2 = if repInDict2 {
+                                ZSTD_count_2segments(
+                                    src,
+                                    ip0 + 4,
+                                    iend,
+                                    prefixStart,
+                                    dict,
+                                    repLocal2 + 4,
+                                    repEnd2,
+                                )
+                            } else {
+                                ZSTD_count(src, ip0 + 4, repLocal2 + 4, iend)
+                            } + 4;
                             std::mem::swap(&mut offset_2, &mut offset_1);
                             ZSTD_storeSeq(
                                 seqStore,
@@ -1397,8 +1432,10 @@ fn ZSTD_compressBlock_fast_extDict_generic_with_start_mls<const MLS: u32>(
                                 REPCODE_TO_OFFBASE(1),
                                 repLength2,
                             );
-                            ms.hashTable[ZSTD_fastHash::<MLS>(src, ip0, hlog)] =
-                                base_off.wrapping_add(ip0 as u32);
+                            let h = ZSTD_fastHash::<MLS>(src, ip0, hlog);
+                            unsafe {
+                                *hashTable.add(h) = base_off.wrapping_add(ip0 as u32);
+                            }
                             ip0 += repLength2;
                             anchor = ip0;
                             continue;
@@ -1466,15 +1503,19 @@ fn ZSTD_compressBlock_fast_extDict_generic_with_start_mls<const MLS: u32>(
                     }
                     offset_2 = offset_1;
                     offset_1 = offset;
-                    mLength += ZSTD_count_2segments(
-                        src,
-                        ip0 + mLength,
-                        iend,
-                        prefixStart,
-                        if idxInDict { dict } else { src },
-                        match_local + mLength,
-                        matchEnd,
-                    );
+                    mLength += if idxInDict {
+                        ZSTD_count_2segments(
+                            src,
+                            ip0 + mLength,
+                            iend,
+                            prefixStart,
+                            dict,
+                            match_local + mLength,
+                            matchEnd,
+                        )
+                    } else {
+                        ZSTD_count(src, ip0 + mLength, match_local + mLength, iend)
+                    };
                     ZSTD_storeSeq(
                         seqStore,
                         ip0 - anchor,
@@ -1504,16 +1545,23 @@ fn ZSTD_compressBlock_fast_extDict_generic_with_start_mls<const MLS: u32>(
                     ip0 += mLength;
                     anchor = ip0;
                     if ip1 < ip0 {
-                        ms.hashTable[hash1] = base_off.wrapping_add(ip1 as u32);
+                        unsafe {
+                            *hashTable.add(hash1) = base_off.wrapping_add(ip1 as u32);
+                        }
                     }
                     if ip0 <= ilimit {
-                        ms.hashTable[ZSTD_fastHash::<MLS>(
+                        let h = ZSTD_fastHash::<MLS>(
                             src,
                             (current0.wrapping_add(2).wrapping_sub(base_off)) as usize,
                             hlog,
-                        )] = current0.wrapping_add(2);
-                        ms.hashTable[ZSTD_fastHash::<MLS>(src, ip0 - 2, hlog)] =
-                            base_off.wrapping_add((ip0 - 2) as u32);
+                        );
+                        unsafe {
+                            *hashTable.add(h) = current0.wrapping_add(2);
+                        }
+                        let h = ZSTD_fastHash::<MLS>(src, ip0 - 2, hlog);
+                        unsafe {
+                            *hashTable.add(h) = base_off.wrapping_add((ip0 - 2) as u32);
+                        }
                         while ip0 <= ilimit {
                             let repIndex2 =
                                 base_off.wrapping_add(ip0 as u32).wrapping_sub(offset_2);
@@ -1545,15 +1593,19 @@ fn ZSTD_compressBlock_fast_extDict_generic_with_start_mls<const MLS: u32>(
                                     break;
                                 }
                                 let repEnd2 = if repInDict2 { dictEnd } else { iend };
-                                let repLength2 = ZSTD_count_2segments(
-                                    src,
-                                    ip0 + 4,
-                                    iend,
-                                    prefixStart,
-                                    if repInDict2 { dict } else { src },
-                                    repLocal2 + 4,
-                                    repEnd2,
-                                ) + 4;
+                                let repLength2 = if repInDict2 {
+                                    ZSTD_count_2segments(
+                                        src,
+                                        ip0 + 4,
+                                        iend,
+                                        prefixStart,
+                                        dict,
+                                        repLocal2 + 4,
+                                        repEnd2,
+                                    )
+                                } else {
+                                    ZSTD_count(src, ip0 + 4, repLocal2 + 4, iend)
+                                } + 4;
                                 std::mem::swap(&mut offset_2, &mut offset_1);
                                 ZSTD_storeSeq(
                                     seqStore,
@@ -1562,8 +1614,10 @@ fn ZSTD_compressBlock_fast_extDict_generic_with_start_mls<const MLS: u32>(
                                     REPCODE_TO_OFFBASE(1),
                                     repLength2,
                                 );
-                                ms.hashTable[ZSTD_fastHash::<MLS>(src, ip0, hlog)] =
-                                    base_off.wrapping_add(ip0 as u32);
+                                let h = ZSTD_fastHash::<MLS>(src, ip0, hlog);
+                                unsafe {
+                                    *hashTable.add(h) = base_off.wrapping_add(ip0 as u32);
+                                }
                                 ip0 += repLength2;
                                 anchor = ip0;
                                 continue;
@@ -1595,7 +1649,7 @@ fn ZSTD_compressBlock_fast_extDict_generic_with_start_mls<const MLS: u32>(
             };
             let _ = hash0_found;
 
-            idx = ms.hashTable[hash1];
+            idx = unsafe { *hashTable.add(hash1) };
             hash0 = hash1;
             hash1 = ZSTD_fastHash::<MLS>(src, ip2, hlog);
             ip0 = ip1;
@@ -1603,7 +1657,9 @@ fn ZSTD_compressBlock_fast_extDict_generic_with_start_mls<const MLS: u32>(
             ip2 = ip3;
 
             let current0 = base_off.wrapping_add(ip0 as u32);
-            ms.hashTable[hash0] = current0;
+            unsafe {
+                *hashTable.add(hash0) = current0;
+            }
 
             if idx >= dictStartIndex {
                 let idxInDict = idx < prefixStartIndex;
@@ -1662,15 +1718,19 @@ fn ZSTD_compressBlock_fast_extDict_generic_with_start_mls<const MLS: u32>(
                     }
                     offset_2 = offset_1;
                     offset_1 = offset;
-                    mLength += ZSTD_count_2segments(
-                        src,
-                        ip0 + mLength,
-                        iend,
-                        prefixStart,
-                        if idxInDict { dict } else { src },
-                        match_local + mLength,
-                        matchEnd,
-                    );
+                    mLength += if idxInDict {
+                        ZSTD_count_2segments(
+                            src,
+                            ip0 + mLength,
+                            iend,
+                            prefixStart,
+                            dict,
+                            match_local + mLength,
+                            matchEnd,
+                        )
+                    } else {
+                        ZSTD_count(src, ip0 + mLength, match_local + mLength, iend)
+                    };
                     ZSTD_storeSeq(
                         seqStore,
                         ip0 - anchor,
@@ -1700,16 +1760,23 @@ fn ZSTD_compressBlock_fast_extDict_generic_with_start_mls<const MLS: u32>(
                     ip0 += mLength;
                     anchor = ip0;
                     if ip1 < ip0 {
-                        ms.hashTable[hash1] = base_off.wrapping_add(ip1 as u32);
+                        unsafe {
+                            *hashTable.add(hash1) = base_off.wrapping_add(ip1 as u32);
+                        }
                     }
                     if ip0 <= ilimit {
-                        ms.hashTable[ZSTD_fastHash::<MLS>(
+                        let h = ZSTD_fastHash::<MLS>(
                             src,
                             (current0.wrapping_add(2).wrapping_sub(base_off)) as usize,
                             hlog,
-                        )] = current0.wrapping_add(2);
-                        ms.hashTable[ZSTD_fastHash::<MLS>(src, ip0 - 2, hlog)] =
-                            base_off.wrapping_add((ip0 - 2) as u32);
+                        );
+                        unsafe {
+                            *hashTable.add(h) = current0.wrapping_add(2);
+                        }
+                        let h = ZSTD_fastHash::<MLS>(src, ip0 - 2, hlog);
+                        unsafe {
+                            *hashTable.add(h) = base_off.wrapping_add((ip0 - 2) as u32);
+                        }
                         while ip0 <= ilimit {
                             let repIndex2 =
                                 base_off.wrapping_add(ip0 as u32).wrapping_sub(offset_2);
@@ -1741,15 +1808,19 @@ fn ZSTD_compressBlock_fast_extDict_generic_with_start_mls<const MLS: u32>(
                                     break;
                                 }
                                 let repEnd2 = if repInDict2 { dictEnd } else { iend };
-                                let repLength2 = ZSTD_count_2segments(
-                                    src,
-                                    ip0 + 4,
-                                    iend,
-                                    prefixStart,
-                                    if repInDict2 { dict } else { src },
-                                    repLocal2 + 4,
-                                    repEnd2,
-                                ) + 4;
+                                let repLength2 = if repInDict2 {
+                                    ZSTD_count_2segments(
+                                        src,
+                                        ip0 + 4,
+                                        iend,
+                                        prefixStart,
+                                        dict,
+                                        repLocal2 + 4,
+                                        repEnd2,
+                                    )
+                                } else {
+                                    ZSTD_count(src, ip0 + 4, repLocal2 + 4, iend)
+                                } + 4;
                                 std::mem::swap(&mut offset_2, &mut offset_1);
                                 ZSTD_storeSeq(
                                     seqStore,
@@ -1758,8 +1829,10 @@ fn ZSTD_compressBlock_fast_extDict_generic_with_start_mls<const MLS: u32>(
                                     REPCODE_TO_OFFBASE(1),
                                     repLength2,
                                 );
-                                ms.hashTable[ZSTD_fastHash::<MLS>(src, ip0, hlog)] =
-                                    base_off.wrapping_add(ip0 as u32);
+                                let h = ZSTD_fastHash::<MLS>(src, ip0, hlog);
+                                unsafe {
+                                    *hashTable.add(h) = base_off.wrapping_add(ip0 as u32);
+                                }
                                 ip0 += repLength2;
                                 anchor = ip0;
                                 continue;
@@ -1786,7 +1859,7 @@ fn ZSTD_compressBlock_fast_extDict_generic_with_start_mls<const MLS: u32>(
                 );
             }
 
-            idx = ms.hashTable[hash1];
+            idx = unsafe { *hashTable.add(hash1) };
             hash0 = hash1;
             hash1 = ZSTD_fastHash::<MLS>(src, ip2, hlog);
             ip0 = ip1;

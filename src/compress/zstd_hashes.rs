@@ -440,6 +440,62 @@ pub fn ZSTD_count(buf: &[u8], in_pos: usize, match_pos: usize, in_limit: usize) 
     pIn - start
 }
 
+#[inline(always)]
+pub unsafe fn ZSTD_count_unchecked(
+    buf: &[u8],
+    in_pos: usize,
+    match_pos: usize,
+    in_limit: usize,
+) -> usize {
+    let word = core::mem::size_of::<usize>();
+    let start = in_pos;
+    let mut pIn = in_pos;
+    let mut pMatch = match_pos;
+    let in_limit = in_limit.min(buf.len());
+    let inLoopLimit = in_limit.saturating_sub(word - 1);
+    let base = buf.as_ptr();
+
+    if pIn < inLoopLimit {
+        loop {
+            let diff = unsafe {
+                (base.add(pMatch) as *const usize).read_unaligned()
+                    ^ (base.add(pIn) as *const usize).read_unaligned()
+            };
+            if diff != 0 {
+                pIn += ZSTD_NbCommonBytes(diff) as usize;
+                return pIn - start;
+            }
+            pIn += word;
+            pMatch += word;
+            if pIn >= inLoopLimit {
+                break;
+            }
+        }
+    }
+
+    unsafe {
+        if MEM_64bits() != 0
+            && pIn + 3 < in_limit
+            && (base.add(pMatch) as *const u32).read_unaligned()
+                == (base.add(pIn) as *const u32).read_unaligned()
+        {
+            pIn += 4;
+            pMatch += 4;
+        }
+        if pIn + 1 < in_limit
+            && (base.add(pMatch) as *const u16).read_unaligned()
+                == (base.add(pIn) as *const u16).read_unaligned()
+        {
+            pIn += 2;
+            pMatch += 2;
+        }
+        if pIn < in_limit && *base.add(pMatch) == *base.add(pIn) {
+            pIn += 1;
+        }
+    }
+    pIn - start
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

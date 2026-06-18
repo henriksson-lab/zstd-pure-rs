@@ -1392,10 +1392,9 @@ fn stream_buffered_compress_zstd_file_to_writer<W: Write>(
         overlap_log,
     )?;
 
-    let file_chunk_size = ZSTD_CStreamInSize().saturating_mul(4).max(1);
+    let file_chunk_size = ZSTD_CStreamInSize().saturating_mul(2).max(1);
     let mut input_buf = vec![0u8; file_chunk_size];
-    let output_bound = ZSTD_compressBound(file_chunk_size).saturating_add(64);
-    let mut output_buf = vec![0u8; ZSTD_CStreamOutSize().max(output_bound).max(32)];
+    let mut output_buf = vec![0u8; ZSTD_CStreamOutSize().max(32)];
     let mut total_in = 0usize;
     let mut total_out = 0usize;
     let mut sent_end = false;
@@ -1496,12 +1495,11 @@ fn stream_buffered_compress_zstd_file(
                     .unwrap_or("out"),
                 std::process::id()
             ));
-            let file =
+            let mut file =
                 File::create(&tmp_path).map_err(|e| format!("{}: {e}", tmp_path.display()))?;
-            let mut writer = BufWriter::with_capacity(FILE_OUTPUT_BUFFER_SIZE, file);
             match stream_buffered_compress_zstd_file_to_writer(
                 input,
-                &mut writer,
+                &mut file,
                 level,
                 checksum,
                 content_size,
@@ -1510,12 +1508,12 @@ fn stream_buffered_compress_zstd_file(
                 overlap_log,
             ) {
                 Ok(sizes) => {
-                    drop(writer);
+                    drop(file);
                     fs::rename(&tmp_path, path).map_err(|e| format!("{}: {e}", path.display()))?;
                     Ok(sizes)
                 }
                 Err(err) => {
-                    drop(writer);
+                    drop(file);
                     let _ = fs::remove_file(&tmp_path);
                     Err(err)
                 }

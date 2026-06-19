@@ -83,12 +83,11 @@ pub fn ZSTD_match4Found_branch(
     match_idx: u32,
     idx_low_limit: u32,
 ) -> bool {
-    if match_idx < idx_low_limit {
+    if match_idx < idx_low_limit || match_pos >= current_pos {
         return false;
     }
-    // SAFETY: when `match_idx >= idx_low_limit` the caller's loop
-    // invariant guarantees `match_pos + 4 ≤ buf.len()` (positions
-    // come from the matcher's hashTable for indices ≥ prefixStart).
+    // SAFETY: when the candidate is in-range and before `current_pos`,
+    // the caller's loop invariant guarantees `match_pos + 4 ≤ buf.len()`.
     // `current_pos` is the matcher's `ip0` ≤ `ilimit < buf.len() - 4`.
     let m = unsafe { (buf.as_ptr().wrapping_add(match_pos) as *const u32).read_unaligned() };
     let c = unsafe { (buf.as_ptr().wrapping_add(current_pos) as *const u32).read_unaligned() };
@@ -114,21 +113,16 @@ pub fn ZSTD_match4Found_cmov(
 ) -> bool {
     static DUMMY: [u8; 4] = [0x12, 0x34, 0x56, 0x78];
     // Mirror upstream's `ZSTD_selectAddr(matchIdx, idxLowLimit, real,
-    // dummy)`: pick the read source via a CMOV on the index-in-range
-    // predicate, then unconditionally load 4 bytes from it. The slice-
-    // bounds-check version emits a `cmp/jb` pair before each load,
-    // breaking CMOV codegen. Caller ensures: when
-    // `match_idx >= idx_low_limit`, `match_pos + 4 ≤ buf.len()`; the
-    // L1 fast-matcher loop invariant `ip3 < ilimit = iend - 8` and the
-    // matcher's prefix-check both uphold this. `current_pos` is `ip0`
-    // which is similarly ≤ ilimit < buf.len() - 4.
+    // dummy)`: pick the read source via a CMOV-style predicate, then
+    // unconditionally load 4 bytes from it. The slice-bounds-check
+    // version emits a `cmp/jb` pair before each load, breaking CMOV
+    // codegen. Caller ensures: when the candidate is in-range and
+    // before `current_pos`, `match_pos + 4 ≤ buf.len()`. `current_pos`
+    // is `ip0`, which is similarly ≤ ilimit < buf.len() - 4.
     let real_ptr = buf.as_ptr().wrapping_add(match_pos);
     let dummy_ptr = DUMMY.as_ptr();
-    let m_ptr = if match_idx >= idx_low_limit {
-        real_ptr
-    } else {
-        dummy_ptr
-    };
+    let in_range = match_idx >= idx_low_limit && match_pos < current_pos;
+    let m_ptr = if in_range { real_ptr } else { dummy_ptr };
     let c_ptr = buf.as_ptr().wrapping_add(current_pos);
     // SAFETY: see comment above. `m_ptr` is either DUMMY (4 bytes
     // valid) or `buf[match_pos..match_pos+4]` (in-range when the
@@ -139,7 +133,7 @@ pub fn ZSTD_match4Found_cmov(
     if m != c {
         return false;
     }
-    match_idx >= idx_low_limit
+    in_range
 }
 
 /// Upstream `HASH_READ_SIZE` — the hash reads 8 bytes at a time.
@@ -377,7 +371,10 @@ fn ZSTD_compressBlock_fast_noDict_generic_mls<const MLS: u32, const USE_CMOV: bo
     let base_off = ms.window.base_offset;
     let srcSize = src.len();
     let endIndex = base_off.wrapping_add(srcSize as u32);
-    let prefixStartIndex = ZSTD_getLowestPrefixIndex(ms, endIndex, windowLog);
+    // The slice-backed no-dict path cannot dereference match indices
+    // before the current slice base, even if older ring-window indices
+    // remain in the hash table.
+    let prefixStartIndex = ZSTD_getLowestPrefixIndex(ms, endIndex, windowLog).max(base_off);
     debug_assert!(prefixStartIndex >= base_off);
     let prefixStart = prefixStartIndex.wrapping_sub(base_off) as usize;
     let iend = srcSize;
@@ -396,7 +393,7 @@ fn ZSTD_compressBlock_fast_noDict_generic_mls<const MLS: u32, const USE_CMOV: bo
     let mut offsetSaved2: u32 = 0;
     {
         let curr = base_off.wrapping_add(ip0 as u32);
-        let windowLow = ZSTD_getLowestPrefixIndex(ms, curr, windowLog);
+        let windowLow = ZSTD_getLowestPrefixIndex(ms, curr, windowLog).max(base_off);
         let maxRep = curr.wrapping_sub(windowLow);
         if rep_offset2 > maxRep {
             offsetSaved2 = rep_offset2;

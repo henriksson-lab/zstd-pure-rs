@@ -4,6 +4,7 @@ A pure-Rust port of the [Zstandard (`zstd`)](https://github.com/facebook/zstd) c
 
 **Beware that translation is immature technology. Check that this crate works on your data to avoid data loss**
 
+* 2026-06-19: Renewed attempt at getting speed up to original code
 * 2026-06-15: Getting closer to being a trustworthy but more testing needed
 * 2026-06-02: Big audit
 * 2026-04-27: Tested locally for core compression/decompression behavior. Treat performance and parity notes as status snapshots, not guarantees.
@@ -55,34 +56,42 @@ Test suite status as of the latest local audit run: `cargo test --features cli` 
 
 ## Local benchmark snapshot
 
-Measured 2026-06-15 on Linux 6.8 x86_64, Intel Xeon Gold 6138, `rustc 1.92.0`, generic release build from `cargo build --release --features cli` (no `-C target-cpu=native`; the upstream comparator is likewise a generic build, so both rely on runtime BMI2 dispatch). The original comparator is the vendored upstream `zstd/programs/zstd` reporting `v1.6.0`. Input was the deterministic 311,951,360-byte `.tmp/bench/realistic_5x.tar` corpus, built from the public Silesia corpus plus enwik8 Wikipedia text as distinct files in a tar archive. Throughput is decimal MB/s from elapsed time — best of three runs for levels 1-12, a single run for levels 13-22 (runtime); RSS is GNU `/usr/bin/time` maximum resident set size from that run. Levels 20-22 were run with `--ultra` for both binaries. The host was moderately loaded, so treat throughput as indicative, not exact. This is a local status snapshot, not a guarantee.
+Measured 2026-06-19 on Linux 6.8 x86_64, Intel Xeon Gold 6138, `rustc 1.92.0`, generic release build from `cargo build --release --features cli` (no `-C target-cpu=native`; the upstream comparator is a generic vendored `zstd/programs/zstd` build reporting `v1.6.0`). The all-level table uses the deterministic 67,108,864-byte `.tmp/bench/realistic_64m.tar` fixture, built from the public Silesia corpus plus enwik8 Wikipedia text as distinct files in a tar archive. Commands were `--single-thread -LEVEL --no-check -f -q`, with `--ultra` added for levels 20-22. The table reports GNU `/usr/bin/time` user CPU seconds and max RSS; wall-clock timings on this host were noisy. `Rust/orig CPU` is original user time divided by Rust user time, so values below `1.00x` mean Rust used more CPU. Two-way decode means upstream decoded the Rust frame to the original input and the Rust decoder decoded the upstream frame to the original input. This is a local status snapshot, not a guarantee.
 
-| Level | Rust speed | Original speed | Rust / original | Rust RSS | Original RSS | Rust size | Original size | Two-way decode |
+| Level | Rust user | Original user | Rust/orig CPU | Rust RSS | Original RSS | Rust size | Original size | Two-way decode |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :---: |
-| 1 | 725.5 MB/s | 891.3 MB/s | 0.81x | 36.9 MiB | 25.3 MiB | 113,940,911 | 113,945,914 | pass |
-| 2 | 588.6 MB/s | 725.5 MB/s | 0.81x | 71.5 MiB | 46.2 MiB | 106,787,160 | 106,796,772 | pass |
-| 3 | 358.6 MB/s | 479.9 MB/s | 0.75x | 124.4 MiB | 81.2 MiB | 101,629,585 | 101,676,160 | pass |
-| 4 | 315.1 MB/s | 415.9 MB/s | 0.76x | 141.2 MiB | 85.0 MiB | 99,814,657 | 99,857,954 | pass |
-| 5 | 221.2 MB/s | 288.8 MB/s | 0.77x | 136.2 MiB | 86.2 MiB | 96,772,294 | 96,617,715 | pass |
-| 6 | 167.7 MB/s | 208.0 MB/s | 0.81x | 143.3 MiB | 85.9 MiB | 94,220,828 | 94,043,466 | pass |
-| 7 | 142.4 MB/s | 178.3 MB/s | 0.80x | 162.7 MiB | 95.9 MiB | 92,732,784 | 92,516,005 | pass |
-| 8 | 107.6 MB/s | 143.1 MB/s | 0.75x | 174.4 MiB | 97.2 MiB | 91,807,310 | 91,491,427 | pass |
-| 9 | 94.5 MB/s | 120.9 MB/s | 0.78x | 333.5 MiB | 187.8 MiB | 90,564,509 | 90,301,620 | pass |
-| 10 | 62.6 MB/s | 85.5 MB/s | 0.73x | 417.0 MiB | 227.8 MiB | 89,499,884 | 89,194,111 | pass |
-| 11 | 45.7 MB/s | 61.0 MB/s | 0.75x | 415.0 MiB | 227.2 MiB | 88,904,223 | 88,580,173 | pass |
-| 12 | 41.8 MB/s | 55.9 MB/s | 0.75x | 595.3 MiB | 307.5 MiB | 88,787,023 | 88,456,447 | pass |
-| 13 | 19.5 MB/s | 23.8 MB/s | 0.82x | 445.5 MiB | 274.1 MiB | 87,779,883 | 87,827,852 | pass |
-| 14 | 17.7 MB/s | 19.5 MB/s | 0.91x | 536.5 MiB | 339.7 MiB | 87,206,504 | 87,254,148 | pass |
-| 15 | 13.6 MB/s | 15.2 MB/s | 0.89x | 632.2 MiB | 403.4 MiB | 86,522,089 | 86,569,224 | pass |
-| 16 | 9.8 MB/s | 12.6 MB/s | 0.78x | 471.0 MiB | 274.1 MiB | 83,902,077 | 83,765,173 | pass |
-| 17 | 7.4 MB/s | 8.9 MB/s | 0.83x | 797.9 MiB | 465.3 MiB | 82,056,260 | 81,931,719 | pass |
-| 18 | 5.9 MB/s | 6.4 MB/s | 0.92x | 807.0 MiB | 466.2 MiB | 80,732,364 | 80,635,069 | pass |
-| 19 | 4.5 MB/s | 5.3 MB/s | 0.84x | 1110.6 MiB | 593.4 MiB | 79,868,593 | 79,773,363 | pass |
-| 20 | 2.9 MB/s | 3.2 MB/s | 0.89x | 1244.6 MiB | 856.2 MiB | 78,439,964 | 78,354,300 | pass |
-| 21 | 1.4 MB/s | 1.7 MB/s | 0.85x | 1310.6 MiB | 1015.6 MiB | 77,842,787 | 77,754,755 | pass |
-| 22 | 1.1 MB/s | 1.3 MB/s | 0.86x | 1015.3 MiB | 1089.4 MiB | 77,598,139 | 77,506,752 | pass |
+| 1 | 0.41 s | 0.32 s | 0.78x | 5.0 MiB | 3.1 MiB | 27306269 | 27304326 | pass |
+| 2 | 0.46 s | 0.41 s | 0.89x | 6.2 MiB | 4.1 MiB | 25066283 | 25066283 | pass |
+| 3 | 0.60 s | 0.56 s | 0.93x | 90.6 MiB | 5.3 MiB | 23784548 | 23889438 | pass |
+| 4 | 0.68 s | 0.64 s | 0.94x | 91.6 MiB | 6.6 MiB | 23302904 | 23426701 | pass |
+| 5 | 1.09 s | 1.04 s | 0.95x | 91.2 MiB | 6.9 MiB | 22629427 | 22633952 | pass |
+| 6 | 1.52 s | 1.43 s | 0.94x | 90.6 MiB | 7.2 MiB | 21902104 | 21906687 | pass |
+| 7 | 1.79 s | 1.68 s | 0.94x | 92.8 MiB | 9.7 MiB | 21478037 | 21482070 | pass |
+| 8 | 2.25 s | 2.22 s | 0.99x | 92.5 MiB | 9.7 MiB | 21213129 | 21217035 | pass |
+| 9 | 2.48 s | 2.34 s | 0.94x | 97.2 MiB | 16.6 MiB | 20873185 | 20876814 | pass |
+| 10 | 3.46 s | 3.44 s | 0.99x | 106.9 MiB | 26.6 MiB | 20574348 | 20578309 | pass |
+| 11 | 4.95 s | 4.94 s | 1.00x | 106.6 MiB | 26.6 MiB | 20433410 | 20437398 | pass |
+| 12 | 5.68 s | 5.45 s | 0.96x | 126.6 MiB | 46.6 MiB | 20381166 | 20385376 | pass |
+| 13 | 12.02 s | 11.02 s | 0.92x | 118.4 MiB | 38.8 MiB | 20131625 | 20135315 | pass |
+| 14 | 14.74 s | 13.55 s | 0.92x | 134.1 MiB | 54.7 MiB | 20013079 | 20016886 | pass |
+| 15 | 20.08 s | 18.92 s | 0.94x | 150.0 MiB | 70.3 MiB | 19776029 | 19779986 | pass |
+| 16 | 23.14 s | 20.62 s | 0.89x | 118.1 MiB | 38.4 MiB | 19106683 | 19108591 | pass |
+| 17 | 31.93 s | 27.72 s | 0.87x | 133.8 MiB | 58.4 MiB | 18616327 | 18617535 | pass |
+| 18 | 41.36 s | 34.13 s | 0.83x | 133.8 MiB | 59.4 MiB | 18369567 | 18369495 | pass |
+| 19 | 49.12 s | 41.60 s | 0.85x | 165.3 MiB | 91.2 MiB | 18123264 | 18123577 | pass |
+| 20 | 60.91 s | 49.84 s | 0.82x | 244.7 MiB | 195.0 MiB | 17515211 | 17516254 | pass |
+| 21 | 68.20 s | 56.55 s | 0.83x | 403.8 MiB | 386.2 MiB | 17293928 | 17295012 | pass |
+| 22 | 65.66 s | 57.53 s | 0.88x | 724.7 MiB | 706.6 MiB | 17245138 | 17246022 | pass |
 
-Rust-compressed and original-compressed frames are generally **not byte-identical**. On this larger mixed corpus, upstream decoded each Rust frame back to the original input at every level 1-22, and the Rust decoder accepted each upstream frame back to the original input at every level 1-22. This snapshot was regenerated after fixing decoder repeat-offset initialization. A larger 466,432,000-byte repeat corpus gives a less noisy decompression comparison: Rust file-output median 1665.8 MB/s / 5.0 MiB RSS versus original median 1504.6 MB/s / 4.4 MiB. In test mode (`-t`, no output), Rust now streams at 6663.3 MB/s / 5.0 MiB RSS versus original 5830.4 MB/s / 4.4 MiB RSS; before the streaming test-mode fix, Rust `-t` staged the whole 466 MB output and reached about 458 MiB RSS. The CLI decompression path now uses the decoder's history-backed streaming path for frames up to a 4 MiB window and uses the whole-buffer decoder above that until high-window streaming history is audited.
+Rust-compressed and original-compressed frames are generally **not byte-identical** across all levels. The current level-1 no-check fast path is byte-identical to upstream on the larger fixtures below:
+
+| Dataset | Input bytes | Rust wall/user/sys | Original wall/user/sys | Rust/orig CPU | Rust RSS | Original RSS | Output bytes | Byte-identical |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :---: |
+| realistic5x | 311951360 | 1.60/1.48/0.12 s | 1.38/1.26/0.12 s | 0.85x | 5.3 MiB | 3.4 MiB | 113894044 | ok |
+| text466m | 466432000 | 0.18/0.09/0.09 s | 0.15/0.07/0.08 s | 0.78x | 5.0 MiB | 3.1 MiB | 97428 | ok |
+| repo_mix12x | 748083200 | 1.87/1.39/0.47 s | 1.61/1.14/0.43 s | 0.82x | 5.3 MiB | 3.4 MiB | 613071966 | ok |
+
+A larger 466,432,000-byte repeat corpus gives a less noisy decompression comparison: Rust file-output median 1665.8 MB/s / 5.0 MiB RSS versus original median 1504.6 MB/s / 4.4 MiB. In test mode (`-t`, no output), Rust now streams at 6663.3 MB/s / 5.0 MiB RSS versus original 5830.4 MB/s / 4.4 MiB RSS; before the streaming test-mode fix, Rust `-t` staged the whole 466 MB output and reached about 458 MiB RSS. The CLI decompression path now uses the decoder's history-backed streaming path for frames up to a 4 MiB window and uses the whole-buffer decoder above that until high-window streaming history is audited.
 
 ## Goals
 

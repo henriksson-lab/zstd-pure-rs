@@ -190,7 +190,7 @@ fn ZSTD_compressBlock_doubleFast_noDict_generic_mls<const MLS: u32>(
     let base_off = ms.window.base_offset;
     let srcSize = src.len();
     let endIndex = base_off.wrapping_add(srcSize as u32);
-    let prefixStartIndex = ZSTD_getLowestPrefixIndex(ms, endIndex, windowLog);
+    let prefixStartIndex = ZSTD_getLowestPrefixIndex(ms, endIndex, windowLog).max(base_off);
     debug_assert!(prefixStartIndex >= base_off);
     let prefixStart = prefixStartIndex.wrapping_sub(base_off) as usize;
     let iend = srcSize;
@@ -208,7 +208,7 @@ fn ZSTD_compressBlock_doubleFast_noDict_generic_mls<const MLS: u32>(
     let mut offsetSaved2: u32 = 0;
     {
         let curr = base_off.wrapping_add(ip as u32);
-        let windowLow = ZSTD_getLowestPrefixIndex(ms, curr, windowLog);
+        let windowLow = ZSTD_getLowestPrefixIndex(ms, curr, windowLog).max(base_off);
         let maxRep = curr.wrapping_sub(windowLow);
         if rep_offset2 > maxRep {
             offsetSaved2 = rep_offset2;
@@ -267,6 +267,7 @@ fn ZSTD_compressBlock_doubleFast_noDict_generic_mls<const MLS: u32>(
             }
 
             if rep_offset1 > 0
+                && rep_offset1 as usize <= (ip + 1).saturating_sub(prefixStart)
                 && unsafe {
                     (src.as_ptr()
                         .wrapping_add((ip + 1).wrapping_sub(rep_offset1 as usize))
@@ -301,6 +302,7 @@ fn ZSTD_compressBlock_doubleFast_noDict_generic_mls<const MLS: u32>(
             // matchl0, dummy)` — the slice-indexing version emits a
             // bounds-check `cmp/jb` per read, defeating CMOV.
             let long_match_valid = idxl0 > prefixStartIndex
+                && idxl0 < curr
                 && matchl0
                     .checked_add(8)
                     .is_some_and(|end| end <= iend && end <= src.len());
@@ -338,6 +340,7 @@ fn ZSTD_compressBlock_doubleFast_noDict_generic_mls<const MLS: u32>(
             // bounds check on `&src[matchs0..]` so both reads can issue
             // unconditionally.
             let short_match_valid = idxs0 > prefixStartIndex
+                && idxs0 < curr
                 && matchs0
                     .checked_add(4)
                     .is_some_and(|end| end <= iend && end <= src.len());
@@ -361,6 +364,7 @@ fn ZSTD_compressBlock_doubleFast_noDict_generic_mls<const MLS: u32>(
                 let mut match_pos = matchs0;
 
                 if idxl1 > prefixStartIndex
+                    && idxl1 < base_off.wrapping_add(ip1 as u32)
                     && matchl1
                         .checked_add(8)
                         .is_some_and(|end| end <= iend && end <= src.len())
@@ -478,7 +482,7 @@ fn ZSTD_compressBlock_doubleFast_noDict_generic_mls<const MLS: u32>(
                 *chainTable.add(h) = base_off.wrapping_add((ip - 1) as u32);
             }
 
-            while ip <= ilimit && rep_offset2 > 0 {
+            while ip <= ilimit && rep_offset2 > 0 && rep_offset2 as usize <= ip - prefixStart {
                 // SAFETY: `ip ≤ ilimit = iend - 8` so `ip + 4 ≤ iend
                 // = src.len()`; `ip - rep_offset2 ≤ ip` so safe.
                 let cval =
@@ -1002,6 +1006,16 @@ pub fn ZSTD_compressBlock_doubleFast_extDict_generic(
     rep: &mut [u32; ZSTD_REP_NUM],
     src: &[u8],
 ) -> usize {
+    ZSTD_compressBlock_doubleFast_extDict_generic_with_start(ms, seqStore, rep, src, 0)
+}
+
+pub fn ZSTD_compressBlock_doubleFast_extDict_generic_with_start(
+    ms: &mut ZSTD_MatchState_t,
+    seqStore: &mut SeqStore_t,
+    rep: &mut [u32; ZSTD_REP_NUM],
+    src: &[u8],
+    istart: usize,
+) -> usize {
     let cParams = ms.cParams;
     let mls = match cParams.minMatch {
         5 => 5,
@@ -1010,7 +1024,7 @@ pub fn ZSTD_compressBlock_doubleFast_extDict_generic(
         _ => 4,
     };
     if !ZSTD_window_hasExtDict(&ms.window) {
-        return ZSTD_compressBlock_doubleFast_noDict_generic(ms, seqStore, rep, src, 0, mls);
+        return ZSTD_compressBlock_doubleFast_noDict_generic(ms, seqStore, rep, src, istart, mls);
     }
     let hBitsL = cParams.hashLog;
     let hBitsS = cParams.chainLog;
@@ -1027,14 +1041,14 @@ pub fn ZSTD_compressBlock_doubleFast_extDict_generic(
     let dictEnd = prefixStartIndex.wrapping_sub(dict_base_off) as usize;
     let mut offset_1 = rep[0];
     let mut offset_2 = rep[1];
-    let mut ip = 0usize;
-    let mut anchor = 0usize;
+    let mut ip = istart;
+    let mut anchor = istart;
 
     if prefixStartIndex == dictStartIndex {
-        return ZSTD_compressBlock_doubleFast_noDict_generic(ms, seqStore, rep, src, 0, mls);
+        return ZSTD_compressBlock_doubleFast_noDict_generic(ms, seqStore, rep, src, istart, mls);
     }
-    if src.len() < HASH_READ_SIZE {
-        return src.len();
+    if src.len().saturating_sub(istart) < HASH_READ_SIZE {
+        return src.len().saturating_sub(istart);
     }
     debug_assert!(endIndex >= prefixStartIndex);
     debug_assert!(dictStartIndex >= dict_base_off);

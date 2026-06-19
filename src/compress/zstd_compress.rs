@@ -5421,6 +5421,17 @@ fn ZSTD_buildSeqStore_selectMatches_with_window(
                 )
             }
             (s, ZSTD_dictMode_e::ZSTD_extDict)
+                if s == crate::compress::zstd_compress_sequences::ZSTD_dfast =>
+            {
+                crate::compress::zstd_double_fast::ZSTD_compressBlock_doubleFast_extDict_generic_with_start(
+                    ms,
+                    seqStore,
+                    &mut cctx.next_rep,
+                    window_to_block_end,
+                    src_pos,
+                )
+            }
+            (s, ZSTD_dictMode_e::ZSTD_extDict)
                 if s == crate::compress::zstd_compress_sequences::ZSTD_greedy =>
             {
                 let searchMethod = if crate::compress::match_state::ZSTD_rowMatchFinderUsed(

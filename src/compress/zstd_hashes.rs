@@ -283,6 +283,41 @@ pub fn ZSTD_count_2segments(
 }
 
 #[inline(always)]
+pub unsafe fn ZSTD_count_2segments_unchecked(
+    input_buf: &[u8],
+    ip_pos: usize,
+    iend_pos: usize,
+    istart_pos: usize,
+    dict_buf: &[u8],
+    match_pos: usize,
+    mend_pos: usize,
+) -> usize {
+    debug_assert!(ip_pos <= iend_pos);
+    debug_assert!(iend_pos <= input_buf.len());
+    debug_assert!(istart_pos < input_buf.len() || ip_pos >= iend_pos);
+    debug_assert!(match_pos <= mend_pos);
+    debug_assert!(mend_pos <= dict_buf.len());
+
+    let dict_remaining = mend_pos - match_pos;
+    let vend_pos = (ip_pos + dict_remaining).min(iend_pos);
+    let matchLength = unsafe {
+        ZSTD_count_2segments_first_segment_unchecked(
+            input_buf, ip_pos, vend_pos, dict_buf, match_pos,
+        )
+    };
+
+    if match_pos + matchLength != mend_pos {
+        return matchLength;
+    }
+
+    if istart_pos >= input_buf.len() || ip_pos + matchLength >= iend_pos {
+        return matchLength;
+    }
+    matchLength
+        + unsafe { ZSTD_count_unchecked(input_buf, ip_pos + matchLength, istart_pos, iend_pos) }
+}
+
+#[inline(always)]
 fn ZSTD_count_2segments_first_segment(
     input_buf: &[u8],
     ip_pos: usize,
@@ -351,6 +386,64 @@ fn ZSTD_count_2segments_first_segment(
             && pMatch < match_limit
             && *dict_base.add(pMatch) == *input_base.add(pIn)
         {
+            pIn += 1;
+        }
+    }
+
+    pIn - start
+}
+
+#[inline(always)]
+unsafe fn ZSTD_count_2segments_first_segment_unchecked(
+    input_buf: &[u8],
+    ip_pos: usize,
+    vend_pos: usize,
+    dict_buf: &[u8],
+    match_pos: usize,
+) -> usize {
+    let word = core::mem::size_of::<usize>();
+    let start = ip_pos;
+    let mut pIn = ip_pos;
+    let mut pMatch = match_pos;
+    let inLoopLimit = vend_pos.saturating_sub(word - 1);
+    let input_base = input_buf.as_ptr();
+    let dict_base = dict_buf.as_ptr();
+
+    if pIn < inLoopLimit {
+        loop {
+            let diff = unsafe {
+                (dict_base.add(pMatch) as *const usize).read_unaligned()
+                    ^ (input_base.add(pIn) as *const usize).read_unaligned()
+            };
+            if diff != 0 {
+                pIn += ZSTD_NbCommonBytes(diff) as usize;
+                return pIn - start;
+            }
+            pIn += word;
+            pMatch += word;
+            if pIn >= inLoopLimit {
+                break;
+            }
+        }
+    }
+
+    unsafe {
+        if MEM_64bits() != 0
+            && pIn + 3 < vend_pos
+            && (dict_base.add(pMatch) as *const u32).read_unaligned()
+                == (input_base.add(pIn) as *const u32).read_unaligned()
+        {
+            pIn += 4;
+            pMatch += 4;
+        }
+        if pIn + 1 < vend_pos
+            && (dict_base.add(pMatch) as *const u16).read_unaligned()
+                == (input_base.add(pIn) as *const u16).read_unaligned()
+        {
+            pIn += 2;
+            pMatch += 2;
+        }
+        if pIn < vend_pos && *dict_base.add(pMatch) == *input_base.add(pIn) {
             pIn += 1;
         }
     }
@@ -547,6 +640,17 @@ mod tests {
         let dict = b"abc";
         let n = ZSTD_count_2segments(input, 3, input.len(), 0, dict, 0, dict.len());
         assert_eq!(n, 6);
+    }
+
+    #[test]
+    fn count_2segments_unchecked_matches_safe_crossing_case() {
+        let input = b"defabcdefQ";
+        let dict = b"abc";
+        let safe = ZSTD_count_2segments(input, 3, input.len(), 0, dict, 0, dict.len());
+        let fast = unsafe {
+            ZSTD_count_2segments_unchecked(input, 3, input.len(), 0, dict, 0, dict.len())
+        };
+        assert_eq!(fast, safe);
     }
 
     #[test]

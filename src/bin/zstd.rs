@@ -1356,7 +1356,7 @@ fn stream_buffered_compress_zstd_file_to_writer<W: Write>(
         .metadata()
         .map_err(|e| format!("{}: {e}", input.display()))?
         .len();
-    let mut reader = BufReader::new(file);
+    let mut reader = file;
     if level >= 3
         && src_size <= 256 << 20
         && nb_workers == 0
@@ -1392,9 +1392,9 @@ fn stream_buffered_compress_zstd_file_to_writer<W: Write>(
         overlap_log,
     )?;
 
-    let file_chunk_size = ZSTD_CStreamInSize().saturating_mul(2).max(1);
+    let file_chunk_size = ZSTD_CStreamInSize().saturating_mul(3).max(1);
     let mut input_buf = vec![0u8; file_chunk_size];
-    let mut output_buf = vec![0u8; ZSTD_CStreamOutSize().max(32)];
+    let mut output_buf = vec![0u8; ZSTD_CStreamOutSize().saturating_mul(2).max(32)];
     let mut total_in = 0usize;
     let mut total_out = 0usize;
     let mut sent_end = false;

@@ -203,24 +203,6 @@ pub fn ZSTD_compressLiterals(
 
     let srcSize = src.len();
     let mut prevRepeat = prevRepeat;
-    // Snapshot the caller's CTable on entry. Upstream's
-    // `ZSTD_compressLiterals` does `ZSTD_memcpy(nextHuf, prevHuf, ...)` at
-    // the top — the caller pre-clones into `prevHufTable`, so on entry
-    // `prevHufTable` already mirrors `prevHuf`. On any noCompress
-    // fallback (HUF error, RLE detection, gain check fails) we MUST
-    // restore the table so the decoder's view of "last set_compressed"
-    // stays in sync with the compressor's `nextEntropy.huf.CTable`.
-    // Forgetting this restore was a bug that fired on long inputs
-    // (silesia past ~165 MB at L5+): HUF's fresh-build path would
-    // overwrite the table even though we eventually emitted the block
-    // as `set_basic`, leaving compressor and decoder with mismatched
-    // tables for the next `set_repeat`.
-    let mut snapshot_huf_ctable = [crate::compress::huf_compress::HUF_CElt::default(); 257];
-    let snapshot_huf_ctable_len = prevHufTable.as_deref().map(|t| {
-        let n = t.len().min(snapshot_huf_ctable.len());
-        snapshot_huf_ctable[..n].copy_from_slice(&t[..n]);
-        n
-    });
     let mut prevHufTable = prevHufTable;
     // Literal block header length: 3, 4, or 5 bytes depending on size.
     let lhSize = 3 + (srcSize >= 1024) as usize + (srcSize >= 16384) as usize;
@@ -275,6 +257,16 @@ pub fn ZSTD_compressLiterals(
         crate::decompress::huf_decompress::HUF_flags_suspectUncompressible
     } else {
         0
+    });
+
+    // Snapshot the caller's CTable immediately before HUF can mutate it.
+    // Early raw-literal exits above never touch the table and don't need
+    // rollback; post-HUF fallback paths below still restore from this.
+    let mut snapshot_huf_ctable = [crate::compress::huf_compress::HUF_CElt::default(); 257];
+    let snapshot_huf_ctable_len = prevHufTable.as_deref().map(|t| {
+        let n = t.len().min(snapshot_huf_ctable.len());
+        snapshot_huf_ctable[..n].copy_from_slice(&t[..n]);
+        n
     });
 
     // Snapshot the caller's initial repeat flag before handing

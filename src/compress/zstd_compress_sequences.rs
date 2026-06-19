@@ -390,7 +390,7 @@ const fn STREAM_ACCUMULATOR_MIN() -> u32 {
 /// also what lets the `#[target_feature(enable = "bmi1,bmi2,lzcnt")]`
 /// wrapper actually emit BZHI/SHLX codegen for the bit packing.
 #[inline(always)]
-pub fn ZSTD_encodeSequences_body(
+pub fn ZSTD_encodeSequences_body<const LONG_OFFSETS: bool>(
     dst: &mut [u8],
     CTable_MatchLength: &[FSE_CTable],
     mlCodeTable: &[u8],
@@ -400,7 +400,6 @@ pub fn ZSTD_encodeSequences_body(
     llCodeTable: &[u8],
     sequences: &[SeqDef],
     nbSeq: usize,
-    longOffsets: i32,
 ) -> usize {
     let dstCapacity = dst.len();
     let (mut blockStream, rc) = BIT_initCStream(dst, dstCapacity);
@@ -453,7 +452,7 @@ pub fn ZSTD_encodeSequences_body(
     if MEM_32bits() != 0 {
         BIT_flushBits(&mut blockStream);
     }
-    if longOffsets != 0 {
+    if LONG_OFFSETS {
         let ofBits = ofCodeTable[last] as u32;
         let extraBits = ofBits - ofBits.min(STREAM_ACCUMULATOR_MIN() - 1);
         if extraBits != 0 {
@@ -527,7 +526,7 @@ pub fn ZSTD_encodeSequences_body(
             if MEM_32bits() != 0 || ofBits + mlBits + llBits > 56 {
                 BIT_flushBits(&mut blockStream);
             }
-            if longOffsets != 0 {
+            if LONG_OFFSETS {
                 let extraBits = ofBits - ofBits.min(STREAM_ACCUMULATOR_MIN() - 1);
                 if extraBits != 0 {
                     BIT_addBits(&mut blockStream, seq.offBase as usize, extraBits);
@@ -572,18 +571,31 @@ pub fn ZSTD_encodeSequences_default(
     nbSeq: usize,
     longOffsets: i32,
 ) -> usize {
-    ZSTD_encodeSequences_body(
-        dst,
-        CTable_MatchLength,
-        mlCodeTable,
-        CTable_OffsetBits,
-        ofCodeTable,
-        CTable_LitLength,
-        llCodeTable,
-        sequences,
-        nbSeq,
-        longOffsets,
-    )
+    if longOffsets != 0 {
+        ZSTD_encodeSequences_body::<true>(
+            dst,
+            CTable_MatchLength,
+            mlCodeTable,
+            CTable_OffsetBits,
+            ofCodeTable,
+            CTable_LitLength,
+            llCodeTable,
+            sequences,
+            nbSeq,
+        )
+    } else {
+        ZSTD_encodeSequences_body::<false>(
+            dst,
+            CTable_MatchLength,
+            mlCodeTable,
+            CTable_OffsetBits,
+            ofCodeTable,
+            CTable_LitLength,
+            llCodeTable,
+            sequences,
+            nbSeq,
+        )
+    }
 }
 
 /// Rust-only helper: BMI2-targeted body of `ZSTD_encodeSequences`.
@@ -613,18 +625,31 @@ unsafe fn ZSTD_encodeSequences_body_bmi2_impl(
     nbSeq: usize,
     longOffsets: i32,
 ) -> usize {
-    ZSTD_encodeSequences_body(
-        dst,
-        CTable_MatchLength,
-        mlCodeTable,
-        CTable_OffsetBits,
-        ofCodeTable,
-        CTable_LitLength,
-        llCodeTable,
-        sequences,
-        nbSeq,
-        longOffsets,
-    )
+    if longOffsets != 0 {
+        ZSTD_encodeSequences_body::<true>(
+            dst,
+            CTable_MatchLength,
+            mlCodeTable,
+            CTable_OffsetBits,
+            ofCodeTable,
+            CTable_LitLength,
+            llCodeTable,
+            sequences,
+            nbSeq,
+        )
+    } else {
+        ZSTD_encodeSequences_body::<false>(
+            dst,
+            CTable_MatchLength,
+            mlCodeTable,
+            CTable_OffsetBits,
+            ofCodeTable,
+            CTable_LitLength,
+            llCodeTable,
+            sequences,
+            nbSeq,
+        )
+    }
 }
 
 /// Port of `ZSTD_encodeSequences_bmi2` (`zstd_compress_sequences.c:403`).

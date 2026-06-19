@@ -20,8 +20,8 @@ use crate::compress::seq_store::{
     SeqStore_t, ZSTD_storeSeq, OFFSET_TO_OFFBASE, REPCODE_TO_OFFBASE, ZSTD_REP_NUM,
 };
 use crate::compress::zstd_hashes::{
-    ZSTD_count_2segments, ZSTD_count_unchecked, ZSTD_hash4, ZSTD_hash5, ZSTD_hash6, ZSTD_hash7,
-    ZSTD_hash8, ZSTD_hashPtr,
+    ZSTD_count_2segments, ZSTD_count_2segments_unchecked, ZSTD_count_unchecked, ZSTD_hash4,
+    ZSTD_hash5, ZSTD_hash6, ZSTD_hash7, ZSTD_hash8, ZSTD_hashPtr,
 };
 #[cfg(debug_assertions)]
 use std::sync::OnceLock;
@@ -417,7 +417,6 @@ fn ZSTD_compressBlock_fast_noDict_generic_mls<const MLS: u32, const USE_CMOV: bo
     // pointer through the matchState struct each iteration —
     // measurable overhead on the L1 inner loop.
     let hashTable = ms.hashTable.as_mut_ptr();
-
     'search: loop {
         let mut step = stepSize;
         let mut nextStep = ip0 + kStepIncr;
@@ -1168,6 +1167,54 @@ pub fn ZSTD_compressBlock_fast_extDict_generic_with_start(
 }
 
 #[inline(always)]
+unsafe fn ZSTD_countBack_noDict_unchecked(
+    src: &[u8],
+    ip: &mut usize,
+    match_pos: &mut usize,
+    anchor: usize,
+    low_match: usize,
+) -> usize {
+    let base = src.as_ptr();
+    let mut count = 0usize;
+    while *ip > anchor && *match_pos > low_match {
+        let in_byte = unsafe { *base.add(*ip - 1) };
+        let match_byte = unsafe { *base.add(*match_pos - 1) };
+        if in_byte != match_byte {
+            break;
+        }
+        *ip -= 1;
+        *match_pos -= 1;
+        count += 1;
+    }
+    count
+}
+
+#[inline(always)]
+unsafe fn ZSTD_countBack_extDict_unchecked(
+    src: &[u8],
+    dict: &[u8],
+    ip: &mut usize,
+    match_pos: &mut usize,
+    anchor: usize,
+    low_match: usize,
+) -> usize {
+    let src_base = src.as_ptr();
+    let dict_base = dict.as_ptr();
+    let mut count = 0usize;
+    while *ip > anchor && *match_pos > low_match {
+        let in_byte = unsafe { *src_base.add(*ip - 1) };
+        let match_byte = unsafe { *dict_base.add(*match_pos - 1) };
+        if in_byte != match_byte {
+            break;
+        }
+        *ip -= 1;
+        *match_pos -= 1;
+        count += 1;
+    }
+    count
+}
+
+#[inline(always)]
 fn ZSTD_fastHash<const MLS: u32>(src: &[u8], pos: usize, hlog: u32) -> usize {
     unsafe {
         let p = src.as_ptr().wrapping_add(pos);
@@ -1368,19 +1415,28 @@ fn ZSTD_compressBlock_fast_extDict_generic_with_start_mls<const MLS: u32>(
                     let mut match_local = idxLocal;
                     let lowMatchPtr = if idxInDict { dictStart } else { prefixStart };
                     let mut mLength = 4usize;
-                    while ip0 > anchor
-                        && match_local > lowMatchPtr
-                        && src[ip0 - 1]
-                            == if idxInDict {
-                                dict[match_local - 1]
-                            } else {
-                                src[match_local - 1]
-                            }
-                    {
-                        ip0 -= 1;
-                        match_local -= 1;
-                        mLength += 1;
-                    }
+                    mLength += if idxInDict {
+                        unsafe {
+                            ZSTD_countBack_extDict_unchecked(
+                                src,
+                                dict,
+                                &mut ip0,
+                                &mut match_local,
+                                anchor,
+                                lowMatchPtr,
+                            )
+                        }
+                    } else {
+                        unsafe {
+                            ZSTD_countBack_noDict_unchecked(
+                                src,
+                                &mut ip0,
+                                &mut match_local,
+                                anchor,
+                                lowMatchPtr,
+                            )
+                        }
+                    };
                     offset_2 = offset_1;
                     offset_1 = offset;
                     break 'search (
@@ -1466,19 +1522,28 @@ fn ZSTD_compressBlock_fast_extDict_generic_with_start_mls<const MLS: u32>(
                     let mut match_local = idxLocal;
                     let lowMatchPtr = if idxInDict { dictStart } else { prefixStart };
                     let mut mLength = 4usize;
-                    while ip0 > anchor
-                        && match_local > lowMatchPtr
-                        && src[ip0 - 1]
-                            == if idxInDict {
-                                dict[match_local - 1]
-                            } else {
-                                src[match_local - 1]
-                            }
-                    {
-                        ip0 -= 1;
-                        match_local -= 1;
-                        mLength += 1;
-                    }
+                    mLength += if idxInDict {
+                        unsafe {
+                            ZSTD_countBack_extDict_unchecked(
+                                src,
+                                dict,
+                                &mut ip0,
+                                &mut match_local,
+                                anchor,
+                                lowMatchPtr,
+                            )
+                        }
+                    } else {
+                        unsafe {
+                            ZSTD_countBack_noDict_unchecked(
+                                src,
+                                &mut ip0,
+                                &mut match_local,
+                                anchor,
+                                lowMatchPtr,
+                            )
+                        }
+                    };
                     offset_2 = offset_1;
                     offset_1 = offset;
                     break 'search (
@@ -1525,15 +1590,17 @@ fn ZSTD_compressBlock_fast_extDict_generic_with_start_mls<const MLS: u32>(
         };
 
         mLength += if match_in_dict {
-            ZSTD_count_2segments(
-                src,
-                ip0 + mLength,
-                iend,
-                prefixStart,
-                dict,
-                match_local + mLength,
-                dictEnd,
-            )
+            unsafe {
+                ZSTD_count_2segments_unchecked(
+                    src,
+                    ip0 + mLength,
+                    iend,
+                    prefixStart,
+                    dict,
+                    match_local + mLength,
+                    dictEnd,
+                )
+            }
         } else {
             unsafe { ZSTD_count_unchecked(src, ip0 + mLength, match_local + mLength, iend) }
         };
@@ -1609,15 +1676,17 @@ fn ZSTD_compressBlock_fast_extDict_generic_with_start_mls<const MLS: u32>(
                 {
                     let repEnd2 = if repInDict2 { dictEnd } else { iend };
                     let repLength2 = if repInDict2 {
-                        ZSTD_count_2segments(
-                            src,
-                            ip0 + 4,
-                            iend,
-                            prefixStart,
-                            dict,
-                            repLocal2 + 4,
-                            repEnd2,
-                        )
+                        unsafe {
+                            ZSTD_count_2segments_unchecked(
+                                src,
+                                ip0 + 4,
+                                iend,
+                                prefixStart,
+                                dict,
+                                repLocal2 + 4,
+                                repEnd2,
+                            )
+                        }
                     } else {
                         unsafe { ZSTD_count_unchecked(src, ip0 + 4, repLocal2 + 4, iend) }
                     } + 4;

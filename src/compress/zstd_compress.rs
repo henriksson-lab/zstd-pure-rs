@@ -1886,8 +1886,20 @@ fn ZSTD_traceBlock(
     } else {
         (0, 0, 0, 0, 0)
     };
+    let (base, dict_limit, low_limit, next_src, next_to_update) = if let Some(ms) = cctx.ms.as_ref()
+    {
+        (
+            ms.window.base_offset,
+            ms.window.dictLimit,
+            ms.window.lowLimit,
+            ms.window.nextSrc,
+            ms.nextToUpdate,
+        )
+    } else {
+        (0, 0, 0, 0, 0)
+    };
     eprintln!(
-        "zstd-rs-block index={} abs_src_pos={} block_size={} strategy={} minMatch={} row={:?} targetCBlock={} splitter={} bss={} c_body={:?} c_block={:?} rep_prev={:?} rep_next={:?} nb_seq={} nb_lit={} long_ty={} long_pos={} seq_hash={:016x}",
+        "zstd-rs-block index={} abs_src_pos={} block_size={} strategy={} minMatch={} row={:?} targetCBlock={} splitter={} bss={} c_body={:?} c_block={:?} rep_prev={:?} rep_next={:?} base={} dictLimit={} lowLimit={} nextSrc={} nextToUpdate={} nb_seq={} nb_lit={} long_ty={} long_pos={} seq_hash={:016x}",
         cctx.traceBlockIndex,
         abs_src_pos,
         block_size,
@@ -1901,6 +1913,11 @@ fn ZSTD_traceBlock(
         final_block_size,
         cctx.prev_rep,
         cctx.next_rep,
+        base,
+        dict_limit,
+        low_limit,
+        next_src,
+        next_to_update,
         nb_seq,
         nb_lit,
         long_ty,
@@ -13218,6 +13235,16 @@ fn zstd_stream_compress_windowed_block(
         return cSize;
     }
     op += cSize;
+    if zcs.consumedSrcSize == 0
+        && zcs.appliedParams.cParams.strategy
+            == crate::compress::zstd_compress_sequences::ZSTD_btultra2
+    {
+        if let Some(ms) = zcs.ms.as_ref() {
+            if ms.window.base_offset != zcs.stream_window_base {
+                zcs.stream_window_base = ms.window.base_offset;
+            }
+        }
+    }
     zcs.consumedSrcSize = zcs.consumedSrcSize.saturating_add(src_len as u64);
     zcs.producedCSize = zcs.producedCSize.saturating_add(op as u64);
     if zcs.pledgedSrcSizePlusOne != 0 && zcs.consumedSrcSize + 1 > zcs.pledgedSrcSizePlusOne {

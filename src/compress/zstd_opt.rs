@@ -2171,6 +2171,15 @@ pub fn ZSTD_compressBlock_btultra2_window(
     src_pos: usize,
     src_end: usize,
 ) -> usize {
+    let curr = ms.window.base_offset.wrapping_add(src_pos as u32);
+    if ms.opt.litLengthSum == 0
+        && seqStore.sequences.is_empty()
+        && ms.window.dictLimit == ms.window.lowLimit
+        && curr == ms.window.dictLimit
+        && src_end.saturating_sub(src_pos) > ZSTD_PREDEF_THRESHOLD as usize
+    {
+        ZSTD_initStats_ultra(ms, seqStore, rep, &window_buf[src_pos..src_end]);
+    }
     ZSTD_compressBlock_opt_generic_window(
         ms,
         seqStore,

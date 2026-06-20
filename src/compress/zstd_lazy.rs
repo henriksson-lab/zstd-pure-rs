@@ -2015,9 +2015,15 @@ pub fn ZSTD_compressBlock_lazy_generic_with_istart(
         }
 
         if matchLength < 4 {
-            let step = ((ip - anchor) >> kSearchStrength) + 1;
-            ip += step;
-            ms.lazySkipping = u32::from(step > kLazySkippingStep);
+            let step = (ip - anchor) >> kSearchStrength;
+            ip += step + 1;
+            // The C noDict generic folds `+1` into `step` before this cutoff,
+            // while the extDict generic tests the pre-increment value.
+            ms.lazySkipping = if dictMode == ZSTD_dictMode_e::ZSTD_noDict {
+                u32::from(step + 1 > kLazySkippingStep)
+            } else {
+                u32::from(step > kLazySkippingStep)
+            };
             continue;
         }
 

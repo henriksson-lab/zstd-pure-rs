@@ -524,17 +524,15 @@ pub mod fastcover_c {
         parameters: ZDICT_cover_params_t,
     ) {
         use crate::dict_builder::cover::{
-            COVER_best_finish, COVER_dictSelectionError, COVER_dictSelectionIsError,
-            COVER_selectDict,
+            COVER_best_finish, COVER_dictSelectionIsError, COVER_selectDict,
         };
 
         let totalCompressedSize = ERROR(ErrorCode::Generic);
         let mut segmentFreqs = vec![0u16; 1usize << ctx.f];
         let mut dict = vec![0u8; dictBufferCapacity];
-        let mut selection = COVER_dictSelectionError(ERROR(ErrorCode::Generic));
         /* Copy the frequencies because we need to modify them */
         let mut freqs = ctx.freqs.clone();
-        {
+        let selection = {
             let tail = FASTCOVER_buildDictionary(
                 ctx,
                 &mut freqs,
@@ -550,7 +548,7 @@ pub mod fastcover_c {
             let samples = unsafe { core::slice::from_raw_parts(ctx.samples, total_samples_size) };
             let samplesSizes =
                 unsafe { core::slice::from_raw_parts(ctx.samplesSizes, ctx.nbSamples) };
-            selection = COVER_selectDict(
+            let selection = COVER_selectDict(
                 &content,
                 dictBufferCapacity,
                 dictBufferCapacity - tail,
@@ -564,7 +562,8 @@ pub mod fastcover_c {
                 totalCompressedSize,
             );
             let _ = COVER_dictSelectionIsError(&selection); /* C logs/cleanups; best_finish still called */
-        }
+            selection
+        };
         COVER_best_finish(best, parameters, &selection);
         // `selection` (and its Vec) drops here == COVER_dictSelectionFree.
     }

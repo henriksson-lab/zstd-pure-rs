@@ -199,7 +199,7 @@ unsafe fn ss_fixdown(Td: *const u8, PA: *const i32, SA: *mut i32, mut i: i32, si
     let mut j: i32;
     let mut k: i32;
     let v: i32;
-    let mut c: i32;
+    let c: i32;
     let mut d: i32;
 
     v = *SA.offset(i as isize);
@@ -813,7 +813,7 @@ unsafe fn ss_rotate(mut first: *mut i32, middle: *mut i32, mut last: *mut i32) {
 unsafe fn ss_inplacemerge(
     T: *const u8,
     PA: *const i32,
-    mut first: *mut i32,
+    first: *mut i32,
     mut middle: *mut i32,
     mut last: *mut i32,
     depth: i32,
@@ -1524,7 +1524,7 @@ unsafe fn tr_fixdown(ISAd: *const i32, SA: *mut i32, mut i: i32, size: i32) {
     let mut j: i32;
     let mut k: i32;
     let v: i32;
-    let mut c: i32;
+    let c: i32;
     let mut d: i32;
 
     v = *SA.offset(i as isize);
@@ -1881,7 +1881,7 @@ unsafe fn tr_copy(
 ) {
     let mut c: *mut i32;
     let mut d: *mut i32;
-    let mut e: *mut i32;
+    let e: *mut i32;
     let mut s: i32;
     let v: i32;
 
@@ -2013,7 +2013,7 @@ unsafe fn tr_introsort(
     let mut b: *mut i32;
     let mut c: *mut i32;
     let mut v: i32;
-    let mut x: i32 = 0;
+    let mut x: i32;
     let incr: i32 = ISAd.offset_from(ISA as *const i32) as i32;
     let mut limit: i32;
     let mut next: i32;

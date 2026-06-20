@@ -25,22 +25,39 @@ fn main() {
     let n = match mode.as_str() {
         "default" => ZDICT_trainFromBuffer(&mut dict, maxdict, &samples, &sizes, nb),
         "legacy" => ZDICT_trainFromBuffer_legacy(
-            &mut dict, maxdict, &samples, &sizes, nb, ZDICT_legacy_params_t::default(),
+            &mut dict,
+            maxdict,
+            &samples,
+            &sizes,
+            nb,
+            ZDICT_legacy_params_t::default(),
         ),
         "cover" => {
             let mut p = ZDICT_cover_params_t::default();
-            p.k = 512; p.d = 8; p.steps = 4;
+            p.k = 512;
+            p.d = 8;
+            p.steps = 4;
             ZDICT_optimizeTrainFromBuffer_cover(&mut dict, maxdict, &samples, &sizes, nb, &mut p)
         }
         "fastcover" => {
             let mut p = ZDICT_fastCover_params_t::default();
-            p.k = 512; p.d = 8; p.steps = 4;
-            ZDICT_optimizeTrainFromBuffer_fastCover(&mut dict, maxdict, &samples, &sizes, nb, &mut p)
+            p.k = 512;
+            p.d = 8;
+            p.steps = 4;
+            ZDICT_optimizeTrainFromBuffer_fastCover(
+                &mut dict, maxdict, &samples, &sizes, nb, &mut p,
+            )
         }
-        _ => { eprintln!("bad mode {mode}"); std::process::exit(2); }
+        _ => {
+            eprintln!("bad mode {mode}");
+            std::process::exit(2);
+        }
     };
     eprintln!("train_elapsed_ms={}", t.elapsed().as_millis());
-    if ERR_isError(n) { eprintln!("train error {n:#x}"); std::process::exit(1); }
+    if ERR_isError(n) {
+        eprintln!("train error {n:#x}");
+        std::process::exit(1);
+    }
     dict.truncate(n);
     std::fs::write(&out, &dict).unwrap();
 }

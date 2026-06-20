@@ -166,7 +166,7 @@ fn external_tool_available(command: &str) -> bool {
 }
 
 #[test]
-#[ignore = "large corpus bitwise parity target; currently documents the known encoder divergence"]
+#[ignore = "large corpus bitwise parity target; run manually when the fixture is present"]
 fn cli_single_thread_large_mixed_corpus_matches_upstream_bitwise_level1() {
     let Some(upstream) = upstream_zstd() else {
         eprintln!("vendored upstream zstd/programs/zstd not built; skipping");

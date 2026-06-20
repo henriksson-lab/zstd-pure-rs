@@ -294,7 +294,11 @@ fn stableSort(ctx: &mut COVER_ctx_t) {
     let d = ctx.d;
     ctx.suffix.sort_by(|&a, &b| unsafe {
         if d <= 8 {
-            let mask: u64 = if d == 8 { u64::MAX } else { (1u64 << (8 * d)) - 1 };
+            let mask: u64 = if d == 8 {
+                u64::MAX
+            } else {
+                (1u64 << (8 * d)) - 1
+            };
             let lhs = mem_read_le64(samples.add(a as usize)) & mask;
             let rhs = mem_read_le64(samples.add(b as usize)) & mask;
             lhs.cmp(&rhs)
@@ -542,7 +546,8 @@ fn COVER_ctx_init(
     ctx.nbTrainSamples = nbTrainSamples as usize;
     ctx.nbTestSamples = nbTestSamples as usize;
     /* Partial suffix array */
-    ctx.suffixSize = trainingSamplesSize - core::cmp::max(d as usize, core::mem::size_of::<u64>()) + 1;
+    ctx.suffixSize =
+        trainingSamplesSize - core::cmp::max(d as usize, core::mem::size_of::<u64>()) + 1;
     ctx.suffix = vec![0u32; ctx.suffixSize];
     ctx.dmerAt = vec![0u32; ctx.suffixSize];
     ctx.offsets = vec![0usize; nbSamples as usize + 1];
@@ -566,7 +571,14 @@ fn COVER_ctx_init(
         if ctx.d <= 8 { COVER_cmp8 } else { COVER_cmp };
     unsafe {
         let data = ctx.suffix.as_ptr() as *const u8;
-        COVER_groupBy(data, ctx.suffixSize, core::mem::size_of::<u32>(), ctx, cmp, COVER_group);
+        COVER_groupBy(
+            data,
+            ctx.suffixSize,
+            core::mem::size_of::<u32>(),
+            ctx,
+            cmp,
+            COVER_group,
+        );
     }
     /* ctx->freqs = ctx->suffix; ctx->suffix = NULL; */
     ctx.freqs = core::mem::take(&mut ctx.suffix);
@@ -585,7 +597,12 @@ pub fn COVER_warnOnSmallCorpus(maxDictSize: usize, nbDmers: usize, displayLevel:
 
 /// Port of `COVER_computeEpochs`. Computes the number of epochs and the
 /// size of each epoch (each epoch gets at least `10 * k` bytes).
-pub fn COVER_computeEpochs(maxDictSize: u32, nbDmers: u32, k: u32, passes: u32) -> COVER_epoch_info_t {
+pub fn COVER_computeEpochs(
+    maxDictSize: u32,
+    nbDmers: u32,
+    k: u32,
+    passes: u32,
+) -> COVER_epoch_info_t {
     let minEpochSize = k * 10;
     let mut epochs = COVER_epoch_info_t { num: 0, size: 0 };
     epochs.num = core::cmp::max(1, maxDictSize / k / passes);
@@ -620,7 +637,11 @@ pub fn COVER_checkTotalCompressedSize(
     let mut totalCompressedSize = ERROR(ErrorCode::Generic);
     /* Allocate dst with enough space to compress the maximum sized sample. */
     let mut maxSampleSize: usize = 0;
-    let mut i = if parameters.splitPoint < 1.0 { nbTrainSamples } else { 0 };
+    let mut i = if parameters.splitPoint < 1.0 {
+        nbTrainSamples
+    } else {
+        0
+    };
     while i < nbSamples {
         maxSampleSize = core::cmp::max(samplesSizes[i], maxSampleSize);
         i += 1;
@@ -637,7 +658,11 @@ pub fn COVER_checkTotalCompressedSize(
     };
     /* Compress each sample and sum their sizes (or error). */
     totalCompressedSize = dict.len();
-    i = if parameters.splitPoint < 1.0 { nbTrainSamples } else { 0 };
+    i = if parameters.splitPoint < 1.0 {
+        nbTrainSamples
+    } else {
+        0
+    };
     while i < nbSamples {
         let src = &samples[offsets[i]..offsets[i] + samplesSizes[i]];
         let size = ZSTD_compress_usingCDict(&mut cctx, &mut dst, src, &cdict);
@@ -669,14 +694,18 @@ fn COVER_buildDictionary(
         parameters.k,
         4,
     );
-    let maxZeroScoreRun = core::cmp::max(10usize, core::cmp::min(100usize, (epochs.num >> 3) as usize));
+    let maxZeroScoreRun = core::cmp::max(
+        10usize,
+        core::cmp::min(100usize, (epochs.num >> 3) as usize),
+    );
     let mut zeroScoreRun: usize = 0;
     let mut epoch: usize = 0;
     while tail > 0 {
         let epochBegin = (epoch as u32).wrapping_mul(epochs.size);
         let epochEnd = epochBegin + epochs.size;
         /* Select a segment. */
-        let segment = COVER_selectSegment(ctx, freqs, activeDmers, epochBegin, epochEnd, parameters);
+        let segment =
+            COVER_selectSegment(ctx, freqs, activeDmers, epochBegin, epochEnd, parameters);
         /* If the segment covers no dmers, we may be out of content. */
         if segment.score == 0 {
             zeroScoreRun += 1;
@@ -700,7 +729,8 @@ fn COVER_buildDictionary(
         tail -= segmentSize;
         // memcpy(dict + tail, ctx->samples + segment.begin, segmentSize)
         unsafe {
-            let src = core::slice::from_raw_parts(ctx.samples.add(segment.begin as usize), segmentSize);
+            let src =
+                core::slice::from_raw_parts(ctx.samples.add(segment.begin as usize), segmentSize);
             dict[tail..tail + segmentSize].copy_from_slice(src);
         }
         epoch = (epoch + 1) % epochs.num as usize;
@@ -1072,8 +1102,16 @@ pub fn ZDICT_optimizeTrainFromBuffer_cover(
     let kMinD = if parameters.d == 0 { 6 } else { parameters.d };
     let kMaxD = if parameters.d == 0 { 8 } else { parameters.d };
     let kMinK = if parameters.k == 0 { 50 } else { parameters.k };
-    let kMaxK = if parameters.k == 0 { 2000 } else { parameters.k };
-    let kSteps = if parameters.steps == 0 { 40 } else { parameters.steps };
+    let kMaxK = if parameters.k == 0 {
+        2000
+    } else {
+        parameters.k
+    };
+    let kSteps = if parameters.steps == 0 {
+        40
+    } else {
+        parameters.steps
+    };
     let kStepSize = core::cmp::max((kMaxK - kMinK) / kSteps, 1);
     let shrinkDict: u32 = 0;
     let displayLevel = parameters.zParams.notificationLevel as i32;
@@ -1101,7 +1139,11 @@ pub fn ZDICT_optimizeTrainFromBuffer_cover(
     while d <= kMaxD {
         let mut ctx = COVER_ctx_t::default();
         {
-            let childDisplayLevel = if displayLevel == 0 { 0 } else { displayLevel - 1 };
+            let childDisplayLevel = if displayLevel == 0 {
+                0
+            } else {
+                displayLevel - 1
+            };
             let initVal = COVER_ctx_init(
                 &mut ctx,
                 samplesBuffer,

@@ -56,42 +56,44 @@ Test suite status as of the latest local audit run: `cargo test --features cli` 
 
 ## Local benchmark snapshot
 
-Measured 2026-06-19 on Linux 6.8 x86_64, Intel Xeon Gold 6138, `rustc 1.92.0`, generic release build from `cargo build --release --features cli` (no `-C target-cpu=native`; the upstream comparator is a generic vendored `zstd/programs/zstd` build reporting `v1.6.0`). The all-level table uses the deterministic 67,108,864-byte `.tmp/bench/realistic_64m.tar` fixture, built from the public Silesia corpus plus enwik8 Wikipedia text as distinct files in a tar archive. Commands were `--single-thread -LEVEL --no-check -f -q`, with `--ultra` added for levels 20-22. The table reports GNU `/usr/bin/time` user CPU seconds and max RSS; wall-clock timings on this host were noisy. `Rust/orig CPU` is original user time divided by Rust user time, so values below `1.00x` mean Rust used more CPU. Two-way decode means upstream decoded the Rust frame to the original input and the Rust decoder decoded the upstream frame to the original input. This is a local status snapshot, not a guarantee.
+Measured 2026-06-20 on Linux 6.8 x86_64, Intel Xeon Gold 6138, `rustc 1.92.0`, generic release build from `cargo build --release --features cli` (no `-C target-cpu=native`; the upstream comparator is a generic vendored `zstd/programs/zstd` build reporting `v1.6.0`). The all-level table uses the deterministic 67,108,864-byte `.tmp/bench/realistic_64m.tar` fixture, built from the public Silesia corpus plus enwik8 Wikipedia text as distinct files in a tar archive. Commands were `--single-thread -LEVEL --no-check -f -q`, with `--ultra` added for levels 20-22. The table reports GNU `/usr/bin/time` user CPU seconds and max RSS; wall-clock timings on this host were noisy. `Rust/orig CPU` is original user time divided by Rust user time, so values below `1.00x` mean Rust used more CPU. `Byte-identical` compares the compressed frames against the vendored upstream CLI. This is a local status snapshot, not a guarantee.
 
-| Level | Rust user | Original user | Rust/orig CPU | Rust RSS | Original RSS | Rust size | Original size | Two-way decode |
+Levels 1-12 currently use the file streaming path and are byte-identical on this fixture. Levels 13-22 remain valid but not byte-identical; the file CLI keeps a guarded one-shot fallback for those levels on small regular files because the streaming optimal-parser path is not yet faithful.
+
+| Level | Rust user | Original user | Rust/orig CPU | Rust RSS | Original RSS | Rust size | Original size | Byte-identical |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :---: |
-| 1 | 0.46 s | 0.39 s | 0.85x | 5.0 MiB | 3.1 MiB | 27304329 | 27304326 | pass |
-| 2 | 0.69 s | 0.58 s | 0.84x | 6.2 MiB | 4.1 MiB | 25066286 | 25066283 | pass |
-| 3 | 0.80 s | 0.76 s | 0.95x | 90.6 MiB | 5.3 MiB | 23784549 | 23889438 | pass |
-| 4 | 0.83 s | 0.86 s | 1.04x | 91.6 MiB | 6.6 MiB | 23302907 | 23426701 | pass |
-| 5 | 1.54 s | 1.25 s | 0.81x | 91.2 MiB | 7.2 MiB | 22629427 | 22633952 | pass |
-| 6 | 2.19 s | 1.98 s | 0.90x | 90.6 MiB | 7.2 MiB | 21902104 | 21906687 | pass |
-| 7 | 2.79 s | 2.44 s | 0.87x | 92.5 MiB | 9.7 MiB | 21478037 | 21482070 | pass |
-| 8 | 3.45 s | 3.00 s | 0.87x | 92.2 MiB | 9.7 MiB | 21213129 | 21217035 | pass |
-| 9 | 3.96 s | 3.42 s | 0.86x | 97.2 MiB | 16.6 MiB | 20873185 | 20876814 | pass |
-| 10 | 5.77 s | 4.75 s | 0.82x | 106.6 MiB | 26.6 MiB | 20574348 | 20578309 | pass |
-| 11 | 8.77 s | 7.04 s | 0.80x | 105.9 MiB | 26.6 MiB | 20433410 | 20437398 | pass |
-| 12 | 9.91 s | 7.94 s | 0.80x | 126.2 MiB | 46.6 MiB | 20381166 | 20385376 | pass |
-| 13 | 19.33 s | 17.84 s | 0.92x | 117.2 MiB | 38.8 MiB | 20131625 | 20135315 | pass |
-| 14 | 23.52 s | 22.09 s | 0.94x | 132.8 MiB | 54.4 MiB | 20013079 | 20016886 | pass |
-| 15 | 29.04 s | 27.44 s | 0.94x | 148.4 MiB | 70.6 MiB | 19776029 | 19779986 | pass |
-| 16 | 34.73 s | 30.10 s | 0.87x | 117.5 MiB | 38.1 MiB | 19106683 | 19108591 | pass |
-| 17 | 45.72 s | 41.48 s | 0.91x | 130.9 MiB | 58.4 MiB | 18616327 | 18617535 | pass |
-| 18 | 58.83 s | 50.66 s | 0.86x | 129.4 MiB | 58.4 MiB | 18369567 | 18369495 | pass |
-| 19 | 64.22 s | 56.47 s | 0.88x | 162.5 MiB | 90.6 MiB | 18123264 | 18123577 | pass |
-| 20 | 73.85 s | 65.32 s | 0.88x | 242.8 MiB | 193.8 MiB | 17515211 | 17516254 | pass |
-| 21 | 80.45 s | 73.33 s | 0.91x | 401.6 MiB | 384.1 MiB | 17293928 | 17295012 | pass |
-| 22 | 90.37 s | 76.95 s | 0.85x | 720.6 MiB | 703.1 MiB | 17245138 | 17246022 | pass |
+| 1 | 0.40 s | 0.34 s | 0.85x | 4.7 MiB | 3.1 MiB | 27304326 | 27304326 | ok |
+| 2 | 0.55 s | 0.54 s | 0.98x | 5.9 MiB | 4.1 MiB | 25066283 | 25066283 | ok |
+| 3 | 0.75 s | 0.57 s | 0.76x | 8.4 MiB | 5.3 MiB | 23889438 | 23889438 | ok |
+| 4 | 0.90 s | 0.70 s | 0.78x | 9.7 MiB | 6.6 MiB | 23426701 | 23426701 | ok |
+| 5 | 1.42 s | 0.99 s | 0.70x | 10.0 MiB | 6.9 MiB | 22633952 | 22633952 | ok |
+| 6 | 1.86 s | 1.47 s | 0.79x | 10.0 MiB | 7.2 MiB | 21906687 | 21906687 | ok |
+| 7 | 2.32 s | 1.89 s | 0.81x | 12.5 MiB | 9.7 MiB | 21482070 | 21482070 | ok |
+| 8 | 3.07 s | 2.43 s | 0.79x | 12.5 MiB | 9.7 MiB | 21217035 | 21217035 | ok |
+| 9 | 3.43 s | 2.48 s | 0.72x | 21.6 MiB | 16.6 MiB | 20876814 | 20876814 | ok |
+| 10 | 5.39 s | 3.94 s | 0.73x | 31.6 MiB | 26.6 MiB | 20578309 | 20578309 | ok |
+| 11 | 8.44 s | 5.86 s | 0.69x | 31.9 MiB | 26.6 MiB | 20437398 | 20437398 | ok |
+| 12 | 9.04 s | 5.71 s | 0.63x | 51.6 MiB | 46.6 MiB | 20385376 | 20385376 | ok |
+| 13 | 13.66 s | 12.20 s | 0.89x | 118.4 MiB | 38.8 MiB | 20131625 | 20135315 | diff |
+| 14 | 15.95 s | 15.05 s | 0.94x | 134.1 MiB | 54.7 MiB | 20013079 | 20016886 | diff |
+| 15 | 20.97 s | 19.87 s | 0.95x | 150.0 MiB | 70.6 MiB | 19776029 | 19779986 | diff |
+| 16 | 25.55 s | 20.60 s | 0.81x | 117.8 MiB | 38.4 MiB | 19106683 | 19108591 | diff |
+| 17 | 34.67 s | 32.62 s | 0.94x | 133.8 MiB | 58.1 MiB | 18616327 | 18617535 | diff |
+| 18 | 42.22 s | 35.71 s | 0.85x | 133.8 MiB | 59.4 MiB | 18369567 | 18369495 | diff |
+| 19 | 48.16 s | 42.33 s | 0.88x | 165.3 MiB | 90.6 MiB | 18123264 | 18123577 | diff |
+| 20 | 59.81 s | 51.47 s | 0.86x | 245.0 MiB | 194.7 MiB | 17515211 | 17516254 | diff |
+| 21 | 67.80 s | 61.68 s | 0.91x | 404.4 MiB | 385.0 MiB | 17293928 | 17295012 | diff |
+| 22 | 71.02 s | 62.08 s | 0.87x | 724.1 MiB | 706.2 MiB | 17245138 | 17246022 | diff |
 
-Rust-compressed and original-compressed frames are generally **not byte-identical** across all levels. The current level-1 no-check fast path remains byte-identical on the highly repetitive text fixture below, while the other larger fixtures produce different but mutually decodable frames:
+Rust-compressed and original-compressed frames are byte-identical for levels 1-12 on the all-level fixture above, and not yet byte-identical for levels 13-22. The current level-1 no-check fast path is byte-identical on the larger real-data fixtures below. Timings are single sequential warm-cache runs using `--single-thread -1 --no-check`; RSS is from `/usr/bin/time`.
 
 | Dataset | Input bytes | Rust wall/user/sys | Original wall/user/sys | Rust/orig CPU | Rust RSS | Original RSS | Rust bytes | Original bytes | Byte-identical |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :---: |
-| realistic5x | 311951360 | 2.96/2.00/0.22 s | 1.85/1.66/0.18 s | 0.83x | 5.6 MiB | 3.4 MiB | 113894212 | 113894044 | DIFF |
-| text466m | 466432000 | 0.22/0.10/0.08 s | 0.21/0.13/0.07 s | 1.30x | 5.3 MiB | 3.1 MiB | 97428 | 97428 | ok |
-| repo_mix12x | 748083200 | 17.33/1.86/1.01 s | 2.07/1.53/0.64 s | 0.82x | 5.6 MiB | 3.4 MiB | 613071901 | 613071966 | DIFF |
-| random2g | 2147483648 | 44.98/1.14/3.40 s | 3.50/0.84/2.39 s | 0.74x | 5.6 MiB | 3.1 MiB | 2147532813 | 2147532810 | DIFF |
-| micro2700k | 2764801024 | 2.96/2.05/0.62 s | 2.41/1.79/0.54 s | 0.87x | 5.0 MiB | 3.1 MiB | 38036231 | 38037397 | DIFF |
+| realistic5x | 311951360 | 2.75/1.66/0.22 s | 1.62/1.44/0.17 s | 0.87x | 5.3 MiB | 3.4 MiB | 113894044 | 113894044 | ok |
+| text466m | 466432000 | 0.20/0.11/0.07 s | 0.17/0.09/0.07 s | 0.82x | 5.3 MiB | 3.1 MiB | 97428 | 97428 | ok |
+| repo_mix12x | 748083200 | 5.84/1.43/1.00 s | 1.72/1.16/0.56 s | 0.81x | 5.3 MiB | 3.1 MiB | 613071966 | 613071966 | ok |
+| random2g | 2147483648 | 2.50/0.90/1.57 s | 2.37/0.73/1.63 s | 0.81x | 5.3 MiB | 3.1 MiB | 2147532810 | 2147532810 | ok |
+| micro2700k | 2764801024 | 2.24/1.48/0.56 s | 1.91/1.42/0.49 s | 0.96x | 5.0 MiB | 3.1 MiB | 38037397 | 38037397 | ok |
 
 A larger 466,432,000-byte repeat corpus gives a less noisy decompression comparison: Rust file-output median 1665.8 MB/s / 5.0 MiB RSS versus original median 1504.6 MB/s / 4.4 MiB. In test mode (`-t`, no output), Rust now streams at 6663.3 MB/s / 5.0 MiB RSS versus original 5830.4 MB/s / 4.4 MiB RSS; before the streaming test-mode fix, Rust `-t` staged the whole 466 MB output and reached about 458 MiB RSS. The CLI decompression path now uses the decoder's history-backed streaming path for frames up to a 4 MiB window and uses the whole-buffer decoder above that until high-window streaming history is audited.
 

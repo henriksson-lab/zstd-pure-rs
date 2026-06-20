@@ -485,13 +485,9 @@ fn ZSTD_compressBlock_fast_noDict_generic_mls<const MLS: u32, const USE_CMOV: bo
             // rep_offset1) ≤ ip2` for the in-window cases above, so the
             // 4-byte read stays in-bounds (identical to the address the
             // prior `rep_safe` branch already read from).
-            let rep_safe = rep_offset1 > 0 && rep_offset1 as usize <= ip2 - prefixStart;
             let rep_read_pos = ip2.wrapping_sub(rep_offset1 as usize);
-            let rep_rval = if rep_safe {
-                unsafe { (src.as_ptr().wrapping_add(rep_read_pos) as *const u32).read_unaligned() }
-            } else {
-                0
-            };
+            let rep_rval =
+                unsafe { (src.as_ptr().wrapping_add(rep_read_pos) as *const u32).read_unaligned() };
             let rep_cval =
                 unsafe { (src.as_ptr().wrapping_add(ip2) as *const u32).read_unaligned() };
             if ZSTD_fastTraceEnabled(istart, ip2, base_off.wrapping_add(ip2 as u32)) {
@@ -511,7 +507,7 @@ fn ZSTD_compressBlock_fast_noDict_generic_mls<const MLS: u32, const USE_CMOV: bo
                     prefixStartIndex
                 );
             }
-            if rep_safe && rep_rval == rep_cval {
+            if (rep_rval == rep_cval) & (rep_offset1 > 0) {
                 ip0 = ip2;
                 let mut match0 = ip0 - rep_offset1 as usize;
                 let back = usize::from(ip0 > 0 && match0 > 0 && src[ip0 - 1] == src[match0 - 1]);
@@ -756,7 +752,7 @@ fn ZSTD_compressBlock_fast_noDict_generic_mls<const MLS: u32, const USE_CMOV: bo
             unsafe {
                 *hashTable.add(h) = base_off.wrapping_add((ip0 - 2) as u32);
             }
-            while ip0 <= ilimit && rep_offset2 > 0 && rep_offset2 as usize <= ip0 - prefixStart {
+            while ip0 <= ilimit && rep_offset2 > 0 {
                 // SAFETY: `ip0 ≤ ilimit = iend - 8`, so `ip0 + 4 ≤ iend
                 // = src.len()`; `ip0 - rep_offset2 ≤ ip0` so same bound.
                 let cval =
@@ -1319,14 +1315,7 @@ fn ZSTD_compressBlock_fast_extDict_generic_with_start_mls<const MLS: u32>(
                 *hashTable.add(hash0) = current0;
             }
 
-            let rep_candidate = offset_1 > 0
-                && if repInDict {
-                    repIndex >= dictStartIndex
-                        && repIndex < prefixStartIndex
-                        && repLocal + 4 <= dictEnd
-                } else {
-                    repIndex > prefixStartIndex && repIndex < current2 && repLocal + 4 <= src.len()
-                };
+            let rep_candidate = offset_1 > 0 && prefixStartIndex.wrapping_sub(repIndex) >= 4;
             let cval = unsafe { (src.as_ptr().wrapping_add(ip2) as *const u32).read_unaligned() };
             let rval = if rep_candidate {
                 if repInDict {
@@ -1389,22 +1378,15 @@ fn ZSTD_compressBlock_fast_extDict_generic_with_start_mls<const MLS: u32>(
                 } else {
                     idx.wrapping_sub(base_off) as usize
                 };
-                let idx_valid = if idxInDict {
-                    idx < prefixStartIndex && idxLocal + 4 <= dictEnd
-                } else {
-                    idx >= prefixStartIndex && idx < current0 && idxLocal + 4 <= src.len()
-                };
-                let mval = if idx_valid && idxInDict {
+                let mval = if idxInDict {
                     debug_assert!(idxLocal + 4 <= dictEnd);
                     unsafe { (dict.as_ptr().wrapping_add(idxLocal) as *const u32).read_unaligned() }
-                } else if idx_valid {
+                } else {
                     debug_assert!(idxLocal + 4 <= src.len());
                     unsafe { (src.as_ptr().wrapping_add(idxLocal) as *const u32).read_unaligned() }
-                } else {
-                    0
                 };
-                let found = idx_valid
-                    && unsafe { (src.as_ptr().wrapping_add(ip0) as *const u32).read_unaligned() }
+                let found =
+                    unsafe { (src.as_ptr().wrapping_add(ip0) as *const u32).read_unaligned() }
                         == mval;
                 if ZSTD_fastTraceEnabled(istart, ip0, current0) {
                     eprintln!(
@@ -1503,22 +1485,15 @@ fn ZSTD_compressBlock_fast_extDict_generic_with_start_mls<const MLS: u32>(
                 } else {
                     idx.wrapping_sub(base_off) as usize
                 };
-                let idx_valid = if idxInDict {
-                    idx < prefixStartIndex && idxLocal + 4 <= dictEnd
-                } else {
-                    idx >= prefixStartIndex && idx < current0 && idxLocal + 4 <= src.len()
-                };
-                let mval = if idx_valid && idxInDict {
+                let mval = if idxInDict {
                     debug_assert!(idxLocal + 4 <= dictEnd);
                     unsafe { (dict.as_ptr().wrapping_add(idxLocal) as *const u32).read_unaligned() }
-                } else if idx_valid {
+                } else {
                     debug_assert!(idxLocal + 4 <= src.len());
                     unsafe { (src.as_ptr().wrapping_add(idxLocal) as *const u32).read_unaligned() }
-                } else {
-                    0
                 };
-                let found = idx_valid
-                    && unsafe { (src.as_ptr().wrapping_add(ip0) as *const u32).read_unaligned() }
+                let found =
+                    unsafe { (src.as_ptr().wrapping_add(ip0) as *const u32).read_unaligned() }
                         == mval;
                 if ZSTD_fastTraceEnabled(istart, ip0, current0) {
                     eprintln!(
@@ -1674,17 +1649,7 @@ fn ZSTD_compressBlock_fast_extDict_generic_with_start_mls<const MLS: u32>(
                 } else {
                     repIndex2.wrapping_sub(base_off) as usize
                 };
-                let rep2_valid = offset_2 > 0
-                    && if repInDict2 {
-                        repIndex2 >= dictStartIndex
-                            && repIndex2 < prefixStartIndex
-                            && repLocal2 + 4 <= dictEnd
-                    } else {
-                        repIndex2 > prefixStartIndex
-                            && repIndex2 < base_off.wrapping_add(ip0 as u32)
-                            && repLocal2 + 4 <= src.len()
-                    };
-                if rep2_valid
+                if offset_2 > 0
                     && ZSTD_index_overlap_check(prefixStartIndex, repIndex2)
                     && if repInDict2 {
                         if repLocal2 + 4 <= dictEnd {

@@ -1324,7 +1324,8 @@ pub fn ZSTD_insertBtAndGetAllMatches(
                     let prefixPos = dictMatchIndex
                         .wrapping_add(dmsIndexDelta)
                         .wrapping_add(matchLength as u32)
-                        .wrapping_sub(ms.window.base_offset) as usize;
+                        .wrapping_sub(ms.window.base_offset)
+                        as usize;
                     buf[prefixPos]
                 } else {
                     dms.dictContent

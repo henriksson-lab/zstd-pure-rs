@@ -13811,7 +13811,9 @@ fn zstd_endStream_buffered(
                 } else {
                     ZSTD_compressEnd_public(zcs, &mut compressed, &src)
                 }
-            } else if zcs.stage != ZSTD_compressionStage_e::ZSTDcs_created {
+            } else if zcs.stage != ZSTD_compressionStage_e::ZSTDcs_created
+                && zcs.stream_in_to_compress != 0
+            {
                 if direct_to_output {
                     ZSTD_compressEnd_public(zcs, &mut output[*output_pos..], &src)
                 } else {
@@ -14785,6 +14787,68 @@ mod local_streaming_static_tests {
         let d = ZSTD_decompress(&mut decoded, &dst[..dp]);
         assert_eq!(d, expected.len());
         assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn pledged_unflushed_stream_matches_one_shot_last_block_flag() {
+        let mut src = Vec::new();
+        for i in 0..8192u32 {
+            src.extend_from_slice(b"pledged stream parity payload ");
+            src.extend_from_slice(&i.to_le_bytes());
+            src.extend_from_slice(b" repeated enough to span several blocks\n");
+        }
+
+        let mut one_shot_ctx = ZSTD_CCtx::default();
+        let rc = ZSTD_CCtx_setParameter(
+            &mut one_shot_ctx,
+            ZSTD_cParameter::ZSTD_c_compressionLevel,
+            1,
+        );
+        assert!(!ERR_isError(rc));
+        let rc = ZSTD_CCtx_setParameter(&mut one_shot_ctx, ZSTD_cParameter::ZSTD_c_checksumFlag, 0);
+        assert!(!ERR_isError(rc));
+        let rc = ZSTD_CCtx_setParameter(
+            &mut one_shot_ctx,
+            ZSTD_cParameter::ZSTD_c_contentSizeFlag,
+            1,
+        );
+        assert!(!ERR_isError(rc));
+        let mut one_shot = vec![0u8; ZSTD_compressBound(src.len())];
+        let one_shot_size = ZSTD_compress2(&mut one_shot_ctx, &mut one_shot, &src);
+        assert!(!ERR_isError(one_shot_size));
+        one_shot.truncate(one_shot_size);
+
+        let mut stream_ctx = ZSTD_CCtx::default();
+        assert_eq!(ZSTD_initCStream(&mut stream_ctx, 1), 0);
+        let rc = ZSTD_CCtx_setParameter(&mut stream_ctx, ZSTD_cParameter::ZSTD_c_checksumFlag, 0);
+        assert!(!ERR_isError(rc));
+        let rc =
+            ZSTD_CCtx_setParameter(&mut stream_ctx, ZSTD_cParameter::ZSTD_c_contentSizeFlag, 1);
+        assert!(!ERR_isError(rc));
+        let rc = ZSTD_CCtx_setPledgedSrcSize(&mut stream_ctx, src.len() as u64);
+        assert!(!ERR_isError(rc));
+
+        let mut streamed = vec![0u8; ZSTD_compressBound(src.len())];
+        let mut dp = 0usize;
+        for chunk in src.chunks(97_123) {
+            let mut ip = 0usize;
+            let rc = ZSTD_compressStream(&mut stream_ctx, &mut streamed, &mut dp, chunk, &mut ip);
+            assert!(!ERR_isError(rc), "compressStream errored: {rc:#x}");
+            assert_eq!(ip, chunk.len());
+        }
+        loop {
+            let rc = ZSTD_endStream(&mut stream_ctx, &mut streamed, &mut dp);
+            assert!(!ERR_isError(rc), "endStream errored: {rc:#x}");
+            if rc == 0 {
+                break;
+            }
+            if dp == streamed.len() {
+                streamed.resize(streamed.len() * 2, 0);
+            }
+        }
+        streamed.truncate(dp);
+
+        assert_eq!(streamed, one_shot);
     }
 
     #[test]

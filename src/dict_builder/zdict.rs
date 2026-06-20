@@ -67,13 +67,12 @@ use crate::common::xxhash::XXH64;
 use crate::common::zstd_internal::repStartValue;
 use crate::compress::fse_compress::{FSE_normalizeCount, FSE_writeNCount};
 use crate::compress::huf_compress::{
-    HUF_buildCTable_wksp, HUF_writeCTable_wksp, HUF_CElt, HUF_CTABLE_WORKSPACE_SIZE_U32,
+    HUF_CElt, HUF_buildCTable_wksp, HUF_writeCTable_wksp, HUF_CTABLE_WORKSPACE_SIZE_U32,
     HUF_WRITE_CTABLE_WORKSPACE_SIZE,
 };
 use crate::compress::zstd_compress::{
-    ZSTD_compressBegin_usingCDict_deprecated, ZSTD_compressBlock_deprecated, ZSTD_createCCtx,
-    ZSTD_createCDict_advanced, ZSTD_getParams, ZSTD_parameters, ZSTD_seqToCodes, ZSTD_CCtx,
-    ZSTD_CDict,
+    ZSTD_CCtx, ZSTD_CDict, ZSTD_compressBegin_usingCDict_deprecated, ZSTD_compressBlock_deprecated,
+    ZSTD_createCCtx, ZSTD_createCDict_advanced, ZSTD_getParams, ZSTD_parameters, ZSTD_seqToCodes,
 };
 use crate::decompress::zstd_ddict::{ZSTD_dictContentType_e, ZSTD_dictLoadMethod_e};
 use crate::decompress::zstd_decompress::ZSTD_MAGIC_DICTIONARY;
@@ -160,8 +159,12 @@ fn ZDICT_countEStats(
 
         if nbSeq >= 2 {
             /* rep offsets */
-            let mut offset1 = seqStorePtr.sequences[0].offBase.wrapping_sub(ZSTD_REP_NUM as u32);
-            let mut offset2 = seqStorePtr.sequences[1].offBase.wrapping_sub(ZSTD_REP_NUM as u32);
+            let mut offset1 = seqStorePtr.sequences[0]
+                .offBase
+                .wrapping_sub(ZSTD_REP_NUM as u32);
+            let mut offset2 = seqStorePtr.sequences[1]
+                .offBase
+                .wrapping_sub(ZSTD_REP_NUM as u32);
             if offset1 as usize >= MAXREPOFFSET {
                 offset1 = 0;
             }
@@ -332,7 +335,14 @@ fn ZDICT_analyzeEntropy(
     for u in 0..=offcodeMax as usize {
         total += offcodeCount[u];
     }
-    let errorCode = FSE_normalizeCount(&mut offcodeNCount, Offlog, &offcodeCount, total as usize, offcodeMax, 1);
+    let errorCode = FSE_normalizeCount(
+        &mut offcodeNCount,
+        Offlog,
+        &offcodeCount,
+        total as usize,
+        offcodeMax,
+        1,
+    );
     if ERR_isError(errorCode) {
         return errorCode;
     }
@@ -342,7 +352,14 @@ fn ZDICT_analyzeEntropy(
     for u in 0..=MaxML as usize {
         total += matchLengthCount[u];
     }
-    let errorCode = FSE_normalizeCount(&mut matchLengthNCount, mlLog, &matchLengthCount, total as usize, MaxML, 1);
+    let errorCode = FSE_normalizeCount(
+        &mut matchLengthNCount,
+        mlLog,
+        &matchLengthCount,
+        total as usize,
+        MaxML,
+        1,
+    );
     if ERR_isError(errorCode) {
         return errorCode;
     }
@@ -352,7 +369,14 @@ fn ZDICT_analyzeEntropy(
     for u in 0..=MaxLL as usize {
         total += litLengthCount[u];
     }
-    let errorCode = FSE_normalizeCount(&mut litLengthNCount, llLog, &litLengthCount, total as usize, MaxLL, 1);
+    let errorCode = FSE_normalizeCount(
+        &mut litLengthNCount,
+        llLog,
+        &litLengthCount,
+        total as usize,
+        MaxLL,
+        1,
+    );
     if ERR_isError(errorCode) {
         return errorCode;
     }
@@ -361,7 +385,13 @@ fn ZDICT_analyzeEntropy(
     /* write result to buffer */
     {
         let mut writeWksp = vec![0u8; HUF_WRITE_CTABLE_WORKSPACE_SIZE + 64];
-        let hhSize = HUF_writeCTable_wksp(&mut dstBuffer[pos..], &hufTable, 255, huffLog, &mut writeWksp);
+        let hhSize = HUF_writeCTable_wksp(
+            &mut dstBuffer[pos..],
+            &hufTable,
+            255,
+            huffLog,
+            &mut writeWksp,
+        );
         if ERR_isError(hhSize) {
             return hhSize;
         }
@@ -519,7 +549,12 @@ fn isIncluded(buffer: &[u8], in_off: usize, into_off: usize, length: usize) -> i
 /// Port of `ZDICT_tryMerge`. Checks if `elt` can be merged into the table;
 /// returns the destination id, or 0 if not merged. `table[0].pos` is the
 /// element count.
-fn ZDICT_tryMerge(table: &mut [dictItem], mut elt: dictItem, eltNbToSkip: u32, buffer: &[u8]) -> u32 {
+fn ZDICT_tryMerge(
+    table: &mut [dictItem],
+    mut elt: dictItem,
+    eltNbToSkip: u32,
+    buffer: &[u8],
+) -> u32 {
     use crate::common::mem::MEM_read64;
     let tableSize = table[0].pos;
     let eltEnd = elt.pos + elt.length;
@@ -561,7 +596,8 @@ fn ZDICT_tryMerge(table: &mut [dictItem], mut elt: dictItem, eltNbToSkip: u32, b
             && (table[u as usize].pos < elt.pos)
         {
             /* overlap, existing < new : append */
-            let addedLength = eltEnd as i32 - (table[u as usize].pos + table[u as usize].length) as i32;
+            let addedLength =
+                eltEnd as i32 - (table[u as usize].pos + table[u as usize].length) as i32;
             table[u as usize].savings += elt.length / 8; /* bonus */
             if addedLength > 0 {
                 table[u as usize].length += addedLength as u32;
@@ -910,7 +946,11 @@ fn ZDICT_trainBuffer_legacy(
 
     /* sort */
     {
-        let divResult = divsufsort(&buffer[..bufferSize], &mut suffix0[1..1 + bufferSize], bufferSize as i32);
+        let divResult = divsufsort(
+            &buffer[..bufferSize],
+            &mut suffix0[1..1 + bufferSize],
+            bufferSize as i32,
+        );
         if divResult != 0 {
             return ERROR(ErrorCode::Generic);
         }

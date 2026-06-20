@@ -49,7 +49,10 @@ fn check_dict(dict: &[u8], sample: &[u8]) {
     let mut dctx = ZSTD_createDCtx();
     let mut out = vec![0u8; sample.len()];
     let dsize = ZSTD_decompress_usingDict(&mut dctx, &mut out, &cdst[..csize], dict);
-    assert!(!ERR_isError(dsize), "decompress_usingDict failed: {dsize:#x}");
+    assert!(
+        !ERR_isError(dsize),
+        "decompress_usingDict failed: {dsize:#x}"
+    );
     assert_eq!(&out[..dsize], sample, "dict round-trip mismatch");
 }
 
@@ -73,7 +76,8 @@ fn zdict_trainFromBuffer_fastCover_explicit() {
     params.d = 8;
     params.k = 200;
     let n = ZDICT_trainFromBuffer_fastCover(
-        &mut dict, cap,
+        &mut dict,
+        cap,
         &samples,
         &sizes,
         sizes.len() as u32,
@@ -92,13 +96,8 @@ fn zdict_trainFromBuffer_cover_explicit() {
     let mut params = ZDICT_cover_params_t::default();
     params.d = 8;
     params.k = 200;
-    let n = ZDICT_trainFromBuffer_cover(
-        &mut dict, cap,
-        &samples,
-        &sizes,
-        sizes.len() as u32,
-        params,
-    );
+    let n =
+        ZDICT_trainFromBuffer_cover(&mut dict, cap, &samples, &sizes, sizes.len() as u32, params);
     assert!(!ERR_isError(n), "cover train failed: {n:#x}");
     dict.truncate(n);
     check_dict(&dict, &samples[..sizes[0]]);
@@ -110,13 +109,8 @@ fn zdict_trainFromBuffer_legacy_explicit() {
     let mut dict = vec![0u8; 16 * 1024];
     let cap = dict.len();
     let params = ZDICT_legacy_params_t::default();
-    let n = ZDICT_trainFromBuffer_legacy(
-        &mut dict, cap,
-        &samples,
-        &sizes,
-        sizes.len() as u32,
-        params,
-    );
+    let n =
+        ZDICT_trainFromBuffer_legacy(&mut dict, cap, &samples, &sizes, sizes.len() as u32, params);
     assert!(!ERR_isError(n), "legacy train failed: {n:#x}");
     dict.truncate(n);
     check_dict(&dict, &samples[..sizes[0]]);

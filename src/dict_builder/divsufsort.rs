@@ -151,7 +151,13 @@ unsafe fn ss_compare(T: *const u8, p1: *const i32, p2: *const i32, depth: i32) -
 /* ------------------------------------------------------------------------ */
 
 /// Port of `ss_insertionsort`. Insertion sort for small size groups.
-unsafe fn ss_insertionsort(T: *const u8, PA: *const i32, first: *mut i32, last: *mut i32, depth: i32) {
+unsafe fn ss_insertionsort(
+    T: *const u8,
+    PA: *const i32,
+    first: *mut i32,
+    last: *mut i32,
+    depth: i32,
+) {
     let mut i: *mut i32;
     let mut j: *mut i32;
     let mut t: i32;
@@ -270,11 +276,17 @@ unsafe fn ss_median3(
     mut v2: *mut i32,
     v3: *mut i32,
 ) -> *mut i32 {
-    if (*Td.offset(*PA.offset(*v1 as isize) as isize)) > (*Td.offset(*PA.offset(*v2 as isize) as isize)) {
+    if (*Td.offset(*PA.offset(*v1 as isize) as isize))
+        > (*Td.offset(*PA.offset(*v2 as isize) as isize))
+    {
         core::mem::swap(&mut v1, &mut v2);
     }
-    if (*Td.offset(*PA.offset(*v2 as isize) as isize)) > (*Td.offset(*PA.offset(*v3 as isize) as isize)) {
-        if (*Td.offset(*PA.offset(*v1 as isize) as isize)) > (*Td.offset(*PA.offset(*v3 as isize) as isize)) {
+    if (*Td.offset(*PA.offset(*v2 as isize) as isize))
+        > (*Td.offset(*PA.offset(*v3 as isize) as isize))
+    {
+        if (*Td.offset(*PA.offset(*v1 as isize) as isize))
+            > (*Td.offset(*PA.offset(*v3 as isize) as isize))
+        {
             return v1;
         } else {
             return v3;
@@ -294,24 +306,36 @@ unsafe fn ss_median5(
     mut v4: *mut i32,
     mut v5: *mut i32,
 ) -> *mut i32 {
-    if (*Td.offset(*PA.offset(*v2 as isize) as isize)) > (*Td.offset(*PA.offset(*v3 as isize) as isize)) {
+    if (*Td.offset(*PA.offset(*v2 as isize) as isize))
+        > (*Td.offset(*PA.offset(*v3 as isize) as isize))
+    {
         core::mem::swap(&mut v2, &mut v3);
     }
-    if (*Td.offset(*PA.offset(*v4 as isize) as isize)) > (*Td.offset(*PA.offset(*v5 as isize) as isize)) {
+    if (*Td.offset(*PA.offset(*v4 as isize) as isize))
+        > (*Td.offset(*PA.offset(*v5 as isize) as isize))
+    {
         core::mem::swap(&mut v4, &mut v5);
     }
-    if (*Td.offset(*PA.offset(*v2 as isize) as isize)) > (*Td.offset(*PA.offset(*v4 as isize) as isize)) {
+    if (*Td.offset(*PA.offset(*v2 as isize) as isize))
+        > (*Td.offset(*PA.offset(*v4 as isize) as isize))
+    {
         core::mem::swap(&mut v2, &mut v4);
         core::mem::swap(&mut v3, &mut v5);
     }
-    if (*Td.offset(*PA.offset(*v1 as isize) as isize)) > (*Td.offset(*PA.offset(*v3 as isize) as isize)) {
+    if (*Td.offset(*PA.offset(*v1 as isize) as isize))
+        > (*Td.offset(*PA.offset(*v3 as isize) as isize))
+    {
         core::mem::swap(&mut v1, &mut v3);
     }
-    if (*Td.offset(*PA.offset(*v1 as isize) as isize)) > (*Td.offset(*PA.offset(*v4 as isize) as isize)) {
+    if (*Td.offset(*PA.offset(*v1 as isize) as isize))
+        > (*Td.offset(*PA.offset(*v4 as isize) as isize))
+    {
         core::mem::swap(&mut v1, &mut v4);
         core::mem::swap(&mut v3, &mut v5);
     }
-    if (*Td.offset(*PA.offset(*v3 as isize) as isize)) > (*Td.offset(*PA.offset(*v4 as isize) as isize)) {
+    if (*Td.offset(*PA.offset(*v3 as isize) as isize))
+        > (*Td.offset(*PA.offset(*v4 as isize) as isize))
+    {
         return v4;
     }
     v3
@@ -319,7 +343,12 @@ unsafe fn ss_median5(
 
 /// Port of `ss_pivot`. Returns the pivot element.
 #[inline(always)]
-unsafe fn ss_pivot(Td: *const u8, PA: *const i32, mut first: *mut i32, mut last: *mut i32) -> *mut i32 {
+unsafe fn ss_pivot(
+    Td: *const u8,
+    PA: *const i32,
+    mut first: *mut i32,
+    mut last: *mut i32,
+) -> *mut i32 {
     let mut middle: *mut i32;
     let mut t: i32;
 
@@ -343,8 +372,20 @@ unsafe fn ss_pivot(Td: *const u8, PA: *const i32, mut first: *mut i32, mut last:
         }
     }
     t >>= 3;
-    first = ss_median3(Td, PA, first, first.offset(t as isize), first.offset((t << 1) as isize));
-    middle = ss_median3(Td, PA, middle.offset(-(t as isize)), middle, middle.offset(t as isize));
+    first = ss_median3(
+        Td,
+        PA,
+        first,
+        first.offset(t as isize),
+        first.offset((t << 1) as isize),
+    );
+    middle = ss_median3(
+        Td,
+        PA,
+        middle.offset(-(t as isize)),
+        middle,
+        middle.offset(t as isize),
+    );
     last = ss_median3(
         Td,
         PA,
@@ -368,14 +409,18 @@ unsafe fn ss_partition(PA: *const i32, first: *mut i32, last: *mut i32, depth: i
     loop {
         loop {
             a = a.offset(1);
-            if !((a < b) && ((*PA.offset(*a as isize) + depth) >= (*PA.offset((*a + 1) as isize) + 1))) {
+            if !((a < b)
+                && ((*PA.offset(*a as isize) + depth) >= (*PA.offset((*a + 1) as isize) + 1)))
+            {
                 break;
             }
             *a = !*a;
         }
         loop {
             b = b.offset(-1);
-            if !((a < b) && ((*PA.offset(*b as isize) + depth) < (*PA.offset((*b + 1) as isize) + 1))) {
+            if !((a < b)
+                && ((*PA.offset(*b as isize) + depth) < (*PA.offset((*b + 1) as isize) + 1)))
+            {
                 break;
             }
         }
@@ -1332,13 +1377,10 @@ unsafe fn sssort(
         first = first.offset(1);
     }
 
-    if (bufsize < SS_BLOCKSIZE)
-        && (bufsize < (last.offset_from(first) as i32))
-        && {
-            limit = ss_isqrt(last.offset_from(first) as i32);
-            bufsize < limit
-        }
-    {
+    if (bufsize < SS_BLOCKSIZE) && (bufsize < (last.offset_from(first) as i32)) && {
+        limit = ss_isqrt(last.offset_from(first) as i32);
+        bufsize < limit
+    } {
         if SS_BLOCKSIZE < limit {
             limit = SS_BLOCKSIZE;
         }
@@ -1384,7 +1426,16 @@ unsafe fn sssort(
     k = SS_BLOCKSIZE;
     while i != 0 {
         if (i & 1) != 0 {
-            ss_swapmerge(T, PA, a.offset(-(k as isize)), a, middle, buf, bufsize, depth);
+            ss_swapmerge(
+                T,
+                PA,
+                a.offset(-(k as isize)),
+                a,
+                middle,
+                buf,
+                bufsize,
+                depth,
+            );
             a = a.offset(-(k as isize));
         }
         k <<= 1;
@@ -1400,7 +1451,9 @@ unsafe fn sssort(
         let PAi: [i32; 2] = [*PA.offset(*first.offset(-1) as isize), n - 2];
         a = first;
         i = *first.offset(-1);
-        while (a < last) && ((*a < 0) || (0 < ss_compare(T, PAi.as_ptr(), PA.offset(*a as isize), depth))) {
+        while (a < last)
+            && ((*a < 0) || (0 < ss_compare(T, PAi.as_ptr(), PA.offset(*a as isize), depth)))
+        {
             *a.offset(-1) = *a;
             a = a.offset(1);
         }
@@ -1541,7 +1594,12 @@ unsafe fn tr_heapsort(ISAd: *const i32, SA: *mut i32, size: i32) {
 
 /// Port of `tr_median3`.
 #[inline(always)]
-unsafe fn tr_median3(ISAd: *const i32, mut v1: *mut i32, mut v2: *mut i32, v3: *mut i32) -> *mut i32 {
+unsafe fn tr_median3(
+    ISAd: *const i32,
+    mut v1: *mut i32,
+    mut v2: *mut i32,
+    v3: *mut i32,
+) -> *mut i32 {
     if *ISAd.offset(*v1 as isize) > *ISAd.offset(*v2 as isize) {
         core::mem::swap(&mut v1, &mut v2);
     }
@@ -1613,8 +1671,18 @@ unsafe fn tr_pivot(ISAd: *const i32, mut first: *mut i32, mut last: *mut i32) ->
         }
     }
     t >>= 3;
-    first = tr_median3(ISAd, first, first.offset(t as isize), first.offset((t << 1) as isize));
-    middle = tr_median3(ISAd, middle.offset(-(t as isize)), middle, middle.offset(t as isize));
+    first = tr_median3(
+        ISAd,
+        first,
+        first.offset(t as isize),
+        first.offset((t << 1) as isize),
+    );
+    middle = tr_median3(
+        ISAd,
+        middle.offset(-(t as isize)),
+        middle,
+        middle.offset(t as isize),
+    );
     last = tr_median3(
         ISAd,
         last.offset(-1 - (t << 1) as isize),
@@ -2043,7 +2111,15 @@ unsafe fn tr_introsort(
                 a = stack[ssize].b;
                 b = stack[ssize].c;
                 if stack[ssize].d == 0 {
-                    tr_copy(ISA, SA, first, a, b, last, ISAd.offset_from(ISA as *const i32) as i32);
+                    tr_copy(
+                        ISA,
+                        SA,
+                        first,
+                        a,
+                        b,
+                        last,
+                        ISAd.offset_from(ISA as *const i32) as i32,
+                    );
                 } else {
                     if 0 <= trlink {
                         stack[trlink as usize].d = -1;
@@ -2187,7 +2263,9 @@ unsafe fn tr_introsort(
             }
 
             /* push */
-            if (1 < b.offset_from(a) as i32) && (trbudget_check(budget, b.offset_from(a) as i32) != 0) {
+            if (1 < b.offset_from(a) as i32)
+                && (trbudget_check(budget, b.offset_from(a) as i32) != 0)
+            {
                 if (a.offset_from(first) as i32) <= (last.offset_from(b) as i32) {
                     if (last.offset_from(b) as i32) <= (b.offset_from(a) as i32) {
                         if 1 < a.offset_from(first) as i32 {
@@ -2410,7 +2488,7 @@ unsafe fn sort_typeBstar(
     }
 
     /* Count the number of occurrences of the first one or two characters of
-       each type A, B and B* suffix. */
+    each type A, B and B* suffix. */
     i = n - 1;
     m = n;
     c0 = *T.offset((n - 1) as isize) as i32;
@@ -2607,7 +2685,14 @@ unsafe fn sort_typeBstar(
 
 /// Port of `construct_SA`. Constructs the suffix array using the sorted
 /// order of type B* suffixes.
-unsafe fn construct_SA(T: *const u8, SA: *mut i32, bucket_A: *mut i32, bucket_B: *mut i32, n: i32, m: i32) {
+unsafe fn construct_SA(
+    T: *const u8,
+    SA: *mut i32,
+    bucket_A: *mut i32,
+    bucket_B: *mut i32,
+    n: i32,
+    m: i32,
+) {
     let mut i: *mut i32;
     let mut j: *mut i32;
     let mut k: *mut i32;
@@ -2704,7 +2789,14 @@ unsafe fn construct_SA(T: *const u8, SA: *mut i32, bucket_A: *mut i32, bucket_B:
 }
 
 /// Port of `construct_BWT`. Builds the BWT directly; returns the primary index.
-unsafe fn construct_BWT(T: *const u8, SA: *mut i32, bucket_A: *mut i32, bucket_B: *mut i32, n: i32, m: i32) -> i32 {
+unsafe fn construct_BWT(
+    T: *const u8,
+    SA: *mut i32,
+    bucket_A: *mut i32,
+    bucket_B: *mut i32,
+    n: i32,
+    m: i32,
+) -> i32 {
     let mut i: *mut i32;
     let mut j: *mut i32;
     let mut k: *mut i32;

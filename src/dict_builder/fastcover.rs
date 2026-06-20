@@ -2,9 +2,7 @@
 //! trainer). The verbatim translation lives in [`fastcover_c`]; its public
 //! entry points are re-exported here.
 
-pub use fastcover_c::{
-    ZDICT_optimizeTrainFromBuffer_fastCover, ZDICT_trainFromBuffer_fastCover,
-};
+pub use fastcover_c::{ZDICT_optimizeTrainFromBuffer_fastCover, ZDICT_trainFromBuffer_fastCover};
 
 #[allow(dead_code)]
 #[allow(non_upper_case_globals)]
@@ -41,17 +39,50 @@ pub mod fastcover_c {
 
     /// Port of `FASTCOVER_defaultAccelParameters`.
     pub static FASTCOVER_defaultAccelParameters: [FASTCOVER_accel_t; FASTCOVER_MAX_ACCEL + 1] = [
-        FASTCOVER_accel_t { finalize: 100, skip: 0 }, // accel = 0 (defaults to 1)
-        FASTCOVER_accel_t { finalize: 100, skip: 0 }, // accel = 1
-        FASTCOVER_accel_t { finalize: 50, skip: 1 },
-        FASTCOVER_accel_t { finalize: 34, skip: 2 },
-        FASTCOVER_accel_t { finalize: 25, skip: 3 },
-        FASTCOVER_accel_t { finalize: 20, skip: 4 },
-        FASTCOVER_accel_t { finalize: 17, skip: 5 },
-        FASTCOVER_accel_t { finalize: 14, skip: 6 },
-        FASTCOVER_accel_t { finalize: 13, skip: 7 },
-        FASTCOVER_accel_t { finalize: 11, skip: 8 },
-        FASTCOVER_accel_t { finalize: 10, skip: 9 },
+        FASTCOVER_accel_t {
+            finalize: 100,
+            skip: 0,
+        }, // accel = 0 (defaults to 1)
+        FASTCOVER_accel_t {
+            finalize: 100,
+            skip: 0,
+        }, // accel = 1
+        FASTCOVER_accel_t {
+            finalize: 50,
+            skip: 1,
+        },
+        FASTCOVER_accel_t {
+            finalize: 34,
+            skip: 2,
+        },
+        FASTCOVER_accel_t {
+            finalize: 25,
+            skip: 3,
+        },
+        FASTCOVER_accel_t {
+            finalize: 20,
+            skip: 4,
+        },
+        FASTCOVER_accel_t {
+            finalize: 17,
+            skip: 5,
+        },
+        FASTCOVER_accel_t {
+            finalize: 14,
+            skip: 6,
+        },
+        FASTCOVER_accel_t {
+            finalize: 13,
+            skip: 7,
+        },
+        FASTCOVER_accel_t {
+            finalize: 11,
+            skip: 8,
+        },
+        FASTCOVER_accel_t {
+            finalize: 10,
+            skip: 9,
+        },
     ];
 
     /// Port of `FASTCOVER_ctx_t`.
@@ -115,15 +146,18 @@ pub mod fastcover_c {
         };
 
         while activeSegment.end < end {
-            let idx = unsafe { FASTCOVER_hashPtrToIndex(ctx.samples.add(activeSegment.end as usize), f, d) };
+            let idx = unsafe {
+                FASTCOVER_hashPtrToIndex(ctx.samples.add(activeSegment.end as usize), f, d)
+            };
             if segmentFreqs[idx] == 0 {
                 activeSegment.score += freqs[idx];
             }
             activeSegment.end += 1;
             segmentFreqs[idx] += 1;
             if activeSegment.end - activeSegment.begin == dmersInK + 1 {
-                let delIndex =
-                    unsafe { FASTCOVER_hashPtrToIndex(ctx.samples.add(activeSegment.begin as usize), f, d) };
+                let delIndex = unsafe {
+                    FASTCOVER_hashPtrToIndex(ctx.samples.add(activeSegment.begin as usize), f, d)
+                };
                 segmentFreqs[delIndex] -= 1;
                 if segmentFreqs[delIndex] == 0 {
                     activeSegment.score -= freqs[delIndex];
@@ -137,8 +171,9 @@ pub mod fastcover_c {
 
         /* Zero out rest of segmentFreqs array */
         while activeSegment.begin < end {
-            let delIndex =
-                unsafe { FASTCOVER_hashPtrToIndex(ctx.samples.add(activeSegment.begin as usize), f, d) };
+            let delIndex = unsafe {
+                FASTCOVER_hashPtrToIndex(ctx.samples.add(activeSegment.begin as usize), f, d)
+            };
             segmentFreqs[delIndex] -= 1;
             activeSegment.begin += 1;
         }
@@ -266,7 +301,8 @@ pub mod fastcover_c {
         ctx.nbSamples = nbSamples as usize;
         ctx.nbTrainSamples = nbTrainSamples as usize;
         ctx.nbTestSamples = nbTestSamples as usize;
-        ctx.nbDmers = trainingSamplesSize - core::cmp::max(d as usize, core::mem::size_of::<u64>()) + 1;
+        ctx.nbDmers =
+            trainingSamplesSize - core::cmp::max(d as usize, core::mem::size_of::<u64>()) + 1;
         ctx.d = d;
         ctx.f = f;
         ctx.accelParams = accelParams;
@@ -334,7 +370,10 @@ pub mod fastcover_c {
             }
             tail -= segmentSize;
             unsafe {
-                let src = core::slice::from_raw_parts(ctx.samples.add(segment.begin as usize), segmentSize);
+                let src = core::slice::from_raw_parts(
+                    ctx.samples.add(segment.begin as usize),
+                    segmentSize,
+                );
                 dict[tail..tail + segmentSize].copy_from_slice(src);
             }
             epoch = (epoch + 1) % epochs.num as usize;
@@ -391,7 +430,11 @@ pub mod fastcover_c {
         let displayLevel = parameters.zParams.notificationLevel as i32;
         /* Assign splitPoint and f if not provided */
         parameters.splitPoint = 1.0;
-        parameters.f = if parameters.f == 0 { DEFAULT_F } else { parameters.f };
+        parameters.f = if parameters.f == 0 {
+            DEFAULT_F
+        } else {
+            parameters.f
+        };
         parameters.accel = if parameters.accel == 0 {
             DEFAULT_ACCEL
         } else {
@@ -401,7 +444,13 @@ pub mod fastcover_c {
         let mut coverParams = ZDICT_cover_params_t::default();
         FASTCOVER_convertToCoverParams(parameters, &mut coverParams);
         /* Checks */
-        if FASTCOVER_checkParameters(coverParams, dictBufferCapacity, parameters.f, parameters.accel) == 0 {
+        if FASTCOVER_checkParameters(
+            coverParams,
+            dictBufferCapacity,
+            parameters.f,
+            parameters.accel,
+        ) == 0
+        {
             return ERROR(ErrorCode::ParameterOutOfBound);
         }
         if nbSamples == 0 {
@@ -475,7 +524,8 @@ pub mod fastcover_c {
         parameters: ZDICT_cover_params_t,
     ) {
         use crate::dict_builder::cover::{
-            COVER_best_finish, COVER_dictSelectionError, COVER_dictSelectionIsError, COVER_selectDict,
+            COVER_best_finish, COVER_dictSelectionError, COVER_dictSelectionIsError,
+            COVER_selectDict,
         };
 
         let totalCompressedSize = ERROR(ErrorCode::Generic);
@@ -498,7 +548,8 @@ pub mod fastcover_c {
             let content = dict[tail..dictBufferCapacity].to_vec();
             let total_samples_size = ctx.offsets[ctx.nbSamples];
             let samples = unsafe { core::slice::from_raw_parts(ctx.samples, total_samples_size) };
-            let samplesSizes = unsafe { core::slice::from_raw_parts(ctx.samplesSizes, ctx.nbSamples) };
+            let samplesSizes =
+                unsafe { core::slice::from_raw_parts(ctx.samplesSizes, ctx.nbSamples) };
             selection = COVER_selectDict(
                 &content,
                 dictBufferCapacity,
@@ -545,11 +596,27 @@ pub mod fastcover_c {
         let kMinD = if parameters.d == 0 { 6 } else { parameters.d };
         let kMaxD = if parameters.d == 0 { 8 } else { parameters.d };
         let kMinK = if parameters.k == 0 { 50 } else { parameters.k };
-        let kMaxK = if parameters.k == 0 { 2000 } else { parameters.k };
-        let kSteps = if parameters.steps == 0 { 40 } else { parameters.steps };
+        let kMaxK = if parameters.k == 0 {
+            2000
+        } else {
+            parameters.k
+        };
+        let kSteps = if parameters.steps == 0 {
+            40
+        } else {
+            parameters.steps
+        };
         let kStepSize = core::cmp::max((kMaxK - kMinK) / kSteps, 1);
-        let f = if parameters.f == 0 { DEFAULT_F } else { parameters.f };
-        let accel = if parameters.accel == 0 { DEFAULT_ACCEL } else { parameters.accel };
+        let f = if parameters.f == 0 {
+            DEFAULT_F
+        } else {
+            parameters.f
+        };
+        let accel = if parameters.accel == 0 {
+            DEFAULT_ACCEL
+        } else {
+            parameters.accel
+        };
         let shrinkDict: u32 = 0;
         let displayLevel = parameters.zParams.notificationLevel as i32;
         let _ = displayLevel;
@@ -584,7 +651,11 @@ pub mod fastcover_c {
         while d <= kMaxD {
             let mut ctx = FASTCOVER_ctx_t::default();
             {
-                let childDisplayLevel = if displayLevel == 0 { 0 } else { displayLevel - 1 };
+                let childDisplayLevel = if displayLevel == 0 {
+                    0
+                } else {
+                    displayLevel - 1
+                };
                 let initVal = FASTCOVER_ctx_init(
                     &mut ctx,
                     samplesBuffer,

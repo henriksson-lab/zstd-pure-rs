@@ -183,7 +183,7 @@ pub fn ZSTD_deriveSeqStoreChunkInto(
         ZSTD_longLengthType_e::ZSTD_llt_none => (ZSTD_longLengthType_e::ZSTD_llt_none, 0),
         _ => {
             let p = originalSeqStore.longLengthPos as usize;
-            if p < startIdx || p >= endIdx {
+            if p < startIdx || p > endIdx {
                 (ZSTD_longLengthType_e::ZSTD_llt_none, 0)
             } else {
                 (originalSeqStore.longLengthType, (p - startIdx) as u32)
@@ -659,7 +659,7 @@ mod tests {
     }
 
     #[test]
-    fn deriveSeqStoreChunk_clears_long_length_at_end_boundary() {
+    fn deriveSeqStoreChunk_keeps_long_length_at_end_boundary_like_c() {
         let mut ss = SeqStore_t::with_capacity(8, 128);
         ZSTD_storeSeqOnly(&mut ss, 3, OFFSET_TO_OFFBASE(10), 7);
         ZSTD_storeSeqOnly(&mut ss, 4, OFFSET_TO_OFFBASE(11), 8);
@@ -670,12 +670,15 @@ mod tests {
 
         let chunk = ZSTD_deriveSeqStoreChunk(&ss, 0, 2);
         assert_eq!(chunk.sequences.len(), 2);
-        assert_eq!(chunk.longLengthType, ZSTD_longLengthType_e::ZSTD_llt_none);
-        assert_eq!(chunk.longLengthPos, 0);
+        assert_eq!(
+            chunk.longLengthType,
+            ZSTD_longLengthType_e::ZSTD_llt_matchLength
+        );
+        assert_eq!(chunk.longLengthPos, 2);
     }
 
     #[test]
-    fn deriveSeqStoreChunk_end_boundary_is_safe_for_seq_to_codes() {
+    fn deriveSeqStoreChunk_end_boundary_marker_is_safe_for_seq_to_codes() {
         let mut ss = SeqStore_t::with_capacity(8, 128);
         ZSTD_storeSeqOnly(&mut ss, 3, OFFSET_TO_OFFBASE(10), 7);
         ZSTD_storeSeqOnly(&mut ss, 4, OFFSET_TO_OFFBASE(11), 8);

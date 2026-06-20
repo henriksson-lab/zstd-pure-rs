@@ -671,7 +671,7 @@ pub fn ZSTD_insertBt1(
     ms.hashTable[h] = curr;
 
     debug_assert!(windowLow > 0);
-    while nbCompares > 0 && matchIndex >= windowLow {
+    while nbCompares > 0 && matchIndex >= windowLow && matchIndex < curr {
         let next_base = (2 * (matchIndex & btMask)) as usize;
         let mut matchLength = commonLengthSmaller.min(commonLengthLarger);
         debug_assert!(matchIndex < curr);
@@ -1186,7 +1186,7 @@ pub fn ZSTD_insertBtAndGetAllMatches(
     let mut matchIndex = ms.hashTable[h];
     ms.hashTable[h] = curr;
 
-    while nbCompares > 0 && matchIndex >= matchLow {
+    while nbCompares > 0 && matchIndex >= matchLow && matchIndex < curr {
         let nextBase = (2 * (matchIndex & btMask)) as usize;
         let mut matchLength = commonLengthSmaller.min(commonLengthLarger);
         debug_assert!(curr > matchIndex);
@@ -2065,6 +2065,27 @@ pub fn ZSTD_compressBlock_btopt_window(
     )
 }
 
+/// Rust-only window-buffer variant of `ZSTD_compressBlock_btopt_extDict`.
+pub fn ZSTD_compressBlock_btopt_extDict_window(
+    ms: &mut ZSTD_MatchState_t,
+    seqStore: &mut crate::compress::seq_store::SeqStore_t,
+    rep: &mut [u32; ZSTD_REP_NUM],
+    window_buf: &[u8],
+    src_pos: usize,
+    src_end: usize,
+) -> usize {
+    ZSTD_compressBlock_opt_generic_window(
+        ms,
+        seqStore,
+        rep,
+        window_buf,
+        src_pos,
+        src_end,
+        0,
+        ZSTD_dictMode_e::ZSTD_extDict,
+    )
+}
+
 /// Port of `ZSTD_compressBlock_btultra`.
 pub fn ZSTD_compressBlock_btultra(
     ms: &mut ZSTD_MatchState_t,
@@ -2100,6 +2121,27 @@ pub fn ZSTD_compressBlock_btultra_window(
     )
 }
 
+/// Rust-only window-buffer variant of `ZSTD_compressBlock_btultra_extDict`.
+pub fn ZSTD_compressBlock_btultra_extDict_window(
+    ms: &mut ZSTD_MatchState_t,
+    seqStore: &mut crate::compress::seq_store::SeqStore_t,
+    rep: &mut [u32; ZSTD_REP_NUM],
+    window_buf: &[u8],
+    src_pos: usize,
+    src_end: usize,
+) -> usize {
+    ZSTD_compressBlock_opt_generic_window(
+        ms,
+        seqStore,
+        rep,
+        window_buf,
+        src_pos,
+        src_end,
+        2,
+        ZSTD_dictMode_e::ZSTD_extDict,
+    )
+}
+
 /// Port of `ZSTD_compressBlock_btultra2`.
 pub fn ZSTD_compressBlock_btultra2(
     ms: &mut ZSTD_MatchState_t,
@@ -2107,7 +2149,7 @@ pub fn ZSTD_compressBlock_btultra2(
     rep: &mut [u32; ZSTD_REP_NUM],
     src: &[u8],
 ) -> usize {
-    let curr = ms.window.nextSrc;
+    let curr = ms.window.base_offset;
     if ms.opt.litLengthSum == 0
         && seqStore.sequences.is_empty()
         && ms.window.dictLimit == ms.window.lowLimit
@@ -2129,9 +2171,6 @@ pub fn ZSTD_compressBlock_btultra2_window(
     src_pos: usize,
     src_end: usize,
 ) -> usize {
-    if src_pos == 0 {
-        return ZSTD_compressBlock_btultra2(ms, seqStore, rep, &window_buf[..src_end]);
-    }
     ZSTD_compressBlock_opt_generic_window(
         ms,
         seqStore,
@@ -2141,6 +2180,31 @@ pub fn ZSTD_compressBlock_btultra2_window(
         src_end,
         2,
         ZSTD_dictMode_e::ZSTD_noDict,
+    )
+}
+
+/// Rust-only window-buffer variant of `ZSTD_compressBlock_btultra2`.
+///
+/// Upstream maps the extDict `btultra2` selector to the same optLevel=2
+/// parser used by `btultra_extDict`; keep that behavior while preserving
+/// access to the bytes before `src_pos` in the streaming ring.
+pub fn ZSTD_compressBlock_btultra2_extDict_window(
+    ms: &mut ZSTD_MatchState_t,
+    seqStore: &mut crate::compress::seq_store::SeqStore_t,
+    rep: &mut [u32; ZSTD_REP_NUM],
+    window_buf: &[u8],
+    src_pos: usize,
+    src_end: usize,
+) -> usize {
+    ZSTD_compressBlock_opt_generic_window(
+        ms,
+        seqStore,
+        rep,
+        window_buf,
+        src_pos,
+        src_end,
+        2,
+        ZSTD_dictMode_e::ZSTD_extDict,
     )
 }
 
@@ -3249,7 +3313,7 @@ mod tests {
     }
 
     #[test]
-    fn btultra2_first_pass_gate_uses_current_source_index() {
+    fn btultra2_first_pass_gate_uses_block_start_index() {
         use crate::compress::match_state::ZSTD_compressionParameters;
         use crate::compress::seq_store::SeqStore_t;
 
@@ -3266,8 +3330,8 @@ mod tests {
         ms.chainTable = vec![0u32; 1 << cp.chainLog];
         ms.hashLog3 = 12;
         ms.hashTable3 = vec![0u32; 1 << ms.hashLog3];
-        ms.window.base_offset = 1024;
-        ms.window.nextSrc = 2048;
+        ms.window.base_offset = 2048;
+        ms.window.nextSrc = 4096;
         ms.window.dictLimit = 2048;
         ms.window.lowLimit = 2048;
         ms.nextToUpdate = ms.window.dictLimit;
@@ -3280,7 +3344,7 @@ mod tests {
 
         assert!(
             ms.window.dictLimit > 2048,
-            "btultra2 first pass should be gated by nextSrc, not base_offset"
+            "btultra2 first pass should be gated by the current block start, not nextSrc"
         );
     }
 

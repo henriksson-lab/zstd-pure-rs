@@ -1357,7 +1357,7 @@ fn stream_buffered_compress_zstd_file_to_writer<W: Write>(
         .map_err(|e| format!("{}: {e}", input.display()))?
         .len();
     let mut reader = file;
-    if level >= 13
+    if level >= 23
         && src_size <= 256 << 20
         && nb_workers == 0
         && job_size == 0

@@ -524,10 +524,14 @@ pub fn ZSTD_seqToCodes(seqStore: &mut SeqStore_t) -> i32 {
         }
     }
     if seqStore.longLengthType == ZSTD_longLengthType_e::ZSTD_llt_literalLength {
-        seqStore.llCode[seqStore.longLengthPos as usize] = MaxLL as u8;
+        if (seqStore.longLengthPos as usize) < nbSeq {
+            seqStore.llCode[seqStore.longLengthPos as usize] = MaxLL as u8;
+        }
     }
     if seqStore.longLengthType == ZSTD_longLengthType_e::ZSTD_llt_matchLength {
-        seqStore.mlCode[seqStore.longLengthPos as usize] = MaxML as u8;
+        if (seqStore.longLengthPos as usize) < nbSeq {
+            seqStore.mlCode[seqStore.longLengthPos as usize] = MaxML as u8;
+        }
     }
     longOffsets
 }
@@ -5497,6 +5501,56 @@ fn ZSTD_buildSeqStore_selectMatches_with_window(
                     ZSTD_dictMode_e::ZSTD_extDict,
                 )
             }
+            (s, ZSTD_dictMode_e::ZSTD_extDict)
+                if s == crate::compress::zstd_compress_sequences::ZSTD_btlazy2 =>
+            {
+                crate::compress::zstd_lazy::ZSTD_compressBlock_lazy_generic_with_istart(
+                    ms,
+                    seqStore,
+                    &mut cctx.next_rep,
+                    window_to_block_end,
+                    src_pos,
+                    crate::compress::zstd_lazy::searchMethod_e::search_binaryTree,
+                    2,
+                    ZSTD_dictMode_e::ZSTD_extDict,
+                )
+            }
+            (s, ZSTD_dictMode_e::ZSTD_extDict)
+                if s == crate::compress::zstd_compress_sequences::ZSTD_btopt =>
+            {
+                crate::compress::zstd_opt::ZSTD_compressBlock_btopt_extDict_window(
+                    ms,
+                    seqStore,
+                    &mut cctx.next_rep,
+                    window_to_block_end,
+                    src_pos,
+                    src_end,
+                )
+            }
+            (s, ZSTD_dictMode_e::ZSTD_extDict)
+                if s == crate::compress::zstd_compress_sequences::ZSTD_btultra =>
+            {
+                crate::compress::zstd_opt::ZSTD_compressBlock_btultra_extDict_window(
+                    ms,
+                    seqStore,
+                    &mut cctx.next_rep,
+                    window_to_block_end,
+                    src_pos,
+                    src_end,
+                )
+            }
+            (s, ZSTD_dictMode_e::ZSTD_extDict)
+                if s == crate::compress::zstd_compress_sequences::ZSTD_btultra2 =>
+            {
+                crate::compress::zstd_opt::ZSTD_compressBlock_btultra2_extDict_window(
+                    ms,
+                    seqStore,
+                    &mut cctx.next_rep,
+                    window_to_block_end,
+                    src_pos,
+                    src_end,
+                )
+            }
             _ => {
                 ms.ldmSeqStore = None;
                 let blockCompressor = ZSTD_selectBlockCompressor(
@@ -7420,18 +7474,17 @@ fn ZSTD_deriveBlockSplitsHelper(
         let secondHalfSeqStore = &mut ctx.secondHalfSeqStore as *mut SeqStore_t;
 
         ZSTD_deriveSeqStoreChunkInto(&mut *fullSeqStoreChunk, origSeqStore, startIdx, endIdx);
+        ZSTD_deriveSeqStoreChunkInto(&mut *firstHalfSeqStore, origSeqStore, startIdx, midIdx);
+        ZSTD_deriveSeqStoreChunkInto(&mut *secondHalfSeqStore, origSeqStore, midIdx, endIdx);
+
         let estimatedOriginalSize = ZSTD_buildEntropyStatisticsAndEstimateSubBlockSize(
             &mut *fullSeqStoreChunk,
             &mut *zc_ptr,
         );
-
-        ZSTD_deriveSeqStoreChunkInto(&mut *firstHalfSeqStore, origSeqStore, startIdx, midIdx);
         let estimatedFirstHalfSize = ZSTD_buildEntropyStatisticsAndEstimateSubBlockSize(
             &mut *firstHalfSeqStore,
             &mut *zc_ptr,
         );
-
-        ZSTD_deriveSeqStoreChunkInto(&mut *secondHalfSeqStore, origSeqStore, midIdx, endIdx);
         let estimatedSecondHalfSize = ZSTD_buildEntropyStatisticsAndEstimateSubBlockSize(
             &mut *secondHalfSeqStore,
             &mut *zc_ptr,
@@ -7587,7 +7640,6 @@ pub fn ZSTD_compressBlock_splitBlock_internal(
         .as_ref()
         .map(|ctx| ctx.partitions)
         .unwrap_or([0; ZSTD_MAX_NB_BLOCK_SPLITS]);
-
     let mut dRep = Repcodes_t { rep: zc.prev_rep };
     let mut cRep = Repcodes_t { rep: zc.prev_rep };
 
@@ -7674,7 +7726,6 @@ pub fn ZSTD_compressBlock_splitBlock_internal(
         if ERR_isError(cSizeChunk) {
             return cSizeChunk;
         }
-
         ip += srcBytes;
         op += cSizeChunk;
         cSize += cSizeChunk;
@@ -7757,12 +7808,12 @@ pub fn ZSTD_buildBlockEntropyStats_literals(
     histWksp: &mut [u32],
     hufBuildWksp: &mut [u32],
     hufWriteWksp: &mut [u8],
-    _hufFlags: i32,
+    hufFlags: i32,
 ) -> usize {
     use crate::compress::hist::HIST_count_wksp;
     use crate::compress::huf_compress::{
-        HUF_buildCTable_wksp, HUF_estimateCompressedSize, HUF_optimalTableLog, HUF_validateCTable,
-        HUF_writeCTable_wksp, HUF_SYMBOLVALUE_MAX,
+        HUF_buildCTable_wksp, HUF_estimateCompressedSize, HUF_optimalTableLog_internal,
+        HUF_validateCTable, HUF_writeCTable_wksp, HUF_SYMBOLVALUE_MAX,
     };
     use crate::compress::zstd_compress_literals::{HUF_repeat, LitHufLog};
 
@@ -7812,7 +7863,14 @@ pub fn ZSTD_buildBlockEntropyStats_literals(
     }
 
     nextHuf.CTable.fill(0);
-    huffLog = HUF_optimalTableLog(huffLog, srcSize, maxSymbolValue);
+    huffLog = HUF_optimalTableLog_internal(
+        huffLog,
+        srcSize,
+        maxSymbolValue,
+        &mut nextHuf.CTable,
+        count,
+        hufFlags,
+    );
     let maxBits = HUF_buildCTable_wksp(
         &mut nextHuf.CTable,
         count,
@@ -12882,8 +12940,6 @@ fn zstd_stream_can_use_windowed_with_stable_one_shot(
     zcs: &ZSTD_CCtx,
     allow_stable_one_shot: bool,
 ) -> bool {
-    use crate::compress::zstd_compress_sequences::ZSTD_btopt;
-
     let level = zcs
         .stream_level
         .unwrap_or(zcs.requestedParams.compressionLevel);
@@ -12902,8 +12958,7 @@ fn zstd_stream_can_use_windowed_with_stable_one_shot(
         && zcs.stream_dict.is_empty()
         && !zcs.prefix_is_single_use
         && (1..=22).contains(&level)
-        && level < 16
-        && strategy < ZSTD_btopt
+        && strategy <= crate::compress::zstd_compress_sequences::ZSTD_btultra2
         && zcs.requestedParams.nbWorkers == 0
         && zcs.appliedParams.nbWorkers == 0
         && (buffered_modes || stable_one_shot_modes)

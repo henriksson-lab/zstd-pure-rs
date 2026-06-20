@@ -59,7 +59,7 @@ Test suite status as of the latest local audit run: `cargo test --features cli` 
 
 Measured 2026-06-20 on Linux 6.8 x86_64, Intel Xeon Gold 6138, `rustc 1.92.0`, generic release build from `cargo build --release --features cli` (no `-C target-cpu=native`; the upstream comparator is a generic vendored `zstd/programs/zstd` build reporting `v1.6.0`). The all-level table uses the deterministic 67,108,864-byte `.tmp/bench/realistic_64m.tar` fixture, built from the public Silesia corpus plus enwik8 Wikipedia text as distinct files in a tar archive. Commands were `--single-thread -LEVEL --no-check -f -q`, with `--ultra` added for levels 20-22. The table reports GNU `/usr/bin/time` user CPU seconds and max RSS; wall-clock timings on this host were noisy. `Rust/orig CPU` is original user time divided by Rust user time, so values below `1.00x` mean Rust used more CPU. `Byte-identical` compares the compressed frames against the vendored upstream CLI. This is a local status snapshot, not a guarantee.
 
-Levels 1-12 currently use the file streaming path and are byte-identical on this fixture. Levels 13-22 remain valid but not byte-identical; the file CLI keeps a guarded one-shot fallback for those levels on small regular files because the streaming optimal-parser path is not yet faithful.
+Levels 1-22 currently use the file streaming path and are byte-identical on this fixture. The all-level table is single-threaded for both implementations.
 
 | Level | Rust user | Original user | Rust/orig CPU | Rust RSS | Original RSS | Rust size | Original size | Byte-identical |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :---: |
@@ -75,18 +75,47 @@ Levels 1-12 currently use the file streaming path and are byte-identical on this
 | 10 | 5.39 s | 3.94 s | 0.73x | 31.6 MiB | 26.6 MiB | 20578309 | 20578309 | ok |
 | 11 | 8.44 s | 5.86 s | 0.69x | 31.9 MiB | 26.6 MiB | 20437398 | 20437398 | ok |
 | 12 | 9.04 s | 5.71 s | 0.63x | 51.6 MiB | 46.6 MiB | 20385376 | 20385376 | ok |
-| 13 | 13.66 s | 12.20 s | 0.89x | 118.4 MiB | 38.8 MiB | 20131625 | 20135315 | diff |
-| 14 | 15.95 s | 15.05 s | 0.94x | 134.1 MiB | 54.7 MiB | 20013079 | 20016886 | diff |
-| 15 | 20.97 s | 19.87 s | 0.95x | 150.0 MiB | 70.6 MiB | 19776029 | 19779986 | diff |
-| 16 | 25.55 s | 20.60 s | 0.81x | 117.8 MiB | 38.4 MiB | 19106683 | 19108591 | diff |
-| 17 | 34.67 s | 32.62 s | 0.94x | 133.8 MiB | 58.1 MiB | 18616327 | 18617535 | diff |
-| 18 | 42.22 s | 35.71 s | 0.85x | 133.8 MiB | 59.4 MiB | 18369567 | 18369495 | diff |
-| 19 | 48.16 s | 42.33 s | 0.88x | 165.3 MiB | 90.6 MiB | 18123264 | 18123577 | diff |
-| 20 | 59.81 s | 51.47 s | 0.86x | 245.0 MiB | 194.7 MiB | 17515211 | 17516254 | diff |
-| 21 | 67.80 s | 61.68 s | 0.91x | 404.4 MiB | 385.0 MiB | 17293928 | 17295012 | diff |
-| 22 | 71.02 s | 62.08 s | 0.87x | 724.1 MiB | 706.2 MiB | 17245138 | 17246022 | diff |
+| 13 | 14.01 s | 12.97 s | 0.93x | 43.4 MiB | 38.8 MiB | 20135315 | 20135315 | ok |
+| 14 | 20.28 s | 16.47 s | 0.81x | 59.4 MiB | 54.4 MiB | 20016886 | 20016886 | ok |
+| 15 | 23.36 s | 21.63 s | 0.93x | 75.6 MiB | 70.6 MiB | 19779986 | 19779986 | ok |
+| 16 | 30.08 s | 24.39 s | 0.81x | 44.4 MiB | 38.8 MiB | 19108591 | 19108591 | ok |
+| 17 | 37.82 s | 32.19 s | 0.85x | 68.1 MiB | 58.8 MiB | 18617535 | 18617535 | ok |
+| 18 | 44.35 s | 38.79 s | 0.87x | 68.8 MiB | 59.4 MiB | 18369495 | 18369495 | ok |
+| 19 | 51.17 s | 45.27 s | 0.88x | 100.6 MiB | 90.9 MiB | 18123577 | 18123577 | ok |
+| 20 | 61.53 s | 56.72 s | 0.92x | 227.8 MiB | 194.7 MiB | 17516254 | 17516254 | ok |
+| 21 | 64.38 s | 54.41 s | 0.85x | 387.8 MiB | 386.6 MiB | 17295012 | 17295012 | ok |
+| 22 | 64.43 s | 58.79 s | 0.91x | 708.4 MiB | 706.6 MiB | 17246022 | 17246022 | ok |
 
-Rust-compressed and original-compressed frames are byte-identical for levels 1-12 on the all-level fixture above, and not yet byte-identical for levels 13-22. The current level-1 no-check fast path is byte-identical on the larger real-data fixtures below. Timings are single sequential warm-cache runs using `--single-thread -1 --no-check`; RSS is from `/usr/bin/time`.
+Rust-compressed and original-compressed frames are byte-identical for levels 1-22 on the single-threaded all-level fixture above.
+
+The next table repeats the same fixture with 5 worker threads for both implementations: `-T5 -LEVEL --no-check -f -q`, with `--ultra` added for levels 20-22. Multi-threaded output is valid and cross-decodable but not byte-identical to upstream on this fixture, because the frame/job layout differs.
+
+| Level | Rust user | Original user | Rust/orig CPU | Rust RSS | Original RSS | Rust size | Original size | Byte-identical |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :---: |
+| 1 | 0.54 s | 0.40 s | 0.74x | 39.9 MiB | 23.8 MiB | 27310395 | 27311558 | diff |
+| 2 | 0.60 s | 0.48 s | 0.80x | 71.3 MiB | 46.6 MiB | 25091812 | 25093181 | diff |
+| 3 | 0.88 s | 0.69 s | 0.78x | 127.8 MiB | 87.8 MiB | 23801763 | 23802052 | diff |
+| 4 | 0.95 s | 0.77 s | 0.81x | 131.6 MiB | 90.9 MiB | 23342360 | 23342699 | diff |
+| 5 | 1.42 s | 1.25 s | 0.88x | 138.1 MiB | 92.8 MiB | 22702112 | 22658348 | diff |
+| 6 | 1.96 s | 1.60 s | 0.82x | 139.7 MiB | 92.8 MiB | 21989678 | 21938239 | diff |
+| 7 | 2.33 s | 1.91 s | 0.82x | 159.4 MiB | 106.9 MiB | 21597903 | 21537422 | diff |
+| 8 | 3.16 s | 2.43 s | 0.77x | 160.3 MiB | 103.8 MiB | 21341458 | 21256467 | diff |
+| 9 | 3.51 s | 2.62 s | 0.75x | 201.2 MiB | 126.2 MiB | 20965632 | 20905318 | diff |
+| 10 | 5.36 s | 3.77 s | 0.70x | 252.3 MiB | 166.6 MiB | 20684932 | 20615549 | diff |
+| 11 | 7.36 s | 5.92 s | 0.80x | 252.9 MiB | 166.2 MiB | 20552059 | 20478281 | diff |
+| 12 | 8.76 s | 6.22 s | 0.71x | 356.5 MiB | 245.3 MiB | 20505617 | 20429864 | diff |
+| 13 | 18.35 s | 15.70 s | 0.86x | 274.7 MiB | 213.1 MiB | 20169077 | 20171692 | diff |
+| 14 | 23.28 s | 19.87 s | 0.85x | 339.8 MiB | 276.9 MiB | 20054600 | 20057234 | diff |
+| 15 | 28.37 s | 25.20 s | 0.89x | 404.2 MiB | 340.6 MiB | 19842064 | 19844780 | diff |
+| 16 | 34.61 s | 29.08 s | 0.84x | 287.3 MiB | 213.1 MiB | 19122099 | 19124004 | diff |
+| 17 | 44.03 s | 39.12 s | 0.89x | 227.4 MiB | 179.4 MiB | 18623807 | 18624691 | diff |
+| 18 | 58.02 s | 45.08 s | 0.78x | 227.8 MiB | 181.2 MiB | 18377295 | 18378439 | diff |
+| 19 | 65.13 s | 55.64 s | 0.85x | 308.8 MiB | 243.4 MiB | 18124549 | 18126952 | diff |
+| 20 | 63.61 s | 53.88 s | 0.85x | 244.4 MiB | 243.4 MiB | 17515104 | 17516923 | diff |
+| 21 | 68.93 s | 61.79 s | 0.90x | 403.4 MiB | 401.9 MiB | 17293770 | 17294481 | diff |
+| 22 | 72.86 s | 65.74 s | 0.90x | 723.1 MiB | 722.8 MiB | 17245213 | 17245829 | diff |
+
+The current level-1 no-check fast path is byte-identical on the larger real-data fixtures below. Timings are single sequential warm-cache runs using `--single-thread -1 --no-check`; RSS is from `/usr/bin/time`.
 
 | Dataset | Input bytes | Rust wall/user/sys | Original wall/user/sys | Rust/orig CPU | Rust RSS | Original RSS | Rust bytes | Original bytes | Byte-identical |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :---: |

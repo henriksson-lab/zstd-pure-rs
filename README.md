@@ -4,6 +4,7 @@ A pure-Rust port of the [Zstandard (`zstd`)](https://github.com/facebook/zstd) c
 
 **Beware that translation is immature technology. Check that this crate works on your data to avoid data loss**
 
+* 2027-08-01: CI added
 * 2026-06-20: reached single thread parity again
 * 2026-06-19: Renewed attempt at getting speed up to original code. bugs created and fixed in the process
 * 2026-06-15: Getting closer to being a trustworthy but more testing needed
@@ -57,7 +58,22 @@ Test suite status as of the latest local audit run: `cargo test --features cli` 
 
 ## Local benchmark snapshot
 
-Measured 2026-06-20 on Linux 6.8 x86_64, Intel Xeon Gold 6138, `rustc 1.92.0`, generic release build from `cargo build --release --features cli` (no `-C target-cpu=native`; the upstream comparator is a generic vendored `zstd/programs/zstd` build reporting `v1.6.0`). The all-level table uses the deterministic 67,108,864-byte `.tmp/bench/realistic_64m.tar` fixture, built from the public Silesia corpus plus enwik8 Wikipedia text as distinct files in a tar archive. Commands were `--single-thread -LEVEL --no-check -f -q`, with `--ultra` added for levels 20-22. The table reports GNU `/usr/bin/time` user CPU seconds and max RSS; wall-clock timings on this host were noisy. `Rust/orig CPU` is original user time divided by Rust user time, so values below `1.00x` mean Rust used more CPU. `Byte-identical` compares the compressed frames against the vendored upstream CLI. This is a local status snapshot, not a guarantee.
+Original benchmark baseline: the installed comparator
+`/home/mahogny/miniconda3/bin/zstd` reports `v1.5.7`, while the vendored source
+tree is commit `48c0ed736252` (`git describe`: `v1.4.7-3018-g48c0ed73-dirty`).
+
+Latest rustification roll-up rerun: 2026-07-14 at Rust repo commit
+`0f163d5c3a0e966ae5225c9d13a8526fe0bb7c50`, against the installed original
+`/home/mahogny/miniconda3/bin/zstd` reporting `v1.5.7`. The old README
+Silesia/enwik8 fixture was not copied locally and is tracked as
+provenance-only, so this rerun used a deterministic local 64 MiB fixture. It
+ran single-threaded levels 1-22 with `--no-check`; all Rust frames were
+byte-identical to original frames. The aggregate reports mean original/Rust
+user-CPU speedup 0.98x and mean Rust/original RSS ratio 1.15 across 22 paired
+rows. The raw rows are tracked in
+`pres_rustification/benchmarks/zstd-pure-rs.tsv`.
+
+Measured 2026-06-20 on Linux 6.8 x86_64, Intel Xeon Gold 6138, `rustc 1.92.0`, generic release build from `cargo build --release --features cli` (no `-C target-cpu=native`). The all-level table uses the deterministic 67,108,864-byte `.tmp/bench/realistic_64m.tar` fixture, built from the public Silesia corpus plus enwik8 Wikipedia text as distinct files in a tar archive. Commands were `--single-thread -LEVEL --no-check -f -q`, with `--ultra` added for levels 20-22. The table reports GNU `/usr/bin/time` user CPU seconds and max RSS; wall-clock timings on this host were noisy. `Rust/orig CPU` is original user time divided by Rust user time, so values below `1.00x` mean Rust used more CPU. `Byte-identical` compares the compressed frames against the vendored upstream CLI. This is a local status snapshot, not a guarantee.
 
 Levels 1-22 currently use the file streaming path and are byte-identical on this fixture. The all-level table is single-threaded for both implementations.
 

@@ -1469,6 +1469,13 @@ pub struct ZSTD_DCtx {
     pub stream_out_buffer: Vec<u8>,
     /// Bytes already drained from `stream_out_buffer` into the caller.
     pub stream_out_drained: usize,
+    /// Whether `ZSTD_decompressStream` has begun a frame since the last
+    /// session reset. Parameter and dictionary setters are gated on this
+    /// state even after the frame's buffered output has been drained.
+    pub stream_active: bool,
+    /// Whether the current stream session has parsed a regular frame header.
+    /// Skippable frames must not consume a one-shot prefix dictionary.
+    pub stream_regular_frame_started: bool,
     /// Upstream `oversizedDuration`: number of consecutive streaming
     /// calls whose retained buffers are much larger than the needed
     /// input/output workspace.
@@ -1476,6 +1483,10 @@ pub struct ZSTD_DCtx {
     /// Raw-content dict set by `ZSTD_initDStream_usingDict` — applied
     /// to every frame decoded until reset / re-init.
     pub stream_dict: Vec<u8>,
+    /// Original bytes used to install `stream_dict`. Full-format dictionaries
+    /// need these bytes to restore entropy tables and repeat offsets at the
+    /// next streaming frame boundary.
+    pub stream_dict_source: Vec<u8>,
     /// Sliding history of prior-block output, retained across
     /// `ZSTD_decompressContinue` calls so back-references in later
     /// blocks can resolve into earlier-block bytes that no longer live
@@ -1655,8 +1666,11 @@ impl Default for ZSTD_DCtx {
             stream_in_buffer: Vec::new(),
             stream_out_buffer: Vec::new(),
             stream_out_drained: 0,
+            stream_active: false,
+            stream_regular_frame_started: false,
             oversizedDuration: 0,
             stream_dict: Vec::new(),
+            stream_dict_source: Vec::new(),
             historyBuffer: Vec::new(),
             d_windowLogMax: crate::decompress::zstd_decompress::ZSTD_WINDOWLOG_LIMIT_DEFAULT,
             d_maxWindowSize: (1u64

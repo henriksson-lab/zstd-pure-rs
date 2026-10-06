@@ -4349,18 +4349,26 @@ mod tests {
         let n = crate::compress::zstd_compress::ZSTD_compress(&mut frame, &src, 3);
         assert!(!crate::common::error::ERR_isError(n));
 
-        let mut stream = Vec::new();
-        stream.extend_from_slice(&ZSTD_MAGIC_SKIPPABLE_START.to_le_bytes());
-        stream.extend_from_slice(&8u32.to_le_bytes());
-        stream.extend_from_slice(b"SKIPDATA");
-        stream.extend_from_slice(&frame[..n]);
+        let mut skip = Vec::new();
+        skip.extend_from_slice(&ZSTD_MAGIC_SKIPPABLE_START.to_le_bytes());
+        skip.extend_from_slice(&8u32.to_le_bytes());
+        skip.extend_from_slice(b"SKIPDATA");
 
         let mut dctx = ZSTD_DCtx::new();
         ZSTD_initDStream(&mut dctx);
+        assert_eq!(ZSTD_DCtx_refPrefix(&mut dctx, b"one-shot-prefix"), 0);
         let mut out = vec![0u8; src.len() + 64];
         let mut in_pos = 0usize;
         let mut out_pos = 0usize;
-        let _hint = ZSTD_decompressStream(&mut dctx, &mut out, &mut out_pos, &stream, &mut in_pos);
+        let hint = ZSTD_decompressStream(&mut dctx, &mut out, &mut out_pos, &skip, &mut in_pos);
+        assert_eq!(hint, 0);
+        assert_eq!(in_pos, skip.len());
+        assert_eq!(out_pos, 0);
+        assert_eq!(dctx.dictUses, ZSTD_dictUses_e::ZSTD_use_once);
+
+        in_pos = 0;
+        let _hint =
+            ZSTD_decompressStream(&mut dctx, &mut out, &mut out_pos, &frame[..n], &mut in_pos);
         // Keep draining until no more progress is expected (simple
         // cap on iterations).
         for _ in 0..8 {
@@ -4370,6 +4378,7 @@ mod tests {
             let _ = ZSTD_decompressStream(&mut dctx, &mut out, &mut out_pos, &[], &mut 0usize);
         }
         assert_eq!(&out[..out_pos], &src[..]);
+        assert_eq!(dctx.dictUses, ZSTD_dictUses_e::ZSTD_dont_use);
     }
 
     #[test]
@@ -4404,6 +4413,42 @@ mod tests {
         assert_eq!(out_pos, first.len() + second.len());
         assert_eq!(&out[..first.len()], first.as_slice());
         assert_eq!(&out[first.len()..out_pos], second.as_slice());
+    }
+
+    #[test]
+    fn decompressStream_staging_is_bounded_by_block_not_frame() {
+        use crate::compress::zstd_compress::{ZSTD_compress, ZSTD_compressBound};
+        use crate::decompress::zstd_decompress_block::ZSTD_BLOCKSIZE_MAX;
+
+        let source = vec![b'q'; 8 * 1024 * 1024 + 123];
+        let mut frame = vec![0; ZSTD_compressBound(source.len())];
+        let frame_len = ZSTD_compress(&mut frame, &source, 3);
+        assert!(!crate::common::error::ERR_isError(frame_len));
+        frame.truncate(frame_len);
+
+        let mut dctx = ZSTD_DCtx::new();
+        ZSTD_initDStream(&mut dctx);
+        let mut input_pos = 0usize;
+        let mut decoded = Vec::with_capacity(source.len());
+        loop {
+            let mut chunk = [0; 997];
+            let mut output_pos = 0usize;
+            let hint = ZSTD_decompressStream(
+                &mut dctx,
+                &mut chunk,
+                &mut output_pos,
+                &frame,
+                &mut input_pos,
+            );
+            assert!(!crate::common::error::ERR_isError(hint));
+            decoded.extend_from_slice(&chunk[..output_pos]);
+            assert!(dctx.stream_out_buffer.capacity() <= ZSTD_BLOCKSIZE_MAX);
+            assert!(dctx.stream_in_buffer.capacity() <= ZSTD_BLOCKSIZE_MAX);
+            if hint == 0 && input_pos == frame.len() {
+                break;
+            }
+        }
+        assert_eq!(decoded, source);
     }
 
     #[test]
@@ -6306,6 +6351,7 @@ pub fn ZSTD_DCtx_trace_end(
 /// `ddictLocal` + `ddict` + `dictUses` separately.
 pub fn ZSTD_clearDict(dctx: &mut ZSTD_DCtx) {
     dctx.stream_dict.clear();
+    dctx.stream_dict_source.clear();
     dctx.dictID = 0;
     dctx.ddict_rep = crate::common::zstd_internal::repStartValue;
     dctx.litEntropy = 0;
@@ -6624,12 +6670,15 @@ fn dctx_is_in_init_stage(dctx: &ZSTD_DCtx) -> bool {
     dctx.stream_in_buffer.is_empty()
         && dctx.stream_out_buffer.is_empty()
         && dctx.stream_out_drained == 0
+        && !dctx.stream_active
 }
 
 fn ZSTD_DCtx_resetSession(dctx: &mut ZSTD_DCtx) {
     dctx.stream_in_buffer.clear();
     dctx.stream_out_buffer.clear();
     dctx.stream_out_drained = 0;
+    dctx.stream_active = false;
+    dctx.stream_regular_frame_started = false;
     dctx.oversizedDuration = 0;
     dctx.isFrameDecompression = 1;
     dctx.expected = ZSTD_startingInputLength(dctx.format);
@@ -6685,6 +6734,7 @@ pub fn ZSTD_DCtx_refPrefix(dctx: &mut ZSTD_DCtx, prefix: &[u8]) -> usize {
     ZSTD_clearDict(dctx);
     if !prefix.is_empty() {
         dctx.stream_dict = prefix.to_vec();
+        dctx.stream_dict_source = prefix.to_vec();
         // `dictID` was just zeroed by `clearDict` — no explicit
         // re-write needed for the raw-content prefix path.
         // Upstream (zstd_decompress.c:1728) marks prefix-dict as
@@ -6879,6 +6929,7 @@ pub fn ZSTD_DCtx_setParameter(dctx: &mut ZSTD_DCtx, param: ZSTD_dParameter, valu
                 }
                 _ => ZSTD_format_e::ZSTD_f_zstd1,
             };
+            dctx.expected = ZSTD_startingInputLength(dctx.format);
             0
         }
         ZSTD_dParameter::ZSTD_d_forceIgnoreChecksum => {
@@ -7236,6 +7287,8 @@ pub fn ZSTD_decompress_usingDDict(
 pub fn ZSTD_decompress_insertDictionary(dctx: &mut ZSTD_DCtx, dict: &[u8]) -> usize {
     use crate::common::error::{ERR_isError, ErrorCode, ERROR};
     use crate::common::mem::MEM_readLE32;
+
+    dctx.stream_dict_source = dict.to_vec();
 
     // Raw content path: too small or no magic → just stash bytes.
     if dict.len() < 8 {
@@ -8044,9 +8097,15 @@ pub fn ZSTD_decompressContinue(dctx: &mut ZSTD_DCtx, dst: &mut [u8], src: &[u8])
             if crate::common::error::ERR_isError(rc) {
                 return rc;
             }
+            if dctx.fParams.frameType == ZSTD_FrameType_e::ZSTD_frame
+                && dctx.fParams.windowSize > dctx.d_maxWindowSize
+            {
+                return ERROR(ErrorCode::FrameParameterWindowTooLarge);
+            }
             if dctx.fParams.frameType != ZSTD_FrameType_e::ZSTD_frame {
                 return ERROR(ErrorCode::PrefixUnknown);
             }
+            dctx.stream_regular_frame_started = true;
             dctx.expected = ZSTD_blockHeaderSize;
             dctx.stage = ZSTD_dStage::ZSTDds_decodeBlockHeader;
             0
@@ -8585,17 +8644,38 @@ pub fn ZSTD_decompressContinueStream(
     0
 }
 
-/// Port of `ZSTD_decompressStream`. Buffers `input[input_pos..]` into
-/// the DCtx, detects when a complete frame has been received via
-/// `ZSTD_findFrameCompressedSize`, decodes it into an internal output
-/// buffer, and drains the result into `output[output_pos..]`.
-///
-/// Returns a hint for the next suggested input size: 0 when the
-/// current frame is complete and fully drained, `ZSTD_blockHeaderSize`
-/// as a conservative "need more" hint otherwise.
-///
-/// v0.1 scope: single-frame per call-sequence. Multi-frame streams
-/// work if the caller invokes `ZSTD_initDStream` between frames.
+fn ZSTD_restoreStreamingDictAtFrameBoundary(zds: &mut ZSTD_DCtx) -> usize {
+    if !zds.stream_regular_frame_started {
+        return 0;
+    }
+    zds.stream_regular_frame_started = false;
+    match zds.dictUses {
+        ZSTD_dictUses_e::ZSTD_dont_use => 0,
+        ZSTD_dictUses_e::ZSTD_use_once => {
+            ZSTD_clearDict(zds);
+            0
+        }
+        ZSTD_dictUses_e::ZSTD_use_indefinitely => {
+            let source = zds.stream_dict_source.clone();
+            if source.is_empty() {
+                return 0;
+            }
+            ZSTD_clearDict(zds);
+            let result = ZSTD_decompress_insertDictionary(zds, &source);
+            if crate::common::error::ERR_isError(result) {
+                return result;
+            }
+            zds.dictUses = ZSTD_dictUses_e::ZSTD_use_indefinitely;
+            0
+        }
+    }
+}
+
+/// Port of `ZSTD_decompressStream`. Input is staged only until the next
+/// exact chunk requested by the translated block decoder is available.
+/// Decoded output is retained at most one block at a time while the rolling
+/// history stays bounded by the frame window. In particular, neither buffer
+/// grows with the complete compressed or decompressed frame.
 pub fn ZSTD_decompressStream(
     zds: &mut ZSTD_DCtx,
     output: &mut [u8],
@@ -8603,7 +8683,6 @@ pub fn ZSTD_decompressStream(
     input: &[u8],
     input_pos: &mut usize,
 ) -> usize {
-    use crate::common::error::ERR_isError;
     if *output_pos > output.len() {
         return ERROR(ErrorCode::DstSizeTooSmall);
     }
@@ -8614,139 +8693,8 @@ pub fn ZSTD_decompressStream(
         return ERROR(ErrorCode::Generic);
     }
 
-    // Drain any already-decoded bytes first.
-    let avail = output.len() - *output_pos;
-    let pending = zds.stream_out_buffer.len() - zds.stream_out_drained;
-    let n = avail.min(pending);
-    if n > 0 {
-        output[*output_pos..*output_pos + n].copy_from_slice(
-            &zds.stream_out_buffer[zds.stream_out_drained..zds.stream_out_drained + n],
-        );
-        zds.stream_out_drained += n;
-        *output_pos += n;
-    }
-    let pending = zds.stream_out_buffer.len() - zds.stream_out_drained;
-    if pending > 0 {
-        return pending.max(3);
-    }
-
-    // Ingest fresh input.
-    zds.stream_in_buffer.extend_from_slice(&input[*input_pos..]);
-    *input_pos = input.len();
-
-    // If nothing pending on either side, we're done.
-    if zds.stream_out_drained == zds.stream_out_buffer.len() && zds.stream_in_buffer.is_empty() {
-        return 0;
-    }
-    // If output fully drained AND fresh input is available, keep
-    // probing complete frames. Upstream's streaming loop continues
-    // while it can make progress, so concatenated frames supplied in
-    // one input buffer should all decode in this call when output has
-    // room.
-    while zds.stream_out_drained == zds.stream_out_buffer.len() && !zds.stream_in_buffer.is_empty()
-    {
-        if *output_pos == output.len()
-            && !(zds.format == ZSTD_format_e::ZSTD_f_zstd1
-                && zds.stream_in_buffer.len() >= ZSTD_SKIPPABLEHEADERSIZE
-                && (MEM_readLE32(&zds.stream_in_buffer[..4]) & ZSTD_MAGIC_SKIPPABLE_MASK)
-                    == ZSTD_MAGIC_SKIPPABLE_START)
-        {
-            break;
-        }
-
-        // Try to measure a full frame from the staged input. Thread
-        // the dctx's stored format through so magicless-mode streams
-        // decode without the 4-byte magic prefix.
-        let frame_sz = ZSTD_findFrameCompressedSize_advanced(&zds.stream_in_buffer, zds.format);
-        if ERR_isError(frame_sz) {
-            if crate::common::error::ERR_getErrorCode(frame_sz) == ErrorCode::SrcSizeWrong {
-                // Incomplete input: return a non-zero hint so the
-                // caller keeps feeding.
-                let start = ZSTD_startingInputLength(zds.format);
-                return start.saturating_sub(zds.stream_in_buffer.len()).max(1);
-            }
-            return frame_sz;
-        }
-        let frame_info = ZSTD_findFrameSizeInfo(&zds.stream_in_buffer, zds.format);
-        if ERR_isError(frame_info.compressedSize) {
-            return frame_info.compressedSize;
-        }
-        let frame_bytes = zds.stream_in_buffer[..frame_sz].to_vec();
-        let mut zfh = ZSTD_FrameHeader::default();
-        let header_rc = ZSTD_getFrameHeader_advanced(&mut zfh, &frame_bytes, zds.format);
-        if ERR_isError(header_rc) {
-            return header_rc;
-        }
-        if header_rc != 0 {
-            return ERROR(ErrorCode::SrcSizeWrong);
-        }
-        if zfh.frameType == ZSTD_FrameType_e::ZSTD_frame && zfh.windowSize > zds.d_maxWindowSize {
-            return ERROR(ErrorCode::FrameParameterWindowTooLarge);
-        }
-        // Determine decoded size.
-        let declared = zfh.frameContentSize;
-        let out_size = if declared == ZSTD_CONTENTSIZE_UNKNOWN {
-            match usize::try_from(frame_info.decompressedBound) {
-                Ok(size) if size != usize::MAX => size,
-                _ => return ERROR(ErrorCode::DstSizeTooSmall),
-            }
-        } else {
-            match usize::try_from(declared) {
-                Ok(size) => size,
-                Err(_) => return ERROR(ErrorCode::DstSizeTooSmall),
-            }
-        };
-        let mut decoded = vec![0u8; out_size.max(1)];
-        let has_prepared_dict = !zds.stream_dict.is_empty()
-            || zds.dictID != 0
-            || zds.litEntropy != 0
-            || zds.fseEntropy != 0;
-        let d = if !has_prepared_dict {
-            // Route through `ZSTD_decompressDCtx` (not `ZSTD_decompress`)
-            // so the stream's DCtx state — crucially `dctx.format` —
-            // is honored. A magicless-mode streaming decoder would
-            // previously fail here because `ZSTD_decompress` allocates
-            // a fresh dctx fixed to `ZSTD_f_zstd1`.
-            use crate::common::xxhash::XXH64_state_t;
-            use crate::decompress::zstd_decompress_block::ZSTD_decoder_entropy_rep;
-            let mut rep = ZSTD_decoder_entropy_rep::default();
-            let mut xxh = XXH64_state_t::default();
-            ZSTD_decompressDCtx(zds, &mut rep, &mut xxh, &mut decoded, &frame_bytes)
-        } else {
-            // Snapshot the already-loaded dictionary state. For full
-            // dictionaries, `stream_dict` contains the exposed DDict
-            // content; dictID, entropy flags, and repcodes live on the
-            // DCtx and must be replayed as a unit.
-            let was_use_once = zds.dictUses == ZSTD_dictUses_e::ZSTD_use_once;
-            let prepared = ZSTD_takePreparedDictForFrame(zds);
-            let decoded_len = match prepared {
-                Some(dict) => {
-                    ZSTD_decompressMultiFrame_preparedDict(zds, &mut decoded, &frame_bytes, &dict)
-                }
-                None => {
-                    use crate::common::xxhash::XXH64_state_t;
-                    use crate::decompress::zstd_decompress_block::ZSTD_decoder_entropy_rep;
-                    let mut rep = ZSTD_decoder_entropy_rep::default();
-                    let mut xxh = XXH64_state_t::default();
-                    ZSTD_decompressDCtx(zds, &mut rep, &mut xxh, &mut decoded, &frame_bytes)
-                }
-            };
-            if was_use_once && !ERR_isError(decoded_len) {
-                ZSTD_clearDict(zds);
-            }
-            decoded_len
-        };
-        if ERR_isError(d) {
-            return d;
-        }
-        decoded.truncate(d);
-        zds.stream_out_buffer = decoded;
-        zds.stream_out_drained = 0;
-        // Remove the consumed frame from the input buffer so multi-
-        // frame streams work when the caller re-inits between frames.
-        zds.stream_in_buffer.drain(..frame_sz);
-
-        // Drain the freshly-decoded output.
+    loop {
+        // Drain the at-most-one-block output staged by the prior step.
         let avail = output.len() - *output_pos;
         let pending = zds.stream_out_buffer.len() - zds.stream_out_drained;
         let n = avail.min(pending);
@@ -8757,16 +8705,80 @@ pub fn ZSTD_decompressStream(
             zds.stream_out_drained += n;
             *output_pos += n;
         }
-        if zds.stream_out_drained < zds.stream_out_buffer.len() {
-            break;
+        let pending = zds.stream_out_buffer.len() - zds.stream_out_drained;
+        if pending > 0 {
+            return pending.max(1);
         }
-    }
+        zds.stream_out_buffer.clear();
+        zds.stream_out_drained = 0;
 
-    let remaining = zds.stream_out_buffer.len() - zds.stream_out_drained;
-    if remaining == 0 && zds.stream_in_buffer.is_empty() {
-        0
-    } else {
-        remaining.max(3)
+        let mut expected = ZSTD_nextSrcSizeToDecompress(zds);
+        if expected == 0 {
+            let result = ZSTD_restoreStreamingDictAtFrameBoundary(zds);
+            if crate::common::error::ERR_isError(result) {
+                return result;
+            }
+            if *input_pos == input.len() && zds.stream_in_buffer.is_empty() {
+                return 0;
+            }
+            expected = ZSTD_resetDStream(zds);
+            if crate::common::error::ERR_isError(expected) {
+                return expected;
+            }
+        }
+
+        if *output_pos == output.len() {
+            return expected.max(1);
+        }
+
+        let needed = expected.saturating_sub(zds.stream_in_buffer.len());
+        let available_input = input.len() - *input_pos;
+        let take = needed.min(available_input);
+        zds.stream_in_buffer
+            .extend_from_slice(&input[*input_pos..*input_pos + take]);
+        *input_pos += take;
+        zds.stream_active |= take != 0;
+        if zds.stream_in_buffer.len() < expected {
+            return (expected - zds.stream_in_buffer.len()).max(1);
+        }
+
+        let mut chunk = std::mem::take(&mut zds.stream_in_buffer);
+        if zds.stage == ZSTD_dStage::ZSTDds_getFrameHeaderSize
+            && zds.format == ZSTD_format_e::ZSTD_f_zstd1
+            && chunk.len() >= ZSTD_FRAMEIDSIZE
+        {
+            let magic = MEM_readLE32(&chunk[..ZSTD_FRAMEIDSIZE]);
+            if magic != ZSTD_MAGICNUMBER
+                && (magic & ZSTD_MAGIC_SKIPPABLE_MASK) != ZSTD_MAGIC_SKIPPABLE_START
+            {
+                chunk.clear();
+                zds.stream_in_buffer = chunk;
+                return ERROR(ErrorCode::PrefixUnknown);
+            }
+        }
+        let produced_len = match ZSTD_decompressContinue_into_history(zds, &chunk) {
+            Ok(produced) => produced.len(),
+            Err(error) => {
+                chunk.clear();
+                zds.stream_in_buffer = chunk;
+                return error;
+            }
+        };
+        chunk.clear();
+        zds.stream_in_buffer = chunk;
+        let produced_end = zds.historyBuffer.len();
+        let produced_begin = produced_end - produced_len;
+        zds.stream_out_buffer.clear();
+        zds.stream_out_buffer
+            .extend_from_slice(&zds.historyBuffer[produced_begin..produced_end]);
+        zds.stream_out_drained = 0;
+
+        if zds.stream_out_buffer.is_empty()
+            && *input_pos == input.len()
+            && ZSTD_nextSrcSizeToDecompress(zds) == 0
+        {
+            return 0;
+        }
     }
 }
 

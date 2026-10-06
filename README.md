@@ -4,6 +4,7 @@ A pure-Rust port of the [Zstandard (`zstd`)](https://github.com/facebook/zstd) c
 
 **Beware that translation is immature technology. Check that this crate works on your data to avoid data loss**
 
+* 2027-10-06: Fixes for streaming
 * 2027-08-01: CI added
 * 2026-06-20: reached single thread parity again
 * 2026-06-19: Renewed attempt at getting speed up to original code. bugs created and fixed in the process

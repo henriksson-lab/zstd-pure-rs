@@ -344,6 +344,7 @@ pub fn ZSTD_copyDDictParameters(
     use crate::decompress::zstd_decompress::ZSTD_loadDEntropy;
 
     dctx.stream_dict = ZSTD_DDict_dictContent(ddict).to_vec();
+    dctx.stream_dict_source = ZSTD_DDict_originalContent(ddict).to_vec();
     let dict_start = ddict.dictContent as usize;
     let dict_end = dict_start.wrapping_add(ddict.dictSize);
     dctx.prefixStart = Some(dict_start);

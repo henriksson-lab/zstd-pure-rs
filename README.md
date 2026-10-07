@@ -4,8 +4,8 @@ A pure-Rust port of the [Zstandard (`zstd`)](https://github.com/facebook/zstd) c
 
 **Beware that translation is immature technology. Check that this crate works on your data to avoid data loss**
 
-* 2027-10-07: Fixes for streaming. New 0.2.0 version due to API change
-* 2027-08-01: CI added
+* 2026-10-07: Fixes for streaming. New 0.2.0 version due to API change
+* 2026-08-01: CI added
 * 2026-06-20: reached single thread parity again
 * 2026-06-19: Renewed attempt at getting speed up to original code. bugs created and fixed in the process
 * 2026-06-15: Getting closer to being a trustworthy but more testing needed
@@ -228,4 +228,3 @@ but if you link to our Git repository, for reproducibility, it is better that yo
 In addition, we appreciate if you cite the paper below describing the translation approach. If for some reason you struggle with journal citation limits, please prioritizing citing the original software over our translation paper.
 
 > Johan Henriksson. Static analysis-guided agentic AI translation enables Rust as a full stack bioinformatics language. arXiv:2608.13029, 2026. https://doi.org/10.48550/arXiv.2608.13029
-

@@ -1,5 +1,5 @@
 //! Dictionary-trainer benchmark harness (behind the `cli` feature).
-//! usage: train <default|legacy|cover|fastcover> <maxDict> <out.dict> <file...>
+//! Usage: `train <default|legacy|cover|fastcover> <maxDict> <out.dict> <file...>`
 use std::time::Instant;
 use zstd_pure_rs::prelude::*;
 

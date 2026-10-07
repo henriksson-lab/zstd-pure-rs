@@ -1373,7 +1373,7 @@ pub fn HUF_compress1X_usingCTable_body_loop_specialized<
     }
     debug_assert_eq!(n % KU, 0);
 
-    if !n.is_multiple_of(2 * KU) {
+    if n % (2 * KU) != 0 {
         let mut u = 1usize;
         while u < KU {
             HUF_encodeSymbol(
@@ -1506,7 +1506,7 @@ fn HUF_compress1X_usingCTable_body_loop_runtime(
         }
         HUF_flushBits(bitC, kFastFlush);
     }
-    if !n.is_multiple_of(2 * kUnroll) {
+    if n % (2 * kUnroll) != 0 {
         let mut u = 1usize;
         while u < kUnroll {
             HUF_encodeSymbol(bitC, ip[n - u] as u32, ctable, 0, true);
@@ -2856,7 +2856,7 @@ mod tests {
         let mut dst = [0u8; HUF_CTABLEBOUND];
         let mut backing = [0u8; HUF_WRITE_CTABLE_WORKSPACE_SIZE + HUF_WORKSPACE_MAX_ALIGNMENT];
         let base = backing.as_ptr() as usize;
-        let offset = if base.is_multiple_of(4) { 1 } else { 0 };
+        let offset = if base % 4 == 0 { 1 } else { 0 };
         let written =
             HUF_writeCTable_wksp(&mut dst, &ct, 3, table_log as u32, &mut backing[offset..]);
         assert!(

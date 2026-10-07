@@ -25,7 +25,7 @@ pub enum ZSTD_cwksp_static_alloc_e {
     ZSTD_cwksp_static_alloc = 1,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ZSTD_cwksp {
     pub owned: Option<Box<[usize]>>,
     pub workspace: *mut u8,
@@ -39,6 +39,25 @@ pub struct ZSTD_cwksp {
     pub workspaceOversizedDuration: i32,
     pub phase: ZSTD_cwksp_alloc_phase_e,
     pub isStatic: ZSTD_cwksp_static_alloc_e,
+}
+
+impl Default for ZSTD_cwksp {
+    fn default() -> Self {
+        Self {
+            owned: None,
+            workspace: null_mut(),
+            workspaceEnd: null_mut(),
+            objectEnd: null_mut(),
+            tableEnd: null_mut(),
+            tableValidEnd: null_mut(),
+            allocStart: null_mut(),
+            initOnceStart: null_mut(),
+            allocFailed: 0,
+            workspaceOversizedDuration: 0,
+            phase: ZSTD_cwksp_alloc_phase_e::default(),
+            isStatic: ZSTD_cwksp_static_alloc_e::default(),
+        }
+    }
 }
 
 impl Default for ZSTD_cwksp_alloc_phase_e {

@@ -285,7 +285,7 @@ pub fn FSE_buildDTable_internal(
 
         let mut position: usize = 0;
         let unroll = 2usize;
-        debug_assert!((tableSize as usize).is_multiple_of(unroll));
+        debug_assert!((tableSize as usize) % unroll == 0);
         let mut s = 0;
         while s < tableSize as usize {
             for u in 0..unroll {

@@ -3,6 +3,7 @@ name = "zstd-pure-rs"
 version = "0.2.0"
 edition = "2021"
 rust-version = "1.85"
+autobins = false
 autoexamples = false
 description = "Pure-Rust port of the Zstandard (zstd) compression library"
 license = "BSD-3-Clause OR GPL-2.0-only"

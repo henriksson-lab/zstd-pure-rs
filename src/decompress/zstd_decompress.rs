@@ -8727,7 +8727,19 @@ pub fn ZSTD_decompressStream(
             }
         }
 
-        if *output_pos == output.len() {
+        // Header parsing and skippable frames don't produce output. Keep
+        // consuming them even when the caller's output buffer is exactly
+        // full, so trailing metadata can complete in the current call.
+        // Once a regular frame header has been identified, wait for output
+        // space before consuming any block data.
+        if *output_pos == output.len()
+            && !matches!(
+                zds.stage,
+                ZSTD_dStage::ZSTDds_getFrameHeaderSize
+                    | ZSTD_dStage::ZSTDds_decodeSkippableHeader
+                    | ZSTD_dStage::ZSTDds_skipFrame
+            )
+        {
             return expected.max(1);
         }
 

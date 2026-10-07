@@ -136,7 +136,7 @@ pub fn ct_header_maxSV(ct: &[FSE_CTable]) -> u32 {
 fn ct_u16_write(ct: &mut [FSE_CTable], i: usize, val: u16) {
     let slot = 1 + (i / 2);
     let prev = ct[slot];
-    if i.is_multiple_of(2) {
+    if i % 2 == 0 {
         ct[slot] = (prev & 0xFFFF_0000) | val as u32;
     } else {
         ct[slot] = (prev & 0x0000_FFFF) | ((val as u32) << 16);
@@ -584,7 +584,7 @@ pub struct FSE_CState_t {
 fn ct_u16_read(ct: &[FSE_CTable], i: usize) -> u16 {
     let slot = 1 + (i / 2);
     let w = ct[slot];
-    if i.is_multiple_of(2) {
+    if i % 2 == 0 {
         w as u16
     } else {
         (w >> 16) as u16
@@ -604,7 +604,7 @@ fn ct_u16_read(ct: &[FSE_CTable], i: usize) -> u16 {
 unsafe fn ct_u16_read_unchecked(ct: &[FSE_CTable], i: usize) -> u16 {
     let slot = 1 + (i / 2);
     let w = unsafe { *ct.get_unchecked(slot) };
-    if i.is_multiple_of(2) {
+    if i % 2 == 0 {
         w as u16
     } else {
         (w >> 16) as u16
@@ -704,7 +704,7 @@ fn FSE_compress_usingCTable_generic<const FAST: bool>(
         stateLog: 0,
     };
 
-    if srcSize.is_multiple_of(2) {
+    if srcSize % 2 == 0 {
         ip -= 1;
         FSE_initCState2(&mut state2, ct, src[ip] as u32);
         ip -= 1;

@@ -144,7 +144,7 @@
 // throughout. A proper `no_std` variant is a future effort.
 #[cfg(not(feature = "std"))]
 compile_error!(
-    "zstd-pure-rs v0.1 requires the `std` feature (enabled by default). \
+    "zstd-pure-rs requires the `std` feature (enabled by default). \
      no_std support is a future goal."
 );
 

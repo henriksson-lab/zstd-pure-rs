@@ -1398,6 +1398,7 @@ pub const MIN_LITERALS_FOR_4_STREAMS: usize = 6;
 /// Rust port keeps them in the same place so the 1:1 mapping is still
 /// useful to code-complexity-comparator.
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct ZSTD_DCtx {
     /// Huffman decoding table, sized for `HUF_TABLELOG_MAX`.
     pub hufTable: Vec<HUF_DTable>,
